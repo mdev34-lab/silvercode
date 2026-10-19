@@ -38,6 +38,7 @@ import { SessionRunCoordinator } from "@opencode-ai/core/session/run-coordinator
 import { SessionRunner } from "@opencode-ai/core/session/runner"
 import * as SessionRunnerLLM from "@opencode-ai/core/session/runner/llm"
 import { SessionRunnerModel } from "@opencode-ai/core/session/runner/model"
+import { SessionContextReduction } from "@opencode-ai/core/session/context-reduction"
 import { ToolRegistry } from "@opencode-ai/core/tool/registry"
 import { ApplicationTools } from "@opencode-ai/core/tool/application-tools"
 import { AgentV2 } from "@opencode-ai/core/agent"
@@ -113,6 +114,18 @@ const recoveryModel = Model.make({
   provider: "fake",
   route: OpenAIChat.route.with({ limits: { context: 20_000, output: 1_000 } }),
 })
+// A window whose reduction threshold (0.8 of the usable window) sits below the inherited
+// compaction gate, so a test controls which lever a request reaches.
+const pressureModel = Model.make({
+  id: "pressure",
+  provider: "fake",
+  route: OpenAIChat.route.with({ limits: { context: 40_000, output: 24_000 } }),
+})
+const escalateModel = Model.make({
+  id: "escalate",
+  provider: "fake",
+  route: OpenAIChat.route.with({ limits: { context: 20_000, output: 12_000 } }),
+})
 const authorizations: Tool.Context[] = []
 const executions: string[] = []
 const permission = Layer.succeed(
@@ -159,6 +172,7 @@ const echo = Layer.effectDiscard(
 const echoNode = makeLocationNode({ name: "test/session-runner-tools", layer: echo, deps: [ToolRegistry.node] })
 let modelResolveHook = Effect.void
 let currentModel = model
+let bulkPayload = "z".repeat(9_000)
 const models = SessionRunnerModel.layerWith((session) =>
   modelResolveHook.pipe(Effect.as(session.model?.id === "replacement" ? replacementModel : currentModel)),
 )
@@ -323,6 +337,7 @@ const setup = Effect.gen(function* () {
   systemLoadHook = Effect.void
   modelResolveHook = Effect.void
   currentModel = model
+  bulkPayload = "z".repeat(9_000)
   skillBaselines.clear()
   responses = undefined
   streamFailure = undefined
@@ -3438,6 +3453,55 @@ describe("SessionRunnerLLM", () => {
     }),
   )
 
+  /** Tool result texts the provider request carries, for a provider that received a completion. */
+  const toolResultTexts = (request: LLMRequest) =>
+    request.messages.flatMap((message) =>
+      message.role === "tool"
+        ? message.content.flatMap((part) =>
+            part.type === "tool-result" && part.result.type === "text" ? [part.result.value] : [],
+          )
+        : [],
+    )
+
+  /**
+   * A tool with a small call record and a caller-controlled output.
+   *
+   * Context pressure has to come from the payload, not from the call itself: a tool whose input is as
+   * large as its result cannot show whether a reduction changed the output or the argument.
+   */
+  const registerBulk = Effect.gen(function* () {
+    const registry = yield* ToolRegistry.Service
+    yield* registry.register({
+      bulk: Tool.make({
+        description: "Return the configured bulk payload",
+        input: Schema.Struct({ tag: Schema.String }),
+        output: Schema.Struct({ text: Schema.String }),
+        toModelOutput: ({ output }) => [{ type: "text", text: output.text }],
+        execute: () => Effect.succeed({ text: bulkPayload }),
+      }),
+    })
+  })
+
+  const bulkCalls = (input: readonly { readonly id: string; readonly tag: string }[]) => [
+    LLMEvent.stepStart({ index: 0 }),
+    ...input.map((call) => LLMEvent.toolCall({ id: call.id, name: "bulk", input: { tag: call.tag } })),
+    LLMEvent.stepFinish({ index: 0, reason: "tool-calls" }),
+    LLMEvent.finish({ reason: "tool-calls" }),
+  ]
+
+  const sameTagCalls = (ids: readonly string[]) => bulkCalls(ids.map((id) => ({ id, tag: "same" })))
+
+  const reportCollector = (events: EventV2.Interface) => {
+    const reports: (typeof SessionEvent.Context.Prepared.Type)[] = []
+    return events
+      .listen((event) =>
+        Effect.sync(() => {
+          if (event.type === SessionEvent.Context.Prepared.type) reports.push(event.data)
+        }),
+      )
+      .pipe(Effect.as(reports))
+  }
+
   it.effect("rejects malformed streamed tool input ordering", () =>
     Effect.gen(function* () {
       yield* setup
@@ -3450,6 +3514,150 @@ describe("SessionRunnerLLM", () => {
       expect(yield* session.resume(sessionID).pipe(Effect.catchDefect(Effect.succeed))).toBe(
         "Tool input delta before start: call-1",
       )
+    }),
+  )
+
+  it.effect("reduces the provider request under context pressure and reports it once per request", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const session = yield* SessionV2.Service
+      const events = yield* EventV2.Service
+      const reports = yield* reportCollector(events)
+      yield* registerBulk
+      currentModel = pressureModel
+      bulkPayload = "z".repeat(9_000)
+
+      // Six identical calls in one turn: only the newest result is a fact worth resending.
+      responses = [
+        sameTagCalls(["call-1", "call-2", "call-3", "call-4", "call-5", "call-6"]),
+        fragmentFixture("text", "text-first", ["Done"]).completeEvents,
+      ]
+      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Run it" }), resume: false })
+      yield* session.resume(sessionID)
+
+      // Three further turns push the redundant outputs out of the protected recent window.
+      for (const turn of ["one", "two", "three"]) {
+        responses = [fragmentFixture("text", `text-${turn}`, [turn]).completeEvents]
+        yield* session.prompt({ sessionID, prompt: Prompt.make({ text: turn }), resume: false })
+        yield* session.resume(sessionID)
+      }
+
+      requests.length = 0
+      reports.length = 0
+      responses = [fragmentFixture("text", "text-final", ["Final"]).completeEvents]
+      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Final question" }), resume: false })
+      yield* session.resume(sessionID)
+
+      expect(requests).toHaveLength(1)
+      const sent = toolResultTexts(requests[0]!)
+      expect(sent.filter((text) => text === SessionContextReduction.DUPLICATE_MARKER)).toHaveLength(5)
+      expect(sent.filter((text) => text === bulkPayload)).toHaveLength(1)
+      expect(userTexts(requests[0]!).at(-1)).toBe("Final question")
+
+      // One report, for the request that was sent.
+      expect(reports).toHaveLength(1)
+      expect(reports[0]).toMatchObject({ sessionID, outcome: "reduced" })
+      // Five outputs of 9,000 characters were replaced by a marker, and the request that was sent is
+      // back inside the window.
+      expect(reports[0]!.reclaimedTokens).toBeGreaterThan(10_000)
+      // Reduction stops as soon as the projection fits, so the reported request is one that was
+      // actually sent rather than a hypothetical result.
+      const threshold = SessionContextReduction.policy([]).threshold * reports[0]!.limit!
+      expect(reports[0]!.tokens).toBeLessThanOrEqual(threshold)
+
+      // Canonical history is authoritative and keeps every recorded output verbatim.
+      const context = yield* session.context(sessionID)
+      expect(
+        context.flatMap((message) =>
+          message.type === "assistant"
+            ? message.content.flatMap((part) =>
+                part.type === "tool" && part.state.status === "completed"
+                  ? part.state.content.flatMap((item) => (item.type === "text" ? [item.text] : []))
+                  : [],
+              )
+            : [],
+        ),
+      ).toEqual([bulkPayload, bulkPayload, bulkPayload, bulkPayload, bulkPayload, bulkPayload])
+    }),
+  )
+
+  it.effect("keeps the reduced projection across turn boundaries instead of resetting it", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const session = yield* SessionV2.Service
+      const events = yield* EventV2.Service
+      const reports = yield* reportCollector(events)
+      yield* registerBulk
+      currentModel = pressureModel
+      bulkPayload = "z".repeat(9_000)
+
+      responses = [
+        sameTagCalls(["call-1", "call-2", "call-3", "call-4", "call-5", "call-6"]),
+        fragmentFixture("text", "text-first", ["Done"]).completeEvents,
+      ]
+      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Run it" }), resume: false })
+      yield* session.resume(sessionID)
+      for (const turn of ["one", "two", "three"]) {
+        responses = [fragmentFixture("text", `text-${turn}`, [turn]).completeEvents]
+        yield* session.prompt({ sessionID, prompt: Prompt.make({ text: turn }), resume: false })
+        yield* session.resume(sessionID)
+      }
+
+      requests.length = 0
+      reports.length = 0
+      responses = [fragmentFixture("text", "text-a", ["A"]).completeEvents]
+      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "First follow-up" }), resume: false })
+      yield* session.resume(sessionID)
+      responses = [fragmentFixture("text", "text-b", ["B"]).completeEvents]
+      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Second follow-up" }), resume: false })
+      yield* session.resume(sessionID)
+
+      // The second turn of pressure re-derives the same projection from the same history: the
+      // reduction is not remembered, so it cannot go stale, and it does not fall back to the
+      // unreduced history either.
+      expect(requests).toHaveLength(2)
+      for (const request of requests) {
+        const sent = toolResultTexts(request)
+        expect(sent.filter((text) => text === SessionContextReduction.DUPLICATE_MARKER)).toHaveLength(5)
+        expect(sent.filter((text) => text === bulkPayload)).toHaveLength(1)
+      }
+      expect(userTexts(requests[0]!).at(-1)).toBe("First follow-up")
+      expect(userTexts(requests[1]!).at(-1)).toBe("Second follow-up")
+      expect(reports.map((report) => report.outcome)).toEqual(["reduced", "reduced"])
+    }),
+  )
+
+  it.effect("escalates to compaction instead of reducing protected content", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const session = yield* SessionV2.Service
+      const events = yield* EventV2.Service
+      const reports = yield* reportCollector(events)
+      yield* registerBulk
+      currentModel = escalateModel
+      bulkPayload = "z".repeat(36_000)
+      responses = [
+        bulkCalls([
+          { id: "call-1", tag: "one" },
+          { id: "call-2", tag: "two" },
+          { id: "call-3", tag: "three" },
+          { id: "call-4", tag: "four" },
+        ]),
+        fragmentFixture("text", "text-summary", ["## Objective\n- Preserve the task"]).completeEvents,
+        fragmentFixture("text", "text-final", ["Continued"]).completeEvents,
+      ]
+
+      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Run it" }), resume: false })
+      yield* session.resume(sessionID)
+
+      // Nothing may be reduced here — the only output is inside the protected recent window — so the
+      // runtime summarizes durably instead of sending an oversized request.
+      const context = yield* session.context(sessionID)
+      expect(context[0]).toMatchObject({ type: "compaction", summary: "## Objective\n- Preserve the task" })
+      expect(userTexts(requests.at(-1)!)[0]).toContain("<summary>\n## Objective\n- Preserve the task")
+
+      // A report describes a request that is actually sent, so the escalated request has none.
+      expect(reports.map((report) => report.outcome)).toEqual(["untouched", "untouched"])
     }),
   )
 })

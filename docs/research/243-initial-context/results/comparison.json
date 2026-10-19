@@ -1,0 +1,121 @@
+{
+  "alpha": "alpha-empty-gpt52-medium-run1",
+  "upstream": "upstream-empty-gpt52",
+  "totals": {
+    "system": {
+      "alpha": 4284,
+      "upstream": 2104
+    },
+    "tools": {
+      "alpha": 8208,
+      "upstream": 4412
+    },
+    "user": {
+      "alpha": 7,
+      "upstream": 7
+    },
+    "total": {
+      "alpha": 12499,
+      "upstream": 6523,
+      "delta": 5976
+    }
+  },
+  "tools": {
+    "onlyAlpha": [
+      "finish",
+      "tool_search",
+      "tool_search_regex"
+    ],
+    "onlyUpstream": [
+      "webfetch"
+    ],
+    "perTool": [
+      {
+        "name": "apply_patch",
+        "alpha": 360,
+        "upstream": 360,
+        "delta": 0
+      },
+      {
+        "name": "bash",
+        "alpha": 1633,
+        "upstream": 1245,
+        "delta": 388
+      },
+      {
+        "name": "finish",
+        "alpha": 1274,
+        "upstream": 0,
+        "delta": 1274
+      },
+      {
+        "name": "glob",
+        "alpha": 242,
+        "upstream": 242,
+        "delta": 0
+      },
+      {
+        "name": "grep",
+        "alpha": 280,
+        "upstream": 280,
+        "delta": 0
+      },
+      {
+        "name": "read",
+        "alpha": 415,
+        "upstream": 415,
+        "delta": 0
+      },
+      {
+        "name": "skill",
+        "alpha": 144,
+        "upstream": 144,
+        "delta": 0
+      },
+      {
+        "name": "task",
+        "alpha": 1823,
+        "upstream": 825,
+        "delta": 998
+      },
+      {
+        "name": "todowrite",
+        "alpha": 1445,
+        "upstream": 614,
+        "delta": 831
+      },
+      {
+        "name": "tool_search",
+        "alpha": 357,
+        "upstream": 0,
+        "delta": 357
+      },
+      {
+        "name": "tool_search_regex",
+        "alpha": 244,
+        "upstream": 0,
+        "delta": 244
+      },
+      {
+        "name": "webfetch",
+        "alpha": 0,
+        "upstream": 294,
+        "delta": -294
+      }
+    ]
+  },
+  "systemSections": {
+    "envBlock": {
+      "alpha": 98,
+      "upstream": 59
+    },
+    "skillsBlock": {
+      "alpha": 156,
+      "upstream": 156
+    },
+    "toolOverview": {
+      "alpha": 13,
+      "upstream": 0
+    }
+  }
+}

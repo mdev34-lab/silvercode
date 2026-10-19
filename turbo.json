@@ -8,10 +8,14 @@
       "dependsOn": [],
       "outputs": ["dist/**"]
     },
-    "opencode#test": {
+    "silvercode-ai#test": {
       "dependsOn": ["^build"],
       "outputs": [],
       "passThroughEnv": ["*"]
+    },
+    "@opencode-ai/tui#test": {
+      "dependsOn": ["^build"],
+      "outputs": []
     },
     "@opencode-ai/core#test": {
       "dependsOn": ["^build"],

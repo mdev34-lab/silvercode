@@ -887,17 +887,46 @@ describe("tool.finish – waiting for a background subagent", () => {
     }),
   )
 
-  // A session that is itself a subagent cannot yield: its run ends at the
-  // yield, so the parent would get this provisional result as the run's only
-  // delivery and whatever the child waits on would never reach it. The child
-  // has to deliver its own result instead. #222 makes a nested yield real.
-  it.instance("refuses a wait from a child session with a running subagent of its own", () =>
+  // A subagent may yield for background subagents it launched itself: `task`
+  // keeps its job running through the wait and resumes it as they report, so
+  // the wait is woken by work that belongs to the session (#222). Yielding for
+  // anything else - its parent's work, or nothing at all - would end its run
+  // here and deliver a provisional result as the run's only delivery.
+  it.instance("accepts a wait from a child session with a running subagent of its own", () =>
     Effect.gen(function* () {
       const sessions = yield* Session.Service
       const parent = yield* sessions.create({ title: "parent" })
       const { chat, assistant } = yield* seedSession("child", "work", parent.id)
-      // A wait would otherwise be accepted for this session.
       yield* startRunningChild(chat.id)
+      const tool = yield* FinishTool
+      const def = yield* tool.init()
+      const recorded: Record<string, unknown>[] = []
+
+      const result = yield* def.execute(
+        { reason: "waiting_for_subagent", result: "waiting" },
+        workCtx(chat.id, assistant.id, (input) => {
+          recorded.push(input.metadata ?? {})
+          return Effect.void
+        }),
+      )
+
+      expect(result.title).toBe("Waiting for 1 background subagent(s)")
+      expect(result.output).toBe("waiting")
+      expect(result.metadata.waiting).toBe(true)
+      expect(result.metadata).not.toHaveProperty("review")
+      // Non-terminal: the wait persists nothing for the eventual finish to read.
+      expect(recorded).toEqual([])
+    }),
+  )
+
+  it.instance("refuses a wait from a child session with nothing of its own running", () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const parent = yield* sessions.create({ title: "parent" })
+      const { chat, assistant } = yield* seedSession("child", "work", parent.id)
+      // A wait would otherwise be accepted: the parent itself has a child
+      // running, but that child is not work this session launched.
+      yield* startRunningChild(parent.id)
       const tool = yield* FinishTool
       const def = yield* tool.init()
       const recorded: Record<string, unknown>[] = []
@@ -915,6 +944,7 @@ describe("tool.finish – waiting for a background subagent", () => {
       )
 
       expect(failure?.message).toContain("this session is itself a subagent")
+      expect(failure?.message).toContain("has no background subagents of its own running")
       expect(failure?.message).toContain('Deliver your own result with reason: "success"')
       // Model feedback, not a nudge persisted for the eventual finish.
       expect(recorded).toEqual([])
@@ -922,12 +952,12 @@ describe("tool.finish – waiting for a background subagent", () => {
   )
 
   // A resumed task (`task_id`) can run a session that never had a parentID, so
-  // the task job running the session is the signal that it is a subagent.
-  it.instance("refuses a wait from a session running as a task job", () =>
+  // the task job running the session is the signal that it is a subagent. With
+  // nothing of its own running, the wait is refused for that reason.
+  it.instance("refuses a wait from a session running as a task job with nothing of its own running", () =>
     Effect.gen(function* () {
       const { chat, assistant } = yield* seedSession()
       const background = yield* BackgroundJob.Service
-      yield* startRunningChild(chat.id)
       yield* background.start({
         id: `${chat.id}-task-run`,
         type: "task",

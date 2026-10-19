@@ -4,6 +4,7 @@ import { Ripgrep } from "@opencode-ai/core/ripgrep"
 import { PlanExitTool } from "./plan"
 import { FinishTool } from "./finish"
 import { Session } from "@/session/session"
+import { SessionStatus } from "@/session/status"
 import { QuestionTool } from "./question"
 import { ShellTool } from "./shell"
 import { EditTool } from "./edit"
@@ -307,7 +308,10 @@ const layer = Layer.effect(
 
     const tools: Interface["tools"] = Effect.fn("ToolRegistry.tools")(function* (input) {
       const filtered = (yield* all()).filter((tool) => {
-        if (tool.id === FinishTool.id) return true
+        // Agents that opt out of the finish tool end turns on end-of-stream,
+        // so the model is not offered finish at all (the loop gating in
+        // prompt.ts already skips the requirement for them).
+        if (tool.id === FinishTool.id) return input.agent.finishTool !== false
         if (tool.id === WebSearchTool.id) {
           return webSearchEnabled(input.providerID, { exa: flags.enableExa, parallel: flags.enableParallel })
         }
@@ -467,6 +471,7 @@ export const node = LayerNode.make({
     Agent.node,
     Skill.node,
     Session.node,
+    SessionStatus.node,
     BackgroundJob.node,
     Provider.node,
     LSP.node,

@@ -1,0 +1,36 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "probe/gpt-5.2",
+  "plugin": [],
+  "mcp": {},
+  "lsp": false,
+  "share": "disabled",
+  "provider": {
+    "probe": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Probe",
+      "options": {
+        "baseURL": "http://127.0.0.1:38679/v1",
+        "apiKey": "fixture-key-not-a-secret"
+      },
+      "models": {
+        "gpt-5.2": {
+          "name": "gpt-5.2",
+          "tool_call": true,
+          "limit": {
+            "context": 400000,
+            "output": 32000
+          }
+        },
+        "claude-sonnet-4-5": {
+          "name": "claude-sonnet-4-5",
+          "tool_call": true,
+          "limit": {
+            "context": 200000,
+            "output": 32000
+          }
+        }
+      }
+    }
+  }
+}

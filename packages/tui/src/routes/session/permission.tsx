@@ -706,6 +706,7 @@ function Prompt<const T extends Record<string, string>>(props: {
       </box>
       <box
         flexDirection={narrow() ? "column" : "row"}
+        flexWrap="wrap"
         flexShrink={0}
         gap={1}
         paddingTop={1}
@@ -716,6 +717,9 @@ function Prompt<const T extends Record<string, string>>(props: {
         justifyContent={narrow() ? "flex-start" : "space-between"}
         alignItems={narrow() ? "flex-start" : "center"}
       >
+        {/* Actions and key hints wrap onto separate lines when the row does
+            not fit (#241): the confirm/reject controls must stay fully
+            visible at 80 columns instead of clipping at the right edge. */}
         <box flexDirection="row" gap={1} flexShrink={0}>
           <For each={keys}>
             {(option) => (
@@ -736,7 +740,7 @@ function Prompt<const T extends Record<string, string>>(props: {
             )}
           </For>
         </box>
-        <box flexDirection="row" gap={2} flexShrink={0}>
+        <box flexDirection="row" flexWrap="wrap" gap={2} flexShrink={0}>
           <Show when={props.expiresAt}>{(expiresAt) => <Countdown expiresAt={expiresAt()} />}</Show>
           <Show when={props.fullscreen}>
             <text fg={theme.text}>

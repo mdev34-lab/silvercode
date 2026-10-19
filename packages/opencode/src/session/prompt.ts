@@ -1440,9 +1440,16 @@ const layer = Layer.effect(
                 })
                 break
               }
-              if (finishNudges >= MAX_FINISH_NUDGES) {
+              // A review agent in an active stagnation run gets one slot past the
+              // generic budget: the #171 protocol spends a generic nudge before the
+              // recovery nudge, and the #176 backstop needs one more generation to
+              // honor it. Capping at the generic count would kill the run one nudge
+              // before the backstop (or the model's own finish) can end it. The
+              // flow stays strictly bounded either way.
+              const maxNudges = MAX_FINISH_NUDGES + (stagnated ? 1 : 0)
+              if (finishNudges >= maxNudges) {
                 const error = new NamedError.Unknown({
-                  message: `The assistant did not complete the required finish tool after ${MAX_FINISH_NUDGES} nudges. The turn was stopped to prevent an unbounded continuation loop. Set agent.<name>.finishTool to false for agents that must end turns without finish.`,
+                  message: `The assistant did not complete the required finish tool after ${maxNudges} nudges. The turn was stopped to prevent an unbounded continuation loop. Set agent.<name>.finishTool to false for agents that must end turns without finish.`,
                 }).toObject()
                 yield* sessions.updateMessage({
                   ...lastAssistant,

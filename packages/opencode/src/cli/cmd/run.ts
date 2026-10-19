@@ -18,6 +18,7 @@ import path from "path"
 import { pathToFileURL } from "url"
 import { open } from "node:fs/promises"
 import { Effect } from "effect"
+import { BackgroundTasks } from "./run/background-tasks"
 import { UI } from "../ui"
 import { effectCmd } from "../effect-cmd"
 import { EOL } from "os"
@@ -697,13 +698,12 @@ export const RunCommand = effectCmd({
         async function loop(client: OpencodeClient, events: Awaited<ReturnType<typeof sdk.event.subscribe>>) {
           const toggles = new Map<string, boolean>()
           // Background subagents are the default task mode: the parent turn may
-          // finish while child jobs still run. Track child sessions launched in
-          // the background so the loop does not exit (killing the in-process
-          // server and its jobs) before every result is surfaced. `Resolved`
-          // keeps fast completions (which can arrive before the tool part) from
-          // re-marking a task as pending.
-          const backgroundPending = new Set<string>()
-          const backgroundResolved = new Set<string>()
+          // finish while child jobs still run. Track the sessions this run
+          // launched - and the sessions they launched - so the loop does not
+          // exit, killing the in-process server and every job with it, before
+          // all of their results are surfaced.
+          const background = BackgroundTasks.make(sessionID)
+          let rootIdle = false
           let error: string | undefined
 
           for await (const event of events.stream) {
@@ -722,8 +722,9 @@ export const RunCommand = effectCmd({
 
             if (event.type === "message.part.updated") {
               const part = event.properties.part
-              if (part.sessionID !== sessionID) continue
-
+              // Launches are observed wherever they happen: a subagent's own
+              // subagents have to settle before this run may exit, and the
+              // envelope that reports them lands in the subagent's session.
               if (part.type === "tool" && part.tool === "task" && part.state.status === "completed") {
                 const taskID =
                   ("metadata" in part.state && typeof part.state.metadata?.sessionId === "string"
@@ -736,19 +737,25 @@ export const RunCommand = effectCmd({
                 if (
                   launched &&
                   typeof part.state.output === "string" &&
-                  part.state.output.includes(`state="running"`) &&
-                  !backgroundResolved.has(taskID!)
+                  part.state.output.includes(`state="running"`)
                 ) {
-                  backgroundPending.add(taskID!)
+                  background.launch({ sessionID: taskID!, parentSessionID: part.sessionID })
                 }
               }
               if (part.type === "text") {
                 const match = part.text.match(/<task id="([^"]+)" state="(?:completed|error|cancelled)">/)
-                if (match?.[1]) {
-                  backgroundResolved.add(match[1])
-                  backgroundPending.delete(match[1])
+                if (match?.[1] && !/<termination reason="waiting_for_subagent">/.test(part.text)) {
+                  background.resolve(match[1])
+                  // A normal notification is about to wake the root. Do not
+                  // exit in the gap between its user part and busy status.
+                  if (part.sessionID === sessionID && part.synthetic && part.metadata?.backgroundNoReply !== true)
+                    rootIdle = false
+                  if (rootIdle && background.settled()) break
                 }
               }
+
+              // Everything below mirrors and prints the run's own session.
+              if (part.sessionID !== sessionID) continue
 
               if (part.type === "tool" && (part.state.status === "completed" || part.state.status === "error")) {
                 if (emit("tool_use", { part })) continue
@@ -819,27 +826,13 @@ export const RunCommand = effectCmd({
               UI.error(err)
             }
 
-            // A background subagent session settling (completed, failed, or
-            // cancelled) emits its own idle status and resolves the task.
-            if (
-              event.type === "session.status" &&
-              event.properties.sessionID !== sessionID &&
-              event.properties.status.type === "idle"
-            ) {
-              backgroundResolved.add(event.properties.sessionID)
-              backgroundPending.delete(event.properties.sessionID)
+            if (event.type === "session.status" && event.properties.sessionID === sessionID) {
+              rootIdle = event.properties.status.type === "idle"
             }
-
-            if (
-              event.type === "session.status" &&
-              event.properties.sessionID === sessionID &&
-              event.properties.status.type === "idle"
-            ) {
-              // Keep the loop alive until every launched background task has
-              // been resolved, so non-interactive runs surface child results.
-              if (backgroundPending.size > 0) continue
-              break
-            }
+            // A deferred/silent descendant delivery can arrive after the root's
+            // last idle event. Recheck on every event, not only another root
+            // turn: teardown deliberately does not wake the stopped session.
+            if (rootIdle && background.settled()) break
 
             if (event.type === "permission.asked") {
               const permission = event.properties

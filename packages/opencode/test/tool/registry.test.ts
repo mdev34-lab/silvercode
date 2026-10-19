@@ -150,7 +150,7 @@ describe("tool.registry", () => {
     }),
   )
 
-  it.instance("hides task background parameter unless experimental background subagents are enabled", () =>
+  it.instance("exposes the task background parameter now that background subagents are stable", () =>
     Effect.gen(function* () {
       const registry = yield* ToolRegistry.Service
       const agent = yield* Agent.Service
@@ -162,8 +162,11 @@ describe("tool.registry", () => {
         agent: build,
       })).find((tool) => tool.id === "task")
 
-      expect(task?.jsonSchema).toBeDefined()
-      expect((task?.jsonSchema?.properties as Record<string, unknown> | undefined)?.background).toBeUndefined()
+      if (!task) throw new Error("task tool not found in registry")
+      // The registry defers JSON Schema materialization, so assert against the
+      // schema the model actually receives (fromTool falls back to parameters).
+      const schema = ToolJsonSchema.fromTool(task)
+      expect((schema.properties as Record<string, unknown> | undefined)?.background).toBeDefined()
     }),
   )
 

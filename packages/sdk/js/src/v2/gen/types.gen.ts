@@ -45,6 +45,7 @@ export type Event =
   | EventSessionNextCompactionStarted
   | EventSessionNextCompactionDelta
   | EventSessionNextCompactionEnded
+  | EventSessionNextContextPrepared
   | EventSessionNextRevertStaged
   | EventSessionNextRevertCleared
   | EventSessionNextRevertCommitted
@@ -1166,6 +1167,20 @@ export type GlobalEvent = {
           reason: "auto" | "manual"
           text: string
           recent: string
+        }
+      }
+    | {
+        id: string
+        type: "session.next.context.prepared"
+        properties: {
+          timestamp: number
+          sessionID: string
+          tokens: number
+          overheadTokens: number
+          reclaimedTokens: number
+          limit?: number
+          utilization: number
+          outcome: "untouched" | "reduced" | "exhausted"
         }
       }
     | {
@@ -2920,6 +2935,7 @@ export type V2Event =
   | SessionNextCompactionStarted
   | SessionNextCompactionDelta
   | SessionNextCompactionEnded
+  | SessionNextContextPrepared
   | SessionNextRevertStaged
   | SessionNextRevertCleared
   | SessionNextRevertCommitted
@@ -5344,6 +5360,30 @@ export type SessionNextCompactionDelta = {
   }
 }
 
+export type SessionNextContextPrepared = {
+  id: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  type: "session.next.context.prepared"
+  durable?: {
+    aggregateID: string
+    seq: number
+    version: number
+  }
+  location?: LocationRef
+  data: {
+    timestamp: number
+    sessionID: string
+    tokens: number
+    overheadTokens: number
+    reclaimedTokens: number
+    limit?: number
+    utilization: number
+    outcome: "untouched" | "reduced" | "exhausted"
+  }
+}
+
 export type MessagePartDelta = {
   id: string
   metadata?: {
@@ -6676,6 +6716,21 @@ export type EventSessionNextCompactionEnded = {
     reason: "auto" | "manual"
     text: string
     recent: string
+  }
+}
+
+export type EventSessionNextContextPrepared = {
+  id: string
+  type: "session.next.context.prepared"
+  properties: {
+    timestamp: number
+    sessionID: string
+    tokens: number
+    overheadTokens: number
+    reclaimedTokens: number
+    limit?: number
+    utilization: number
+    outcome: "untouched" | "reduced" | "exhausted"
   }
 }
 

@@ -7,7 +7,7 @@
 import { describe, expect, test } from "bun:test"
 import os from "os"
 import path from "path"
-import { QwenWebError, isStaleChatError } from "@opencode-ai/webchat/adapters/qwen/errors"
+import { QwenWebError, isStaleAnchorError, isStaleChatError } from "@opencode-ai/webchat/adapters/qwen/errors"
 import { QwenWebSession } from "@opencode-ai/webchat/adapters/qwen/session"
 import { ThreadStore } from "@opencode-ai/webchat/store"
 import type { QwenWebTransport } from "@opencode-ai/webchat/adapters/qwen/transport"
@@ -25,7 +25,11 @@ const text = (content: string, responseId = "r1") =>
   `data: {"response_id":"${responseId}","choices":[{"delta":{"phase":"answer","content":"${content}"}}]}\n`
 const DONE = "data: [DONE]\n"
 const STALE_EVENT = `data: {"error":{"code":"CHAT_NOT_FOUND","message":"This chat has been deleted. Please start a new chat to continue."}}\n`
+const STALE_ANCHOR_EVENT = `data: {"error":{"code":"PARENT_NOT_FOUND","message":"parent id not found"}}\n`
+const STALE_ANCHOR_JSON = JSON.stringify({ success: false, code: "PARENT_NOT_FOUND", message: "parent id not found" })
+const AMBIGUOUS_NOT_FOUND_JSON = JSON.stringify({ error: { code: "Not_Found", message: "resource not found" } })
 const MODEL_NOT_FOUND_EVENT = `data: {"error":{"code":"Not_Found","message":"Model does not exist"}}\n`
+const USAGE_EVENT = `data: {"usage":{"input_tokens":10,"output_tokens":5,"total_tokens":15}}\n`
 
 function byteStream(lines: string[], chunkBytes = 64): ReadableStream<Uint8Array> {
   const bytes = new TextEncoder().encode(lines.join(""))
@@ -52,6 +56,7 @@ interface State {
   stopBodies: Array<Record<string, unknown>>
   stopGate?: Promise<unknown>
   aborts: number
+  challengeReveals: number
   newChatIds: string[]
 }
 
@@ -63,6 +68,7 @@ function newState(): State {
     stops: [],
     stopBodies: [],
     aborts: 0,
+    challengeReveals: 0,
     newChatIds: ["fresh-1", "fresh-2", "fresh-3"],
   }
 }
@@ -107,6 +113,10 @@ function scriptedTransport(results: CompletionResult[], state: State): QwenWebTr
         },
       }
     },
+    revealChallengeWindow: async () => {
+      state.challengeReveals++
+      return true
+    },
     idleBudgetMs: () => 1000,
   } as unknown as QwenWebTransport
 }
@@ -116,6 +126,23 @@ function sessionFor(results: CompletionResult[], state: State): QwenWebSession {
     file: path.join(os.tmpdir(), `qwen-webchat-recovery-${Math.random().toString(36).slice(2)}.json`),
   })
   return new QwenWebSession({ transport: scriptedTransport(results, state), store })
+}
+
+/** A session whose store records every `put` with the chat id persisted then. */
+function sessionWithStore(
+  results: CompletionResult[],
+  state: State,
+): { session: QwenWebSession; store: ThreadStore; puts: Array<string | undefined> } {
+  const store = new ThreadStore({
+    file: path.join(os.tmpdir(), `qwen-webchat-adopt-${Math.random().toString(36).slice(2)}.json`),
+  })
+  const puts: Array<string | undefined> = []
+  const original = store.put.bind(store)
+  store.put = (thread: WebChatThread) => {
+    puts.push(thread.providerId)
+    original(thread)
+  }
+  return { session: new QwenWebSession({ transport: scriptedTransport(results, state), store }), store, puts }
 }
 
 /** A thread that already looks like an in-progress conversation. */
@@ -151,6 +178,31 @@ function promptOf(payload: { body: Record<string, unknown> } | undefined): strin
 }
 
 describe("fresh-chat recovery from a dead upstream chat (issue 232)", () => {
+  test("challenge pauses without replay, reveals once, and preserves the chat anchor", async () => {
+    const state = newState()
+    const session = sessionFor(
+      [{ kind: "json", status: 403, body: '{"message":"CAPTCHA verification required"}' }],
+      state,
+    )
+    const thread = await seededThread(session, { providerId: "chat-kept", responseId: "r-kept" })
+
+    const failure = await drain(session.runTurn({ thread, content: "possibly accepted prompt" })).then(
+      () => undefined,
+      (error: unknown) => error as QwenWebError,
+    )
+
+    expect(failure?.code).toBe("challenge")
+    expect(failure?.retryable).toBe(false)
+    expect(state.completionsCalled).toBe(1)
+    expect(state.chatsCreated).toBe(0)
+    expect(state.challengeReveals).toBe(1)
+    // The challenge does not prove the chat or response anchor is dead. Keep
+    // both for a user-directed retry, but never replay the possibly accepted turn.
+    expect(thread.providerId).toBe("chat-kept")
+    expect(thread.messages.at(-1)?.providerState).toEqual({ responseId: "r-kept" })
+    expect(thread.messages.some((message) => message.content.includes("possibly accepted prompt"))).toBe(false)
+  })
+
   test("pre-stream CHAT_NOT_FOUND recovers once, on a fresh chat, with the FULL prompt", async () => {
     const state = newState()
     const session = sessionFor(
@@ -270,6 +322,91 @@ describe("fresh-chat recovery from a dead upstream chat (issue 232)", () => {
     expect(thread.messages.at(-1)?.role).toBe("user")
   })
 
+  test("a dead chat after response.created metadata alone surfaces honestly and drops the binding (issue 238)", async () => {
+    const state = newState()
+    const session = sessionFor(
+      [{ kind: "sse", lines: [CREATED("r1", "dead-chat"), STALE_EVENT] }],
+      state,
+    )
+    const thread = await seededThread(session, { providerId: "dead-chat", responseId: "r-old" })
+
+    const events = await drain(session.runTurn({ thread, content: "tail", recoveryContent: "FULL" }))
+
+    // response-metadata was emitted, committing stream identity; the stale error surfaces without silent re-run.
+    expect(events.some((event) => event.type === "response-metadata")).toBe(true)
+    expect(events.some((event) => event.type === "text-delta")).toBe(false)
+    const errorEvent = events.find((event) => event.type === "error") as { error: unknown } | undefined
+    expect(errorEvent).toBeDefined()
+    expect(isStaleChatError(errorEvent!.error)).toBe(true)
+    expect(events.at(-1)?.type).toBe("done")
+    expect(state.completionsCalled).toBe(1)
+
+    // Dead binding is cleared so the next turn starts fresh with the full prompt.
+    expect(thread.providerId).toBeUndefined()
+    expect(thread.messages.some((message) => message.providerState?.["responseId"] === "r-old")).toBe(false)
+  })
+
+  test("a dead chat after usage metadata alone surfaces honestly and drops the binding (issue 238)", async () => {
+    const state = newState()
+    const session = sessionFor(
+      [{ kind: "sse", lines: [USAGE_EVENT, STALE_EVENT] }],
+      state,
+    )
+    const thread = await seededThread(session, { providerId: "dead-chat", responseId: "r-old" })
+
+    const events = await drain(session.runTurn({ thread, content: "tail", recoveryContent: "FULL" }))
+
+    expect(events.some((event) => event.type === "usage")).toBe(true)
+    expect(events.some((event) => event.type === "text-delta")).toBe(false)
+    const errorEvent = events.find((event) => event.type === "error") as { error: unknown } | undefined
+    expect(errorEvent).toBeDefined()
+    expect(isStaleChatError(errorEvent!.error)).toBe(true)
+    expect(state.completionsCalled).toBe(1)
+    expect(thread.providerId).toBeUndefined()
+    expect(thread.messages.some((message) => message.providerState?.["responseId"] === "r-old")).toBe(false)
+  })
+
+  test("a dead chat after reasoning-only output surfaces honestly and drops the binding (issue 238)", async () => {
+    const state = newState()
+    const thinking =
+      'data: {"response_id":"r1","choices":[{"delta":{"phase":"thinking_summary","extra":{"summary_title":{"content":["Plan"]},"summary_thought":{"content":["Think first."]}}}}]}\n'
+    const session = sessionFor(
+      [{ kind: "sse", lines: [CREATED("r1", "dead-chat"), thinking, STALE_EVENT] }],
+      state,
+    )
+    const thread = await seededThread(session, { providerId: "dead-chat", responseId: "r-old" })
+
+    const events = await drain(session.runTurn({ thread, content: "tail", recoveryContent: "FULL" }))
+
+    expect(events.some((event) => event.type === "thinking-delta")).toBe(true)
+    expect(events.some((event) => event.type === "text-delta")).toBe(false)
+    const errorEvent = events.find((event) => event.type === "error") as { error: unknown } | undefined
+    expect(errorEvent).toBeDefined()
+    expect(isStaleChatError(errorEvent!.error)).toBe(true)
+    expect(state.completionsCalled).toBe(1)
+    expect(thread.providerId).toBeUndefined()
+  })
+
+  test("a dead chat after tool-call output surfaces honestly and drops the binding (issue 238)", async () => {
+    const state = newState()
+    const toolCall =
+      'data: {"response_id":"r1","choices":[{"delta":{"tool_calls":[{"id":"call_1","function":{"name":"read_file","arguments":"{}"}}]}}]}\n'
+    const session = sessionFor(
+      [{ kind: "sse", lines: [CREATED("r1", "dead-chat"), toolCall, STALE_EVENT] }],
+      state,
+    )
+    const thread = await seededThread(session, { providerId: "dead-chat", responseId: "r-old" })
+
+    const events = await drain(session.runTurn({ thread, content: "tail", recoveryContent: "FULL" }))
+
+    expect(events.some((event) => event.type === "tool-call")).toBe(true)
+    const errorEvent = events.find((event) => event.type === "error") as { error: unknown } | undefined
+    expect(errorEvent).toBeDefined()
+    expect(isStaleChatError(errorEvent!.error)).toBe(true)
+    expect(state.completionsCalled).toBe(1)
+    expect(thread.providerId).toBeUndefined()
+  })
+
   test("a stale fresh-chat recovery stops without a blind setup retry", async () => {
     const state = newState()
     const session = sessionFor([{ kind: "json", status: 200, body: DELETED_JSON }], state)
@@ -341,6 +478,196 @@ describe("fresh-chat recovery from a dead upstream chat (issue 232)", () => {
   })
 })
 
+describe("stale response/parent anchor (issue 232 binding contract)", () => {
+  test("a dead anchor re-anchors the SAME chat once, with the FULL prompt", async () => {
+    const state = newState()
+    const session = sessionFor(
+      [
+        { kind: "json", status: 200, body: STALE_ANCHOR_JSON },
+        { kind: "sse", lines: [CREATED("r9", "live-chat"), text("Re-anchored", "r9"), DONE] },
+      ],
+      state,
+    )
+    const thread = await seededThread(session, { providerId: "live-chat", responseId: "r-old" })
+
+    const events = await drain(
+      session.runTurn({ thread, content: "trimmed tail", recoveryContent: "FULL PROMPT WITH CONTEXT" }),
+    )
+
+    expect(events.some((event) => event.type === "error")).toBe(false)
+    expect(events.some((event) => event.type === "finish")).toBe(true)
+    expect(events.at(-1)?.type).toBe("done")
+
+    // Delivery 1 chained onto the anchor that upstream rejected.
+    expect(state.payloads[0]!.path).toContain("chat_id=live-chat")
+    expect(state.payloads[0]!.body["parent_id"]).toBe("r-old")
+    expect(promptOf(state.payloads[0])).toContain("trimmed tail")
+
+    // Delivery 2 keeps the live chat and only drops the anchor: no new chat,
+    // no parent — and the full prompt, because a re-anchored branch carries no
+    // upstream transcript of its own.
+    expect(state.chatsCreated).toBe(0)
+    expect(state.completionsCalled).toBe(2)
+    expect(state.payloads[1]!.path).toContain("chat_id=live-chat")
+    expect(state.payloads[1]!.body["parent_id"]).toBeNull()
+    expect(promptOf(state.payloads[1])).toBe("FULL PROMPT WITH CONTEXT")
+    expect(promptOf(state.payloads[1])).not.toContain("trimmed tail")
+
+    // The chat stays bound; only the dead anchor is gone, and the turn
+    // committed its own anchor for the next turn.
+    expect(thread.providerId).toBe("live-chat")
+    expect(thread.messages.some((message) => message.providerState?.["responseId"] === "r-old")).toBe(false)
+    expect(thread.messages.filter((message) => message.role === "user")).toHaveLength(2) // u0 + re-anchored turn
+    expect(thread.messages.some((message) => message.content.includes("trimmed tail"))).toBe(false)
+    expect(thread.messages.at(-1)?.providerState).toEqual({ responseId: "r9" })
+  })
+
+  test("a mid-stream dead anchor before any output re-anchors the same chat", async () => {
+    const state = newState()
+    const session = sessionFor(
+      [
+        { kind: "sse", lines: [STALE_ANCHOR_EVENT] },
+        { kind: "sse", lines: [CREATED("r9", "live-chat"), text("Re-anchored", "r9"), DONE] },
+      ],
+      state,
+    )
+    const thread = await seededThread(session, { providerId: "live-chat", responseId: "r-old" })
+
+    const events = await drain(session.runTurn({ thread, content: "tail", recoveryContent: "FULL PROMPT" }))
+
+    expect(events.some((event) => event.type === "error")).toBe(false)
+    expect(events.some((event) => event.type === "text-delta")).toBe(true)
+    expect(state.chatsCreated).toBe(0)
+    expect(state.completionsCalled).toBe(2)
+    expect(state.payloads[1]!.body["parent_id"]).toBeNull()
+    expect(promptOf(state.payloads[1])).toBe("FULL PROMPT")
+    expect(thread.providerId).toBe("live-chat")
+    // The dead stream was released locally.
+    expect(state.aborts).toBe(1)
+  })
+
+  test("a dead anchor after partial output surfaces honestly and still drops the anchor", async () => {
+    const state = newState()
+    const session = sessionFor(
+      [{ kind: "sse", lines: [CREATED("r1", "live-chat"), text("partial", "r1"), STALE_ANCHOR_EVENT] }],
+      state,
+    )
+    const thread = await seededThread(session, { providerId: "live-chat", responseId: "r-old" })
+
+    const events = await drain(session.runTurn({ thread, content: "tail", recoveryContent: "FULL" }))
+    const errorEvent = events.find((event) => event.type === "error") as { error: unknown } | undefined
+
+    // The caller saw output, so the turn cannot silently re-run.
+    expect(events.some((event) => event.type === "text-delta")).toBe(true)
+    expect(errorEvent).toBeDefined()
+    expect(isStaleAnchorError(errorEvent!.error)).toBe(true)
+    expect(state.completionsCalled).toBe(1)
+    // The chat is still live and stays bound; only the anchor is dropped.
+    expect(thread.providerId).toBe("live-chat")
+    expect(thread.messages.some((message) => message.providerState?.["responseId"] === "r-old")).toBe(false)
+  })
+
+  test("no anchor recovery without a full prompt: the error surfaces instead of silently losing turns", async () => {
+    const state = newState()
+    const session = sessionFor([{ kind: "json", status: 200, body: STALE_ANCHOR_JSON }], state)
+    const thread = await seededThread(session, { providerId: "live-chat", responseId: "r-old" })
+
+    const error = await drain(session.runTurn({ thread, content: "trimmed tail" })).then(
+      () => undefined,
+      (thrown: unknown) => thrown,
+    )
+
+    expect(isStaleAnchorError(error)).toBe(true)
+    // Re-anchoring with only the tail would silently drop every earlier turn
+    // the trim had left to upstream memory, so nothing is re-sent.
+    expect(state.completionsCalled).toBe(1)
+    expect(state.chatsCreated).toBe(0)
+    // The undelivered turn was rolled back and the dead anchor dropped, but
+    // the live chat stays bound for the next turn.
+    expect(thread.messages.some((message) => message.content.includes("trimmed tail"))).toBe(false)
+    expect(thread.providerId).toBe("live-chat")
+    expect(thread.messages.some((message) => message.providerState?.["responseId"] === "r-old")).toBe(false)
+  })
+
+  test("one recovery per turn: a dead chat after an anchor recovery is not recovered again", async () => {
+    const state = newState()
+    const session = sessionFor(
+      [
+        { kind: "json", status: 200, body: STALE_ANCHOR_JSON },
+        { kind: "json", status: 200, body: DELETED_JSON },
+      ],
+      state,
+    )
+    const thread = await seededThread(session, { providerId: "live-chat", responseId: "r-old" })
+
+    const error = await drain(session.runTurn({ thread, content: "tail", recoveryContent: "FULL" })).then(
+      () => undefined,
+      (thrown: unknown) => thrown,
+    )
+
+    expect(isStaleChatError(error)).toBe(true)
+    // Anchor recovery (delivery 2) then the dead-chat error: no fresh chat and
+    // no third delivery.
+    expect(state.completionsCalled).toBe(2)
+    expect(state.chatsCreated).toBe(0)
+    // The chat confirmed dead on the second delivery is unbound.
+    expect(thread.providerId).toBeUndefined()
+    expect(thread.messages.some((message) => message.content.includes("FULL"))).toBe(false)
+  })
+
+  test("an ambiguous Not_Found recovers nothing and keeps the whole binding", async () => {
+    const state = newState()
+    const session = sessionFor(
+      [
+        { kind: "json", status: 404, body: AMBIGUOUS_NOT_FOUND_JSON },
+        { kind: "sse", lines: [CREATED("r2", "live-chat"), text("Next turn", "r2"), DONE] },
+      ],
+      state,
+    )
+    const thread = await seededThread(session, { providerId: "live-chat", responseId: "r-old" })
+
+    const error = await drain(session.runTurn({ thread, content: "tail", recoveryContent: "FULL PROMPT" })).then(
+      () => undefined,
+      (thrown: unknown) => thrown,
+    )
+
+    expect(error).toBeDefined()
+    expect(isStaleChatError(error)).toBe(false)
+    expect(isStaleAnchorError(error)).toBe(false)
+    expect(state.completionsCalled).toBe(1)
+    expect(state.chatsCreated).toBe(0)
+    expect(thread.providerId).toBe("live-chat")
+    expect(thread.messages.some((message) => message.providerState?.["responseId"] === "r-old")).toBe(true)
+
+    // Nothing was silently dropped: the next turn still chains to r-old.
+    await drain(session.runTurn({ thread, content: "next", recoveryContent: "FULL PROMPT" }))
+    expect(state.payloads[1]!.path).toContain("chat_id=live-chat")
+    expect(state.payloads[1]!.body["parent_id"]).toBe("r-old")
+  })
+
+  test("the anchor recovery re-merges a pending seed into the full prompt", async () => {
+    const state = newState()
+    const session = sessionFor(
+      [
+        { kind: "json", status: 200, body: STALE_ANCHOR_JSON },
+        { kind: "sse", lines: [CREATED("r9", "live-chat"), text("ok", "r9"), DONE] },
+      ],
+      state,
+    )
+    const thread = await seededThread(session, { providerId: "live-chat", seed: "Remember: blue" })
+
+    await drain(session.runTurn({ thread, content: "tail", recoveryContent: "FULL" }))
+
+    expect(promptOf(state.payloads[0])).toContain("Remember: blue")
+    // The rolled-back delivery restored the seed; the retry re-merged it with
+    // the FULL prompt, not the tail.
+    expect(promptOf(state.payloads[1])).toContain("Remember: blue")
+    expect(promptOf(state.payloads[1])).toContain("FULL")
+    expect(promptOf(state.payloads[1])).not.toContain("tail")
+    expect(thread.seedText).toBeUndefined()
+  })
+})
+
 describe("upstream chat id adoption (issue 232)", () => {
   test("response-created chat_id replaces a divergent local binding", async () => {
     const state = newState()
@@ -360,6 +687,65 @@ describe("upstream chat id adoption (issue 232)", () => {
     expect(state.payloads[1]!.path).toContain("chat_id=c2-migrated")
     expect(state.payloads[1]!.body["parent_id"]).toBe("r1")
     expect(state.chatsCreated).toBe(0)
+  })
+
+  test("a chat id reported outside response.created is adopted too", async () => {
+    const state = newState()
+    // The rotation never shows up in `response.created`: only chunk-level ids.
+    const session = sessionFor(
+      [
+        {
+          kind: "sse",
+          lines: [
+            'data: {"type":"response.created","response":{"id":"r1"}}\n',
+            'data: {"response_id":"r1","chat_id":"c-rotated","choices":[{"delta":{"phase":"answer","content":"hi"}}]}\n',
+            DONE,
+          ],
+        },
+        { kind: "sse", lines: [CREATED("r2", "c-rotated"), text("again", "r2"), DONE] },
+      ],
+      state,
+    )
+    const thread = await seededThread(session, { providerId: "c1" })
+
+    await drain(session.runTurn({ thread, content: "first" }))
+    expect(thread.providerId).toBe("c-rotated")
+
+    await drain(session.runTurn({ thread, content: "second" }))
+    expect(state.payloads[1]!.path).toContain("chat_id=c-rotated")
+    expect(state.payloads[1]!.body["parent_id"]).toBe("r1")
+    expect(state.chatsCreated).toBe(0)
+  })
+
+  test("the adopted chat id is persisted during the turn, not only at commit", async () => {
+    const state = newState()
+    const { session, puts } = sessionWithStore(
+      [
+        {
+          kind: "sse",
+          lines: [
+            CREATED("r1", "c-adopted"),
+            text("working", "r1"),
+            `data: {"error":{"code":"E_BOOM","message":"kaput"}}\n`,
+          ],
+        },
+      ],
+      state,
+    )
+    const thread = await seededThread(session, { providerId: "c1" })
+
+    const events = await drain(session.runTurn({ thread, content: "first" }))
+    expect(events.some((event) => event.type === "error")).toBe(true)
+
+    // [undefined (thread created), "c1" (user node persisted before the
+    // stream), "c-adopted" (adoption), "c-adopted" (end-of-turn commit)]: a
+    // crash between adoption and commit cannot leave the stale id behind for
+    // the next process to pick up.
+    expect(puts[1]).toBe("c1")
+    // Pins BOTH the adoption put and the end-of-turn commit put: deleting the
+    // adoption persist leaves exactly one "c-adopted" put and fails here.
+    expect(puts.filter((id) => id === "c-adopted")).toHaveLength(2)
+    expect(thread.providerId).toBe("c-adopted")
   })
 })
 

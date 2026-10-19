@@ -52,6 +52,29 @@ export interface WebChatMessage {
   createdAt?: number
 }
 
+/**
+ * Provenance cursor for the upstream transcript mirror.
+ *
+ * Recorded by the model layer when a turn commits: `fingerprint` covers the
+ * exact conversation transcript (rendered prompt minus system messages, plus
+ * media descriptors) that the bound upstream chat is believed to mirror at
+ * that point. Before a later turn reuses the binding — chaining a trimmed
+ * prompt tail onto `providerId` — the caller re-fingerprints its current
+ * prompt prefix and compares. A mismatch means local history diverged from
+ * the upstream transcript (a provider switch inserted foreign turns, a
+ * message was edited, a compaction rewrote history), so the binding must be
+ * discarded and the full prompt re-sent on a fresh chat instead of silently
+ * dropping context the upstream never saw.
+ */
+export interface WebChatContextCursor {
+  /** Fingerprint of the rendered transcript committed by the last turn. */
+  fingerprint: string
+  /** Number of prompt messages (system included) the fingerprint covered. */
+  messages: number
+  /** Epoch ms when the turn that produced this cursor committed. */
+  recordedAt: number
+}
+
 export interface WebChatThread {
   /** Canonical thread id, stable across processes. */
   id: string
@@ -64,6 +87,12 @@ export interface WebChatThread {
   seedText?: string
   /** Ordered message list; the last entry is the thread head. */
   messages: WebChatMessage[]
+  /**
+   * Provenance cursor of the last committed turn (see `WebChatContextCursor`).
+   * Verified before the binding is reused; cleared together with the binding
+   * when the local transcript diverged from the upstream mirror.
+   */
+  contextCursor?: WebChatContextCursor
   createdAt: number
   updatedAt: number
 }

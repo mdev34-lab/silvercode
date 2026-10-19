@@ -38,8 +38,9 @@ import { usePromptStash } from "../../prompt/stash"
 import { DialogStash } from "../dialog-stash"
 import { type AutocompleteRef, Autocomplete } from "./autocomplete"
 import { useRenderer, useTerminalDimensions, type JSX } from "@opentui/solid"
-import type { AssistantMessage, FilePart, UserMessage } from "@opencode-ai/sdk/v2"
+import type { FilePart, UserMessage } from "@opencode-ai/sdk/v2"
 import { Locale } from "../../util/locale"
+import { contextUsage } from "../../util/context-usage"
 import { effortColor } from "../../util/agent-effort"
 import { errorMessage } from "../../util/error"
 import { formatDuration } from "../../util/format"
@@ -58,6 +59,8 @@ import { usePromptWorkspace } from "./workspace"
 import { usePromptMove } from "./move"
 import { useLocation } from "../../context/location"
 import { DOUBLE_PRESS_WINDOW_MS } from "../../util/double-press"
+import { useOptionalSessionTabs } from "../../context/session-tabs"
+import { SessionTabs } from "../../session-tabs"
 
 registerOpencodeSpinner()
 
@@ -130,8 +133,6 @@ function formatEditorContext(selection: EditorSelection) {
   return `<system-reminder>${ranges.join("\n")} This may or may not be relevant to the current task.</system-reminder>\n`
 }
 
-let stashed: { prompt: PromptInfo; cursor: number } | undefined
-
 export function Prompt(props: PromptProps) {
   let input: TextareaRenderable
   let anchor: BoxRenderable
@@ -140,6 +141,10 @@ export function Prompt(props: PromptProps) {
   const leader = useLeaderActive()
   const local = useLocal()
   const args = useArgs()
+  // Drafts and model/agent choices belong to the session that owns them. The
+  // tab context keys them by session; without it, the prompt keeps no draft.
+  const tabs = useOptionalSessionTabs()
+  const draftKey = () => props.sessionID ?? SessionTabs.HOME_DRAFT_KEY
   const paths = useTuiPaths()
   const location = useLocation()
   const clipboard = useClipboard()
@@ -252,25 +257,31 @@ export function Prompt(props: PromptProps) {
     return messages.findLast((m): m is UserMessage => m.role === "user")
   })
 
+  // Optional numeric detail of the sidebar context bar (#241): same measurement,
+  // so the number can never disagree with the bar, and unknown usage shows no
+  // count at all instead of a confident-looking figure.
   const usage = createMemo(() => {
     if (!props.sessionID) return
     const session = sync.session.get(props.sessionID)
     const cost = session?.cost ?? 0
     const spent = cost > 0 ? money.format(cost) : undefined
-    const msg = sync.data.message[props.sessionID] ?? []
-    const last = msg.findLast((item): item is AssistantMessage => item.role === "assistant" && item.tokens.output > 0)
-    if (!last) return
+    const measured = contextUsage({
+      report: sync.data.session_context[props.sessionID],
+      messages: sync.data.message[props.sessionID] ?? [],
+      contextLimit: (providerID, modelID) =>
+        sync.data.provider.find((item) => item.id === providerID)?.models[modelID]?.limit.context,
+    })
+    if (!measured) return
 
-    const tokens =
-      last.tokens.input + last.tokens.output + last.tokens.reasoning + last.tokens.cache.read + last.tokens.cache.write
-    if (tokens <= 0) return
-
-    const model = sync.data.provider.find((item) => item.id === last.providerID)?.models[last.modelID]
-    const pct = model?.limit.context ? `${Math.round((tokens / model.limit.context) * 100)}%` : undefined
+    // #241 owner correction: unknown usage shows no count at all, so a bare
+    // number can never disagree with the bar's "usage unknown".
+    const context =
+      measured.percent === undefined ? undefined : `${Locale.number(measured.tokens)} (${measured.percent}%)`
+    if (!context && !spent) return
     return {
-      context: pct ? `${Locale.number(tokens)} (${pct})` : Locale.number(tokens),
+      context,
       cost: spent,
-      urgent: false,
+      urgent: measured.exhausted,
     }
   })
 
@@ -301,6 +312,15 @@ export function Prompt(props: PromptProps) {
     ),
   )
 
+  // Re-applies the choice the user left a session with. Only a session that has
+  // no saved choice falls back to its last user message.
+  const applySelection = (selection: SessionTabs.TabSelection) => {
+    if (selection.agent && !args.agent) local.agent.set(selection.agent)
+    if (!selection.model) return
+    local.model.set(selection.model)
+    local.model.variant.set(selection.variant, "session")
+  }
+
   // Initialize agent/model/variant from last user message when session changes
   let syncedSessionID: string | undefined
   createEffect(() => {
@@ -308,7 +328,15 @@ export function Prompt(props: PromptProps) {
     const msg = lastUserMessage()
 
     if (sessionID !== syncedSessionID) {
-      if (!sessionID || !msg) return
+      if (!sessionID) return
+
+      const selection = tabs?.selection(sessionID)
+      if (selection) {
+        syncedSessionID = sessionID
+        applySelection(selection)
+        return
+      }
+      if (!msg) return
 
       syncedSessionID = sessionID
 
@@ -609,8 +637,7 @@ export function Prompt(props: PromptProps) {
   }
 
   onMount(() => {
-    const saved = stashed
-    stashed = undefined
+    const saved = tabs?.draft(draftKey())
     if (store.prompt.input) return
     if (saved && saved.prompt.input) {
       input.setText(saved.prompt.input)
@@ -620,9 +647,17 @@ export function Prompt(props: PromptProps) {
     }
   })
 
+  // Unmount happens on every tab switch, close, or route change. Save this
+  // session's own draft and choice; an empty prompt clears the saved draft.
   onCleanup(() => {
-    if (store.prompt.input) {
-      stashed = { prompt: unwrap(store.prompt), cursor: input.cursorOffset }
+    const cursor = store.prompt.input && !input.isDestroyed ? input.cursorOffset : 0
+    tabs?.setDraft(draftKey(), { prompt: unwrap(store.prompt), cursor })
+    if (props.sessionID) {
+      tabs?.setSelection(props.sessionID, {
+        model: local.model.current(),
+        agent: local.agent.current()?.name,
+        variant: local.model.variant.current(),
+      })
     }
     setInputTarget(undefined)
     props.ref?.(undefined)

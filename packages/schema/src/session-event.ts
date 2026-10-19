@@ -12,6 +12,7 @@ import { SessionID } from "./session-id"
 import { Location } from "./location"
 import { SessionMessage } from "./session-message"
 import { Revert } from "./revert"
+import { SessionContext } from "./session-context"
 
 export { FileAttachment }
 
@@ -431,6 +432,21 @@ export namespace Compaction {
   export type Ended = typeof Ended.Type
 }
 
+/**
+ * Dynamic context reduction telemetry.
+ *
+ * One advisory event per provider request, carrying the runtime's own measurement of what that
+ * request sends. It is not durable because there is no durable reduction state to recover: the
+ * canonical session history is authoritative, and the next request re-derives its context from it.
+ */
+export namespace Context {
+  export const Prepared = Event.define({
+    type: "session.next.context.prepared",
+    schema: { ...Base, ...SessionContext.Report.fields },
+  })
+  export type Prepared = typeof Prepared.Type
+}
+
 export namespace RevertEvent {
   export const Staged = Event.define({
     type: "session.next.revert.staged",
@@ -506,6 +522,7 @@ export const Definitions = Event.inventory(
   Compaction.Started,
   Compaction.Delta,
   Compaction.Ended,
+  Context.Prepared,
   RevertEvent.Staged,
   RevertEvent.Cleared,
   RevertEvent.Committed,

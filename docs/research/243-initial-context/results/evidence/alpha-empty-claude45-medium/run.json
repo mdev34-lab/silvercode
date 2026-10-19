@@ -1,0 +1,14 @@
+{
+  "scenario": {
+    "id": "alpha-empty-claude45-medium",
+    "engine": "silvercode",
+    "model": "probe/claude-sonnet-4-5",
+    "prompt": "Say hello in one word.",
+    "effort": "medium"
+  },
+  "exitCode": 1,
+  "elapsedMs": 3030,
+  "project": "/tmp/opencode-243-initial-context/alpha-empty-claude45-medium/project",
+  "stdout": "ok\nok\nok\nok\n",
+  "stderr": "\u001b[0m\n> work · claude-sonnet-4-5\n\u001b[0m\n\u001b[91m\u001b[1mError: \u001b[0mThe assistant did not complete the required finish tool after 3 nudges. The turn was stopped to prevent an unbounded continuation loop. Set agent.<name>.finishTool to false for agents that must end turns without finish.\n"
+}

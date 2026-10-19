@@ -16,8 +16,10 @@ import type { SessionPrompt } from "../../src/session/prompt"
 import { MessageID, PartID, SessionID } from "../../src/session/schema"
 import { SessionRunState } from "@/session/run-state"
 import { SessionStatus } from "@/session/status"
+import { Todo } from "@/session/todo"
+import { Permission } from "@/permission"
 
-import type { Reason } from "../../src/tool/finish"
+import { FinishTool, type Reason } from "../../src/tool/finish"
 import { TaskTool, type TaskPromptOps } from "../../src/tool/task"
 import { Truncate } from "@/tool/truncate"
 import { ToolRegistry } from "@/tool/registry"
@@ -53,6 +55,8 @@ const layer = <R = never>(
       SessionProjector.node,
       SessionRunState.node,
       SessionStatus.node,
+      Todo.node,
+      Permission.node,
       Truncate.node,
       ToolRegistry.node,
       Database.node,
@@ -929,9 +933,14 @@ describe("tool.task", () => {
       expect(result.output).toContain('If your own task is complete, call finish with reason "success" as usual')
       expect(result.output).toContain("does not hold your result back")
       // Scoped to the main session: the wait is refused for a session that is
-      // itself a subagent, so the instruction must not send one to try it.
+      // itself a subagent with nothing of its own running, so the instruction
+      // must not send one to try it - and it must name the one case where a
+      // subagent's yield is accepted (#222).
       expect(result.output).toContain("the main session can call finish")
-      expect(result.output).toContain("A subagent cannot yield this way")
+      expect(result.output).toContain(
+        "A subagent may yield the same way only for background subagents it launched itself",
+      )
+      expect(result.output).toContain("its job stays running until they report")
       expect(result.output).toContain('it must deliver with "success" or "failure" instead')
     }),
   )
@@ -1962,6 +1971,7 @@ describe("tool.task", () => {
       const tool = yield* TaskTool
       const def = yield* tool.init()
       const injections: string[] = []
+      const silent: SessionPrompt.PromptInput[] = []
       const started = defer<SessionID>()
       const promptOps: TaskPromptOps = {
         cancel: () => Effect.void,
@@ -1969,6 +1979,10 @@ describe("tool.task", () => {
         prompt: (input) =>
           input.sessionID === chat.id
             ? Effect.sync(() => {
+                if (input.noReply) {
+                  silent.push(input)
+                  return reply(input, "recorded without waking")
+                }
                 const part = input.parts[0]
                 injections.push(part?.type === "text" ? part.text : "")
                 return reply(input, "notified")
@@ -2015,6 +2029,10 @@ describe("tool.task", () => {
       ).pipe(Effect.exit)
       expect(Exit.isFailure(notified)).toBe(true)
       expect(injections).toEqual([])
+      expect(silent).toHaveLength(1)
+      const receipt = silent[0]?.parts[0]
+      expect(receipt?.type === "text" && receipt.text).toContain('state="cancelled"')
+      expect(receipt?.type === "text" && receipt.metadata?.backgroundNoReply).toBe(true)
     }),
   )
 
@@ -2646,6 +2664,7 @@ describe("tool.task - storage failures", () => {
           expect(Cause.pretty(exit.cause)).toContain(historyError.message)
         }
       }),
+      { config: FOREGROUND },
     )
   }
 
@@ -2746,6 +2765,7 @@ describe("tool.task - storage failures", () => {
       expect(result.metadata.sessionId).not.toBe(missing)
       expect(result.output).toContain('state="completed"')
     }),
+    { config: FOREGROUND },
   )
 })
 
@@ -3004,3 +3024,589 @@ itReverse.instance(
     }),
   { config: FOREGROUND },
 )
+
+// A subagent can yield for background subagents it launched itself (#222). Its
+// run ends at the yield but its work does not: the job stays running, the child
+// is resumed by the report one of those subagents delivered, and the parent
+// receives exactly one delivery - the child's terminal result - so no
+// provisional envelope ever claims to be the run's outcome.
+it.instance("a child that yields for its own subagents keeps its job running and delivers its final result once", () =>
+  Effect.gen(function* () {
+    const jobs = yield* BackgroundJob.Service
+    const status = yield* SessionStatus.Service
+    const { chat, assistant } = yield* seed("Nested wait")
+    const tool = yield* TaskTool
+    const def = yield* tool.init()
+
+    const grandchild = SessionID.make("ses_grandchild_nested")
+    const report = defer<string>()
+    const childTurns = { count: 0 }
+    const childPrompts: SessionPrompt.PromptInput[] = []
+    const parentPrompts: SessionPrompt.PromptInput[] = []
+
+    const finishPart = (
+      messageID: MessageID,
+      sessionID: SessionID,
+      reason: string,
+      result: string,
+    ): SessionV1.ToolPart => {
+      const now = Date.now()
+      return {
+        id: PartID.ascending(),
+        messageID,
+        sessionID,
+        type: "tool",
+        tool: "finish",
+        callID: PartID.ascending(),
+        state: {
+          status: "completed",
+          input: { reason, result },
+          output: result,
+          title: result,
+          metadata: {},
+          time: { start: now, end: now },
+        },
+      }
+    }
+
+    const promptOps: TaskPromptOps = {
+      cancel: () => Effect.void,
+      resolvePromptParts: (template) => Effect.succeed([{ type: "text" as const, text: template }]),
+      prompt: (input) => {
+        if (input.sessionID === chat.id) {
+          parentPrompts.push(input)
+          return Effect.sync(() => reply(input, "notified"))
+        }
+        childPrompts.push(input)
+        childTurns.count++
+        if (childTurns.count === 1)
+          return Effect.gen(function* () {
+            // What the child's own task tool did during this turn: launch a
+            // background subagent that is still running when the child yields.
+            yield* jobs.start({
+              id: grandchild,
+              type: "task",
+              title: "grandchild work",
+              metadata: { parentSessionId: input.sessionID, sessionId: grandchild, background: true },
+              run: Effect.promise(() => report.promise).pipe(Effect.as("grandchild result")),
+            })
+            const replied = reply(input, "waiting for the grandchild")
+            return {
+              ...replied,
+              parts: [
+                ...replied.parts,
+                finishPart(replied.info.id, input.sessionID, "waiting_for_subagent", "waiting"),
+              ],
+            }
+          })
+        const replied = reply(input, "child final result")
+        return Effect.sync(() => ({
+          ...replied,
+          parts: [...replied.parts, finishPart(replied.info.id, input.sessionID, "success", "child final result")],
+        }))
+      },
+    }
+
+    const launched = yield* def.execute(
+      { description: "inspect bug", prompt: "look into the cache key path", subagent_type: "general" },
+      {
+        sessionID: chat.id,
+        messageID: assistant.id,
+        agent: "work",
+        abort: new AbortController().signal,
+        extra: { promptOps },
+        messages: [],
+        metadata: () => Effect.void,
+        ask: () => Effect.void,
+      },
+    )
+    const child = SessionID.make(launched.metadata.sessionId)
+
+    // Parked: the child's first turn ended at its yield while its own subagent
+    // keeps running, so the job is still running and the status says the
+    // session is not finished - a parent may wait on it again.
+    yield* pollWithTimeout(
+      Effect.gen(function* () {
+        const job = yield* jobs.get(child)
+        if (job?.status !== "running" || childTurns.count !== 1) return undefined
+        const current = yield* status.get(child)
+        return current.type === "busy" ? true : undefined
+      }),
+      "child job did not stay running while its subagent runs",
+    )
+    // No provisional delivery: the parent hears about the child once, and only
+    // when the child actually terminates.
+    expect(parentPrompts).toHaveLength(0)
+
+    report.resolve("released")
+
+    const settled = yield* jobs.wait({ id: child, timeout: 5_000 })
+    expect(settled.info?.status).toBe("completed")
+    expect(settled.info?.output).toContain("child final result")
+
+    yield* pollWithTimeout(
+      Effect.sync(() => (parentPrompts.length === 1 ? true : undefined)),
+      "the child's final result was not delivered to the parent",
+    )
+    const delivery = parentPrompts[0]
+    const delivered = delivery?.parts[0]?.type === "text" ? delivery.parts[0].text : ""
+    expect(delivery?.sessionID).toBe(chat.id)
+    expect(delivered).toContain(`<task id="${child}" state="completed">`)
+    expect(delivered).toContain("child final result")
+    expect(delivered).toContain('<termination reason="success">')
+
+    // The resumed turn was prompted by the report its own subagent delivered:
+    // same envelope the notification path injects, addressed to the child.
+    const resume = childPrompts[1]
+    const resumed = resume?.parts[0]?.type === "text" ? resume.parts[0].text : ""
+    expect(childPrompts).toHaveLength(2)
+    expect(resumed).toContain(`<task id="${grandchild}" state="completed">`)
+    expect(resumed).toContain("grandchild result")
+    expect(resumed).toContain("Background task completed: grandchild work")
+
+    // The parked status did not outlive the park.
+    expect((yield* status.get(child)).type).toBe("idle")
+  }),
+)
+
+// A report can settle while the child's turn is still running: the child
+// launched a background subagent, the subagent finished, and the child's turn
+// then ends in a yield. The parked job delivers that report itself - the
+// notification path stands down for a session that is a running task job's
+// subject - so the child is resumed exactly once and its final result still
+// reaches its own parent.
+it.instance(
+  "a report that settled while the child's turn ran is delivered when the child parks",
+  () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const sessions = yield* Session.Service
+      const { chat, assistant } = yield* seed("Mid-turn report")
+      const childTool = yield* TaskTool
+      const childDef = yield* childTool.init()
+      const nestedTool = yield* TaskTool
+      const nestedDef = yield* nestedTool.init()
+
+      const report = defer<string>()
+      const childPrompts: SessionPrompt.PromptInput[] = []
+      const nestedPrompts: SessionPrompt.PromptInput[] = []
+      const parentPrompts: SessionPrompt.PromptInput[] = []
+
+      const finishPart = (
+        messageID: MessageID,
+        sessionID: SessionID,
+        reason: string,
+        result: string,
+      ): SessionV1.ToolPart => {
+        const now = Date.now()
+        return {
+          id: PartID.ascending(),
+          messageID,
+          sessionID,
+          type: "tool",
+          tool: "finish",
+          callID: PartID.ascending(),
+          state: {
+            status: "completed",
+            input: { reason, result },
+            output: result,
+            title: result,
+            metadata: {},
+            time: { start: now, end: now },
+          },
+        }
+      }
+
+      // The grandchild's own run: released by the child's turn, so the report
+      // settles before that turn ends.
+      const nestedOps: TaskPromptOps = {
+        cancel: () => Effect.void,
+        resolvePromptParts: (template) => Effect.succeed([{ type: "text" as const, text: template }]),
+        prompt: (input) => {
+          nestedPrompts.push(input)
+          return Effect.promise(() => report.promise).pipe(
+            Effect.map(() => {
+              const replied = reply(input, "grandchild result")
+              return {
+                ...replied,
+                parts: [...replied.parts, finishPart(replied.info.id, input.sessionID, "success", "grandchild result")],
+              }
+            }),
+          )
+        },
+      }
+
+      const childOps: TaskPromptOps = {
+        cancel: () => Effect.void,
+        resolvePromptParts: (template) => Effect.succeed([{ type: "text" as const, text: template }]),
+        prompt: (input) => {
+          if (input.sessionID === chat.id) {
+            parentPrompts.push(input)
+            return Effect.sync(() => reply(input, "notified"))
+          }
+          childPrompts.push(input)
+          if (childPrompts.length > 1) {
+            const replied = reply(input, "child final result")
+            return Effect.sync(() => ({
+              ...replied,
+              parts: [...replied.parts, finishPart(replied.info.id, input.sessionID, "success", "child final result")],
+            }))
+          }
+          return Effect.gen(function* () {
+            // A real dispatch runs inside a real assistant message of the child
+            // session; the task tool reads that message for its model.
+            const user = yield* sessions.updateMessage({
+              id: MessageID.ascending(),
+              role: "user",
+              sessionID: input.sessionID,
+              agent: "general",
+              model: ref,
+              time: { created: Date.now() },
+            })
+            const dispatch: SessionV1.Assistant = {
+              id: MessageID.ascending(),
+              role: "assistant",
+              parentID: user.id,
+              sessionID: input.sessionID,
+              mode: "general",
+              agent: "general",
+              cost: 0,
+              path: { cwd: "/tmp", root: "/tmp" },
+              tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+              modelID: ref.modelID,
+              providerID: ref.providerID,
+              variant: "xhigh",
+              time: { created: Date.now() },
+            }
+            yield* sessions.updateMessage(dispatch)
+            const nested = yield* Effect.orDie(
+              nestedDef.execute(
+                { description: "grandchild work", prompt: "do the nested work", subagent_type: "general" },
+                {
+                  sessionID: input.sessionID,
+                  messageID: dispatch.id,
+                  agent: "general",
+                  abort: new AbortController().signal,
+                  extra: { promptOps: nestedOps, bypassAgentCheck: true },
+                  messages: [],
+                  metadata: () => Effect.void,
+                  ask: () => Effect.void,
+                },
+              ),
+            )
+            // The subagent finishes while this turn is still running, then the
+            // turn yields for it.
+            report.resolve("released")
+            yield* jobs.wait({ id: nested.metadata.sessionId, timeout: 5_000 }).pipe(Effect.orDie)
+            // A lone settled child cannot satisfy the real finish guard.
+            // Another child still runs, so this wait is reachable in production.
+            const spare = yield* jobs.start({
+              id: `${input.sessionID}_spare`,
+              type: "task",
+              metadata: { parentSessionId: input.sessionID },
+              run: Effect.never,
+            })
+            expect(spare.status).toBe("running")
+            const finish = yield* (yield* FinishTool).init()
+            const accepted = yield* Effect.orDie(
+              finish.execute(
+                { reason: "waiting_for_subagent", result: "waiting" },
+                {
+                  sessionID: input.sessionID,
+                  messageID: dispatch.id,
+                  agent: "general",
+                  abort: new AbortController().signal,
+                  messages: [],
+                  metadata: () => Effect.void,
+                  ask: () => Effect.void,
+                },
+              ),
+            )
+            expect(accepted.metadata.waiting).toBe(true)
+            const part = finishPart(dispatch.id, input.sessionID, "waiting_for_subagent", "waiting")
+            if (part.state.status === "completed") {
+              part.state.output = accepted.output
+              part.state.metadata = accepted.metadata
+            }
+            yield* sessions.updatePart(part)
+            return { info: dispatch, parts: [part] }
+          })
+        },
+      }
+
+      const launched = yield* childDef.execute(
+        { description: "nested dispatch", prompt: "look into the cache key path", subagent_type: "general" },
+        {
+          sessionID: chat.id,
+          messageID: assistant.id,
+          agent: "work",
+          abort: new AbortController().signal,
+          extra: { promptOps: childOps },
+          messages: [],
+          metadata: () => Effect.void,
+          ask: () => Effect.void,
+        },
+      )
+      const child = SessionID.make(launched.metadata.sessionId)
+
+      const settled = yield* jobs.wait({ id: child, timeout: 5_000 })
+      expect(settled.info?.status).toBe("completed")
+      yield* jobs.cancel(`${child}_spare`, { teardown: true })
+      expect(settled.info?.output).toContain("child final result")
+
+      yield* pollWithTimeout(
+        Effect.sync(() => (parentPrompts.length === 1 ? true : undefined)),
+        "the child's final result was not delivered to the parent",
+      )
+      const delivered = parentPrompts[0]?.parts[0]?.type === "text" ? parentPrompts[0].parts[0].text : ""
+      expect(delivered).toContain(`<task id="${child}" state="completed">`)
+      expect(delivered).toContain("child final result")
+
+      // The child was resumed by the parked job with the settled report, and
+      // the notification path did not prompt it a second time for that report.
+      expect(childPrompts).toHaveLength(2)
+      const resumed = childPrompts[1]?.parts[0]?.type === "text" ? childPrompts[1].parts[0].text : ""
+      expect(resumed).toContain('state="completed"')
+      expect(resumed).toContain("grandchild result")
+      expect(nestedPrompts.filter((input) => input.sessionID !== chat.id && input.sessionID !== child)).toHaveLength(1)
+      expect(nestedPrompts.filter((input) => input.sessionID === child)).toHaveLength(0)
+    }),
+  { config: { subagent_depth: 2 } },
+)
+
+// A subagent that reports while the child's turn is still running is the same
+// wait seen from the other side: the notification path stands down for a
+// session that is a running task job's subject, so the report is still in hand
+// when the child yields - the park has to deliver it rather than wait for an
+// event that already happened.
+for (const teardown of [false, true]) {
+  it.instance(
+    teardown
+      ? "a nested teardown records its terminal receipt without waking its live launcher"
+      : "a subagent that reported before the child parked is delivered by the parked job",
+    () =>
+      Effect.gen(function* () {
+        const jobs = yield* BackgroundJob.Service
+        const sessions = yield* Session.Service
+        const { chat, assistant } = yield* seed("Report before the park")
+        const childTool = yield* TaskTool
+        const childDef = yield* childTool.init()
+        const nestedTool = yield* TaskTool
+        const nestedDef = yield* nestedTool.init()
+
+        const report = defer<string>()
+        const childPrompts: SessionPrompt.PromptInput[] = []
+        const nestedPrompts: SessionPrompt.PromptInput[] = []
+        const parentPrompts: SessionPrompt.PromptInput[] = []
+
+        const finishPart = (
+          messageID: MessageID,
+          sessionID: SessionID,
+          reason: string,
+          result: string,
+        ): SessionV1.ToolPart => {
+          const now = Date.now()
+          return {
+            id: PartID.ascending(),
+            messageID,
+            sessionID,
+            type: "tool",
+            tool: "finish",
+            callID: PartID.ascending(),
+            state: {
+              status: "completed",
+              input: { reason, result },
+              output: result,
+              title: result,
+              metadata: {},
+              time: { start: now, end: now },
+            },
+          }
+        }
+
+        const nestedOps: TaskPromptOps = {
+          cancel: () => Effect.void,
+          resolvePromptParts: (template) => Effect.succeed([{ type: "text" as const, text: template }]),
+          prompt: (input) => {
+            nestedPrompts.push(input)
+            if (input.noReply) return Effect.succeed(reply(input, "silent receipt"))
+            return Effect.promise(() => report.promise).pipe(
+              Effect.map(() => {
+                const replied = reply(input, "grandchild result BEFORE_PARK")
+                return {
+                  ...replied,
+                  parts: [
+                    ...replied.parts,
+                    finishPart(replied.info.id, input.sessionID, "success", "grandchild result BEFORE_PARK"),
+                  ],
+                }
+              }),
+            )
+          },
+        }
+
+        const childOps: TaskPromptOps = {
+          cancel: () => Effect.void,
+          resolvePromptParts: (template) => Effect.succeed([{ type: "text" as const, text: template }]),
+          prompt: (input) => {
+            if (input.sessionID === chat.id) {
+              parentPrompts.push(input)
+              return Effect.sync(() => reply(input, "notified"))
+            }
+            childPrompts.push(input)
+            if (childPrompts.length > 1) {
+              const replied = reply(input, "child final result AFTER_PARK")
+              return Effect.sync(() => ({
+                ...replied,
+                parts: [
+                  ...replied.parts,
+                  finishPart(replied.info.id, input.sessionID, "success", "child final result AFTER_PARK"),
+                ],
+              }))
+            }
+            return Effect.gen(function* () {
+              // A real dispatch runs inside a real assistant message of the child
+              // session; the task tool reads that message for its model.
+              const user = yield* sessions.updateMessage({
+                id: MessageID.ascending(),
+                role: "user",
+                sessionID: input.sessionID,
+                agent: "general",
+                model: ref,
+                time: { created: Date.now() },
+              })
+              const dispatch: SessionV1.Assistant = {
+                id: MessageID.ascending(),
+                role: "assistant",
+                parentID: user.id,
+                sessionID: input.sessionID,
+                mode: "general",
+                agent: "general",
+                cost: 0,
+                path: { cwd: "/tmp", root: "/tmp" },
+                tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+                modelID: ref.modelID,
+                providerID: ref.providerID,
+                variant: "xhigh",
+                time: { created: Date.now() },
+              }
+              yield* sessions.updateMessage(dispatch)
+              // The child launches its own subagent through the real dispatch, so
+              // the report reaches the notification path this test is about.
+              const nested = yield* Effect.orDie(
+                nestedDef.execute(
+                  { description: "grandchild work", prompt: "do the nested work", subagent_type: "general" },
+                  {
+                    sessionID: input.sessionID,
+                    messageID: dispatch.id,
+                    agent: "general",
+                    abort: new AbortController().signal,
+                    extra: { promptOps: nestedOps, bypassAgentCheck: true },
+                    messages: [],
+                    metadata: () => Effect.void,
+                    ask: () => Effect.void,
+                  },
+                ),
+              )
+              // It reports before this turn ends, so by the time the child yields
+              // the report has already settled - with nothing left to notify.
+              if (teardown) yield* jobs.cancel(nested.metadata.sessionId, { teardown: true })
+              report.resolve("released")
+              yield* jobs.wait({ id: nested.metadata.sessionId, timeout: 5_000 }).pipe(Effect.orDie)
+              if (teardown) {
+                yield* pollWithTimeout(
+                  Effect.sync(() =>
+                    nestedPrompts.find((prompt) => prompt.sessionID === input.sessionID && prompt.noReply),
+                  ),
+                  "nested teardown did not write its silent terminal receipt",
+                )
+                const replied = reply(input, "AFTER_PARK")
+                return {
+                  ...replied,
+                  parts: [...replied.parts, finishPart(replied.info.id, input.sessionID, "success", "AFTER_PARK")],
+                }
+              }
+              // A lone settled child cannot satisfy the real finish guard.
+              // Another child still runs, so this wait is reachable in production.
+              const spare = yield* jobs.start({
+                id: `${input.sessionID}_spare`,
+                type: "task",
+                metadata: { parentSessionId: input.sessionID },
+                run: Effect.never,
+              })
+              expect(spare.status).toBe("running")
+              const finish = yield* (yield* FinishTool).init()
+              const accepted = yield* Effect.orDie(
+                finish.execute(
+                  { reason: "waiting_for_subagent", result: "waiting" },
+                  {
+                    sessionID: input.sessionID,
+                    messageID: dispatch.id,
+                    agent: "general",
+                    abort: new AbortController().signal,
+                    messages: [],
+                    metadata: () => Effect.void,
+                    ask: () => Effect.void,
+                  },
+                ),
+              )
+              expect(accepted.metadata.waiting).toBe(true)
+              const part = finishPart(dispatch.id, input.sessionID, "waiting_for_subagent", "waiting")
+              if (part.state.status === "completed") {
+                part.state.output = accepted.output
+                part.state.metadata = accepted.metadata
+              }
+              yield* sessions.updatePart(part)
+              return { info: dispatch, parts: [part] }
+            })
+          },
+        }
+
+        const launched = yield* childDef.execute(
+          { description: "nested dispatch", prompt: "look into the cache key path", subagent_type: "general" },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "work",
+            abort: new AbortController().signal,
+            extra: { promptOps: childOps },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        )
+        const child = SessionID.make(launched.metadata.sessionId)
+
+        const settled = yield* jobs.wait({ id: child, timeout: 5_000 })
+        expect(settled.info?.status).toBe("completed")
+        yield* jobs.cancel(`${child}_spare`, { teardown: true })
+        expect(settled.info?.output).toContain("AFTER_PARK")
+
+        yield* pollWithTimeout(
+          Effect.sync(() => (parentPrompts.length === 1 ? true : undefined)),
+          "the child's final result was not delivered to the parent",
+        )
+        const delivered = parentPrompts[0]?.parts[0]?.type === "text" ? parentPrompts[0].parts[0].text : ""
+        expect(delivered).toContain(`<task id="${child}" state="completed">`)
+        expect(delivered).toContain("AFTER_PARK")
+
+        // The settled report was delivered by the park, with no second prompt from
+        // the notification path: the child's own two turns are all it took.
+        expect(childPrompts).toHaveLength(teardown ? 1 : 2)
+        const resumed = childPrompts[1]?.parts[0]?.type === "text" ? childPrompts[1].parts[0].text : ""
+        if (teardown) {
+          const receipts = nestedPrompts.filter((input) => input.sessionID === child)
+          expect(receipts).toHaveLength(1)
+          expect(receipts[0]?.noReply).toBe(true)
+          const part = receipts[0]?.parts[0]
+          expect(part?.type === "text" && part.text).toContain('state="cancelled"')
+          expect(part?.type === "text" && part.metadata?.backgroundNoReply).toBe(true)
+        } else {
+          expect(resumed).toContain('state="completed"')
+          expect(resumed).toContain("BEFORE_PARK")
+          expect(nestedPrompts.filter((input) => input.sessionID === child)).toHaveLength(0)
+        }
+      }),
+    { config: { subagent_depth: 2 } },
+  )
+}

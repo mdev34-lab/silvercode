@@ -56,6 +56,8 @@ import { Session } from "./routes/session"
 import { PromptHistoryProvider } from "./component/prompt/history"
 import { FrecencyProvider } from "./component/prompt/frecency"
 import { PromptStashProvider } from "./component/prompt/stash"
+import { SessionTabsProvider, useSessionTabs } from "./context/session-tabs"
+import { SessionTabsBar } from "./component/session-tabs-bar"
 import { DialogAlert } from "./ui/dialog-alert"
 import { DialogConfirm } from "./ui/dialog-confirm"
 import { ToastProvider, useToast } from "./ui/toast"
@@ -310,24 +312,26 @@ export const run = Effect.fn("Tui.run")(function* (input: TuiInput) {
                                                 <DataProvider>
                                                   <ThemeProvider mode={mode}>
                                                     <LocalProvider>
-                                                      <PromptStashProvider>
-                                                        <DialogProvider>
-                                                          <FrecencyProvider>
-                                                            <PromptHistoryProvider>
-                                                              <PromptRefProvider>
-                                                                <EditorContextProvider>
-                                                                  <LocationProvider>
-                                                                    <App
-                                                                      onSnapshot={input.onSnapshot}
-                                                                      pluginHost={input.pluginHost}
-                                                                    />
-                                                                  </LocationProvider>
-                                                                </EditorContextProvider>
-                                                              </PromptRefProvider>
-                                                            </PromptHistoryProvider>
-                                                          </FrecencyProvider>
-                                                        </DialogProvider>
-                                                      </PromptStashProvider>
+                                                      <SessionTabsProvider>
+                                                        <PromptStashProvider>
+                                                          <DialogProvider>
+                                                            <FrecencyProvider>
+                                                              <PromptHistoryProvider>
+                                                                <PromptRefProvider>
+                                                                  <EditorContextProvider>
+                                                                    <LocationProvider>
+                                                                      <App
+                                                                        onSnapshot={input.onSnapshot}
+                                                                        pluginHost={input.pluginHost}
+                                                                      />
+                                                                    </LocationProvider>
+                                                                  </EditorContextProvider>
+                                                                </PromptRefProvider>
+                                                              </PromptHistoryProvider>
+                                                            </FrecencyProvider>
+                                                          </DialogProvider>
+                                                        </PromptStashProvider>
+                                                      </SessionTabsProvider>
                                                     </LocalProvider>
                                                   </ThemeProvider>
                                                 </DataProvider>
@@ -368,6 +372,7 @@ function App(props: { onSnapshot?: () => Promise<string[]>; pluginHost: TuiPlugi
   const startup = useTuiStartup()
   const tuiConfig = useTuiConfig()
   const route = useRoute()
+  const tabs = useSessionTabs()
   const dimensions = useTerminalDimensions()
   const renderer = useRenderer()
   const dialog = useDialog()
@@ -591,6 +596,35 @@ function App(props: { onSnapshot?: () => Promise<string[]>; pluginHost: TuiPlugi
           route.navigate({
             type: "home",
           })
+          dialog.clear()
+        },
+      },
+      {
+        name: "session.tab.next",
+        title: "Next session tab",
+        category: "Session",
+        run: () => {
+          tabs.step(1)
+          dialog.clear()
+        },
+      },
+      {
+        name: "session.tab.prev",
+        title: "Previous session tab",
+        category: "Session",
+        run: () => {
+          tabs.step(-1)
+          dialog.clear()
+        },
+      },
+      {
+        // Closing a tab never deletes the session or stops its run. Reopen it
+        // from the session list.
+        name: "session.tab.close",
+        title: "Close session tab",
+        category: "Session",
+        run: () => {
+          if (tabs.active) tabs.close(tabs.active)
           dialog.clear()
         },
       },
@@ -888,11 +922,15 @@ function App(props: { onSnapshot?: () => Promise<string[]>; pluginHost: TuiPlugi
       },
       {
         name: "terminal.suspend",
-        title: "Suspend terminal",
+        title: "Suspend terminal (work continues)",
         category: "System",
         hidden: true,
         enabled: process.platform !== "win32",
         run: () => {
+          // SIGTSTP goes to this process group only. The server worker runs
+          // detached (worker-process.ts), so the session keeps executing while
+          // the UI is stopped; queued events are delivered on SIGCONT and any
+          // attention signals fire then. See docs/tui/background.md.
           renderer.suspend()
           process.once("SIGCONT", () => renderer.resume())
           process.kill(0, "SIGTSTP")
@@ -1030,8 +1068,12 @@ function App(props: { onSnapshot?: () => Promise<string[]>; pluginHost: TuiPlugi
   })
 
   event.on("session.deleted", (evt) => {
-    if (route.data.type === "session" && route.data.sessionID === evt.properties.info.id) {
-      route.navigate({ type: "home" })
+    const deleted = evt.properties.info.id
+    const wasCurrent = route.data.type === "session" && route.data.sessionID === deleted
+    // Drops the tab first: if it was active, the close moves to a neighbouring
+    // tab, or home when none is left.
+    tabs.close(deleted)
+    if (wasCurrent) {
       toast.show({
         variant: "info",
         message: "The current session was deleted",
@@ -1133,6 +1175,7 @@ function App(props: { onSnapshot?: () => Promise<string[]>; pluginHost: TuiPlugi
       </Show>
       <Show when={ready()}>
         <box flexGrow={1} minHeight={0} flexDirection="column">
+          <SessionTabsBar />
           <Switch>
             <Match when={route.data.type === "home"}>
               <Home />

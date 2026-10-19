@@ -1,0 +1,828 @@
+{
+  "issue": 243,
+  "kind": "current-head reconciliation and implemented scoped reduction (follow-up to the c8a2ae2 study above)",
+  "capturedAt": "2026-10-16",
+  "baseCommit": "9948cb2787615bac73043c0d8a3ec9be11d91d54",
+  "priorFixtureCommit": "c8a2ae2cd75f1f5657c759d3ee03fdd3a5539e81",
+  "tokenizer": "gpt-tokenizer@4.0.0 (o200k_base), same pinned tokenizer and measure.ts fixture as the prior study",
+  "upstreamComparator": {
+    "source": "not re-run; reused from results/comparison.json in this directory",
+    "total": 6523,
+    "systemTokens": 2104,
+    "toolsTokens": 4412,
+    "userTokens": 7
+  },
+  "changeImplemented": "packages/opencode/src/session/prompt/gpt.txt only: dedupe the Task Management section against the todo scope contract + todowrite description (inventory item 6), compress the duplicated review-routing paragraph, and remove the stale multi_tool_use.parallel reference (item 13)",
+  "scenarios": {
+    "before_primary_gpt52_medium_x3_identical": {
+      "id": "alpha-empty-gpt52-medium-run1",
+      "model": "probe/gpt-5.2",
+      "effort": "medium",
+      "systemTokens": 2880,
+      "systemSections": {
+        "promptFiles": [
+          {
+            "file": "gpt.txt",
+            "tokens": 2327
+          },
+          {
+            "file": "ste-lite.txt",
+            "tokens": 154
+          }
+        ],
+        "envBlock": 98,
+        "skillsBlock": 156,
+        "toolOverview": 13,
+        "effortBlock": 0,
+        "instructionFiles": [],
+        "attributed": 2748,
+        "unattributed": 132
+      },
+      "toolsTokens": 3717,
+      "toolCount": 11,
+      "toolNames": [
+        "apply_patch",
+        "bash",
+        "finish",
+        "glob",
+        "grep",
+        "read",
+        "skill",
+        "task",
+        "todowrite",
+        "tool_search",
+        "tool_search_regex"
+      ],
+      "descriptionTokens": 2230,
+      "schemaTokens": 1209,
+      "perTool": [
+        {
+          "name": "task",
+          "descriptionTokens": 518,
+          "schemaTokens": 220,
+          "rawTokens": 770
+        },
+        {
+          "name": "bash",
+          "descriptionTokens": 480,
+          "schemaTokens": 116,
+          "rawTokens": 631
+        },
+        {
+          "name": "finish",
+          "descriptionTokens": 268,
+          "schemaTokens": 199,
+          "rawTokens": 492
+        },
+        {
+          "name": "apply_patch",
+          "descriptionTokens": 263,
+          "schemaTokens": 52,
+          "rawTokens": 360
+        },
+        {
+          "name": "grep",
+          "descriptionTokens": 149,
+          "schemaTokens": 103,
+          "rawTokens": 280
+        },
+        {
+          "name": "todowrite",
+          "descriptionTokens": 138,
+          "schemaTokens": 120,
+          "rawTokens": 279
+        },
+        {
+          "name": "read",
+          "descriptionTokens": 132,
+          "schemaTokens": 123,
+          "rawTokens": 276
+        },
+        {
+          "name": "glob",
+          "descriptionTokens": 109,
+          "schemaTokens": 66,
+          "rawTokens": 194
+        },
+        {
+          "name": "tool_search",
+          "descriptionTokens": 52,
+          "schemaTokens": 83,
+          "rawTokens": 154
+        },
+        {
+          "name": "tool_search_regex",
+          "descriptionTokens": 46,
+          "schemaTokens": 79,
+          "rawTokens": 146
+        },
+        {
+          "name": "skill",
+          "descriptionTokens": 75,
+          "schemaTokens": 48,
+          "rawTokens": 144
+        }
+      ],
+      "userTokens": 7,
+      "total": 6604,
+      "titleRequestSystemTokens": 503
+    },
+    "after_primary_gpt52_medium_x3_identical": {
+      "id": "alpha-empty-gpt52-medium-run1",
+      "model": "probe/gpt-5.2",
+      "effort": "medium",
+      "systemTokens": 2609,
+      "systemSections": {
+        "promptFiles": [
+          {
+            "file": "gpt.txt",
+            "tokens": 2056
+          },
+          {
+            "file": "ste-lite.txt",
+            "tokens": 154
+          }
+        ],
+        "envBlock": 98,
+        "skillsBlock": 156,
+        "toolOverview": 13,
+        "effortBlock": 0,
+        "instructionFiles": [],
+        "attributed": 2477,
+        "unattributed": 132
+      },
+      "toolsTokens": 3717,
+      "toolCount": 11,
+      "toolNames": [
+        "apply_patch",
+        "bash",
+        "finish",
+        "glob",
+        "grep",
+        "read",
+        "skill",
+        "task",
+        "todowrite",
+        "tool_search",
+        "tool_search_regex"
+      ],
+      "descriptionTokens": 2230,
+      "schemaTokens": 1209,
+      "perTool": [
+        {
+          "name": "task",
+          "descriptionTokens": 518,
+          "schemaTokens": 220,
+          "rawTokens": 770
+        },
+        {
+          "name": "bash",
+          "descriptionTokens": 480,
+          "schemaTokens": 116,
+          "rawTokens": 631
+        },
+        {
+          "name": "finish",
+          "descriptionTokens": 268,
+          "schemaTokens": 199,
+          "rawTokens": 492
+        },
+        {
+          "name": "apply_patch",
+          "descriptionTokens": 263,
+          "schemaTokens": 52,
+          "rawTokens": 360
+        },
+        {
+          "name": "grep",
+          "descriptionTokens": 149,
+          "schemaTokens": 103,
+          "rawTokens": 280
+        },
+        {
+          "name": "todowrite",
+          "descriptionTokens": 138,
+          "schemaTokens": 120,
+          "rawTokens": 279
+        },
+        {
+          "name": "read",
+          "descriptionTokens": 132,
+          "schemaTokens": 123,
+          "rawTokens": 276
+        },
+        {
+          "name": "glob",
+          "descriptionTokens": 109,
+          "schemaTokens": 66,
+          "rawTokens": 194
+        },
+        {
+          "name": "tool_search",
+          "descriptionTokens": 52,
+          "schemaTokens": 83,
+          "rawTokens": 154
+        },
+        {
+          "name": "tool_search_regex",
+          "descriptionTokens": 46,
+          "schemaTokens": 79,
+          "rawTokens": 146
+        },
+        {
+          "name": "skill",
+          "descriptionTokens": 75,
+          "schemaTokens": 48,
+          "rawTokens": 144
+        }
+      ],
+      "userTokens": 7,
+      "total": 6333,
+      "titleRequestSystemTokens": 503
+    },
+    "before_no_toolsearch": {
+      "id": "alpha-empty-gpt52-medium-no-toolsearch",
+      "model": "probe/gpt-5.2",
+      "effort": "medium",
+      "systemTokens": 2869,
+      "systemSections": {
+        "promptFiles": [
+          {
+            "file": "gpt.txt",
+            "tokens": 2327
+          },
+          {
+            "file": "ste-lite.txt",
+            "tokens": 154
+          }
+        ],
+        "envBlock": 100,
+        "skillsBlock": 156,
+        "toolOverview": 0,
+        "effortBlock": 0,
+        "instructionFiles": [],
+        "attributed": 2737,
+        "unattributed": 132
+      },
+      "toolsTokens": 4130,
+      "toolCount": 11,
+      "toolNames": [
+        "apply_patch",
+        "attachment",
+        "bash",
+        "finish",
+        "glob",
+        "grep",
+        "read",
+        "skill",
+        "task",
+        "todowrite",
+        "webfetch"
+      ],
+      "descriptionTokens": 2503,
+      "schemaTokens": 1349,
+      "perTool": [
+        {
+          "name": "task",
+          "descriptionTokens": 518,
+          "schemaTokens": 220,
+          "rawTokens": 770
+        },
+        {
+          "name": "bash",
+          "descriptionTokens": 480,
+          "schemaTokens": 116,
+          "rawTokens": 631
+        },
+        {
+          "name": "webfetch",
+          "descriptionTokens": 314,
+          "schemaTokens": 178,
+          "rawTokens": 516
+        },
+        {
+          "name": "finish",
+          "descriptionTokens": 268,
+          "schemaTokens": 199,
+          "rawTokens": 492
+        },
+        {
+          "name": "apply_patch",
+          "descriptionTokens": 263,
+          "schemaTokens": 52,
+          "rawTokens": 360
+        },
+        {
+          "name": "grep",
+          "descriptionTokens": 149,
+          "schemaTokens": 103,
+          "rawTokens": 280
+        },
+        {
+          "name": "todowrite",
+          "descriptionTokens": 138,
+          "schemaTokens": 120,
+          "rawTokens": 279
+        },
+        {
+          "name": "read",
+          "descriptionTokens": 132,
+          "schemaTokens": 123,
+          "rawTokens": 276
+        },
+        {
+          "name": "attachment",
+          "descriptionTokens": 57,
+          "schemaTokens": 124,
+          "rawTokens": 197
+        },
+        {
+          "name": "glob",
+          "descriptionTokens": 109,
+          "schemaTokens": 66,
+          "rawTokens": 194
+        },
+        {
+          "name": "skill",
+          "descriptionTokens": 75,
+          "schemaTokens": 48,
+          "rawTokens": 144
+        }
+      ],
+      "userTokens": 7,
+      "total": 7006,
+      "titleRequestSystemTokens": 503
+    },
+    "before_no_ste_lite": {
+      "id": "alpha-empty-gpt52-medium-no-ste",
+      "model": "probe/gpt-5.2",
+      "effort": "medium",
+      "systemTokens": 2726,
+      "systemSections": {
+        "promptFiles": [
+          {
+            "file": "gpt.txt",
+            "tokens": 2327
+          }
+        ],
+        "envBlock": 98,
+        "skillsBlock": 156,
+        "toolOverview": 13,
+        "effortBlock": 0,
+        "instructionFiles": [],
+        "attributed": 2594,
+        "unattributed": 132
+      },
+      "toolsTokens": 3717,
+      "toolCount": 11,
+      "toolNames": [
+        "apply_patch",
+        "bash",
+        "finish",
+        "glob",
+        "grep",
+        "read",
+        "skill",
+        "task",
+        "todowrite",
+        "tool_search",
+        "tool_search_regex"
+      ],
+      "descriptionTokens": 2230,
+      "schemaTokens": 1209,
+      "perTool": [
+        {
+          "name": "task",
+          "descriptionTokens": 518,
+          "schemaTokens": 220,
+          "rawTokens": 770
+        },
+        {
+          "name": "bash",
+          "descriptionTokens": 480,
+          "schemaTokens": 116,
+          "rawTokens": 631
+        },
+        {
+          "name": "finish",
+          "descriptionTokens": 268,
+          "schemaTokens": 199,
+          "rawTokens": 492
+        },
+        {
+          "name": "apply_patch",
+          "descriptionTokens": 263,
+          "schemaTokens": 52,
+          "rawTokens": 360
+        },
+        {
+          "name": "grep",
+          "descriptionTokens": 149,
+          "schemaTokens": 103,
+          "rawTokens": 280
+        },
+        {
+          "name": "todowrite",
+          "descriptionTokens": 138,
+          "schemaTokens": 120,
+          "rawTokens": 279
+        },
+        {
+          "name": "read",
+          "descriptionTokens": 132,
+          "schemaTokens": 123,
+          "rawTokens": 276
+        },
+        {
+          "name": "glob",
+          "descriptionTokens": 109,
+          "schemaTokens": 66,
+          "rawTokens": 194
+        },
+        {
+          "name": "tool_search",
+          "descriptionTokens": 52,
+          "schemaTokens": 83,
+          "rawTokens": 154
+        },
+        {
+          "name": "tool_search_regex",
+          "descriptionTokens": 46,
+          "schemaTokens": 79,
+          "rawTokens": 146
+        },
+        {
+          "name": "skill",
+          "descriptionTokens": 75,
+          "schemaTokens": 48,
+          "rawTokens": 144
+        }
+      ],
+      "userTokens": 7,
+      "total": 6450,
+      "titleRequestSystemTokens": 503
+    },
+    "before_contextmd_only": {
+      "id": "alpha-contextmd-only-gpt52-medium",
+      "model": "probe/gpt-5.2",
+      "effort": "medium",
+      "systemTokens": 8675,
+      "systemSections": {
+        "promptFiles": [
+          {
+            "file": "gpt.txt",
+            "tokens": 2327
+          },
+          {
+            "file": "ste-lite.txt",
+            "tokens": 154
+          }
+        ],
+        "envBlock": 98,
+        "skillsBlock": 156,
+        "toolOverview": 13,
+        "effortBlock": 0,
+        "instructionFiles": [
+          "/tmp/opencode-243-initial-context/alpha-contextmd-only-gpt52-medium/project/CONTEXT.md"
+        ],
+        "attributed": 2748,
+        "unattributed": 5927
+      },
+      "toolsTokens": 3717,
+      "toolCount": 11,
+      "toolNames": [
+        "apply_patch",
+        "bash",
+        "finish",
+        "glob",
+        "grep",
+        "read",
+        "skill",
+        "task",
+        "todowrite",
+        "tool_search",
+        "tool_search_regex"
+      ],
+      "descriptionTokens": 2230,
+      "schemaTokens": 1209,
+      "perTool": [
+        {
+          "name": "task",
+          "descriptionTokens": 518,
+          "schemaTokens": 220,
+          "rawTokens": 770
+        },
+        {
+          "name": "bash",
+          "descriptionTokens": 480,
+          "schemaTokens": 116,
+          "rawTokens": 631
+        },
+        {
+          "name": "finish",
+          "descriptionTokens": 268,
+          "schemaTokens": 199,
+          "rawTokens": 492
+        },
+        {
+          "name": "apply_patch",
+          "descriptionTokens": 263,
+          "schemaTokens": 52,
+          "rawTokens": 360
+        },
+        {
+          "name": "grep",
+          "descriptionTokens": 149,
+          "schemaTokens": 103,
+          "rawTokens": 280
+        },
+        {
+          "name": "todowrite",
+          "descriptionTokens": 138,
+          "schemaTokens": 120,
+          "rawTokens": 279
+        },
+        {
+          "name": "read",
+          "descriptionTokens": 132,
+          "schemaTokens": 123,
+          "rawTokens": 276
+        },
+        {
+          "name": "glob",
+          "descriptionTokens": 109,
+          "schemaTokens": 66,
+          "rawTokens": 194
+        },
+        {
+          "name": "tool_search",
+          "descriptionTokens": 52,
+          "schemaTokens": 83,
+          "rawTokens": 154
+        },
+        {
+          "name": "tool_search_regex",
+          "descriptionTokens": 46,
+          "schemaTokens": 79,
+          "rawTokens": 146
+        },
+        {
+          "name": "skill",
+          "descriptionTokens": 75,
+          "schemaTokens": 48,
+          "rawTokens": 144
+        }
+      ],
+      "userTokens": 7,
+      "total": 12399,
+      "titleRequestSystemTokens": 503
+    },
+    "after_repo_instructions": {
+      "id": "alpha-instructions-gpt52-medium",
+      "model": "probe/gpt-5.2",
+      "effort": "medium",
+      "systemTokens": 4513,
+      "systemSections": {
+        "promptFiles": [
+          {
+            "file": "gpt.txt",
+            "tokens": 2056
+          },
+          {
+            "file": "ste-lite.txt",
+            "tokens": 154
+          }
+        ],
+        "envBlock": 96,
+        "skillsBlock": 156,
+        "toolOverview": 13,
+        "effortBlock": 0,
+        "instructionFiles": [
+          "/tmp/opencode-243-initial-context/alpha-instructions-gpt52-medium/project/AGENTS.md"
+        ],
+        "attributed": 2475,
+        "unattributed": 2038
+      },
+      "toolsTokens": 3717,
+      "toolCount": 11,
+      "toolNames": [
+        "apply_patch",
+        "bash",
+        "finish",
+        "glob",
+        "grep",
+        "read",
+        "skill",
+        "task",
+        "todowrite",
+        "tool_search",
+        "tool_search_regex"
+      ],
+      "descriptionTokens": 2230,
+      "schemaTokens": 1209,
+      "perTool": [
+        {
+          "name": "task",
+          "descriptionTokens": 518,
+          "schemaTokens": 220,
+          "rawTokens": 770
+        },
+        {
+          "name": "bash",
+          "descriptionTokens": 480,
+          "schemaTokens": 116,
+          "rawTokens": 631
+        },
+        {
+          "name": "finish",
+          "descriptionTokens": 268,
+          "schemaTokens": 199,
+          "rawTokens": 492
+        },
+        {
+          "name": "apply_patch",
+          "descriptionTokens": 263,
+          "schemaTokens": 52,
+          "rawTokens": 360
+        },
+        {
+          "name": "grep",
+          "descriptionTokens": 149,
+          "schemaTokens": 103,
+          "rawTokens": 280
+        },
+        {
+          "name": "todowrite",
+          "descriptionTokens": 138,
+          "schemaTokens": 120,
+          "rawTokens": 279
+        },
+        {
+          "name": "read",
+          "descriptionTokens": 132,
+          "schemaTokens": 123,
+          "rawTokens": 276
+        },
+        {
+          "name": "glob",
+          "descriptionTokens": 109,
+          "schemaTokens": 66,
+          "rawTokens": 194
+        },
+        {
+          "name": "tool_search",
+          "descriptionTokens": 52,
+          "schemaTokens": 83,
+          "rawTokens": 154
+        },
+        {
+          "name": "tool_search_regex",
+          "descriptionTokens": 46,
+          "schemaTokens": 79,
+          "rawTokens": 146
+        },
+        {
+          "name": "skill",
+          "descriptionTokens": 75,
+          "schemaTokens": 48,
+          "rawTokens": 144
+        }
+      ],
+      "userTokens": 7,
+      "total": 8237,
+      "titleRequestSystemTokens": 503
+    },
+    "after_claude45_medium_unchanged_by_this_change": {
+      "id": "alpha-empty-claude45-medium",
+      "model": "probe/claude-sonnet-4-5",
+      "effort": "medium",
+      "systemTokens": 2954,
+      "systemSections": {
+        "promptFiles": [
+          {
+            "file": "anthropic.txt",
+            "tokens": 2398
+          },
+          {
+            "file": "ste-lite.txt",
+            "tokens": 154
+          }
+        ],
+        "envBlock": 96,
+        "skillsBlock": 156,
+        "toolOverview": 13,
+        "effortBlock": 0,
+        "instructionFiles": [],
+        "attributed": 2817,
+        "unattributed": 137
+      },
+      "toolsTokens": 3835,
+      "toolCount": 12,
+      "toolNames": [
+        "bash",
+        "edit",
+        "finish",
+        "glob",
+        "grep",
+        "read",
+        "skill",
+        "task",
+        "todowrite",
+        "tool_search",
+        "tool_search_regex",
+        "write"
+      ],
+      "descriptionTokens": 2208,
+      "schemaTokens": 1349,
+      "perTool": [
+        {
+          "name": "task",
+          "descriptionTokens": 518,
+          "schemaTokens": 220,
+          "rawTokens": 770
+        },
+        {
+          "name": "bash",
+          "descriptionTokens": 480,
+          "schemaTokens": 116,
+          "rawTokens": 631
+        },
+        {
+          "name": "finish",
+          "descriptionTokens": 268,
+          "schemaTokens": 199,
+          "rawTokens": 492
+        },
+        {
+          "name": "grep",
+          "descriptionTokens": 149,
+          "schemaTokens": 103,
+          "rawTokens": 280
+        },
+        {
+          "name": "todowrite",
+          "descriptionTokens": 138,
+          "schemaTokens": 120,
+          "rawTokens": 279
+        },
+        {
+          "name": "read",
+          "descriptionTokens": 132,
+          "schemaTokens": 123,
+          "rawTokens": 276
+        },
+        {
+          "name": "edit",
+          "descriptionTokens": 117,
+          "schemaTokens": 116,
+          "rawTokens": 255
+        },
+        {
+          "name": "write",
+          "descriptionTokens": 124,
+          "schemaTokens": 76,
+          "rawTokens": 224
+        },
+        {
+          "name": "glob",
+          "descriptionTokens": 109,
+          "schemaTokens": 66,
+          "rawTokens": 194
+        },
+        {
+          "name": "tool_search",
+          "descriptionTokens": 52,
+          "schemaTokens": 83,
+          "rawTokens": 154
+        },
+        {
+          "name": "tool_search_regex",
+          "descriptionTokens": 46,
+          "schemaTokens": 79,
+          "rawTokens": 146
+        },
+        {
+          "name": "skill",
+          "descriptionTokens": 75,
+          "schemaTokens": 48,
+          "rawTokens": 144
+        }
+      ],
+      "userTokens": 7,
+      "total": 6796,
+      "titleRequestSystemTokens": 503
+    }
+  },
+  "delta_primary": {
+    "systemTokens": -271,
+    "toolsTokens": 0,
+    "total": -271,
+    "percent": -4.1
+  },
+  "near3kGoalMet": false,
+  "notes": [
+    "All primary repeats (3 fresh sessions before and 3 after) produced identical totals.",
+    "Tool/schema tokens are unchanged by this change: the saving is system-prompt text removal, not hiding tool input from the count.",
+    "exit=1 in the harness is the mock never calling finish (see README section 8, item 7); only the first conversation request is measured."
+  ]
+}

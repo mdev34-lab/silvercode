@@ -136,6 +136,55 @@ async function captureRejection(promise: Promise<unknown>): Promise<QwenWebError
   throw new Error("expected promise to reject")
 }
 
+function mockFetch(handler: (input: RequestInfo | URL, init: RequestInit | undefined) => Promise<Response>): typeof fetch {
+  return (async (input: RequestInfo | URL, init?: RequestInit) => handler(input, init)) as unknown as typeof fetch
+}
+
+function pending(init: RequestInit | undefined): Promise<Response> {
+  return new Promise((_resolve, reject) => {
+    const signal = init?.signal
+    if (signal?.aborted) {
+      reject(signal.reason instanceof Error ? signal.reason : new DOMException("The operation was aborted.", "AbortError"))
+      return
+    }
+    signal?.addEventListener(
+      "abort",
+      () => reject(signal.reason instanceof Error ? signal.reason : new DOMException("The operation was aborted.", "AbortError")),
+      { once: true },
+    )
+  })
+}
+
+function signalTiedStream(init: RequestInit | undefined): ReadableStream<Uint8Array> {
+  return new ReadableStream<Uint8Array>({
+    start(inner) {
+      const signal = init?.signal
+      if (!signal || signal.aborted) {
+        if (signal?.aborted) {
+          inner.error(signal.reason instanceof Error ? signal.reason : new DOMException("The operation was aborted.", "AbortError"))
+        }
+        return
+      }
+      signal.addEventListener(
+        "abort",
+        () =>
+          inner.error(signal.reason instanceof Error ? signal.reason : new DOMException("The operation was aborted.", "AbortError")),
+        { once: true },
+      )
+    },
+  })
+}
+
+async function withFetch(mock: typeof fetch, run: () => Promise<void>): Promise<void> {
+  const realFetch = globalThis.fetch
+  globalThis.fetch = mock
+  try {
+    await run()
+  } finally {
+    globalThis.fetch = realFetch
+  }
+}
+
 describe("QwenWebTransport.requestJson", () => {
   test("runs in-page fetch with merged headers", async () => {
     const fake = makeFake()
@@ -296,54 +345,6 @@ describe("QwenWebTransport.requestStream", () => {
 })
 
 describe("QwenWebTransport.rawRequest", () => {
-  function mockFetch(handler: (input: RequestInfo | URL, init: RequestInit | undefined) => Promise<Response>): typeof fetch {
-    return (async (input: RequestInfo | URL, init?: RequestInit) => handler(input, init)) as unknown as typeof fetch
-  }
-
-  function pending(init: RequestInit | undefined): Promise<Response> {
-    return new Promise((_resolve, reject) => {
-      const signal = init?.signal
-      if (signal?.aborted) {
-        reject(signal.reason instanceof Error ? signal.reason : new DOMException("The operation was aborted.", "AbortError"))
-        return
-      }
-      signal?.addEventListener(
-        "abort",
-        () => reject(signal.reason instanceof Error ? signal.reason : new DOMException("The operation was aborted.", "AbortError")),
-        { once: true },
-      )
-    })
-  }
-
-  function signalTiedStream(init: RequestInit | undefined): ReadableStream<Uint8Array> {
-    return new ReadableStream<Uint8Array>({
-      start(inner) {
-        const signal = init?.signal
-        if (!signal || signal.aborted) {
-          if (signal?.aborted) {
-            inner.error(signal.reason instanceof Error ? signal.reason : new DOMException("The operation was aborted.", "AbortError"))
-          }
-          return
-        }
-        signal.addEventListener(
-          "abort",
-          () =>
-            inner.error(signal.reason instanceof Error ? signal.reason : new DOMException("The operation was aborted.", "AbortError")),
-          { once: true },
-        )
-      },
-    })
-  }
-
-  async function withFetch(mock: typeof fetch, run: () => Promise<void>): Promise<void> {
-    const realFetch = globalThis.fetch
-    globalThis.fetch = mock
-    try {
-      await run()
-    } finally {
-      globalThis.fetch = realFetch
-    }
-  }
 
   test("rawRequestJson sends cookies + WAF signals and returns the body", async () => {
     const fake = makeFake()
@@ -567,6 +568,81 @@ describe("QwenWebTransport.rawRequest", () => {
           .slice(before)
           .filter((item) => item.kind === "signal").length
         expect(newSignalReads).toBe(1)
+      },
+    )
+  })
+})
+
+
+describe("workstream 232 cancellation cleanup (transport) — listener ownership", () => {
+  test("single ownership: listener set empty after finish, abort, and cancel", async () => {
+    // Track listener identities (not just event names) so a leaked listener
+    // left installed after any terminal path is detected exactly.
+    const scenarios = ["finish", "abort", "cancel"] as const
+    for (const scenario of scenarios) {
+      const fake = makeFake()
+      fake.onBridge = (call) => {
+        emit(fake, call, { type: "headers", status: 200, contentType: "text/event-stream" })
+      }
+      const transport = new QwenWebTransport({ browser: fake.browser, idleTimeoutMs: 5000, metadataTimeoutMs: 1000 })
+      await withFetch(
+        mockFetch(async (_input, init) => {
+          if (scenario === "finish") {
+            return new Response("data: A\n\n", { status: 200, headers: { "content-type": "text/event-stream" } })
+          }
+          // Stay pending until the fetch is torn down by the controller.
+          return new Response(signalTiedStream(init), { status: 200, headers: { "content-type": "text/event-stream" } })
+        }),
+        async () => {
+          const signal = new AbortController()
+          const installed = new Set<unknown>()
+          const origAdd = signal.signal.addEventListener.bind(signal.signal)
+          const origRemove = signal.signal.removeEventListener.bind(signal.signal)
+          signal.signal.addEventListener = ((...args: any[]) => {
+            if (args[0] === "abort") installed.add(args[1])
+            return origAdd(...args)
+          }) as typeof signal.signal.addEventListener
+          signal.signal.removeEventListener = ((...args: any[]) => {
+            if (args[0] === "abort") installed.delete(args[1])
+            return origRemove(...args)
+          }) as typeof signal.signal.removeEventListener
+
+          const response = await transport.rawRequestStream("POST", "/x", { signal: signal.signal })
+          if (scenario === "finish") {
+            await readAll(response.stream)
+          } else if (scenario === "abort") {
+            signal.abort()
+            await readAll(response.stream).catch(() => {})
+          } else {
+            await response.stream.cancel().catch(() => {})
+          }
+          // Let the pump's stop/finalize run.
+          await new Promise((resolve) => setTimeout(resolve, 20))
+          expect(installed.size).toBe(0)
+        },
+      )
+    }
+  })
+
+  test("already-aborted signal aborts controller immediately; no hang", async () => {
+    const fake = makeFake()
+    fake.onBridge = (call) => {
+      emit(fake, call, { type: "headers", status: 200, contentType: "text/event-stream" })
+    }
+    const transport = new QwenWebTransport({ browser: fake.browser, metadataTimeoutMs: 1000 })
+    await withFetch(
+      mockFetch(async () => new Response("data: A\n\n", { status: 200, headers: { "content-type": "text/event-stream" } })),
+      async () => {
+        const signal = new AbortController()
+        signal.abort()
+        // Pre-aborted signals reject before any upstream work (no fetch, no hang).
+        const error = await transport.rawRequestStream("POST", "/x", { signal: signal.signal }).then(
+          () => undefined,
+          (e: unknown) => e,
+        )
+        expect(error).toBeInstanceOf(QwenWebError)
+        expect((error as QwenWebError).code).toBe("aborted")
+        expect((error as QwenWebError).retryable).toBe(false)
       },
     )
   })

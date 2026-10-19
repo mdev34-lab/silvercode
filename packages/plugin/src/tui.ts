@@ -12,6 +12,7 @@ import type {
   PermissionRequest,
   QuestionRequest,
   Session,
+  SessionNextContextPrepared,
   SessionStatus,
   TextPart,
   Config as SdkConfig,
@@ -386,6 +387,8 @@ export type TuiState = {
   session: {
     count: () => number
     get: (sessionID: string) => Session | undefined
+    /** The runtime's own measurement of the last provider request for this session. */
+    context: (sessionID: string) => SessionNextContextPrepared["data"] | undefined
     diff: (sessionID: string) => ReadonlyArray<TuiSidebarFileItem>
     todo: (sessionID: string) => ReadonlyArray<TuiSidebarTodoItem>
     messages: (sessionID: string) => ReadonlyArray<Message>

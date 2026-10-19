@@ -1119,17 +1119,20 @@ noLLMServer.instance(
       // Legacy shape: synthetic Read-tool note + the full decoded content.
       expect(syntheticTexts).toEqual(expect.arrayContaining([expect.stringContaining("Called the Read tool"), content]))
       expect(syntheticTexts.find((text) => text.includes("Large pasted text file"))).toBeUndefined()
-      // No managed paste file for inlined content.
-      const exists = yield* Effect.promise(() =>
+      // Paste to File never ran: no paste-*.txt managed file. The attachment
+      // store may still hold a materialized copy of the file part itself —
+      // that is the managed-attachment path every file part gets, not the
+      // large-paste feature under test here.
+      const names = yield* Effect.promise(() =>
         readdir(pasteDir(chat.id)).then(
-          () => true,
+          (entries) => entries,
           (error) =>
             error instanceof Error && (error as NodeJS.ErrnoException).code === "ENOENT"
-              ? false
+              ? ([] as string[])
               : Promise.reject(error),
         ),
       )
-      expect(exists).toBe(false)
+      expect(names.filter((name) => name.startsWith("paste-"))).toEqual([])
     }),
   { config: cfg },
 )
