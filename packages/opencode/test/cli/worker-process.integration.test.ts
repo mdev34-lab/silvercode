@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test"
 import { mkdtemp, rm } from "fs/promises"
 import { tmpdir } from "os"
 import { join } from "path"
-import { createWorkerProcess } from "../../src/cli/tui/worker-process"
+import { createTuiWorker, createWorkerProcess } from "../../src/cli/tui/worker-process"
 import { Rpc } from "../../src/util/rpc"
 
 const workerSource = `
@@ -141,4 +141,229 @@ describe("TUI worker process integration", () => {
       await rm(dir, { recursive: true, force: true })
     }
   })
+
+  test("spawns the TUI worker in its own process group on POSIX", async () => {
+    if (process.platform === "win32") return
+    const dir = await mkdtemp(join(tmpdir(), "silvercode-worker-pgid-"))
+    const target = join(dir, "worker.ts")
+    await Bun.write(target, `setTimeout(() => process.send?.("ready"), 50)\nsetInterval(() => {}, 1000)\n`)
+
+    const messages: string[] = []
+    const worker = createTuiWorker(target, { log: () => {} })
+    worker.onmessage = (event) => messages.push(event.data)
+
+    try {
+      await waitForCount(messages, "ready", 1, "worker did not start")
+      // The transport does not expose the child PID, so read the group of
+      // every bun process and assert none of them shares this test's group.
+      const own = Number.parseInt(Bun.spawnSync(["ps", "-o", "pgid=", "-p", String(process.pid)]).stdout.toString().trim(), 10)
+      const listing = Bun.spawnSync(["ps", "-ax", "-o", "pgid=,command="]).stdout.toString()
+      const workerGroups = listing
+        .split("\n")
+        .filter((line) => line.includes(target))
+        .map((line) => Number.parseInt(line.trim(), 10))
+      expect(workerGroups.length).toBeGreaterThan(0)
+      expect(workerGroups.every((pgid) => Number.isFinite(pgid) && pgid !== own)).toBe(true)
+    } finally {
+      await worker.terminate()
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("a detached worker keeps running while its parent process group is stopped", async () => {
+    if (process.platform === "win32") return
+    const dir = await mkdtemp(join(tmpdir(), "silvercode-worker-suspend-"))
+    const target = join(dir, "worker.ts")
+    const log = join(dir, "ticks.log")
+    await Bun.write(
+      target,
+      `import { watchOwnerProcess } from ${JSON.stringify(new URL("../../src/cli/tui/owner-watch.ts", import.meta.url).pathname)}
+const log = ${JSON.stringify(log)}
+const note = (message) => require("fs").appendFileSync(log, message + "\\n")
+// Exit when the owner dies so the test never leaks this process.
+process.on("disconnect", () => process.exit(0))
+process.on("message", (message) => {
+  // The stand-in owner reports its PID once up; the worker watches it with
+  // the real production watchdog so a spurious orphan during the owner's
+  // suspension would end the ticks (and fail the assertions below).
+  if (typeof message === "string" && message.startsWith("ownerpid=")) {
+    const ownerPID = Number(message.slice("ownerpid=".length))
+    watchOwnerProcess({
+      ownerAlive: () => {
+        try {
+          process.kill(ownerPID, 0)
+          return true
+        } catch {
+          return false
+        }
+      },
+      interval: 50,
+      onOrphan() {
+        note("orphaned")
+        process.exit(1)
+      },
+    })
+  }
 })
+setTimeout(() => process.send?.("ready"), 50)
+setInterval(() => note("tick " + Date.now()), 50)
+`,
+    )
+
+    // A stand-in owner hosts the worker: stopping this test's own process
+    // would prove nothing about process groups (kill(pid) never hits the
+    // group) and can wedge the runner if the resume path fails. The owner
+    // is spawned detached so it leads its own group; the production worker
+    // is detached too, so it must NOT join that group. On a revert of the
+    // worker's detached flag it would join, get stopped with the owner, and
+    // the tick assertions below would fail.
+    const owner = join(dir, "owner.ts")
+    await Bun.write(
+      owner,
+      `import { createTuiWorker } from ${JSON.stringify(new URL("../../src/cli/tui/worker-process.ts", import.meta.url).pathname)}
+const w = createTuiWorker(${JSON.stringify(target)}, { log: () => {} })
+w.onmessage = (event) => {
+  if (event.data === "ready") {
+    w.postMessage("ownerpid=" + process.pid)
+    process.send?.("owner.ready")
+  }
+}
+setInterval(() => {}, 1000)
+`,
+    )
+
+    let ownerReady!: () => void
+    const ready = new Promise<void>((resolve) => {
+      ownerReady = resolve
+    })
+    const ownerProcess = Bun.spawn([process.execPath, owner], {
+      ipc: () => ownerReady(),
+      stderr: "inherit",
+      detached: true,
+    })
+    // Independent resumer, armed before the stop and owned by the runner's
+    // group (which is never stopped): the suspension window is bounded even
+    // if every other resume path fails.
+    const resumer = Bun.spawn(
+      [
+        process.execPath,
+        "-e",
+        `setTimeout(() => { try { process.kill(${-ownerProcess.pid}, "SIGCONT") } catch {} }, 500)`,
+      ],
+      { stdout: "ignore", stderr: "ignore" },
+    )
+    try {
+      await ready
+      await new Promise((resolve) => setTimeout(resolve, 200))
+      const before = countLines(await Bun.file(log).text())
+
+      // SIGSTOP stands in for Ctrl+Z here: SIGTSTP is ignored when inherited,
+      // while SIGSTOP cannot be. Stopping the owner's whole group must not
+      // reach the detached worker, so ticks keep landing during the stop.
+      const stoppedAt = Date.now()
+      process.kill(-ownerProcess.pid, "SIGSTOP")
+      await new Promise((resolve) => setTimeout(resolve, 800))
+      const windowEnd = Date.now()
+
+      const ticks = (await Bun.file(log).text())
+        .split("\n")
+        .filter((line) => line.startsWith("tick "))
+        .map((line) => Number(line.slice(5)))
+      expect(ticks.length).toBeGreaterThan(before)
+      const whileStopped = ticks.filter((at) => at >= stoppedAt && at <= windowEnd)
+      expect(whileStopped.length).toBeGreaterThanOrEqual(3)
+      // The production watchdog must stay quiet while the owner is merely
+      // stopped: a spurious orphan would exit the worker and end the ticks.
+      expect(await Bun.file(log).text()).not.toContain("orphaned")
+    } finally {
+      try {
+        process.kill(-ownerProcess.pid, "SIGCONT")
+      } catch {}
+      ownerProcess.kill("SIGKILL")
+      await resumer.exited
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("a detached worker shuts itself down when its owner dies without shutdown", async () => {
+    if (process.platform === "win32") return
+    const dir = await mkdtemp(join(tmpdir(), "silvercode-worker-orphan-"))
+    const target = join(dir, "worker.ts")
+    const log = join(dir, "worker.log")
+    await Bun.write(
+      target,
+      `import { watchOwnerProcess } from ${JSON.stringify(new URL("../../src/cli/tui/owner-watch.ts", import.meta.url).pathname)}
+const log = ${JSON.stringify(log)}
+const note = (message) => require("fs").appendFileSync(log, message + "\\n")
+note("start pid=" + process.pid + " ppid=" + process.ppid)
+// Mirrors worker.ts: IPC disconnect is the primary owner-death signal.
+watchOwnerProcess({
+  subscribeDisconnect: (handler) => {
+    process.on("disconnect", handler)
+    return () => process.off("disconnect", handler)
+  },
+  interval: 50,
+  onOrphan() {
+    note("orphaned")
+    process.exit(0)
+  },
+})
+setTimeout(() => process.send?.("ready"), 50)
+setInterval(() => {}, 1000)
+`,
+    )
+
+    const owner = join(dir, "owner.ts")
+    await Bun.write(
+      owner,
+      `import { createTuiWorker } from ${JSON.stringify(new URL("../../src/cli/tui/worker-process.ts", import.meta.url).pathname)}
+createTuiWorker(${JSON.stringify(target)}, { log: () => {} })
+process.send?.("owner.ready")
+setInterval(() => {}, 1000)
+`,
+    )
+
+    let ownerReady!: () => void
+    const ready = new Promise<void>((resolve) => {
+      ownerReady = resolve
+    })
+    const ownerProcess = Bun.spawn([process.execPath, owner], {
+      ipc: () => ownerReady(),
+      stderr: "inherit",
+    })
+    try {
+      await ready
+      // Kill the owner the way the OOM killer does: no shutdown RPC runs.
+      ownerProcess.kill("SIGKILL")
+      await ownerProcess.exited
+      await waitForFileText(log, "orphaned", 10_000)
+      expect(await Bun.file(log).text()).toContain("orphaned")
+    } finally {
+      ownerProcess.kill("SIGKILL")
+      // The worker is detached, so killing the owner does not reap it. On
+      // the pass path it orphans itself out; on the failure path it would
+      // otherwise idle forever holding the deleted temp dir.
+      const started = (await Bun.file(log).text()).match(/^start pid=(\d+)/m)
+      if (started) {
+        try {
+          process.kill(Number(started[1]), "SIGKILL")
+        } catch {}
+      }
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+})
+
+function countLines(text: string) {
+  return text.split("\n").filter((line) => line !== "").length
+}
+
+async function waitForFileText(path: string, needle: string, timeout: number) {
+  const deadline = Date.now() + timeout
+  for (;;) {
+    const text = await Bun.file(path).text().catch(() => "")
+    if (text.includes(needle)) return text
+    if (Date.now() > deadline) throw new Error(`${needle} never appeared in ${path} (saw ${text.length} bytes)`)
+    await Bun.sleep(25)
+  }
+}

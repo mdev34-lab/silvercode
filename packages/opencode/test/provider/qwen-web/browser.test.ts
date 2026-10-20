@@ -173,6 +173,23 @@ describe("quickAuthState", () => {
 })
 
 describe("QwenWebBrowser lifecycle", () => {
+  test("challenge probe outranks 403 login and can re-check as authenticated after manual resolution", async () => {
+    const dir = tmpProfile()
+    let probe = { status: 403, contentType: "application/json", body: "human verification required" }
+    const page = fakePage({
+      evaluate: (async (_fn: unknown, arg: unknown) => {
+        if (arg === undefined) return { title: "Qwen", body: "ordinary page" }
+        return probe
+      }) as unknown as QwenWebPage["evaluate"],
+    })
+    const browser = new QwenWebBrowser({ profileDir: dir, launcher: async () => fakeContext([page]) })
+
+    expect(await browser.detectAuthState()).toBe("challenge")
+    probe = { status: 200, contentType: "application/json", body: '{"success":true}' }
+    expect(await browser.detectAuthState()).toBe("authenticated")
+    await browser.close()
+  })
+
   test("ensure launches once and reuses the context", async () => {
     const dir = tmpProfile()
     const context = fakeContext([fakePage()])

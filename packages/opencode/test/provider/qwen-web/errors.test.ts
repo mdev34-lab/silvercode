@@ -3,6 +3,7 @@ import {
   abortedError,
   CHALLENGE_WINDOW_OPEN_DETAIL,
   challengeError,
+  classifyHttpResponse,
   classifyJsonError,
   classifyStatus,
   classifyStreamError,
@@ -15,6 +16,10 @@ import {
   isHtmlBody,
   isNoDisplayError,
   isQuotaMessage,
+  isStaleAnchorCode,
+  isStaleAnchorError,
+  isStaleAnchorMessage,
+  isStaleBindingError,
   isStaleChatCode,
   isStaleChatError,
   isWafMessage,
@@ -22,8 +27,12 @@ import {
   nonStreamResponseError,
   normalizeUpstreamCode,
   QwenWebError,
+  sanitizeQwenErrorText,
   sessionExpiredError,
+  staleAnchorError,
+  withQwenWebErrorPhase,
   staleChatError,
+  STALE_ANCHOR_UPSTREAM_CODE,
   STALE_CHAT_UPSTREAM_CODE,
 } from "@opencode-ai/webchat/adapters/qwen/errors"
 
@@ -49,6 +58,12 @@ describe("QwenWebError", () => {
     // The default never promises a window that was never opened.
     expect(challengeError().message).toContain("No browser window could be opened")
     expect(challengeError(CHALLENGE_WINDOW_OPEN_DETAIL).message).toContain("visible browser window")
+    // Status parameter pinned: default 403, caller-supplied value preserved
+    // (a challenge can arrive with HTTP 200 and must not be re-labeled).
+    expect(challengeError().status).toBe(403)
+    expect(challengeError(undefined, 200).status).toBe(200)
+    expect(classifyStatus(403, "Forbidden")?.status).toBe(403)
+    expect(classifyStatus(401)?.code).toBe("session_expired")
   })
 
   test("abortedError is AbortError-shaped", () => {
@@ -79,6 +94,11 @@ describe("message classifiers", () => {
   test("WAF / challenge detection", () => {
     expect(isWafMessage("FAIL_SYS_USER_VALIDATE")).toBe(true)
     expect(isWafMessage("rgv587_error happened")).toBe(true)
+    // The browser-probe consolidation must not lose this marker: it was in
+    // the deleted CHALLENGE_BODY_MARKERS and matches nothing else in the list
+    // ("verification required" does not cover it).
+    expect(isWafMessage("Please complete the security verification")).toBe(true)
+    expect(isChallengeMessage("Please complete the security verification")).toBe(true)
     expect(isChallengeMessage("please complete the captcha")).toBe(true)
     expect(isChallengeMessage("human verification required")).toBe(true)
     expect(isChallengeMessage("normal response")).toBe(false)
@@ -104,10 +124,20 @@ describe("classifyJsonError", () => {
     expect(classifyJsonError("[]", 200)).toBeUndefined()
   })
 
-  test("WAF ret codes become challenges", () => {
+  test("WAF ret codes and SSE challenge events become manual challenges", () => {
     const error = classifyJsonError('{"ret":["FAIL_SYS_USER_VALIDATE"]}', 200)
     expect(error?.code).toBe("challenge")
     expect(error?.retryable).toBe(false)
+    expect(classifyStreamError("waf_challenge", "verification required").code).toBe("challenge")
+  })
+
+  test("status and body are classified together, with challenge markers taking precedence", () => {
+    expect(classifyHttpResponse('{"success":false,"message":"login required"}', 403)?.code).toBe("session_expired")
+    expect(classifyHttpResponse('{"message":"CAPTCHA verification required"}', 403)?.code).toBe("challenge")
+    expect(classifyHttpResponse('{"success":true,"data":{"message":"human verification required"}}', 200)?.code).toBe(
+      "challenge",
+    )
+    expect(classifyHttpResponse('<html>login required</html>', 401)?.code).toBe("session_expired")
   })
 
   test("success:false with 401 becomes session_expired", () => {
@@ -252,6 +282,96 @@ describe("stale-chat classification (issue 232)", () => {
   })
 })
 
+describe("stale anchor vs stale chat (issue 232 binding contract)", () => {
+  // A chat id and a continuation anchor are a validated pair, but they fail
+  // differently: a dead chat needs a fresh chat, a dead `parent_id` only needs
+  // the anchor dropped. Neither may be inferred from generic not-found text.
+  const PARENT_BODY = JSON.stringify({
+    success: false,
+    code: "PARENT_NOT_FOUND",
+    message: "parent id not found",
+  })
+
+  test("code detection separates the chat from the anchor", () => {
+    expect(isStaleAnchorCode("PARENT_NOT_FOUND")).toBe(true)
+    expect(isStaleAnchorCode("parent_not_exist")).toBe(true)
+    expect(isStaleAnchorCode("Response_Does_Not_Exist")).toBe(true)
+    expect(isStaleAnchorCode("response_id_not_exist")).toBe(true)
+    expect(isStaleAnchorCode("invalid_parent")).toBe(true)
+    // Anchor codes are not chat codes and the other way round.
+    expect(isStaleChatCode("PARENT_NOT_FOUND")).toBe(false)
+    expect(isStaleAnchorCode("CHAT_NOT_FOUND")).toBe(false)
+    // Still no broad not-found matching: a retired model id is neither.
+    expect(isStaleAnchorCode("Not_Found")).toBe(false)
+    expect(isStaleAnchorCode("Model_Not_Found")).toBe(false)
+    expect(isStaleAnchorCode("RateLimited")).toBe(false)
+    // A malformed upstream payload is not a stale anchor either.
+    expect(isStaleAnchorCode("invalid_response")).toBe(false)
+    expect(isStaleAnchorCode("InvalidParameter")).toBe(false)
+  })
+
+  test("message detection names the anchor explicitly", () => {
+    expect(isStaleAnchorMessage("parent id not found")).toBe(true)
+    expect(isStaleAnchorMessage("The response does not exist")).toBe(true)
+    expect(isStaleAnchorMessage("parent_id is invalid")).toBe(true)
+    expect(isStaleAnchorMessage("no such response")).toBe(true)
+    expect(isStaleAnchorMessage("stale parent id")).toBe(true)
+    // Generic missing-item wording stays out of both buckets.
+    expect(isStaleAnchorMessage("Model does not exist")).toBe(false)
+    expect(isStaleAnchorMessage("Attachment file does not exist")).toBe(false)
+    expect(isStaleAnchorMessage("invalid response format")).toBe(false)
+    expect(isStaleAnchorMessage("chat created")).toBe(false)
+    expect(isChatMissingMessage("parent id not found")).toBe(false)
+  })
+
+  test("a parent/response payload is an anchor error, not a dead chat", () => {
+    const error = classifyJsonError(PARENT_BODY, 200)
+    expect(error).toBeDefined()
+    expect(isStaleAnchorError(error)).toBe(true)
+    expect(isStaleChatError(error)).toBe(false)
+    expect(isStaleBindingError(error)).toBe(true)
+    expect(error?.retryable).toBe(true)
+    expect(error?.upstreamCode).toBe(STALE_ANCHOR_UPSTREAM_CODE)
+    expect(error?.message).toContain("PARENT_NOT_FOUND")
+  })
+
+  test("anchor detection covers stream, OpenAI and truncated shapes", () => {
+    expect(isStaleAnchorError(classifyStreamError("E_UPSTREAM", "parent id not found"))).toBe(true)
+    expect(isStaleAnchorError(classifyStreamError("Parent_Not_Exist", "gone"))).toBe(true)
+    expect(isStaleAnchorError(classifyJsonError('{"error":{"code":"Parent_Not_Exist","message":"gone"}}', 200))).toBe(
+      true,
+    )
+    const truncated = `{"success":false,"code":"PARENT_NOT_FOUND","message":"parent id not found ${"x".repeat(9000)}`
+    expect(() => JSON.parse(truncated)).toThrow()
+    expect(isStaleAnchorError(classifyTruncatedJson(truncated, 200))).toBe(true)
+  })
+
+  test("anchor classification never wins over quota, challenge or chat wording", () => {
+    expect(isStaleAnchorError(classifyStreamError("RateLimited", "quota exceeded"))).toBe(false)
+    expect(isStaleAnchorError(classifyJsonError('{"ret":["FAIL_SYS_USER_VALIDATE"]}', 200))).toBe(false)
+    // Chat wording outranks an anchor-ish code on the same payload.
+    const both = classifyJsonError(
+      JSON.stringify({ success: false, code: "CHAT_NOT_FOUND", message: "parent id not found" }),
+      200,
+    )
+    expect(isStaleChatError(both)).toBe(true)
+    expect(isStaleAnchorError(both)).toBe(false)
+  })
+
+  test("the two markers stay distinguishable for the session layer", () => {
+    const anchor = staleAnchorError({ status: 200, upstreamCode: "PARENT_NOT_FOUND", detail: "gone" })
+    const chat = staleChatError({ status: 200, upstreamCode: "CHAT_NOT_FOUND", detail: "gone" })
+    expect(isStaleAnchorError(anchor)).toBe(true)
+    expect(isStaleChatError(anchor)).toBe(false)
+    expect(isStaleAnchorError(chat)).toBe(false)
+    expect(isStaleChatError(chat)).toBe(true)
+    expect(isStaleBindingError(anchor)).toBe(true)
+    expect(isStaleBindingError(chat)).toBe(true)
+    expect(isStaleBindingError(loginRequiredError())).toBe(false)
+    expect(isStaleBindingError(new Error("parent id not found"))).toBe(false)
+  })
+})
+
 describe("honest empty/truncated error reporting (issue 232)", () => {
   test("empty responses do not promise a safe retry or trigger an automatic retry", () => {
     const error = emptyResponseError()
@@ -298,5 +418,107 @@ describe("honest empty/truncated error reporting (issue 232)", () => {
     expect(text.message).toContain("weird plain text")
     expect(text.retryable).toBe(false)
     expect(nonStreamResponseError("x", 502).retryable).toBe(true)
+  })
+})
+
+describe("issue 232 workstream 5: phase, status and sanitized detail", () => {
+  const SECRETS = ["COOKIE_FIXTURE", "WAF_UA_FIXTURE", "WAF_UMID_FIXTURE", "AUTH_FIXTURE", "ACCESS_FIXTURE", "PRIVATE_PROMPT_FIXTURE"]
+  const FIXTURE = [
+    "backend rejected request",
+    "cookie=COOKIE_FIXTURE",
+    "bx-ua: WAF_UA_FIXTURE",
+    "bx-umidtoken=WAF_UMID_FIXTURE",
+    "Authorization: Bearer AUTH_FIXTURE",
+    "access_token=ACCESS_FIXTURE",
+    "full prompt: PRIVATE_PROMPT_FIXTURE",
+  ].join("; ")
+
+  test("QwenWebError carries phase/detail and sanitizes message, detail and upstream code", () => {
+    const error = new QwenWebError({
+      code: "upstream_error",
+      phase: "setup",
+      retryable: true,
+      status: 503,
+      upstreamCode: "E_UPSTREAM",
+      detail: FIXTURE,
+      message: `failed: ${FIXTURE}`,
+    })
+    expect(error.phase).toBe("setup")
+    expect(error.status).toBe(503)
+    expect(error.upstreamCode).toBe("E_UPSTREAM")
+    expect(error.detail).toContain("backend rejected request")
+    expect(error.detail!.length).toBeLessThanOrEqual(240)
+    for (const secret of SECRETS) {
+      expect(error.message).not.toContain(secret)
+      expect(error.detail).not.toContain(secret)
+    }
+    // A credential-shaped upstream code is not a safe code and must be dropped, not echoed.
+    const unsafe = new QwenWebError({ code: "upstream_error", message: "x", upstreamCode: "A".repeat(64) })
+    expect(unsafe.upstreamCode).toBeUndefined()
+    expect(sanitizeQwenErrorText("x".repeat(500))!.length).toBeLessThanOrEqual(240)
+    expect(withQwenWebErrorPhase(error, "stream").phase).toBe("setup")
+    expect(withQwenWebErrorPhase(new Error("fetch failed"), "setup").phase).toBe("setup")
+  })
+
+  test("table: classifiers preserve phase/status/upstream/retryable without leaking secrets", () => {
+    const cases = [
+      {
+        name: "json chat-create",
+        make: () => classifyJsonError(JSON.stringify({ success: false, code: "E_CREATE", message: FIXTURE }), 503, "chat-create"),
+        phase: "chat-create", code: "upstream_error", status: 503, upstream: "E_CREATE", retryable: true,
+      },
+      {
+        name: "json rate limit preserves actual status",
+        make: () => classifyJsonError('{"success":false,"code":"RateLimited","message":"slow"}', 200, "setup"),
+        phase: "setup", code: "rate_limited", status: 200, upstream: "RateLimited", retryable: true,
+      },
+      {
+        name: "status auth",
+        make: () => classifyStatus(403, "Cookie: COOKIE_FIXTURE"),
+        phase: "auth", code: "session_expired", status: 403, upstream: undefined, retryable: false,
+      },
+      {
+        name: "status setup",
+        make: () => classifyStatus(503, "Service Unavailable", "setup"),
+        phase: "setup", code: "upstream_unavailable", status: 503, upstream: undefined, retryable: true,
+      },
+      {
+        name: "stream generic",
+        make: () => classifyStreamError("E_STREAM", FIXTURE, 200),
+        phase: "stream", code: "upstream_error", status: 200, upstream: "E_STREAM", retryable: true,
+      },
+      {
+        name: "stream stale anchor keeps current-tree anchor contract",
+        make: () => classifyStreamError("Parent_Not_Exist", "parent id not found", 200),
+        phase: "stream", code: "upstream_error", status: 200, upstream: "anchor_not_exist", retryable: true,
+      },
+      {
+        name: "truncated",
+        make: () => classifyTruncatedJson('{"success":false,"code":"E_TRUNC","message":"cookie=COOKIE_FIXTURE; backend broke', 502),
+        phase: "setup", code: "invalid_response", status: 502, upstream: "E_TRUNC", retryable: true,
+      },
+      {
+        name: "transport",
+        make: () => classifyTransportFailure(new Error(`fetch failed cookie=COOKIE_FIXTURE`), "setup"),
+        phase: "setup", code: "network_error", status: undefined, upstream: undefined, retryable: true,
+      },
+    ] as const
+    for (const c of cases) {
+      const error = c.make()!
+      expect(error.phase, c.name).toBe(c.phase)
+      expect(error.code, c.name).toBe(c.code)
+      expect(error.status, c.name).toBe(c.status)
+      expect(error.upstreamCode, c.name).toBe(c.upstream)
+      expect(error.retryable, c.name).toBe(c.retryable)
+      for (const secret of SECRETS) {
+        expect(error.message, c.name).not.toContain(secret)
+        expect(error.detail ?? "", c.name).not.toContain(secret)
+      }
+    }
+    expect(isStaleAnchorError(classifyStreamError("Parent_Not_Exist", "gone", 200))).toBe(true)
+    expect(sessionExpiredError().phase).toBe("auth")
+    expect(challengeError().phase).toBe("auth")
+    expect(abortedError("stop").phase).toBe("stop")
+    expect(abortedError("stop").status).toBe(499)
   })
 })

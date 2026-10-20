@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { createWorkerProcess, isWorkerCrash } from "../../src/cli/tui/worker-process"
+import { createTuiWorker, createWorkerProcess, isWorkerCrash } from "../../src/cli/tui/worker-process"
 
 type FakeProcess = {
   exitCode: number | null
@@ -168,5 +168,46 @@ describe("TUI worker process", () => {
     expect(isWorkerCrash(null, 134)).toBe(true)
     expect(isWorkerCrash(null, 1)).toBe(false)
     expect(isWorkerCrash(null, 0)).toBe(false)
+  })
+
+  test("spawns the TUI worker detached on POSIX so job-control signals skip it", async () => {
+    const options: { detached?: boolean }[] = []
+    const children: FakeProcess[] = []
+    const spawn = (_command: string[], spawnOptions: { detached?: boolean }) => {
+      options.push(spawnOptions)
+      const child = fakeProcess()
+      children.push(child)
+      return child
+    }
+
+    const worker = createTuiWorker("worker.ts", { spawn, log: () => {}, env: {} })
+
+    expect(options[0].detached).toBe(process.platform !== "win32")
+    children[0].resolveExit(0)
+    await worker.closed
+  })
+
+  test("keeps the worker detached across crash restarts", async () => {
+    const options: { detached?: boolean }[] = []
+    const children: FakeProcess[] = []
+    const spawn = (_command: string[], spawnOptions: { detached?: boolean }) => {
+      options.push(spawnOptions)
+      const child = fakeProcess()
+      children.push(child)
+      return child
+    }
+
+    const worker = createWorkerProcess("worker.ts", {
+      spawn,
+      log: () => {},
+      detached: true,
+      onRestart: () => {},
+    })
+    children[0].resolveExit(1, "SIGSEGV")
+    await worker.waitForRestart()
+
+    expect(options).toHaveLength(2)
+    expect(options[1].detached).toBe(true)
+    await worker.terminate()
   })
 })

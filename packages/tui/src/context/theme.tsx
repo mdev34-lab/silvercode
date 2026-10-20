@@ -72,10 +72,13 @@ export {
   resolveTheme,
   selectedForeground,
   terminalMode,
+  textAttributes,
   tint,
   upsertTheme,
+  type SyntaxTheme,
   type Theme,
   type ThemeJson,
+  type ThemeTextStyle,
   type SyntaxStyleOverrides,
 } from "../theme"
 

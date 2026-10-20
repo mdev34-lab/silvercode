@@ -1,0 +1,15 @@
+{
+  "scenario": {
+    "id": "alpha-empty-gpt52-medium-no-toolsearch",
+    "engine": "silvercode",
+    "model": "probe/gpt-5.2",
+    "prompt": "Say hello in one word.",
+    "effort": "medium",
+    "toolSearch": "disabled"
+  },
+  "exitCode": 1,
+  "elapsedMs": 3095,
+  "project": "/tmp/opencode-243-initial-context/alpha-empty-gpt52-medium-no-toolsearch/project",
+  "stdout": "ok\nok\nok\nok\n",
+  "stderr": "\u001b[0m\n> work · gpt-5.2\n\u001b[0m\n\u001b[91m\u001b[1mError: \u001b[0mThe assistant did not complete the required finish tool after 3 nudges. The turn was stopped to prevent an unbounded continuation loop. Set agent.<name>.finishTool to false for agents that must end turns without finish.\n"
+}

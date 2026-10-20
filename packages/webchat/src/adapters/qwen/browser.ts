@@ -18,7 +18,7 @@ import { Global } from "@opencode-ai/core/global"
 import { QWEN_WEB_DEFAULTS, QWEN_WEB_ENV, QWEN_WEB_PROFILE_LOCKFILE, QWEN_WEB_PROFILE_SUBDIR } from "./constants"
 import { debug } from "./log"
 import { qwenWebOrigin, qwenWebUrl } from "./protocol"
-import { QwenWebError, isAbortLike } from "./errors"
+import { QwenWebError, isAbortLike, isChallengeMessage } from "./errors"
 
 // ---------------------------------------------------------------------------
 // Narrow structural interfaces (real Patchright objects satisfy these;
@@ -337,15 +337,6 @@ function explainLaunchFailure(error: unknown): QwenWebError {
 
 const LOGIN_URL_MARKERS = ["/login", "/auth", "login.", "account/login", "signin", "sign-in"]
 const CHALLENGE_URL_MARKERS = ["captcha", "challenge", "verify", "validation", "security-check"]
-const CHALLENGE_BODY_MARKERS = [
-  "aliyun_waf",
-  "_____tmd_____",
-  "fail_sys_user_validate",
-  "rgv587_error",
-  "denyfromx5",
-  "security verification",
-]
-
 function urlSuggestsLogin(url: string): boolean {
   const lowered = url.toLowerCase()
   return LOGIN_URL_MARKERS.some((marker) => lowered.includes(marker))
@@ -679,8 +670,9 @@ export class QwenWebBrowser {
     const quick = await quickAuthState(page)
     if (quick === "challenge" || quick === "login") return quick
     if (steer || page.url().startsWith(qwenWebOrigin())) {
-      if (await this.sniffChallenge(page)) return "challenge"
       const probe = await this.probeSession(page).catch(() => "unknown" as const)
+      // An authenticated probe wins: page text may mention "captcha" in chat titles.
+      if (probe !== "authenticated" && (await this.sniffChallenge(page))) return "challenge"
       const state = probe !== "unknown" ? probe : quick
       if (state === "authenticated") markAuthenticated(this.profileDir)
       return state
@@ -697,7 +689,7 @@ export class QwenWebBrowser {
         const body = (document.body?.textContent ?? "").slice(0, 4000)
         return `${title}\n${body}`.toLowerCase()
       }, undefined)
-      return CHALLENGE_BODY_MARKERS.some((marker) => sample.includes(marker))
+      return isChallengeMessage(sample)
     } catch {
       return false
     }
@@ -723,10 +715,17 @@ export class QwenWebBrowser {
         clearTimeout(timer)
       }
     }, url)
+    const sample = `${result.contentType}\n${result.body}`
+    // Status is not enough: WAFs commonly return challenge pages with 200,
+    // 401, or 403. The body signal always wins over auth classification.
+    // Known trade-off (deferred, needs a product call): a 401/403 login page
+    // whose markup merely mentions "captcha" (e.g. an embedded widget script)
+    // also reports "challenge" here, pausing the run instead of prompting a
+    // re-login. Both directions need the user, so the body-wins rule this
+    // workstream ships stays as-is until that call is made.
+    if (isChallengeMessage(sample)) return "challenge"
     if (result.status >= 200 && result.status < 300) return "authenticated"
     if (result.status === 401 || result.status === 403) return "login"
-    const lowered = `${result.contentType}\n${result.body}`.toLowerCase()
-    if (CHALLENGE_BODY_MARKERS.some((marker) => lowered.includes(marker))) return "challenge"
     if (result.body && /<!doctype\s+html|<html\b/i.test(result.body)) return "login"
     return "unknown"
   }

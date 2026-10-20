@@ -111,19 +111,60 @@ export function buildChatNewBody(model: string, _chatMode: QwenWebChatMode = "te
 
 /** Extract the chat id from the several shapes the endpoint may return. */
 export function parseChatNewResponse(payload: unknown): string | undefined {
+  const outcome = parseChatNewOutcome(payload)
+  return outcome.kind === "ok" ? outcome.chatId : undefined
+}
+
+/**
+ * Why a create response carried no usable chat id.
+ *
+ * `empty` — nothing came back at all (empty body / `{}` / `[]`); `blank` — an
+ * id field was present but blank; `unrecognized` — a body arrived but no id
+ * lives in any of the known shapes. None of them is evidence of a dead chat:
+ * a create call proves nothing about an *existing* binding, so the caller
+ * reports `invalid_response` instead of recovering.
+ */
+export type ChatNewOutcome =
+  | { kind: "ok"; chatId: string }
+  | { kind: "missing-id"; reason: "empty" | "blank" | "unrecognized" }
+
+export function parseChatNewOutcome(payload: unknown): ChatNewOutcome {
+  const extracted = extractChatId(payload)
+  if (extracted !== undefined && extracted.trim()) return { kind: "ok", chatId: extracted.trim() }
+  const empty =
+    payload === undefined ||
+    payload === null ||
+    (typeof payload === "object" && !Array.isArray(payload) && Object.keys(payload as object).length === 0) ||
+    (Array.isArray(payload) && payload.length === 0)
+  if (empty) return { kind: "missing-id", reason: "empty" }
+  return { kind: "missing-id", reason: extracted === undefined ? "unrecognized" : "blank" }
+}
+
+/**
+ * The first id-shaped field in any of the known create-response shapes.
+ *
+ * Returns the raw string even when blank: an id field that arrived empty is
+ * different evidence from a payload that never mentioned one, and the caller
+ * reports the difference.
+ */
+function extractChatId(payload: unknown): string | undefined {
   if (!payload || typeof payload !== "object") return undefined
   const root = payload as Record<string, unknown>
-  const direct = root["chat_id"] ?? root["id"]
-  if (typeof direct === "string" && direct) return direct
+  for (const key of ["chat_id", "id"]) {
+    const value = root[key]
+    if (typeof value === "string") return value
+  }
   const data = root["data"]
   if (data && typeof data === "object") {
     const record = data as Record<string, unknown>
-    const nested = record["chat_id"] ?? record["id"]
-    if (typeof nested === "string" && nested) return nested
+    for (const key of ["chat_id", "id"]) {
+      const value = record[key]
+      if (typeof value === "string") return value
+    }
     const chat = record["chat"]
     if (chat && typeof chat === "object") {
       const id = (chat as Record<string, unknown>)["id"]
-      if (typeof id === "string" && id) return id
+      if (typeof id === "string") return id
     }
   }
   return undefined
@@ -323,14 +364,15 @@ export function incrementalDelta(previous: string, next: string): IncrementalDel
 
 export type QwenWebStreamEvent =
   | { kind: "done" }
-  | { kind: "text"; content: string; responseId?: string }
-  | { kind: "thinking"; delta: Record<string, unknown>; responseId?: string }
-  | { kind: "answer-finished"; responseId?: string }
+  | { kind: "text"; content: string; responseId?: string; chatId?: string }
+  | { kind: "thinking"; delta: Record<string, unknown>; responseId?: string; chatId?: string }
+  | { kind: "answer-finished"; responseId?: string; chatId?: string }
   | { kind: "response-created"; responseId: string; chatId?: string }
-  | { kind: "tool-calls"; responseId?: string; calls: QwenStreamToolCall[] }
+  | { kind: "tool-calls"; responseId?: string; chatId?: string; calls: QwenStreamToolCall[] }
   | { kind: "error"; code: string; message: string }
   | {
       kind: "usage"
+      chatId?: string
       inputTokens?: number
       outputTokens?: number
       totalTokens?: number
@@ -432,6 +474,14 @@ export function parseQwenEvent(data: string): QwenWebStreamEvent {
     return { kind: "error", code, message }
   }
 
+  // The authoritative chat id may ride at the chunk root as well as inside
+  // `response.created`: a rotated chat id that only shows up here must still
+  // reach the session, or the local binding stays stale for the rest of the
+  // conversation. Only non-empty strings are ever surfaced.
+  const chunkChatId = typeof chunk["chat_id"] === "string" && chunk["chat_id"] ? chunk["chat_id"] : undefined
+  const withChatId = <T extends object>(event: T): T & { chatId?: string } =>
+    chunkChatId ? { ...event, chatId: chunkChatId } : event
+
   const created = asRecord(chunk["response"])
   const createdResponseId = created["id"]
   const createdResponseKeyType = chunk["type"]
@@ -440,7 +490,9 @@ export function parseQwenEvent(data: string): QwenWebStreamEvent {
     return {
       kind: "response-created",
       responseId: createdResponseId,
-      chatId: typeof chatId === "string" ? chatId : undefined,
+      // Fall back to the chunk-level id so a rotation is adopted even when
+      // `response.created` omits it.
+      ...(typeof chatId === "string" && chatId ? { chatId } : chunkChatId ? { chatId: chunkChatId } : {}),
     }
   }
 
@@ -450,8 +502,9 @@ export function parseQwenEvent(data: string): QwenWebStreamEvent {
     const delta = asRecord(asRecord(choices[0])["delta"])
     if (Object.keys(delta).length > 0) {
       const phase = delta["phase"]
-      if (phase === "answer" && delta["status"] === "finished") return { kind: "answer-finished", responseId }
-      if (phase === "thinking_summary") return { kind: "thinking", delta, responseId }
+      if (phase === "answer" && delta["status"] === "finished")
+        return withChatId({ kind: "answer-finished", responseId })
+      if (phase === "thinking_summary") return withChatId({ kind: "thinking", delta, responseId })
       if (phase === "answer" || phase === undefined) {
         const toolCallsValue = delta["tool_calls"]
         if (Array.isArray(toolCallsValue) && toolCallsValue.length > 0) {
@@ -466,11 +519,11 @@ export function parseQwenEvent(data: string): QwenWebStreamEvent {
               return { id, name, arguments: args }
             })
             .filter((call): call is QwenStreamToolCall => call !== undefined)
-          if (calls.length > 0) return { kind: "tool-calls", responseId, calls }
+          if (calls.length > 0) return withChatId({ kind: "tool-calls", responseId, calls })
         }
         const content = delta["content"]
-        if (typeof content === "string") return { kind: "text", content, responseId }
-        if (content === undefined && phase === "answer") return { kind: "text", content: "", responseId }
+        if (typeof content === "string") return withChatId({ kind: "text", content, responseId })
+        if (content === undefined && phase === "answer") return withChatId({ kind: "text", content: "", responseId })
       }
     }
   }
@@ -480,7 +533,7 @@ export function parseQwenEvent(data: string): QwenWebStreamEvent {
     const record = asRecord(usage)
     const promptDetails = asRecord(record["prompt_tokens_details"] ?? record["input_tokens_details"])
     const outputDetails = asRecord(record["output_tokens_details"])
-    return {
+    return withChatId({
       kind: "usage",
       inputTokens: asFiniteNumber(record["input_tokens"] ?? record["prompt_tokens"]),
       outputTokens: asFiniteNumber(record["output_tokens"] ?? record["completion_tokens"]),
@@ -488,7 +541,7 @@ export function parseQwenEvent(data: string): QwenWebStreamEvent {
       cachedTokens: asFiniteNumber(promptDetails["cached_tokens"]),
       reasoningTokens: asFiniteNumber(outputDetails["reasoning_tokens"]),
       textTokens: asFiniteNumber(outputDetails["text_tokens"]),
-    }
+    })
   }
 
   if (isChallengeText(data)) return { kind: "error", code: "waf_challenge", message: data.slice(0, 300) }

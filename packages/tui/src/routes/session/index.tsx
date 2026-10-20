@@ -25,7 +25,13 @@ import { useEvent } from "../../context/event"
 import { SplitBorder } from "../../ui/border"
 import { useTuiPaths, useTuiTerminalEnvironment } from "../../context/runtime"
 import { Spinner } from "../../component/spinner"
-import { createSyntaxStyleMemo, generateSubtleSyntax, selectedForeground, useTheme } from "../../context/theme"
+import {
+  createSyntaxStyleMemo,
+  generateSubtleSyntax,
+  selectedForeground,
+  textAttributes,
+  useTheme,
+} from "../../context/theme"
 import { BoxRenderable, ScrollBoxRenderable, addDefaultParsers, TextAttributes, RGBA } from "@opentui/core"
 import { Prompt, type PromptRef } from "../../component/prompt"
 import type {
@@ -390,6 +396,24 @@ export function Session() {
 
   let seeded = false
   let scroll: ScrollBoxRenderable
+  // "Jump to latest" (#241): true while the transcript is scrolled away from
+  // its end. Derived from the scrollbar's own change event, so it follows
+  // every scroll source (wheel, keys, sticky re-engage, session switch) and
+  // stays put while new output lands under a reader who scrolled up.
+  const [scrolledAway, setScrolledAway] = createSignal(false)
+  const lastShortcut = useCommandShortcut("session.last")
+  function watchScroll(r: ScrollBoxRenderable) {
+    scroll = r
+    const update = () =>
+      queueMicrotask(() => {
+        if (r.isDestroyed) return
+        const max = Math.max(0, r.scrollHeight - r.viewport.height)
+        // Same threshold the scrollbox uses to re-engage sticky scrolling.
+        setScrolledAway(max > 1 && r.scrollTop < max - 1)
+      })
+    r.verticalScrollBar.on("change", update)
+    onCleanup(() => r.verticalScrollBar.off("change", update))
+  }
   let prompt: PromptRef | undefined
   const bind = (r: PromptRef | undefined) => {
     prompt = r
@@ -1268,7 +1292,7 @@ export function Session() {
           <box flexGrow={1} minHeight={0} paddingBottom={1} paddingLeft={2} paddingRight={2} gap={1}>
             <Show when={session()}>
               <scrollbox
-                ref={(r) => (scroll = r)}
+                ref={watchScroll}
                 viewportOptions={{
                   paddingRight: showScrollbar() ? 1 : 0,
                 }}
@@ -1384,6 +1408,26 @@ export function Session() {
                 </For>
               </scrollbox>
               <box flexShrink={0}>
+                {/* Sits in the gap row between transcript and prompt, so it
+                    covers no output and shifts nothing when it appears. */}
+                <Show when={scrolledAway()}>
+                  <box
+                    position="absolute"
+                    top={-1}
+                    right={showScrollbar() ? 2 : 0}
+                    paddingLeft={1}
+                    paddingRight={1}
+                    backgroundColor={theme.backgroundElement}
+                    onMouseUp={() => scroll.scrollTo(scroll.scrollHeight)}
+                  >
+                    <text fg={theme.text} wrapMode="none">
+                      ↓ Jump to latest
+                      <Show when={lastShortcut()}>
+                        <span style={{ fg: theme.textMuted }}>{" · " + lastShortcut()}</span>
+                      </Show>
+                    </text>
+                  </box>
+                </Show>
                 <Show when={permissions().length > 0}>
                   <PermissionPrompt
                     request={permissions()[0]}
@@ -1418,6 +1462,19 @@ export function Session() {
                       }}
                       sessionID={route.sessionID}
                       right={<pluginRuntime.Slot name="session_prompt_right" session_id={route.sessionID} />}
+                      hint={
+                        // Session identity lives in the sidebar; when that is
+                        // hidden (narrow terminal or toggled off) the status
+                        // line names the session instead of the directory the
+                        // sidebar footer would otherwise repeat (#241).
+                        sidebarVisible() ? undefined : (
+                          <box marginLeft={1} flexShrink={1} minWidth={0}>
+                            <text fg={theme.text} wrapMode="none">
+                              {session()?.title}
+                            </text>
+                          </box>
+                        )
+                      }
                     />
                   </pluginRuntime.Slot>
                 </Show>
@@ -1860,10 +1917,15 @@ function ReasoningHeader(props: {
   encrypted?: boolean
 }) {
   const { theme } = useTheme()
-  const fg = () =>
-    props.open
-      ? RGBA.fromValues(theme.warning.r, theme.warning.g, theme.warning.b, theme.thinkingOpacity)
-      : theme.warning
+  // The streaming "Thinking" and completed "Thought" labels take their colour
+  // and style from the theme file (#241). `thinkingOpacity` keeps its meaning:
+  // the label dims while the reasoning body is shown underneath it.
+  const color = () => (props.done ? theme.thinkingCompleted : theme.thinkingStreaming)
+  const fg = () => {
+    const base = color()
+    return props.open ? RGBA.fromValues(base.r, base.g, base.b, theme.thinkingOpacity) : base
+  }
+  const attributes = () => textAttributes(props.done ? theme.thinkingCompletedStyle : theme.thinkingStreamingStyle)
   const completed = () => {
     if (props.encrypted) return `Thought${props.duration ? ` · ${props.duration}` : ""}`
     const detail = [props.title, props.duration].filter(Boolean).join(" · ")
@@ -1874,11 +1936,13 @@ function ReasoningHeader(props: {
     <Switch>
       <Match when={!props.done}>
         <box flexDirection="row">
-          <Spinner color={fg()}>{props.title ? "Thinking: " + props.title : "Thinking"}</Spinner>
+          <Spinner color={fg()} attributes={attributes()}>
+            {props.title ? "Thinking: " + props.title : "Thinking"}
+          </Spinner>
         </box>
       </Match>
       <Match when={true}>
-        <text fg={fg()} wrapMode="none">
+        <text fg={fg()} attributes={attributes()} wrapMode="none">
           {completed()}
         </text>
       </Match>

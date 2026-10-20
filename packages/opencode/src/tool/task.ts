@@ -1,6 +1,6 @@
 import { sessionAgent } from "../session/session-agent"
 import * as Tool from "./tool"
-import { FinishTool, deliveredReason, readTermination, type TerminationReason } from "@/tool/finish"
+import { FinishTool, deliveredReason, readTermination, type Reason, type TerminationReason } from "@/tool/finish"
 import DESCRIPTION from "./task.txt"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { ReviewReport } from "@opencode-ai/core/review-report"
@@ -8,6 +8,7 @@ import { declaresFileWrites, hasFileWrites, REVIEW_LOOP_METADATA } from "@openco
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { BackgroundJob } from "@/background/job"
 import { Session, readAgentEffort, withAgentEffort } from "@/session/session"
+import { SessionStatus } from "@/session/status"
 import { SessionID, MessageID } from "../session/schema"
 import { MessageV2 } from "../session/message-v2"
 import { Agent } from "../agent/agent"
@@ -27,6 +28,17 @@ export interface TaskPromptOps {
   prompt(input: SessionPrompt.PromptInput): Effect.Effect<SessionV1.WithParts>
 }
 
+// Delivery receipts share the lifetime of the process-local job registry. A
+// notifier that handed its report to a park must remain alive until that owner
+// settles, then deliver itself if the park never consumed it (e.g. success).
+// Weak keys isolate registries/instances and do not keep disposed ones alive.
+const receipts = new WeakMap<BackgroundJob.Interface, Set<string>>()
+
+// A resumed subagent (task_id) reuses its session ID, so receipts are keyed per
+// run: the ID plus the job's start time. A stale notifier of an earlier run must
+// not claim or consume the receipt of a later run on the same session.
+const runKey = (job: { id: string; started_at: number }) => `${job.id}@${job.started_at}`
+
 const id = "task"
 const BACKGROUND_DESCRIPTION = [
   "Subagents run asynchronously by default: the tool launches the subagent and returns immediately.",
@@ -43,14 +55,14 @@ const BACKGROUND_STARTED = [
   "The task is running in the background. You will be notified automatically when its run ends.",
   "DO NOT sleep, poll for progress, ask the task for status, or duplicate this task's work — avoid working with the same files or topics it is using.",
   'Work on non-overlapping tasks. If your own task is complete, call finish with reason "success" as usual: a task still running in the background does not hold your result back.',
-  'If it is not finished and you have no independent work left, the main session can call finish with reason "waiting_for_subagent" to yield — this task\'s notification wakes it. A subagent cannot yield this way: its run ends at the yield, so it must deliver with "success" or "failure" instead.',
+  'If it is not finished and you have no independent work left, the main session can call finish with reason "waiting_for_subagent" to yield — this task\'s notification wakes it. A subagent may yield the same way only for background subagents it launched itself: its job stays running until they report. With nothing of its own in flight it must deliver with "success" or "failure" instead.',
 ].join("\n")
 const BACKGROUND_UPDATED = [
   "Additional context sent to the running background task.",
   "The task is still working in the background. You will be notified automatically when its run ends.",
   "DO NOT sleep, poll for progress, ask the task for status, or duplicate this task's work — avoid working with the same files or topics it is using.",
   'Work on non-overlapping tasks. If your own task is complete, call finish with reason "success" as usual: a task still running in the background does not hold your result back.',
-  'If it is not finished and you have no independent work left, the main session can call finish with reason "waiting_for_subagent" to yield — this task\'s notification wakes it. A subagent cannot yield this way: its run ends at the yield, so it must deliver with "success" or "failure" instead.',
+  'If it is not finished and you have no independent work left, the main session can call finish with reason "waiting_for_subagent" to yield — this task\'s notification wakes it. A subagent may yield the same way only for background subagents it launched itself: its job stays running until they report. With nothing of its own in flight it must deliver with "success" or "failure" instead.',
 ].join("\n")
 
 const BaseParameterFields = {
@@ -58,8 +70,7 @@ const BaseParameterFields = {
   prompt: Schema.String.annotate({ description: "The task for the agent to perform" }),
   subagent_type: Schema.String.annotate({ description: "The type of specialized agent to use for this task" }),
   task_id: Schema.optional(Schema.String).annotate({
-    description:
-      "Resume a previous subagent session by its task_id",
+    description: "Resume a previous subagent session by its task_id",
   }),
   command: Schema.optional(Schema.String).annotate({ description: "Triggering command" }),
 }
@@ -67,8 +78,7 @@ const BaseParameterFields = {
 export const Parameters = Schema.Struct({
   ...BaseParameterFields,
   effort: Schema.optional(AgentEffort.Level).annotate({
-    description:
-      "Override the child's effort policy; omit to inherit.",
+    description: "Override the child's effort policy; omit to inherit.",
   }),
   background: Schema.optional(Schema.Boolean).annotate({
     description:
@@ -87,10 +97,10 @@ export const Parameters = Schema.Struct({
  *
  * `TERMINATION_NOTE` is keyed by the delivered reasons, and a declared
  * `waiting_for_subagent` is not one of them: it is dropped by
- * {@link deliveredReason} before it reaches an envelope. The finish tool
- * refuses the wait for a session that is itself a subagent, and a provisional
- * result must not be delivered as a terminal one (#222 gives a nested yield a
- * termination of its own).
+ * {@link deliveredReason} before it reaches an envelope. A nested yield keeps
+ * this dispatch's job alive until the child terminates (#222), so there is no
+ * provisional delivery to describe: when the wait has nothing behind it, the
+ * child's last result is delivered as its last word, with no termination.
  */
 const TERMINATION_NOTE: Record<TerminationReason, string> = {
   success: "",
@@ -137,11 +147,14 @@ export const TaskTool = Tool.define(
   Effect.gen(function* () {
     const agent = yield* Agent.Service
     const background = yield* BackgroundJob.Service
+    const receipted = receipts.get(background) ?? new Set<string>()
+    receipts.set(background, receipted)
     const config = yield* Config.Service
     const sessions = yield* Session.Service
     const scope = yield* Scope.Scope
     const database = yield* Database.Service
     const events = yield* EventV2Bridge.Service
+    const status = yield* SessionStatus.Service
 
     const run = Effect.fn("TaskTool.execute")(function* (
       params: Schema.Schema.Type<typeof Parameters>,
@@ -377,6 +390,10 @@ export const TaskTool = Tool.define(
       // records `cancelled` itself, so this ref holds the whole delivered
       // contract rather than the declared subset.
       const termination = yield* Ref.make<TerminationReason | undefined>(undefined)
+      // The reason the child *declared*, kept apart from the delivered one: a
+      // nested yield is never delivered, but it is what decides whether this
+      // dispatch keeps the child's job alive and resumes it (#222).
+      const declaredReason = yield* Ref.make<Reason | undefined>(undefined)
       const projectWrites = Effect.fn("TaskTool.projectChildWrites")(function* (parts: readonly SessionV1.Part[]) {
         if (!parts.some(hasFileWrites)) return
         const evidence = { writesFiles: true, handoff: "pending", sessionId: nextSession.id }
@@ -466,8 +483,10 @@ export const TaskTool = Tool.define(
         )
       })
 
-      const runTask = Effect.fn("TaskTool.runTask")(function* () {
-        const parts = yield* ops.resolvePromptParts(params.prompt)
+      // One child turn, whatever prompted it: the dispatch's own prompt and a
+      // resumed turn after a nested wait (#222) deliver the same contract, so
+      // they read the reply with the same extraction and record the same refs.
+      const promptChild = Effect.fn("TaskTool.promptChild")(function* (parts: SessionPrompt.PromptInput["parts"]) {
         const result = yield* ops.prompt({
           messageID: MessageID.ascending(),
           sessionID: nextSession.id,
@@ -481,14 +500,12 @@ export const TaskTool = Tool.define(
         })
 
         yield* projectWrites(result.parts)
-        yield* Ref.set(
-          wroteFiles,
-          result.parts.some((part) => declaresFileWrites(part)),
-        )
+        yield* Ref.update(wroteFiles, (prev) => prev || result.parts.some((part) => declaresFileWrites(part)))
         const finish = result.parts.findLast(
           (item): item is SessionV1.ToolPart =>
             item.type === "tool" && item.tool === FinishTool.id && item.state.status === "completed",
         )
+        yield* Ref.set(declaredReason, finish ? readTermination(finish) : undefined)
         yield* Ref.set(termination, finish ? deliveredReason(readTermination(finish)) : undefined)
 
         // The review subagent delivers its canonical result through a tagged
@@ -543,20 +560,43 @@ export const TaskTool = Tool.define(
         return typeof summary === "string" ? summary : ""
       })
 
+      const runTask = Effect.fn("TaskTool.runTask")(function* () {
+        return yield* promptChild(yield* ops.resolvePromptParts(params.prompt))
+      })
+
       const inject = Effect.fn("TaskTool.injectBackgroundResult")(function* (
         state: "completed" | "error" | "cancelled",
         text: string,
         termination: TerminationReason | undefined,
+        silent = false,
+        receiptKey = nextSession.id,
       ) {
         // Notifications must run in the parent session, under the parent agent -
         // the same one the routing above read, not a second opinion taken when
         // the child finishes. `ctx.agent` is not a candidate: on the subtask path
         // it is the child's agent.
         const parentAgent = yield* parentAgentOf
+        // A running dispatch owns its session's continuation, but it may end
+        // with success/failure instead of parking. Deferral is a handoff, never
+        // a drop: keep this watcher alive and check its receipt after the owner
+        // settles. The park claims the same receipt before resuming the child.
+        const owner = (yield* background.list()).find(
+          (job) => job.type === id && job.status === "running" && BackgroundJob.runsSession(job, ctx.sessionID),
+        )
+        if (owner && !silent) {
+          const ended = yield* background.wait({ id: owner.id })
+          // An ancestor may be stopping this recipient too. Record the terminal
+          // envelope without starting a turn; its own delivery does NOT resolve
+          // descendant rows in the headless tracker.
+          silent = ended.info?.cancelledByTeardown === true
+        }
+        if (receipted.has(receiptKey)) return
+        receipted.add(receiptKey)
         const wrote = yield* Ref.get(wroteFiles)
         yield* ops
           .prompt({
             sessionID: ctx.sessionID,
+            noReply: silent,
             agent: parentAgent,
             variant,
             parts: [
@@ -580,7 +620,14 @@ export const TaskTool = Tool.define(
                 // The notification itself carries the child's delegated writes
                 // so the parent's review accounting cannot approve a tree the
                 // child changed.
-                ...(wrote ? { metadata: { [REVIEW_LOOP_METADATA]: { writesFiles: true } } } : {}),
+                ...(wrote || silent
+                  ? {
+                      metadata: {
+                        ...(wrote ? { [REVIEW_LOOP_METADATA]: { writesFiles: true } } : {}),
+                        ...(silent ? { backgroundNoReply: true } : {}),
+                      },
+                    }
+                  : {}),
               },
             ],
           })
@@ -593,12 +640,13 @@ export const TaskTool = Tool.define(
             Effect.gen(function* () {
               const reason = yield* Ref.get(termination)
               if (result.info?.status === "completed")
-                return yield* inject("completed", result.info.output ?? "", reason)
+                return yield* inject("completed", result.info.output ?? "", reason, false, runKey(result.info))
               // A subagent can declare a reason and still fail afterwards, for
               // example when review envelope extraction fails after finish. The
               // reason was captured before that failure, so deliver it rather
               // than reporting a bare <task_error> with no signal.
-              if (result.info?.status === "error") return yield* inject("error", result.info.error ?? "", reason)
+              if (result.info?.status === "error")
+                return yield* inject("error", result.info.error ?? "", reason, false, runKey(result.info))
               // A cancelled run produced no finish call and no declared reason.
               // The job outcome is the termination: deliver it so the parent
               // resumes orchestration knowing the user stopped the child,
@@ -606,12 +654,20 @@ export const TaskTool = Tool.define(
               //
               // A cancel that cascaded from an ancestor's teardown is the
               // exception: cancelling a session (Ctrl+C, or its own double-Esc)
-              // sweeps up every job beneath it, so delivering those would prompt
-              // the session that is stopping and undo the interrupt. Only a
-              // cancellation aimed at this job's own session is reported.
+              // sweeps up every job beneath it. Those envelopes are recorded
+              // silently so they resolve their own rows without prompting the
+              // session that is stopping and undoing the interrupt.
               if (result.info?.status === "cancelled") {
-                if (result.info.cancelledByTeardown) return
-                return yield* inject("cancelled", result.info.output ?? CANCELLED_TEXT, "cancelled")
+                // Totality invariant: every launched job has a terminal
+                // envelope, including teardown. Teardown suppresses the wake,
+                // not the receipt: ancestor delivery does not cover this row.
+                return yield* inject(
+                  "cancelled",
+                  result.info.output ?? CANCELLED_TEXT,
+                  "cancelled",
+                  result.info.cancelledByTeardown === true,
+                  runKey(result.info),
+                )
               }
             }),
           ),
@@ -619,10 +675,149 @@ export const TaskTool = Tool.define(
         )
       })
 
+      /**
+       * The child's own task jobs: the background subagents it launched. A
+       * nested yield waits on these, and their report is what wakes the child.
+       */
+      const childJobs = Effect.fn("TaskTool.childJobs")(function* () {
+        const jobs = yield* background.list()
+        return jobs.filter(
+          (job) => job.type === id && BackgroundJob.isSubagentOf(job, nextSession.id) && job.metadata?.background !== false,
+        )
+      })
+
+      /**
+       * What a settled child of the child declared when it ended, read from its
+       * transcript - the same evidence its own dispatch delivered upward. The
+       * job record does not carry the typed reason, and an unreadable session is
+       * not evidence of success: a missing row reads as no termination while any
+       * other storage cause propagates, exactly as the run-end recovery does.
+       */
+      const descendantTermination = (descendant: SessionID) =>
+        sessions.messages({ sessionID: descendant }).pipe(
+          Effect.map((messages) =>
+            messages
+              .flatMap((message) => message.parts)
+              .findLast(
+                (part): part is SessionV1.ToolPart =>
+                  part.type === "tool" && part.tool === FinishTool.id && part.state.status === "completed",
+              ),
+          ),
+          Effect.catchIf(NotFoundError.isInstance, () => Effect.succeed(undefined)),
+          Effect.map((finish) => (finish ? deliveredReason(readTermination(finish)) : undefined)),
+        )
+
+      /**
+       * The child's next turn after one of its subagents reported. This is the
+       * notification the child would have received, rendered from the settled
+       * job and delivered by this dispatch because the parked job owns the
+       * child's continuation (#222): same envelope, same UNREVIEWED marker for
+       * delegated writes, same agent the child session runs under.
+       */
+      const resumeChild = Effect.fn("TaskTool.resumeChild")(function* (job: BackgroundJob.Info) {
+        const state = job.status === "completed" ? "completed" : job.status === "cancelled" ? "cancelled" : "error"
+        const body =
+          state === "completed"
+            ? (job.output ?? "")
+            : state === "cancelled"
+              ? (job.output ?? CANCELLED_TEXT)
+              : (job.error ?? "")
+        const wrote = job.metadata?.[REVIEW_LOOP_METADATA] !== undefined
+        // A descendant's writes make this child's own result unreviewed too.
+        if (wrote) yield* Ref.set(wroteFiles, true)
+        const descendant = SessionID.make(job.id)
+        const termination = state === "cancelled" ? ("cancelled" as const) : yield* descendantTermination(descendant)
+        // Claim only after the transcript read succeeds. If it fails, this
+        // dispatch errors and the still-live notifier must deliver the report.
+        receipted.add(runKey(job))
+        return yield* promptChild([
+          {
+            type: "text" as const,
+            synthetic: true,
+            text: renderOutput({
+              sessionID: descendant,
+              state,
+              summary:
+                state === "completed"
+                  ? `Background task completed: ${job.title ?? "subagent"}`
+                  : state === "cancelled"
+                    ? `Background task cancelled: ${job.title ?? "subagent"}`
+                    : `Background task failed: ${job.title ?? "subagent"}`,
+              text: wrote
+                ? `UNREVIEWED: This child changed files. Parent must run Review before reporting success.\n${body}`
+                : body,
+              termination,
+            }),
+            ...(wrote ? { metadata: { [REVIEW_LOOP_METADATA]: { writesFiles: true } } } : {}),
+          },
+        ])
+      })
+
+      // Jobs this dispatch has already reported to the child. It lives across
+      // parks: a child that waits twice must not be told about the same
+      // finished subagent twice.
+      const reported = yield* Ref.make(new Set<string>())
+
+      /**
+       * Keeps this dispatch's job alive while the child waits on its own
+       * subagents (#222). The child's run ended at its yield but its work did
+       * not: the job stays `running`, so a parent can wait on it again and the
+       * session's status stays truthful; no provisional envelope is delivered;
+       * and the parent receives exactly one delivery - the child's terminal
+       * result - once its subagents have reported and the child has finished
+       * the turns it resumed for.
+       *
+       * `parked: false` means the declared wait has nothing behind it: nothing
+       * of the child's own is running and no report is outstanding, so its last
+       * result is delivered as the run's last word, as it was before.
+       */
+      const park = Effect.fn("TaskTool.parkChild")(function* (last: string) {
+        const delivered = yield* Ref.get(reported)
+        const behind = (yield* childJobs()).filter((job) => job.status === "running" || !delivered.has(runKey(job)))
+        if (behind.length === 0) return { text: last, parked: false }
+        // The child's run has ended, and this is what keeps that from reading
+        // as "the child is finished" to anything watching the session.
+        yield* status.set(nextSession.id, { type: "busy" })
+        const text = yield* Effect.gen(function* () {
+          let text = last
+          while (true) {
+            const kids = yield* childJobs()
+            const seen = yield* Ref.get(reported)
+            const settled = kids.filter((job) => job.status !== "running" && !seen.has(runKey(job)))
+            if (settled.length > 0) {
+              for (const job of settled) {
+                yield* Ref.update(reported, (ids) => new Set(ids).add(runKey(job)))
+                // Teardown notifications still write a silent terminal envelope
+                // themselves. Do not claim their receipt or resurrect the child.
+                if (job.cancelledByTeardown) continue
+                if (receipted.has(runKey(job))) continue
+                text = yield* resumeChild(job)
+                if ((yield* Ref.get(declaredReason)) !== "waiting_for_subagent") return text
+              }
+              continue
+            }
+            const running = kids.filter((job) => job.status === "running")
+            if (running.length === 0) return text
+            yield* running.map((job) => background.wait({ id: job.id })).reduce((a, b) => Effect.raceFirst(a, b))
+          }
+        }).pipe(Effect.ensuring(status.set(nextSession.id, { type: "idle" })))
+        return { text, parked: true }
+      })
+
       // Each continuation owns its listener until that continuation ends.
       // Extending an existing background job must clean up too.
       const runWithEvidence = () =>
         runTask().pipe(
+          Effect.flatMap((text) =>
+            Effect.gen(function* () {
+              while ((yield* Ref.get(declaredReason)) === "waiting_for_subagent") {
+                const next = yield* park(text)
+                text = next.text
+                if (!next.parked) break
+              }
+              return text
+            }),
+          ),
           Effect.onInterrupt(() => ops.cancel(nextSession.id)),
           Effect.onExit((exit) =>
             Effect.gen(function* () {
@@ -656,6 +851,8 @@ export const TaskTool = Tool.define(
         }
       }
 
+      // A reused session ID starts a new job, hence a new delivery obligation:
+      // receipts are keyed per run (runKey), so nothing to reset here.
       const info = yield* background.start({
         id: nextSession.id,
         type: id,

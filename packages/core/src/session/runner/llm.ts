@@ -28,6 +28,7 @@ import { ToolRegistry } from "../../tool/registry"
 import { ToolOutputStore } from "../../tool-output-store"
 import { SessionContextEpoch } from "../context-epoch"
 import { SessionCompaction } from "../compaction"
+import { SessionContextReduction } from "../context-reduction"
 import { SessionEvent } from "../event"
 import { SessionHistory } from "../history"
 import { SessionInput } from "../input"
@@ -109,7 +110,11 @@ const layer = Layer.effect(
     const config = yield* Config.Service
     const snapshots = yield* Snapshot.Service
     const db = (yield* Database.Service).db
-    const compaction = SessionCompaction.make({ events, llm, config: yield* config.entries() })
+    const documents = yield* config.entries()
+    const compaction = SessionCompaction.make({ events, llm, config: documents })
+    // The runner owns dynamic context reduction: it is the only place that knows the canonical
+    // history, the request envelope and the model, and reduction keeps no state of its own.
+    const contextPolicy = SessionContextReduction.policy(documents)
     const getSession = Effect.fn("SessionRunner.getSession")(function* (sessionID: SessionSchema.ID) {
       const session = yield* store.get(sessionID)
       if (!session) return yield* Effect.die(`Session not found: ${sessionID}`)
@@ -250,7 +255,18 @@ const layer = Layer.effect(
         .filter((part): part is string => part !== undefined && part.length > 0)
         .map(SystemPart.make)
       const trailingMessages = isLastStep ? [Message.assistant(MAX_STEPS_PROMPT)] : []
-      const loweredMessages = yield* toLLMMessages(context, model).pipe(Effect.provideService(FSUtil.Service, fsys))
+      // One context pipeline: canonical history in, the projection this request sends out. The
+      // request below never sees the reduction decisions, only their result, and the history in the
+      // database is never any of its business.
+      const reduction = SessionContextReduction.reduce({
+        messages: context,
+        envelope: { system: systemPrompt, tools: toolDefinitions, extra: trailingMessages },
+        model,
+        policy: contextPolicy,
+      })
+      const loweredMessages = yield* toLLMMessages(reduction.messages, model).pipe(
+        Effect.provideService(FSUtil.Service, fsys),
+      )
       const request = LLM.request({
         model,
         http: {
@@ -266,8 +282,23 @@ const layer = Layer.effect(
         tools: toolDefinitions,
         toolChoice: isLastStep ? "none" : undefined,
       })
+      // Compaction is the escalation reduction cannot perform: it summarizes history durably, so it
+      // only runs once the deterministic rungs have given everything they may give.
       if (yield* compaction.compactIfNeeded({ sessionID: session.id, entries, model, request }))
         return yield* Effect.die(continueAfterCompaction(currentStep))
+      if (reduction.report.outcome === "exhausted")
+        yield* Effect.logWarning("context.reduce.exhausted", {
+          sessionID: session.id,
+          tokens: reduction.report.tokens,
+          limit: reduction.report.limit,
+        })
+      // The one authoritative context measurement, published for the request that is actually about
+      // to be sent: clients render it instead of deriving utilization from counters of their own.
+      yield* events.publish(SessionEvent.Context.Prepared, {
+        sessionID: session.id,
+        timestamp: yield* DateTime.now,
+        ...reduction.report,
+      })
       const startSnapshot = yield* snapshots.capture()
       const publisher = createLLMEventPublisher(events, {
         sessionID: session.id,

@@ -7,6 +7,7 @@ import {
   formatThinkingSummary,
   incrementalDelta,
   normalizeModelRecord,
+  parseChatNewOutcome,
   parseChatNewResponse,
   parseModelsResponse,
   parseQwenEvent,
@@ -96,6 +97,28 @@ describe("payload builders", () => {
     expect(feature["auto_thinking"]).toBe(false)
   })
 
+  test("chat-create outcomes separate an ok id from a missing one", () => {
+    expect(parseChatNewOutcome({ chat_id: "c1" })).toEqual({ kind: "ok", chatId: "c1" })
+    expect(parseChatNewOutcome({ data: { chat: { id: "c4" } } })).toEqual({ kind: "ok", chatId: "c4" })
+    // Whitespace-only ids are not ids, and the body did arrive.
+    expect(parseChatNewOutcome({ chat_id: "   " })).toEqual({ kind: "missing-id", reason: "blank" })
+    expect(parseChatNewOutcome({ data: { chat_id: "" } })).toEqual({ kind: "missing-id", reason: "blank" })
+    expect(parseChatNewResponse({ chat_id: " c1 " })).toBe("c1")
+    // Nothing came back at all.
+    expect(parseChatNewOutcome(undefined)).toEqual({ kind: "missing-id", reason: "empty" })
+    expect(parseChatNewOutcome(null)).toEqual({ kind: "missing-id", reason: "empty" })
+    expect(parseChatNewOutcome({})).toEqual({ kind: "missing-id", reason: "empty" })
+    expect(parseChatNewOutcome([])).toEqual({ kind: "missing-id", reason: "empty" })
+    // A body arrived, but no id lives anywhere known. Never stale-chat
+    // evidence: a create call proves nothing about an existing binding.
+    expect(parseChatNewOutcome({ data: {} })).toEqual({ kind: "missing-id", reason: "unrecognized" })
+    expect(parseChatNewOutcome({ ok: true, data: { chat: {} } })).toEqual({
+      kind: "missing-id",
+      reason: "unrecognized",
+    })
+    expect(parseChatNewResponse({ data: {} })).toBeUndefined()
+  })
+
   test("stop and sts bodies", () => {
     expect(buildStopBody("c", "r")).toEqual({ chat_id: "c", response_id: "r" })
     expect(buildStsBody("a.png", 12, "image")).toEqual({ filename: "a.png", filesize: "12", filetype: "image" })
@@ -160,6 +183,50 @@ describe("parseQwenEvent", () => {
       kind: "response-created",
       responseId: "r1",
       chatId: "c1",
+    })
+  })
+
+  test("a chunk-level chat_id is surfaced so a rotated chat can be adopted", () => {
+    // `response.created` is not the only place the authoritative chat id can
+    // appear; a rotation reported only at the chunk root must still arrive.
+    expect(
+      parseQwenEvent(
+        '{"response_id":"r1","chat_id":"c-rotated","choices":[{"delta":{"phase":"answer","content":"Hi"}}]}',
+      ),
+    ).toEqual({ kind: "text", content: "Hi", responseId: "r1", chatId: "c-rotated" })
+    expect(parseQwenEvent('{"chat_id":"c-rotated","usage":{"output_tokens":2}}')).toEqual({
+      kind: "usage",
+      chatId: "c-rotated",
+      outputTokens: 2,
+      inputTokens: undefined,
+      totalTokens: undefined,
+      cachedTokens: undefined,
+      reasoningTokens: undefined,
+      textTokens: undefined,
+    })
+    // `response.created` keeps its own id when it has one; otherwise the
+    // chunk-level id is used instead of leaving the session on a stale binding.
+    expect(parseQwenEvent('{"type":"response.created","response":{"id":"r1"},"chat_id":"c-rotated"}')).toEqual({
+      kind: "response-created",
+      responseId: "r1",
+      chatId: "c-rotated",
+    })
+    expect(
+      parseQwenEvent('{"type":"response.created","response":{"id":"r1","chat_id":"c1"},"chat_id":"c-rotated"}'),
+    ).toEqual({
+      kind: "response-created",
+      responseId: "r1",
+      chatId: "c1",
+    })
+    // No chat id anywhere: nothing to adopt.
+    expect(parseQwenEvent('{"type":"response.created","response":{"id":"r1"}}')).toEqual({
+      kind: "response-created",
+      responseId: "r1",
+    })
+    expect(parseQwenEvent('{"response_id":"r1","choices":[{"delta":{"phase":"answer","content":"Hi"}}]}')).toEqual({
+      kind: "text",
+      content: "Hi",
+      responseId: "r1",
     })
   })
 

@@ -1,0 +1,14 @@
+{
+  "scenario": {
+    "id": "upstream-empty-gpt52",
+    "engine": "upstream",
+    "model": "probe/gpt-5.2",
+    "prompt": "Say hello in one word.",
+    "fullEvidence": true
+  },
+  "exitCode": 0,
+  "elapsedMs": 2895,
+  "project": "/tmp/opencode-243-initial-context/upstream-empty-gpt52/project",
+  "stdout": "ok\n",
+  "stderr": "\u001b[0m\n> build · gpt-5.2\n\u001b[0m\n"
+}

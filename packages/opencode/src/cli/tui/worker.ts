@@ -1,5 +1,6 @@
 import { Server } from "@/server/server"
 import { InstanceRuntime } from "@/project/instance-runtime"
+import { watchOwnerProcess } from "@/cli/tui/owner-watch"
 import { Rpc } from "@/util/rpc"
 import { Config } from "@/config/config"
 import { GlobalBus } from "@/bus/global"
@@ -41,6 +42,17 @@ const isTuiWorker = resolveIsTuiWorker(process.env, processWorker)
 // contract testable without touching the process transport.
 export function resolveIsTuiWorker(env: NodeJS.ProcessEnv, hasProcessSend: boolean) {
   return env["SILVERCODE_TUI_WORKER"] === "1" || hasProcessSend
+}
+
+// Signal-0 probe: the only portable liveness check that does not depend on
+// `process.ppid`, which a detached Bun child cannot trust (see owner-watch.ts).
+function processAlive(pid: number) {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch {
+    return false
+  }
 }
 
 let server: Awaited<ReturnType<typeof Server.listen>> | undefined
@@ -106,6 +118,33 @@ if (isTuiWorker) {
 
   if (processWorker) {
     stopRpcListener = Rpc.listenProcess(rpc)
+    // Only a subprocess can outlive the UI, and only POSIX spawns it detached
+    // (see worker-process.ts). A thread worker shares the process, so it
+    // always exits with the UI.
+    if (process.platform !== "win32") {
+      const ownerPID = Number.parseInt(process.env["SILVERCODE_TUI_WORKER_OWNER_PID"] ?? "", 10)
+      watchOwnerProcess({
+        subscribeDisconnect: (handler) => {
+          process.on("disconnect", handler)
+          return () => {
+            process.off("disconnect", handler)
+          }
+        },
+        ownerAlive: Number.isFinite(ownerPID) && ownerPID > 0 ? () => processAlive(ownerPID) : undefined,
+        onOrphan() {
+          // A hard exit bounds the graceful path so a hung dispose cannot
+          // leave the orphan alive anyway.
+          const force = setTimeout(() => process.exit(0), 5000)
+          force.unref?.()
+          // .then with two branches, not .finally: a shutdown that failed
+          // must not exit 0 and look graceful to a supervisor.
+          void rpc.shutdown().then(
+            () => process.exit(0),
+            () => process.exit(1),
+          )
+        },
+      })
+    }
   } else {
     stopRpcListener = Rpc.listen(rpc)
   }

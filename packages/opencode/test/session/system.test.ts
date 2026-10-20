@@ -111,6 +111,25 @@ describe("session.system", () => {
     }
   })
 
+  test("gpt prompt keeps the todo discipline concise and names no stale tool (#243)", () => {
+    const prompt = SystemPrompt.provider({ api: { id: "gpt-5.2" } } as Provider.Model)[0]
+
+    // `multi_tool_use.parallel` is not a tool either build exposes; parallel
+    // calls are made by emitting independent calls in one response.
+    expect(prompt).not.toContain("multi_tool_use.parallel")
+    // The long todo section duplicated the scope contract and the todowrite
+    // description. The concise form must keep the discipline itself: one
+    // verifiable unit per todo, exactly one in progress, mark on verification.
+    expect(prompt).toContain("One todo = one specific, coherent, independently verifiable unit")
+    expect(prompt).toContain("keep exactly one `in_progress`")
+    expect(prompt).toContain("Never batch completions, mark unverified or future work done")
+    expect(prompt).not.toContain("Todo Planning and Execution Discipline")
+    // Character length is only a regression guard against re-inflating the
+    // always-loaded prompt, not a token count (see #243 for the tokenizer
+    // measurement). The pre-reduction prompt was 11,695 characters.
+    expect(prompt.length).toBeLessThan(10_750)
+  })
+
   test("selects the Kimi prompt for official provider model IDs", () => {
     for (const providerID of ["kimi-for-coding", "moonshotai", "moonshotai-cn"]) {
       const prompt = SystemPrompt.provider({ providerID, api: { id: "k3" } } as Provider.Model)[0]

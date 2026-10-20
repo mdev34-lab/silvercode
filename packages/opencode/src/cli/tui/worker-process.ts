@@ -26,6 +26,8 @@ type SpawnOptions = {
   stdin?: "ignore"
   stdout?: "ignore" | "inherit"
   stderr?: "ignore" | "inherit"
+  /** Run the worker in its own process group (POSIX only). */
+  detached?: boolean
   ipc: (message: string) => void
 }
 
@@ -56,6 +58,17 @@ export interface WorkerProcessOptions {
   cwd?: string
   env?: Record<string, string>
   maxRestarts?: number
+  /**
+   * Spawn the worker in its own process group (POSIX only, ignored on
+   * Windows). Terminal job-control signals — SIGTSTP from Ctrl+Z, SIGINT from
+   * Ctrl+C, SIGHUP when the terminal closes — are delivered to the foreground
+   * process group; a detached worker does not share it, so the UI can be
+   * suspended or signalled without pausing or killing in-flight work. The
+   * worker no longer dies from those signals either, so the owner must
+   * terminate it explicitly (see `terminate`) and the worker watches its
+   * parent's liveness to avoid outliving a dead owner.
+   */
+  detached?: boolean
   onRestart?: () => void | Promise<void>
   onExit?: (exit: WorkerExit) => void | Promise<void>
   log?: (message: string) => void
@@ -170,6 +183,7 @@ export function createWorkerProcess(target: string, options: WorkerProcessOption
       stdin: "ignore",
       stdout: "ignore",
       stderr: "inherit",
+      detached: options.detached,
       ipc(message) {
         transport.onmessage?.({ data: message } as MessageEvent<string>)
       },
@@ -290,11 +304,21 @@ export function createTuiWorker(target: string, options: WorkerProcessOptions = 
     // (`Rpc.listenProcess`) — there is no `process.send` in a thread, so
     // worker.ts picks the thread transport from that absence.
     SILVERCODE_TUI_WORKER: "1",
+    // Owner PID for the worker's liveness watchdog: a detached child cannot
+    // trust `process.ppid` (Bun may parent it under an intermediate reaper),
+    // so the owner passes its identity down explicitly. See owner-watch.ts.
+    SILVERCODE_TUI_WORKER_OWNER_PID: String(process.pid),
   }
   if (compiled) {
     return createThreadWorker(target, { ...options, env })
   }
-  return createWorkerProcess(target, { ...options, env })
+  // A suspended UI must not pause in-flight work: keep the worker out of the
+  // terminal's foreground process group so job-control signals (Ctrl+Z's
+  // SIGTSTP, terminal close's SIGHUP, Ctrl+C's SIGINT) reach only the UI.
+  // Windows has no process-group job control — the console delivers Ctrl+C to
+  // every attached process and `terminal.suspend` is win32-disabled — so the
+  // existing console semantics stay untouched there.
+  return createWorkerProcess(target, { ...options, env, detached: process.platform !== "win32" })
 }
 
 export function isWorkerCrash(signal: string | number | null, code: number | null) {

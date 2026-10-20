@@ -33,10 +33,11 @@ export type Reason = Schema.Schema.Type<typeof Reason>
  * instead of forcing the reason through a tool input the model never supplied.
  *
  * The delivered set is deliberately narrower than the declared one:
- * `waiting_for_subagent` is not in it. A child's run ends at its yield, so an
+ * `waiting_for_subagent` is not in it. A yield ends the child's turn, so an
  * envelope naming that reason would present a provisional result as a terminal
- * one. {@link deliveredReason} drops it, and #222 replaces the gap with a
- * nested yield that has a delivery of its own.
+ * one; {@link deliveredReason} drops it. A nested yield (#222) delivers nothing
+ * at all: the child's job stays running and its terminal result is the only
+ * delivery.
  */
 export const TerminationReason = Schema.Literals(["success", "subagent_wait", "failure", "cancelled"])
 
@@ -45,7 +46,7 @@ export type TerminationReason = Schema.Schema.Type<typeof TerminationReason>
 export const Parameters = Schema.Struct({
   reason: Reason.annotate({
     description:
-      "Why the turn ends: success, waiting_for_subagent (main session only), subagent_wait, or failure.",
+      "Why the turn ends: success, waiting_for_subagent (yield while your own background subagents run, including from a subagent session), subagent_wait, or failure.",
   }),
   result: Schema.String.annotate({
     description:
@@ -95,11 +96,12 @@ export function readTermination(part: SessionV1.ToolPart): Reason | undefined {
  * The declared reason as it is delivered to a parent.
  *
  * A declared `waiting_for_subagent` has no delivered counterpart. The finish
- * tool refuses the wait for a session that is itself a subagent, so a task child
- * cannot declare it, and a transcript that still does must not put a provisional
- * envelope on the wire as a terminal one: it delivers like a legacy record with
- * no declared reason — a plain result with no `<termination>` element. #222
- * gives a nested yield a termination of its own.
+ * tool accepts the wait only while a background subagent of that session is
+ * running - for a task child, one it launched itself, which keeps its job alive
+ * (#222) - so a transcript carrying the reason without one behind it must not
+ * put a provisional envelope on the wire as a terminal one: it delivers like a
+ * legacy record with no declared reason — a plain result with no
+ * `<termination>` element.
  */
 export function deliveredReason(reason: Reason | undefined): TerminationReason | undefined {
   if (reason === "waiting_for_subagent") return undefined
@@ -210,12 +212,6 @@ export const FinishTool = Tool.define(
           //
           if (params.reason === "waiting_for_subagent") {
             const jobs = yield* background.list()
-            // A subagent cannot yield. `runTask` is a single prompt, so a
-            // child's run ends at its yield and this provisional result would
-            // be the parent's only delivery: the work the child waits on would
-            // never reach it, and a child's job that has ended cannot be waited
-            // on again. Only a session that is not itself a task can yield;
-            // #222 tracks keeping a child's job alive so a nested yield works.
             const session = yield* sessions
               .get(ctx.sessionID)
               .pipe(Effect.mapError((error) => new ToolFailure({ message: error.message })))
@@ -225,20 +221,6 @@ export const FinishTool = Tool.define(
                 (job) =>
                   job.type === "task" && job.status === "running" && BackgroundJob.runsSession(job, ctx.sessionID),
               )
-            if (isSubagentRun) {
-              yield* Effect.logWarning("finish declined: a subagent session cannot yield for its own subagents", {
-                sessionID: ctx.sessionID,
-              })
-              return yield* Effect.fail(
-                new ToolFailure({
-                  message:
-                    "Cannot wait: this session is itself a subagent, and a subagent's run ends at its yield — " +
-                    "the parent would receive this provisional result as the run's only delivery, and whatever " +
-                    "this session waits on would never reach it. " +
-                    'Deliver your own result with reason: "success", or "failure" if the task could not be completed.',
-                }),
-              )
-            }
             // The filter below is a snapshot, not a reservation (#222): a job
             // whose cancellation is already in flight still reads `running`
             // here, so a wait can be accepted whose child never notifies.
@@ -250,6 +232,28 @@ export const FinishTool = Tool.define(
                 job.type === "task" && job.status === "running" && BackgroundJob.isSubagentOf(job, ctx.sessionID),
             )
             if (running.length === 0) {
+              // A subagent that launched its own background subagents may yield
+              // for them: `task` keeps its job running through the wait and
+              // resumes it when they report, so the session is woken by exactly
+              // the work it declared (#222). What it must not do is yield with
+              // nothing of its own in flight - its run ends at the yield, so the
+              // parent would receive this provisional result as the run's only
+              // delivery and whatever it waits on would never reach it.
+              if (isSubagentRun) {
+                yield* Effect.logWarning("finish declined: a subagent yielded with no subagents of its own running", {
+                  sessionID: ctx.sessionID,
+                })
+                return yield* Effect.fail(
+                  new ToolFailure({
+                    message:
+                      "Cannot wait: this session is itself a subagent and has no background subagents of its own " +
+                      "running. A subagent may yield only for a task it launched itself, because that is the work " +
+                      "that can wake it; a yield with nothing of its own in flight would end its run here and " +
+                      'deliver this provisional result as the run\'s only delivery. Deliver your own result with reason: "success", ' +
+                      'or "failure" if the task could not be completed.',
+                  }),
+                )
+              }
               return yield* Effect.fail(
                 new ToolFailure({
                   message:
@@ -260,6 +264,9 @@ export const FinishTool = Tool.define(
                 }),
               )
             }
+            // Accepted for a subagent too, when the running jobs are its own:
+            // `task` keeps its job running through the wait and resumes it as
+            // they report, so the wait is woken by work that belongs to it.
             yield* Effect.logInfo("finish yielded while background subagents run", {
               sessionID: ctx.sessionID,
               subagents: running.length,
