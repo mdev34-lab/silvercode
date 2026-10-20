@@ -3496,7 +3496,7 @@ describe("SessionRunnerLLM", () => {
     return events
       .listen((event) =>
         Effect.sync(() => {
-          if (event.type === SessionEvent.Context.Prepared.type) reports.push(event.data)
+          if (event.type === SessionEvent.Context.Prepared.type) reports.push(event.data as (typeof reports)[number])
         }),
       )
       .pipe(Effect.as(reports))
