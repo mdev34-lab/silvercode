@@ -136,6 +136,36 @@ function fail(message: string, data: Record<string, unknown>) {
   console.error(`[tui.plugin] ${text}`, next)
 }
 
+function reportInstallFailures(api: HostPluginApi) {
+  const messages = TuiConfig.installFailures()
+  if (!messages.length) return
+  const category = messages.join(", ")
+  const retry = async () => {
+    api.ui.dialog.clear()
+    await TuiConfig.retryDependencies().catch(() => {})
+    reportInstallFailures(api)
+  }
+  api.ui.dialog.replace(() =>
+    api.ui.DialogSelect({
+      title: "Plugin dependency install failed",
+      renderFilter: false,
+      options: [
+        { title: "Retry", value: "retry", category, onSelect: () => void retry() },
+        { title: "Dismiss", value: "dismiss", category, onSelect: () => api.ui.dialog.clear() },
+        {
+          title: "Open log",
+          value: "log",
+          category,
+          onSelect: () =>
+            api.ui.dialog.replace(() =>
+              api.ui.DialogAlert({ title: "Log", message: Global.Path.log, onConfirm: () => api.ui.dialog.clear() }),
+            ),
+        },
+      ],
+    }),
+  )
+}
+
 function warn(message: string, data: Record<string, unknown>) {
   console.warn(`[tui.plugin] ${message}`, data)
 }
@@ -1104,6 +1134,7 @@ async function load(input: {
     }
 
     const ready = await resolveExternalPlugins(records, () => TuiConfig.waitForDependencies())
+    reportInstallFailures(next.api)
     await addExternalPluginEntries(next, ready)
 
     applyInitialPluginEnabledState(next, config)
