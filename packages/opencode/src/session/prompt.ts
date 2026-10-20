@@ -45,7 +45,7 @@ import { Truncate } from "@/tool/truncate"
 import { Image } from "@/image/image"
 import { decodeDataUrl } from "@/util/data-url"
 import { Process } from "@/util/process"
-import { Cause, Effect, Exit, Latch, Layer, Option, Scope, Context, Schema, Types } from "effect"
+import { Cause, DateTime, Effect, Exit, Latch, Layer, Option, Scope, Context, Schema, Types } from "effect"
 import { InstanceState } from "@/effect/instance-state"
 import { TaskTool, type TaskPromptOps } from "@/tool/task"
 import { FinishTool, readTermination } from "@/tool/finish"
@@ -66,6 +66,8 @@ import { ReviewStagnation } from "./review-stagnation"
 import { SessionRunState } from "./run-state"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { EventV2Bridge } from "@/event-v2-bridge"
+import { SessionEvent } from "@opencode-ai/schema/session-event"
+import { ContextReduction } from "./context-reduction"
 import { Database } from "@opencode-ai/core/database/database"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { ProviderV2 } from "@opencode-ai/core/provider"
@@ -1641,13 +1643,12 @@ const layer = Layer.effect(
 
             yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
 
-            const [skills, env, instructions, mcpInstructions, toolOverview, modelMsgs] = yield* Effect.all([
+            const [skills, env, instructions, mcpInstructions, toolOverview] = yield* Effect.all([
               sys.skills(agent),
               sys.environment(model),
               instruction.system().pipe(Effect.orDie),
               sys.mcp(agent, session.permission),
               catalog.overview(session.id),
-              MessageV2.toModelMessagesEffect(msgs, model),
             ])
             const isDefaultPrimary = yield* agents
               .defaultInfo()
@@ -1681,6 +1682,30 @@ const layer = Layer.effect(
             ]
             const format = lastUser.format ?? { type: "text" as const }
             if (format.type === "json_schema") system.push(STRUCTURED_OUTPUT_SYSTEM_PROMPT)
+            // Dynamic context reduction: the model sees a projection of the history, sized against
+            // the real request (system prompt and tool definitions included). Canonical history is
+            // untouched; the report is published for clients to render.
+            const reduction = ContextReduction.reduce({
+              messages: msgs,
+              envelope: {
+                system,
+                tools: Object.entries(tools).map(([name, tool]) => ({
+                  name,
+                  description: (tool as { description?: string }).description,
+                })),
+                extra: isLastStep ? [MAX_STEPS_PROMPT] : [],
+              },
+              model,
+              config: effortConfig.context,
+            })
+            yield* events
+              .publish(SessionEvent.Context.Prepared, {
+                sessionID,
+                timestamp: yield* DateTime.now,
+                ...reduction.report,
+              })
+              .pipe(Effect.ignore)
+            const modelMsgs = yield* MessageV2.toModelMessagesEffect([...reduction.messages], model)
             const result = yield* handle.process({
               user: effectiveUser,
               agent,
