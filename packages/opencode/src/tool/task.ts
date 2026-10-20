@@ -721,6 +721,8 @@ export const TaskTool = Tool.define(
               ? (job.output ?? CANCELLED_TEXT)
               : (job.error ?? "")
         const wrote = job.metadata?.[REVIEW_LOOP_METADATA] !== undefined
+        // A descendant's writes make this child's own result unreviewed too.
+        if (wrote) yield* Ref.set(wroteFiles, true)
         const descendant = SessionID.make(job.id)
         const termination = state === "cancelled" ? ("cancelled" as const) : yield* descendantTermination(descendant)
         // Claim only after the transcript read succeeds. If it fails, this
