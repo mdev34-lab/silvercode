@@ -39,7 +39,7 @@ describe("tokenharbor model list", () => {
 
   test("maps an entry onto an openai-compatible model", () => {
     const model = toModel({ id: "deepseek-v4.1-flash" })
-    expect(model.providerID).toBe("tokenharbor")
+    expect(String(model.providerID)).toBe("tokenharbor")
     expect(model.api).toMatchObject({ id: "deepseek-v4.1-flash", url: "https://tokenharbor.ai/v1", npm: "@ai-sdk/openai-compatible" })
     expect(model.name).toBe("deepseek-v4.1-flash")
   })
