@@ -211,7 +211,9 @@ export const reduce = (input: Input): Reduction => {
 const usableWindow = (model: Model) => {
   const context = model.route.defaults.limits?.context
   if (context === undefined || context <= 0) return undefined
-  return Math.max(context - (model.route.defaults.limits?.output ?? 0), 1)
+  // A declared output reserve at or above the context limit must not collapse the window to one
+  // token (every request would then be reduced to exhaustion): keep a quarter of the context.
+  return Math.max(context - (model.route.defaults.limits?.output ?? 0), Math.ceil(context / 4))
 }
 
 /** Serialized length of one value as the request carries it. */
@@ -428,6 +430,8 @@ const staleOutputs = (messages: readonly SessionMessage.Message[], protection: P
   rewrite(messages, (tool, index) => {
     if (index >= protection.recentFrom || tool.state.status !== "completed") return undefined
     if (protection.calls.has(tool.id)) return undefined
+    // Truncation rebuilds the result as plain text; a result carrying files or other non-text parts would lose them.
+    if (tool.state.content.some((item) => item.type !== "text")) return undefined
     const text = tool.state.content.map((item) => (item.type === "text" ? item.text : "")).join("\n")
     if (text.length <= TRUNCATE_KEEP * 2) return undefined
     return {
