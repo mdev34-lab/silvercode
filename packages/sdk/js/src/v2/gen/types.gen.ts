@@ -9474,6 +9474,40 @@ export type ProviderAuthResponses = {
 
 export type ProviderAuthResponse = ProviderAuthResponses[keyof ProviderAuthResponses]
 
+export type ProviderProbeData = {
+  body?: {
+    providerID: string
+    modelID: string
+  }
+  path?: never
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/provider/probe"
+}
+
+export type ProviderProbeErrors = {
+  /**
+   * InvalidRequestError
+   */
+  400: InvalidRequestError
+}
+
+export type ProviderProbeError = ProviderProbeErrors[keyof ProviderProbeErrors]
+
+export type ProviderProbeResponses = {
+  /**
+   * Probe outcome
+   */
+  200: {
+    outcome: "ok" | "transient" | "error"
+    latencyMs: number
+  }
+}
+
+export type ProviderProbeResponse = ProviderProbeResponses[keyof ProviderProbeResponses]
+
 export type ProviderOauthAuthorizeData = {
   body?: {
     /**

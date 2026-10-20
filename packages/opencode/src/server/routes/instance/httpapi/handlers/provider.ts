@@ -5,13 +5,15 @@ import { Provider } from "@/provider/provider"
 import { providerInfo as qwenWebProviderInfo, QWEN_WEB_PROVIDER_ID } from "@/provider/qwen-web"
 import { Auth } from "@/auth"
 
+import { APICallError, generateText } from "ai"
 import { mapValues } from "remeda"
-import { Effect, Schema } from "effect"
+import { Cause, Effect, Schema } from "effect"
 import { HttpServerRequest, HttpServerResponse } from "effect/unstable/http"
 import { HttpApiBuilder } from "effect/unstable/httpapi"
 import { InstanceHttpApi } from "../api"
 import { ProviderAuthApiError } from "../groups/provider"
 import { ProviderV2 } from "@opencode-ai/core/provider"
+import { ModelV2 } from "@opencode-ai/core/model"
 
 function mapProviderAuthError<A, R>(self: Effect.Effect<A, ProviderAuth.Error, R>) {
   return self.pipe(
@@ -99,6 +101,35 @@ export const providerHandlers = HttpApiBuilder.group(InstanceHttpApi, "provider"
       return HttpServerResponse.jsonUnsafe(result ?? null)
     })
 
+    const probe = Effect.fn("ProviderHttpApi.probe")(function* (ctx: {
+      payload: { providerID: ProviderV2.ID; modelID: string }
+    }) {
+      const started = Date.now()
+      const outcome = yield* Effect.gen(function* () {
+        const model = yield* provider.getModel(ctx.payload.providerID, ModelV2.ID.make(ctx.payload.modelID))
+        const language = yield* provider.getLanguage(model)
+        yield* Effect.tryPromise({
+          try: (signal) =>
+            generateText({ model: language, prompt: "ok", maxOutputTokens: 16, maxRetries: 0, abortSignal: signal }),
+          catch: (error) => error,
+        }).pipe(Effect.timeout("20 seconds"))
+        return "ok" as const
+      }).pipe(
+        Effect.catchCause((cause) => {
+          const error = Cause.squash(cause)
+          const status = APICallError.isInstance(error) ? error.statusCode : undefined
+          const transient =
+            status === 429 ||
+            (status !== undefined && status >= 500) ||
+            (APICallError.isInstance(error) && error.isRetryable) ||
+            Cause.isTimeoutError(error) ||
+            (!APICallError.isInstance(error) && error instanceof Error && /fetch failed|ECONN|ENOTFOUND|ETIMEDOUT|network/i.test(error.message))
+          return Effect.succeed((transient ? "transient" : "error") as "transient" | "error")
+        }),
+      )
+      return { outcome, latencyMs: Date.now() - started }
+    })
+
     const callback = Effect.fn("ProviderHttpApi.callback")(function* (ctx: {
       params: { providerID: ProviderV2.ID }
       payload: ProviderAuth.CallbackInput
@@ -116,6 +147,7 @@ export const providerHandlers = HttpApiBuilder.group(InstanceHttpApi, "provider"
     return handlers
       .handle("list", list)
       .handle("auth", auth)
+      .handle("probe", probe)
       .handleRaw("authorize", authorizeRaw)
       .handle("callback", callback)
   }),

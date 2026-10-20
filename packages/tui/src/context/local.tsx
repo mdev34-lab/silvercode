@@ -1,6 +1,6 @@
 import { createStore } from "solid-js/store"
 import { createSimpleContext } from "./helper"
-import { batch, createEffect, createMemo, createSignal, on } from "solid-js"
+import { batch, createEffect, createMemo, createSignal, on, onCleanup } from "solid-js"
 import { useSync } from "./sync"
 import { useEvent } from "./event"
 import path from "path"
@@ -8,6 +8,7 @@ import { useTuiPaths } from "./runtime"
 import { useArgs } from "./args"
 import { useSDK } from "./sdk"
 import { effectiveVariant } from "../util/model"
+import * as ModelHealth from "../util/model-health"
 import { RGBA } from "@opentui/core"
 import { readJson, writeJsonAtomic } from "../util/persistence"
 import { errorMessage } from "../util/error"
@@ -320,8 +321,41 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
         )
       })
 
+      // Cached health of favorite models. Only favorites are ever probed, one at a time, in the
+      // background; the picker reads the cache and never waits on a probe.
+      const [health, setHealth] = createStore<Record<string, ModelHealth.HealthEntry | undefined>>({})
+      const healthKey = (model: { providerID: string; modelID: string }) => `${model.providerID}/${model.modelID}`
+      let probing = false
+      async function probeNext() {
+        if (probing || !modelStore.ready) return
+        const now = Date.now()
+        const target = modelStore.favorite
+          .filter((item) => isModelValid(item))
+          .map((item) => ({ item, due: ModelHealth.due(health[healthKey(item)]) }))
+          .filter((entry) => entry.due <= now)
+          .sort((a, b) => a.due - b.due)[0]?.item
+        if (!target) return
+        probing = true
+        const key = healthKey(target)
+        try {
+          const result = await sdk.client.provider
+            .probe({ providerID: target.providerID, modelID: target.modelID })
+            .then((response) => response.data?.outcome ?? ("transient" as const))
+            .catch(() => "transient" as const)
+          setHealth(key, ModelHealth.next(health[key], result, Date.now()))
+        } finally {
+          probing = false
+        }
+      }
+      const probeTimer = setInterval(() => void probeNext(), 15_000)
+      onCleanup(() => clearInterval(probeTimer))
+
       return {
         current: currentModel,
+        health(model: { providerID: string; modelID: string }) {
+          const entry = health[healthKey(model)]
+          return { status: ModelHealth.status(entry, Date.now()), checked: entry ? ModelHealth.age(entry, Date.now()) : undefined }
+        },
         get ready() {
           return modelStore.ready
         },
