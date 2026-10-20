@@ -4921,3 +4921,82 @@ it.instance(
     }),
   10_000,
 )
+
+// Context reduction runs on the real request path: the model sees a projection, canonical history
+// stays intact, and the projection is re-derived on every turn.
+it.instance("loop sends a reduced context projection and keeps canonical history intact across turns", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig((url) => {
+      const base = providerCfg(url)
+      return {
+        ...base,
+        provider: {
+          ...base.provider,
+          test: {
+            ...base.provider.test,
+            models: {
+              "test-model": {
+                ...base.provider.test.models["test-model"],
+                limit: { context: 12000, output: 500 },
+              },
+            },
+          },
+        },
+      }
+    })
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({
+      title: "Pinned",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+    const big = (n: number) => `OUT${n}-` + "x".repeat(6000)
+    for (let i = 0; i < 10; i++) {
+      const seeded = yield* seed(chat.id, { finish: "stop" })
+      yield* sessions.updatePart({
+        id: PartID.ascending(),
+        messageID: seeded.assistant.id,
+        sessionID: chat.id,
+        type: "tool",
+        callID: `call-${i}`,
+        tool: "bash",
+        state: {
+          status: "completed",
+          input: { command: `echo ${i}` },
+          output: big(i),
+          title: "bash",
+          metadata: {},
+          time: { start: 1, end: 2 },
+        },
+      })
+    }
+    const canonical = () =>
+      sessions.messages({ sessionID: chat.id }).pipe(
+        Effect.map((msgs) =>
+          msgs.flatMap((m) => m.parts.flatMap((p) => (p.type === "tool" && p.state.status === "completed" ? [p.state.output] : []))),
+        ),
+      )
+    const before = yield* canonical()
+    expect(before).toHaveLength(10)
+
+    const sizes: number[] = []
+    for (const turn of ["one", "two"]) {
+      yield* prompt.prompt({ sessionID: chat.id, agent: "work", noReply: true, parts: [{ type: "text", text: turn }] })
+      yield* llm.text(`reply ${turn}`)
+      yield* prompt.loop({ sessionID: chat.id })
+      const inputs = turnInputs(yield* llm.inputs)
+      expect(inputs.length).toBeGreaterThan(0)
+      const body = JSON.stringify(inputs.at(-1))
+      sizes.push(body.length)
+      // the oldest output is reduced in the request, the newest is kept in full
+      expect(body).not.toContain(big(0))
+      expect(body).toContain(big(9))
+      expect(body.split("x".repeat(6000)).length - 1).toBeLessThan(10)
+    }
+    // canonical history still holds every full output after both turns
+    const after = yield* canonical()
+    expect(after).toEqual(before)
+    // the request does not grow with the turn: the projection is re-derived, not accumulated
+    expect(sizes[1]).toBeLessThan(sizes[0] + 2000)
+  }),
+)
