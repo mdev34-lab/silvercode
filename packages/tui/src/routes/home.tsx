@@ -95,7 +95,6 @@ function HomeScreen() {
             <Logo />
           </pluginRuntime.Slot>
         </box>
-        <box height={1} minHeight={0} flexShrink={1} />
         <box width="100%" maxWidth={promptMaxWidth()} zIndex={1000} paddingTop={1} flexShrink={0}>
           <pluginRuntime.Slot name="home_prompt" mode="replace" ref={bind}>
             <Prompt
