@@ -277,7 +277,7 @@ export async function mountSessionRoute(options: MountOptions) {
                               <EpilogueProvider set={() => {}}>
                                 <SyncProvider>
                                   <DataProvider>
-                                    <ThemeProvider mode="dark">
+                                    <ThemeProvider mode="dark" source={{ discover: async () => ({}) }}>
                                       <LocalProvider>
                                         <PromptStashProvider>
                                           <DialogProvider>

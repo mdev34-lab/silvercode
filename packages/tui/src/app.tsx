@@ -95,6 +95,9 @@ registerOpencodeSpinner()
 const appGlobalBindingCommands = [
   "session.list",
   "session.new",
+  "session.tab.next",
+  "session.tab.prev",
+  "session.tab.close",
   "session.quick_switch.1",
   "session.quick_switch.2",
   "session.quick_switch.3",

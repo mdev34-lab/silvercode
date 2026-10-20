@@ -13,6 +13,9 @@ describe("session tab shortcuts", () => {
     expect(CommandMap.session_tab_close).toBe("session.tab.close")
     for (const name of ["session.tab.next", "session.tab.prev", "session.tab.close"]) {
       expect(app).toContain(`name: "${name}"`)
+      // A handler alone is not enough: the command must be gathered into a binding list.
+      const lists = app.match(/const app(?:Global)?BindingCommands = \[[\s\S]*?\] as const/g) ?? []
+      expect(lists.some((list) => list.includes(`"${name}"`))).toBe(true)
     }
   })
 })
