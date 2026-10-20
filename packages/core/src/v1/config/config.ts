@@ -3,6 +3,7 @@ export * as ConfigV1 from "./config"
 import { Schema } from "effect"
 import { AgentEffort } from "@opencode-ai/schema/agent-effort"
 import { NonNegativeInt, PositiveInt, type DeepMutable } from "../../schema"
+import { ConfigContext } from "../../config/context"
 import { ConfigExperimental } from "../../config/experimental"
 import { ConfigReference } from "../../config/reference"
 import { ConfigAgentV1 } from "./agent"
@@ -218,6 +219,9 @@ export const Info = Schema.Struct({
   ).annotate({
     description:
       "Thresholds for truncating tool output. When output exceeds either limit, the full text is written to the truncation directory and a preview is returned.",
+  }),
+  context: Schema.optional(ConfigContext.Info).annotate({
+    description: "Dynamic context reduction behavior for provider requests",
   }),
   compaction: Schema.optional(
     Schema.Struct({
