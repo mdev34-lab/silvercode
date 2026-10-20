@@ -802,7 +802,7 @@ describe("agent effort selector", () => {
         },
         "effort label beside thinking",
       )
-      expect(after).toContain("· fast")
+      expect(after).toContain("fast · high")
     } finally {
       await harness.dispose()
     }

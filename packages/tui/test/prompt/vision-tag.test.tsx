@@ -433,7 +433,7 @@ describe("prompt vision tag", () => {
       // the same meta row: effort and explicit HIGH thinking are both shown
       // and stay distinct.
       const highRow = frame.split("\n").find((line) => line.includes("VisionCapableModel")) ?? ""
-      expect(highRow).toContain("· medium")
+      expect(highRow).toContain("medium · high")
       expect(highRow).toContain("· high")
 
       // Set variant to "medium" on text-only model -> "medium" visible, "vision" absent
