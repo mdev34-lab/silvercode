@@ -1363,6 +1363,25 @@ export function Prompt(props: PromptProps) {
   )
   const borderHighlight = createMemo(() => tint(theme.border, highlight(), agentMetaAlpha()))
 
+  // Cells inside the prompt box: terminal width minus the outer margin, left border and padding.
+  const innerWidth = createMemo(() => Math.max(10, dimensions().width - 9))
+  const showProvider = createMemo(() => dimensions().width >= 72)
+  const tagsWidth = createMemo(() => {
+    let width = local.effort.current().length
+    if (showVariant()) width += 3 + (local.model.variant.current()?.length ?? 0)
+    if (showVision()) width += 3 + "vision".length
+    return width
+  })
+  // Room left for the model name on the footer row, with a gap before the tags.
+  const modelRoom = createMemo(() => {
+    const agentName = store.mode === "shell" ? "Shell".length : (local.agent.current()?.name.length ?? 0)
+    const provider = showProvider() ? currentProviderLabel().length + 1 : 0
+    return Math.max(4, innerWidth() - tagsWidth() - 2 - agentName - 3 - provider)
+  })
+  const modelLabel = createMemo(() => Locale.truncate(local.model.parsed().model, modelRoom()))
+  // The placeholder shares its row with the YOLO tag.
+  const placeholderRoom = createMemo(() => innerWidth() - (local.permission.mode === "yolo" ? 8 : 0))
+
   const placeholderText = createMemo(() => {
     if (props.showPlaceholder === false) return undefined
     if (store.mode === "shell") {
@@ -1419,7 +1438,7 @@ export function Prompt(props: PromptProps) {
             </Show>
             <textarea
               width="100%"
-              placeholder={placeholderText()}
+              placeholder={placeholderText() ? Locale.truncate(placeholderText()!, placeholderRoom()) : undefined}
               placeholderColor={theme.textMuted}
               textColor={leader() ? theme.textMuted : theme.text}
               focusedTextColor={leader() ? theme.textMuted : theme.text}
@@ -1507,9 +1526,9 @@ export function Prompt(props: PromptProps) {
                             flexShrink={0}
                             fg={fadeColor(leader() ? theme.textMuted : theme.text, modelMetaAlpha())}
                           >
-                            {local.model.parsed().model}
+                            {modelLabel()}
                           </text>
-                          <Show when={dimensions().width >= 72}>
+                          <Show when={showProvider()}>
                             <text fg={fadeColor(theme.textMuted, modelMetaAlpha())}>{currentProviderLabel()}</text>
                           </Show>
                         </box>
