@@ -139,6 +139,7 @@ function fail(message: string, data: Record<string, unknown>) {
 function reportInstallFailures(api: HostPluginApi) {
   const messages = TuiConfig.installFailures()
   if (!messages.length) return
+  const category = messages.join(", ")
   const retry = async () => {
     api.ui.dialog.clear()
     await TuiConfig.retryDependencies().catch(() => {})
@@ -147,12 +148,14 @@ function reportInstallFailures(api: HostPluginApi) {
   api.ui.dialog.replace(() =>
     api.ui.DialogSelect({
       title: "Plugin dependency install failed",
+      renderFilter: false,
       options: [
-        { title: "Retry", value: "retry", description: messages.join(", "), onSelect: () => void retry() },
-        { title: "Dismiss", value: "dismiss", onSelect: () => api.ui.dialog.clear() },
+        { title: "Retry", value: "retry", category, onSelect: () => void retry() },
+        { title: "Dismiss", value: "dismiss", category, onSelect: () => api.ui.dialog.clear() },
         {
           title: "Open log",
           value: "log",
+          category,
           onSelect: () =>
             api.ui.dialog.replace(() =>
               api.ui.DialogAlert({ title: "Log", message: Global.Path.log, onConfirm: () => api.ui.dialog.clear() }),

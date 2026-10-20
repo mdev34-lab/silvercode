@@ -235,6 +235,7 @@ export function createTuiApiAdapters(input: Input): Omit<TuiPluginApi, "lifecycl
             onFilter={props.onFilter}
             onSelect={mapOptionCb(props.onSelect)}
             skipFilter={props.skipFilter}
+            renderFilter={props.renderFilter}
             current={props.current}
           />
         )

@@ -178,6 +178,8 @@ export type TuiDialogSelectProps<Value = unknown> = {
   onFilter?: (query: string) => void
   onSelect?: (option: TuiDialogSelectOption<Value>) => void
   skipFilter?: boolean
+  /** Set to false to hide the search field. Defaults to shown. */
+  renderFilter?: boolean
   current?: Value
 }
 
