@@ -27,11 +27,6 @@ export function providerInfo(): Info {
   }
 }
 
-/**
- * Reads model ids from a `/v1/models` body. Accepts the OpenAI shape
- * (`{ data: [{ id }] }`), `{ models: [...] }` and a bare array whose items are
- * objects with an `id` or plain strings.
- */
 export type ModelEntry = {
   id: string
   name?: string
@@ -41,6 +36,11 @@ export type ModelEntry = {
   cost?: { input: number; output: number; cacheRead: number; cacheWrite: number }
 }
 
+/**
+ * Reads model ids from a `/v1/models` body. Accepts the OpenAI shape
+ * (`{ data: [{ id }] }`), `{ models: [...] }` and a bare array whose items are
+ * objects with an `id` or plain strings.
+ */
 export function parseModelList(body: unknown): ModelEntry[] {
   const list = Array.isArray(body) ? body : isRecord(body) ? (body.data ?? body.models) : undefined
   if (!Array.isArray(list)) return []
@@ -59,7 +59,7 @@ export function parseModelList(body: unknown): ModelEntry[] {
     const outputPrice = price(pricing?.output_usd_per_1m)
     result.push({
       id,
-      name: typeof record?.label === "string" ? record.label : typeof record?.name === "string" ? record.name : undefined,
+      name: typeof record?.label === "string" && record.label.trim() ? record.label : typeof record?.name === "string" ? record.name : undefined,
       toolcall: typeof record?.tool_call === "boolean" ? record.tool_call : undefined,
       cost:
         input !== undefined && outputPrice !== undefined
@@ -115,7 +115,7 @@ export async function discoverModels(
   if (!apiKey) return {}
   const response = await fetcher(`${baseURL.replace(/\/+$/, "")}/models`, {
     headers: { Authorization: `Bearer ${apiKey}` },
-    signal: AbortSignal.timeout(10_000),
+    signal: AbortSignal.timeout(5_000),
   }).catch(() => undefined)
   if (!response?.ok) return {}
   const body = await response.json().catch(() => undefined)
