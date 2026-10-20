@@ -44,6 +44,7 @@ const npmMock = Layer.mock(Npm.Service)({
 
 const it = testEffect(LayerNode.compile(LayerNode.group([FSUtil.node]), [[Npm.node, npmMock]]))
 
+let reported: readonly string[] = []
 const logs: string[] = []
 const captureLog = Logger.make((options) => {
   logs.push(String(options.message))
@@ -96,6 +97,7 @@ const run = (mode: "ok" | "fail" | "stall", timeoutMs: string) =>
           yield* fs.writeJson(path.join(local, "tui.json"), { plugin: ["some-plugin@1.0.0"] })
           const layer = TuiConfig.node
           yield* TuiConfig.Service.use((svc) => svc.waitForDependencies()).pipe(
+            Effect.tap(() => Effect.sync(() => (reported = TuiConfig.installFailures()))),
             Effect.provide(
               LayerNode.compile(layer, [[Npm.node, npmMock]]).pipe(
                 Layer.provide(Layer.succeed(CurrentWorkingDirectory, test.directory)),
@@ -110,6 +112,7 @@ const run = (mode: "ok" | "fail" | "stall", timeoutMs: string) =>
 
 beforeEach(() => {
   logs.length = 0
+  reported = []
 })
 
 it.instance(
@@ -121,6 +124,7 @@ it.instance(
           expect(install.calls).toBeGreaterThan(0)
           expect(warned("background dependency install failed")).toBe(true)
           expect(warned("timed out")).toBe(false)
+          expect(reported).toEqual(["Could not install @opencode-ai/plugin"])
         }),
       ),
     ),
@@ -136,6 +140,7 @@ it.instance(
           expect(install.interrupted).toBe(true)
           expect(warned("background dependency install timed out")).toBe(true)
           expect(warned("background dependency install failed")).toBe(false)
+          expect(reported).toEqual([])
         }),
       ),
     ),
@@ -150,6 +155,7 @@ it.instance(
         Effect.sync(() => {
           expect(install.calls).toBeGreaterThan(0)
           expect(warned("background dependency install")).toBe(false)
+          expect(reported).toEqual([])
         }),
       ),
     ),

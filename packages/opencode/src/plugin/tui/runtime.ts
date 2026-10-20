@@ -1104,6 +1104,8 @@ async function load(input: {
     }
 
     const ready = await resolveExternalPlugins(records, () => TuiConfig.waitForDependencies())
+    for (const message of TuiConfig.installFailures())
+      next.api.ui.toast({ variant: "error", title: "Plugin dependency install failed", message })
     await addExternalPluginEntries(next, ready)
 
     applyInitialPluginEnabledState(next, config)

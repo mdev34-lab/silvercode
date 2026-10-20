@@ -225,12 +225,23 @@ const loadState = Effect.fn("TuiConfig.loadState")(function* (ctx: { directory: 
   }
 })
 
+// Non-timeout background install failures, one short message each. Module state so the TUI can read
+// them without instantiating the config service again.
+const failures: string[] = []
+
+function failureMessage(cause: Cause.Cause<unknown>) {
+  const error = Cause.squash(cause)
+  if (error instanceof Npm.InstallFailedError && error.add?.length) return `Could not install ${error.add.join(", ")}`
+  return "Could not install dependencies"
+}
+
 const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const directory = yield* CurrentWorkingDirectory
     const npm = yield* Npm.Service
     const data = yield* loadState({ directory })
+    failures.length = 0
     const deps = yield* Effect.forEach(
       data.dirs,
       (dir) => {
@@ -258,7 +269,13 @@ const layer = Layer.effect(
             Effect.exit,
             Effect.tap((exit) =>
               Exit.isFailure(exit)
-                ? Effect.logWarning("background dependency install failed", { dir, error: String(exit.cause) })
+                ? Effect.sync(() => {
+                    failures.push(failureMessage(exit.cause))
+                  }).pipe(
+                    Effect.andThen(
+                      Effect.logWarning("background dependency install failed", { dir, error: String(exit.cause) }),
+                    ),
+                  )
                 : Effect.void,
             ),
             Effect.asVoid,
@@ -286,6 +303,10 @@ const { runPromise } = makeRuntime(Service, AppNodeBuilder.build(node))
 
 export async function waitForDependencies() {
   await runPromise((svc) => svc.waitForDependencies())
+}
+
+export function installFailures(): readonly string[] {
+  return [...failures]
 }
 
 export async function get() {
