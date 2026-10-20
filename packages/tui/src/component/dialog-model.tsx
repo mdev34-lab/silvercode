@@ -28,7 +28,7 @@ export function DialogModel(props: { providerID?: string }) {
     const favorites = connected() ? local.model.favorite() : []
     const recents = local.model.recent()
 
-    function healthFooter(model: { providerID: string; modelID: string }) {
+    function health(model: { providerID: string; modelID: string }) {
       const { status, checked } = local.model.health(model)
       const color = {
         working: theme.success,
@@ -36,12 +36,7 @@ export function DialogModel(props: { providerID?: string }) {
         failing: theme.error,
         unknown: theme.textMuted,
       }[status]
-      return (
-        <>
-          <span style={{ fg: color }}>●</span> {status}
-          {checked ? ` ${checked}` : ""}
-        </>
-      )
+      return { status, checked, color }
     }
 
     function toOptions(items: typeof favorites, category: string) {
@@ -59,9 +54,20 @@ export function DialogModel(props: { providerID?: string }) {
             description: provider.name,
             category,
             disabled: provider.id === "opencode" && model.id.includes("-nano"),
+            titleView:
+              category === "Pinned"
+                ? (() => {
+                    const state = health({ providerID: provider.id, modelID: model.id })
+                    return (
+                      <>
+                        {model.name ?? item.modelID} <span style={{ fg: state.color }}>● {state.status}</span>
+                      </>
+                    )
+                  })()
+                : undefined,
             footer:
-              category === "Favorites"
-                ? healthFooter({ providerID: provider.id, modelID: model.id })
+              category === "Pinned"
+                ? health({ providerID: provider.id, modelID: model.id }).checked
                 : model.cost?.input === 0 && provider.id === "opencode"
                   ? "Free"
                   : undefined,
@@ -73,7 +79,7 @@ export function DialogModel(props: { providerID?: string }) {
       })
     }
 
-    const favoriteOptions = toOptions(favorites, "Favorites")
+    const favoriteOptions = toOptions(favorites, "Pinned")
     const recentOptions = toOptions(
       recents.filter(
         (item) => !favorites.some((fav) => fav.providerID === item.providerID && fav.modelID === item.modelID),
@@ -97,10 +103,8 @@ export function DialogModel(props: { providerID?: string }) {
             value: { providerID: provider.id, modelID: model },
             title: info.name ?? model,
             releaseDate: info.release_date,
-            description: favorites.some((item) => item.providerID === provider.id && item.modelID === model)
-              ? "(Favorite)"
-              : undefined,
-            category: connected() ? provider.name : undefined,
+            description: showSections ? provider.name : undefined,
+            category: showSections && !props.providerID ? "All models" : connected() ? provider.name : undefined,
             disabled: provider.id === "opencode" && model.includes("-nano"),
             footer: info.cost?.input === 0 && provider.id === "opencode" ? "Free" : undefined,
             onSelect() {
@@ -190,7 +194,7 @@ export function DialogModel(props: { providerID?: string }) {
         },
         {
           command: "model.dialog.favorite",
-          title: "Favorite",
+          title: "Pin",
           hidden: !connected(),
           onTrigger: (option) => {
             local.model.toggleFavorite(option.value as { providerID: string; modelID: string })
