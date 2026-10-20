@@ -342,8 +342,12 @@ describe("util.effect-flock", () => {
             Array.from({ length: n }, () => run({ key: "eflock:stress", dir, done, active, holdMs: 30 })),
           )
 
-          expect(out.map((x) => x.code)).toEqual(Array.from({ length: n }, () => 0))
-          expect(out.map((x) => x.stderr.toString()).filter(Boolean)).toEqual([])
+          // Keep the child's real exit status and stderr in the failure so an
+          // intermittent Windows exit is diagnosable from the CI log (#310).
+          const failed = out
+            .map((x, index) => ({ index, code: x.code, stderr: x.stderr.toString() }))
+            .filter((x) => x.code !== 0 || x.stderr)
+          expect(failed).toEqual([])
 
           const lines = (await fs.readFile(done, "utf8"))
             .split("\n")
