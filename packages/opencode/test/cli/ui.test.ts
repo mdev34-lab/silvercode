@@ -54,7 +54,7 @@ test("colored wordmark keeps the highlighted half on one column", () => {
   const stdout = Object.getOwnPropertyDescriptor(process.stdout, "isTTY")
   Object.defineProperty(process.stdout, "isTTY", { value: true, configurable: true })
   try {
-    const rows = UI.logo().split("\n")
+    const rows = UI.logo().split(/\r?\n/)
     expect(rows).toHaveLength(inked.length)
     for (const [index, row] of rows.entries()) {
       const left = plain(logo.left[index]!)
