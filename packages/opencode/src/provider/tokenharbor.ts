@@ -54,22 +54,24 @@ export function parseModelList(body: unknown): ModelEntry[] {
     const positive = (...values: unknown[]) =>
       values.find((value): value is number => typeof value === "number" && Number.isFinite(value) && value > 0)
     const pricing = isRecord(record?.pricing) ? record.pricing : undefined
-    const price = (value: unknown) => (typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined)
+    const price = (value: unknown) => {
+      const number = typeof value === "string" && value.trim() ? Number(value) : value
+      return typeof number === "number" && Number.isFinite(number) && number >= 0 ? number : undefined
+    }
     const input = price(pricing?.input_usd_per_1m)
     const outputPrice = price(pricing?.output_usd_per_1m)
     result.push({
       id,
       name: typeof record?.label === "string" && record.label.trim() ? record.label : typeof record?.name === "string" ? record.name : undefined,
       toolcall: typeof record?.tool_call === "boolean" ? record.tool_call : undefined,
-      cost:
-        input !== undefined && outputPrice !== undefined
-          ? {
-              input,
-              output: outputPrice,
-              cacheRead: price(pricing?.cache_read_usd_per_1m) ?? 0,
-              cacheWrite: price(pricing?.cache_write_usd_per_1m) ?? 0,
-            }
-          : undefined,
+      cost: pricing
+        ? {
+            input: input ?? 0,
+            output: outputPrice ?? 0,
+            cacheRead: price(pricing.cache_read_usd_per_1m) ?? 0,
+            cacheWrite: price(pricing.cache_write_usd_per_1m) ?? 0,
+          }
+        : undefined,
       context: positive(record?.context_length, record?.context_window, record?.max_context_length),
       output: positive(record?.max_output_tokens, record?.max_completion_tokens),
     })
