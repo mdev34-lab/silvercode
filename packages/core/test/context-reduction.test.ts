@@ -122,6 +122,13 @@ describe("SessionContextReduction", () => {
     expect(result.report.reclaimedTokens).toBe(0)
   })
 
+  test("keeps a quarter of the context when the output reserve meets or exceeds it", () => {
+    const messages = [user("hello"), assistant([text("hi")])]
+    const result = reduce({ messages, model: windowModel(8_000, 8_000) })
+    expect(result.report.limit).toBe(2_000)
+    expect(result.report.outcome).toBe("untouched")
+  })
+
   test("reports as sent when the model declares no usable window", () => {
     const messages = [user(big("question")), assistant([text(big("answer"))])]
     const result = reduce({ messages, model: Model.make({ id: "unknown", provider: "test", route: OpenAIChat.route }) })
