@@ -2228,6 +2228,7 @@ function Finish(props: ToolProps) {
   // gate and must not pre-announce its verdict.
   const review = createMemo(() => (props.part.state.status === "completed" ? parseReviewReport(result()) : undefined))
   const [expanded, setExpanded] = createSignal(false)
+  const [errorExpanded, setErrorExpanded] = createSignal(false)
   // The block shows the agent's own summary; the tool output also carries
   // runtime bookkeeping lines that are not part of what the agent said.
   const shown = createMemo(() => stringValue(props.input.result)?.trim() || result())
@@ -2251,7 +2252,18 @@ function Finish(props: ToolProps) {
       fallback={
         <Switch>
           <Match when={block()?.tone === "quiet"}>
-            <InlineToolRow icon="✕" color={theme.textMuted} complete={true} pending="" separate={false}>
+            <InlineToolRow
+              icon="✕"
+              color={theme.textMuted}
+              errorColor={theme.textMuted}
+              failed={true}
+              complete={true}
+              pending=""
+              separate={false}
+              error={props.part.state.status === "error" ? props.part.state.error : undefined}
+              errorExpanded={errorExpanded()}
+              onMouseUp={() => setErrorExpanded((prev) => !prev)}
+            >
               Finish call failed
             </InlineToolRow>
           </Match>
@@ -2293,7 +2305,7 @@ export function tintColor(color: RGBA, base: RGBA, amount: number) {
     base.r + (color.r - base.r) * amount,
     base.g + (color.g - base.g) * amount,
     base.b + (color.b - base.b) * amount,
-    1,
+    base.a,
   )
 }
 
@@ -2344,7 +2356,8 @@ export function finishBlockView(part: ToolPart, input: Record<string, unknown>, 
     metadata?.waiting === true || reason === "waiting_for_subagent" || reason === "subagent_wait"
   if (waiting) return { tone: "waiting" as const, title: `${WAITING_ICON} ${WAITING_LABEL}`, detail: result }
   if (reason === "failure") return { tone: "failure" as const, title: "✗ Task failed", detail: result }
-  if (reason === "cancelled") return { tone: "waiting" as const, title: "✗ Task cancelled", detail: result }
+  if (reason !== undefined && reason !== "success")
+    return { tone: "waiting" as const, title: `◌ Finish: ${reason}`, detail: result }
   return { tone: "success" as const, title: "✓ Task completed", detail: result }
 }
 

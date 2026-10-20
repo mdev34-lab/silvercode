@@ -28,6 +28,11 @@ describe("finish block view", () => {
     })
   })
 
+  test("an unrecognised reason is never shown as success", () => {
+    expect(finishBlockView(part("completed"), { reason: "mystery" })?.tone).toBe("waiting")
+    expect(finishBlockView(part("completed"), {})?.tone).toBe("success")
+  })
+
   test("pending and running calls have no block", () => {
     expect(finishBlockView(part("pending"), {})).toBeUndefined()
     expect(finishBlockView(part("running"), {})).toBeUndefined()
