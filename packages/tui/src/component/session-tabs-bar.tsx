@@ -19,7 +19,7 @@ export function SessionTabsBar() {
   const tabs = useSessionTabs()
   const sync = useSync()
   const route = useRoute()
-  const theme = useTheme()
+  const { theme } = useTheme()
   const dimensions = useTerminalDimensions()
 
   const layout = createMemo(() =>

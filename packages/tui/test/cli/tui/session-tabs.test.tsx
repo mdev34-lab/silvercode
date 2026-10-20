@@ -126,7 +126,7 @@ async function mount(options: { width: number; route: Route; sessions: string[];
             <RouteProvider initialRoute={options.route}>
               <TuiConfigProvider config={config}>
                 <PluginRuntimeProvider value={pluginRuntime}>
-                  <SDKProvider url="http://test" directory={directory} fetch={fetch} events={events.source}>
+                  <SDKProvider url="http://test" directory={directory} fetch={fetch as unknown as typeof globalThis.fetch} events={events.source}>
                     <PermissionProvider>
                       <ProjectProvider>
                         <LocationProvider>
