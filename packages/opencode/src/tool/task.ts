@@ -34,6 +34,11 @@ export interface TaskPromptOps {
 // Weak keys isolate registries/instances and do not keep disposed ones alive.
 const receipts = new WeakMap<BackgroundJob.Interface, Set<string>>()
 
+// A resumed subagent (task_id) reuses its session ID, so receipts are keyed per
+// run: the ID plus the job's start time. A stale notifier of an earlier run must
+// not claim or consume the receipt of a later run on the same session.
+const runKey = (job: { id: string; started_at: number }) => `${job.id}@${job.started_at}`
+
 const id = "task"
 const BACKGROUND_DESCRIPTION = [
   "Subagents run asynchronously by default: the tool launches the subagent and returns immediately.",
@@ -567,6 +572,7 @@ export const TaskTool = Tool.define(
         text: string,
         termination: TerminationReason | undefined,
         silent = false,
+        receiptKey = nextSession.id,
       ) {
         // Notifications must run in the parent session, under the parent agent -
         // the same one the routing above read, not a second opinion taken when
@@ -587,8 +593,8 @@ export const TaskTool = Tool.define(
           // descendant rows in the headless tracker.
           silent = ended.info?.cancelledByTeardown === true
         }
-        if (receipted.has(nextSession.id)) return
-        receipted.add(nextSession.id)
+        if (receipted.has(receiptKey)) return
+        receipted.add(receiptKey)
         const wrote = yield* Ref.get(wroteFiles)
         yield* ops
           .prompt({
@@ -637,12 +643,13 @@ export const TaskTool = Tool.define(
             Effect.gen(function* () {
               const reason = yield* Ref.get(termination)
               if (result.info?.status === "completed")
-                return yield* inject("completed", result.info.output ?? "", reason)
+                return yield* inject("completed", result.info.output ?? "", reason, false, runKey(result.info))
               // A subagent can declare a reason and still fail afterwards, for
               // example when review envelope extraction fails after finish. The
               // reason was captured before that failure, so deliver it rather
               // than reporting a bare <task_error> with no signal.
-              if (result.info?.status === "error") return yield* inject("error", result.info.error ?? "", reason)
+              if (result.info?.status === "error")
+                return yield* inject("error", result.info.error ?? "", reason, false, runKey(result.info))
               // A cancelled run produced no finish call and no declared reason.
               // The job outcome is the termination: deliver it so the parent
               // resumes orchestration knowing the user stopped the child,
@@ -662,6 +669,7 @@ export const TaskTool = Tool.define(
                   result.info.output ?? CANCELLED_TEXT,
                   "cancelled",
                   result.info.cancelledByTeardown === true,
+                  runKey(result.info),
                 )
               }
             }),
@@ -720,7 +728,7 @@ export const TaskTool = Tool.define(
         const termination = state === "cancelled" ? ("cancelled" as const) : yield* descendantTermination(descendant)
         // Claim only after the transcript read succeeds. If it fails, this
         // dispatch errors and the still-live notifier must deliver the report.
-        receipted.add(job.id)
+        receipted.add(runKey(job))
         return yield* promptChild([
           {
             type: "text" as const,
@@ -764,7 +772,7 @@ export const TaskTool = Tool.define(
        */
       const park = Effect.fn("TaskTool.parkChild")(function* (last: string) {
         const delivered = yield* Ref.get(reported)
-        const behind = (yield* childJobs()).filter((job) => job.status === "running" || !delivered.has(job.id))
+        const behind = (yield* childJobs()).filter((job) => job.status === "running" || !delivered.has(runKey(job)))
         if (behind.length === 0) return { text: last, parked: false }
         // The child's run has ended, and this is what keeps that from reading
         // as "the child is finished" to anything watching the session.
@@ -774,14 +782,14 @@ export const TaskTool = Tool.define(
           while (true) {
             const kids = yield* childJobs()
             const seen = yield* Ref.get(reported)
-            const settled = kids.filter((job) => job.status !== "running" && !seen.has(job.id))
+            const settled = kids.filter((job) => job.status !== "running" && !seen.has(runKey(job)))
             if (settled.length > 0) {
               for (const job of settled) {
-                yield* Ref.update(reported, (ids) => new Set(ids).add(job.id))
+                yield* Ref.update(reported, (ids) => new Set(ids).add(runKey(job)))
                 // Teardown notifications still write a silent terminal envelope
                 // themselves. Do not claim their receipt or resurrect the child.
                 if (job.cancelledByTeardown) continue
-                if (receipted.has(job.id)) continue
+                if (receipted.has(runKey(job))) continue
                 text = yield* resumeChild(job)
                 if ((yield* Ref.get(declaredReason)) !== "waiting_for_subagent") return text
               }
@@ -842,8 +850,8 @@ export const TaskTool = Tool.define(
         }
       }
 
-      // A reused session ID starts a new job, hence a new delivery obligation.
-      receipted.delete(nextSession.id)
+      // A reused session ID starts a new job, hence a new delivery obligation:
+      // receipts are keyed per run (runKey), so nothing to reset here.
       const info = yield* background.start({
         id: nextSession.id,
         type: id,

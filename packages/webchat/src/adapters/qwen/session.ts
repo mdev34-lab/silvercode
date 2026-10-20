@@ -847,6 +847,9 @@ export class QwenWebSession implements WebChatProvider {
       }
 
       let failure: unknown
+      // A stall ends the turn gracefully, but with no output at all it must still
+      // surface as the retryable timeout rather than an empty-response error.
+      let stall: unknown
       try {
         for (;;) {
           if (signal?.aborted) {
@@ -891,6 +894,7 @@ export class QwenWebSession implements WebChatProvider {
           // The upstream went quiet without a terminating event. Recover the
           // unclosed tail and end gracefully so tool calls already emitted are
           // still usable instead of the turn wedging forever.
+          stall = error
           stopUpstream()
         } else {
           failure = withQwenWebErrorPhase(error, "stream")
@@ -943,7 +947,7 @@ export class QwenWebSession implements WebChatProvider {
           removeById(thread, fid)
           if (seedUsed !== undefined) thread.seedText = seedUsed
           this.store.put(thread)
-          yield { type: "error", error: failure ?? emptyResponseError() }
+          yield { type: "error", error: failure ?? stall ?? emptyResponseError() }
           trace("turn done", { failure: true, empty: true })
           yield { type: "done", thread }
           return "finished"
