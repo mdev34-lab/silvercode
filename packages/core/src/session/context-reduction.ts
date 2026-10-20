@@ -453,7 +453,7 @@ const staleOutputs = (messages: readonly SessionMessage.Message[], protection: P
  * Only the prefix *before* the protected recent window is ever eligible: dropping a recent turn is
  * worse than sending an oversized request, because the model would answer a question it can no
  * longer see. So "until it fits" is a best effort — when the eligible prefix runs out the report
- * says `exhausted` and the runtime escalates to compaction rather than pruning protected content.
+ * says `exhausted` and the runtime does not prune protected content. Compaction is a separate, config-driven step (`compaction.auto`) that runs on its own measurement of the request.
  */
 const dropOldest = (
   state: { readonly messages: readonly SessionMessage.Message[]; readonly characters: number },
