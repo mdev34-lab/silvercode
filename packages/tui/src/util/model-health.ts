@@ -20,12 +20,11 @@ export function next(previous: HealthEntry | undefined, outcome: ProbeOutcome, a
   return { outcome, at, failures: outcome === "ok" ? 0 : (previous?.failures ?? 0) + 1 }
 }
 
-/** One rate limit or network error is degraded; only repeated real errors count as failing. */
+/** A rate limit or network error is degraded; a real error from the provider is failing. */
 export function status(entry: HealthEntry | undefined, now: number): HealthStatus {
   if (!entry || now - entry.at > STALE_MS) return "unknown"
   if (entry.outcome === "ok") return "working"
-  if (entry.outcome === "error" && entry.failures >= 2) return "failing"
-  return "degraded"
+  return entry.outcome === "error" ? "failing" : "degraded"
 }
 
 /** When the model is next due for a probe. Failures back off exponentially up to 8x the base interval. */

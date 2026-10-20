@@ -51,7 +51,7 @@ export function DialogModel(props: { providerID?: string }) {
             key: item,
             value: { providerID: provider.id, modelID: model.id },
             title: model.name ?? item.modelID,
-            description: provider.name,
+            description: category === "Pinned" ? undefined : provider.name,
             category,
             disabled: provider.id === "opencode" && model.id.includes("-nano"),
             titleView:

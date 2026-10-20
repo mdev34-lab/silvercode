@@ -13,11 +13,10 @@ describe("model health", () => {
     const once = next(undefined, "transient", 0)
     expect(status(once, 1)).toBe("degraded")
     expect(status(next(once, "transient", 1), 2)).toBe("degraded")
-    expect(status(next(undefined, "error", 0), 1)).toBe("degraded")
   })
 
-  test("repeated real errors fail, and a success recovers", () => {
-    const failing = next(next(undefined, "error", 0), "error", 1)
+  test("a real error fails, and a success recovers", () => {
+    const failing = next(undefined, "error", 1)
     expect(status(failing, 2)).toBe("failing")
     const recovered = next(failing, "ok", 3)
     expect(recovered.failures).toBe(0)
