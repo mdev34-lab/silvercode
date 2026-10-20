@@ -22,7 +22,13 @@ export const make = (rootSessionID: string) => {
 
   return {
     launch(input: { sessionID: string; parentSessionID: string }) {
-      if (launched.has(input.sessionID) || input.sessionID === rootSessionID) return false
+      if (input.sessionID === rootSessionID) return false
+      // A session already launched and still pending is the same run. One that
+      // already resolved was resumed (task_id): a new run, so it is pending again.
+      if (launched.has(input.sessionID)) {
+        if (!resolved.has(input.sessionID)) return false
+        resolved.delete(input.sessionID)
+      }
       launched.set(input.sessionID, input.parentSessionID)
       return known(input.sessionID) && !resolved.has(input.sessionID)
     },

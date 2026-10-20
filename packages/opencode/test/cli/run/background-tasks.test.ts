@@ -89,3 +89,15 @@ test("descendant launches observed before the parent are adopted", () => {
   tasks.resolve(grandchild)
   expect(tasks.settled()).toBe(true)
 })
+
+test("a resolved session resumed through task_id is pending again until its new run reports", () => {
+  const tasks = BackgroundTasks.make(root)
+  expect(tasks.launch(launch(root, child))).toBe(true)
+  tasks.resolve(child)
+  expect(tasks.settled()).toBe(true)
+  expect(tasks.launch(launch(root, child))).toBe(true)
+  expect(tasks.pending()).toEqual([child])
+  expect(tasks.settled()).toBe(false)
+  tasks.resolve(child)
+  expect(tasks.settled()).toBe(true)
+})
