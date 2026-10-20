@@ -76,6 +76,8 @@ jobs:
       - run: gh release edit "${{ needs.version.outputs.tag }}" --draft=false --latest
 
   npm:
+    env:
+      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
     # The launcher downloads the finished release, so it can only be published after finalize.
     needs: [version, finalize]
     if: ${{ !inputs.dry_run }}
@@ -88,11 +90,10 @@ jobs:
       - name: Publish the launcher package to npm
         if: ${{ env.NPM_TOKEN != '' }}
         run: |
+          trap 'rm -f "$HOME/.npmrc"' EXIT
           echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" > "$HOME/.npmrc"
           ./packages/opencode/script/publish.ts
-          rm -f "$HOME/.npmrc"
         env:
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
           SILVERCODE_VERSION: ${{ needs.version.outputs.version }}
           SILVERCODE_RELEASE: "1"
 
