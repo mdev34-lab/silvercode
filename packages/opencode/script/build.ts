@@ -243,6 +243,15 @@ if (Script.release) {
     }
     archives.push(`./dist/${archive}`)
   }
+  // The npm launcher downloads these archives and checks each against this file.
+  const sums = await Promise.all(
+    archives.map(async (archive) => {
+      const hash = new Bun.CryptoHasher("sha256").update(await Bun.file(archive).arrayBuffer()).digest("hex")
+      return `${hash}  ${archive.split("/").pop()}\n`
+    }),
+  )
+  await Bun.write("./dist/SHA256SUMS", sums.join(""))
+  archives.push("./dist/SHA256SUMS")
   await uploadReleaseArchives(tagForVersion(Script.version), archives)
 }
 
