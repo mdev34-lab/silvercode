@@ -681,7 +681,9 @@ export const TaskTool = Tool.define(
        */
       const childJobs = Effect.fn("TaskTool.childJobs")(function* () {
         const jobs = yield* background.list()
-        return jobs.filter((job) => job.type === id && BackgroundJob.isSubagentOf(job, nextSession.id))
+        return jobs.filter(
+          (job) => job.type === id && BackgroundJob.isSubagentOf(job, nextSession.id) && job.metadata?.background !== false,
+        )
       })
 
       /**
