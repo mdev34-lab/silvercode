@@ -40,8 +40,8 @@ export interface Policy {
    * Fraction of the usable window at which reduction starts, and the target it reduces back to.
    *
    * Reduction aims at the threshold rather than at the window itself so the response keeps its
-   * headroom. Compaction — not a deeper reduction — is the escalation when the threshold cannot be
-   * reached, because everything left is protected.
+   * headroom. When the threshold cannot be reached because everything left is protected, reduction
+   * stops; compaction (a separate step, see `compaction.auto`) is what shrinks the history then.
    */
   readonly threshold: number
   /** Assistant turns a failed call keeps its original input for. */
@@ -384,7 +384,7 @@ const duplicateOutputs = (messages: readonly SessionMessage.Message[], protectio
   }
   // The newest occurrence always survives, including inside the protected window: protection means
   // a call never loses its own output, and that rule has no override. When nothing unprotected is
-  // left the request stays large and the runtime escalates instead of pruning anyway.
+  // left the request stays large and reduction stops instead of pruning anyway.
   const superseded = new Set(
     Array.from(seen.values())
       .flatMap((ids) => ids.slice(0, -1))

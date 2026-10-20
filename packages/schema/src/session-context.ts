@@ -10,7 +10,7 @@ import { NonNegativeInt, optional } from "./schema"
  * - `reduced`: the request was over the reduction threshold and the deterministic rungs brought it
  *   back under.
  * - `exhausted`: every rung ran and the request is still over, because only protected content is
- *   left to send. Reduction stops; compaction is a separate step governed by `compaction.auto`.
+ *   left to send. Reduction stops; compaction is a separate step: threshold compaction follows `compaction.auto`, overflow compaction after a provider error does not.
  */
 export const Outcome = Schema.Literals(["untouched", "reduced", "exhausted"])
 export type Outcome = typeof Outcome.Type
