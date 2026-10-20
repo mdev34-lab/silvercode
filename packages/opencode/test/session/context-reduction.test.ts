@@ -49,3 +49,22 @@ describe("session context reduction adapter", () => {
     expect(result.messages).toBe(messages)
   })
 })
+
+describe("multi-turn behavior", () => {
+  test("is deterministic and re-derives from canonical history every turn", () => {
+    const big = "x".repeat(20000)
+    const history: never[] = [user("m0", "start")]
+    const sizes: number[] = []
+    for (let turn = 0; turn < 8; turn++) {
+      history.push(tool(`a${turn}`, `c${turn}`, big + turn), user(`u${turn}`, "next"))
+      const snapshot = JSON.stringify(history)
+      const first = ContextReduction.reduce({ messages: history, envelope: {}, model, config: undefined })
+      const second = ContextReduction.reduce({ messages: history, envelope: {}, model, config: undefined })
+      expect(JSON.stringify(first.messages)).toBe(JSON.stringify(second.messages))
+      expect(JSON.stringify(history)).toBe(snapshot)
+      sizes.push(JSON.stringify(first.messages).length)
+    }
+    // pressure is bounded: the projection does not grow with every turn
+    expect(sizes[7]).toBeLessThan(JSON.stringify(history).length)
+  })
+})
