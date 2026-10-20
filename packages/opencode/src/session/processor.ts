@@ -264,9 +264,13 @@ const layer = Layer.effect(
         if (!(reasoningID in ctx.reasoningMap)) return
         // oxlint-disable-next-line no-self-assign -- reactivity trigger
         ctx.reasoningMap[reasoningID].text = ctx.reasoningMap[reasoningID].text
-        ctx.reasoningMap[reasoningID].time = { ...ctx.reasoningMap[reasoningID].time, end: ctx.reasoningLast[reasoningID] ?? Date.now() }
+        ctx.reasoningMap[reasoningID].time = {
+          ...ctx.reasoningMap[reasoningID].time,
+          end: ctx.reasoningLast[reasoningID] ?? Date.now(),
+        }
         yield* session.updatePart(ctx.reasoningMap[reasoningID])
         delete ctx.reasoningMap[reasoningID]
+        delete ctx.reasoningLast[reasoningID]
         delete ctx.reasoningLast[reasoningID]
       })
 
@@ -636,6 +640,7 @@ const layer = Layer.effect(
           })
         }
         ctx.reasoningMap = {}
+        ctx.reasoningLast = {}
 
         yield* Effect.forEach(
           Object.values(ctx.toolcalls),
@@ -710,6 +715,8 @@ const layer = Layer.effect(
           yield* Effect.gen(function* () {
             ctx.currentText = undefined
             ctx.reasoningMap = {}
+            ctx.reasoningLast = {}
+        ctx.reasoningLast = {}
             yield* status.set(ctx.sessionID, { type: "busy" })
             const stream = llm.stream(streamInput)
             clock.startRequest(Date.now())
