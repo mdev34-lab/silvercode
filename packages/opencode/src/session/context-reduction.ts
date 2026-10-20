@@ -61,7 +61,7 @@ const view = (entry: Entry): SessionMessage.Message => {
   return {
     type: "assistant",
     id: entry.info.id,
-    content: entry.parts.flatMap((part) => {
+    content: entry.parts.flatMap((part): unknown[] => {
       if (part.type === "text") return [{ type: "text", id: part.id, text: part.text }]
       if (part.type === "reasoning") return [{ type: "reasoning", id: part.id, text: part.text }]
       if (part.type === "tool")
