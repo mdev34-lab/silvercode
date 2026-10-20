@@ -1,4 +1,7 @@
-import { describe, expect } from "bun:test"
+import { describe, expect, setDefaultTimeout } from "bun:test"
+
+// These fixtures run several real Git operations; Windows runners exceed Bun's 5s default.
+setDefaultTimeout(20_000)
 import { $ } from "bun"
 import fs from "fs/promises"
 import path from "path"
