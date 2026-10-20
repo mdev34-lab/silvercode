@@ -32,11 +32,20 @@ export function providerInfo(): Info {
  * (`{ data: [{ id }] }`), `{ models: [...] }` and a bare array whose items are
  * objects with an `id` or plain strings.
  */
-export function parseModelList(body: unknown): { id: string; name?: string; context?: number; output?: number }[] {
+export type ModelEntry = {
+  id: string
+  name?: string
+  context?: number
+  output?: number
+  toolcall?: boolean
+  cost?: { input: number; output: number; cacheRead: number; cacheWrite: number }
+}
+
+export function parseModelList(body: unknown): ModelEntry[] {
   const list = Array.isArray(body) ? body : isRecord(body) ? (body.data ?? body.models) : undefined
   if (!Array.isArray(list)) return []
   const seen = new Set<string>()
-  const result: { id: string; name?: string; context?: number; output?: number }[] = []
+  const result: ModelEntry[] = []
   for (const item of list) {
     const record = isRecord(item) ? item : undefined
     const id = typeof item === "string" ? item : typeof record?.id === "string" ? record.id : undefined
@@ -44,9 +53,23 @@ export function parseModelList(body: unknown): { id: string; name?: string; cont
     seen.add(id)
     const positive = (...values: unknown[]) =>
       values.find((value): value is number => typeof value === "number" && Number.isFinite(value) && value > 0)
+    const pricing = isRecord(record?.pricing) ? record.pricing : undefined
+    const price = (value: unknown) => (typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined)
+    const input = price(pricing?.input_usd_per_1m)
+    const outputPrice = price(pricing?.output_usd_per_1m)
     result.push({
       id,
-      name: typeof record?.name === "string" ? record.name : undefined,
+      name: typeof record?.label === "string" ? record.label : typeof record?.name === "string" ? record.name : undefined,
+      toolcall: typeof record?.tool_call === "boolean" ? record.tool_call : undefined,
+      cost:
+        input !== undefined && outputPrice !== undefined
+          ? {
+              input,
+              output: outputPrice,
+              cacheRead: price(pricing?.cache_read_usd_per_1m) ?? 0,
+              cacheWrite: price(pricing?.cache_write_usd_per_1m) ?? 0,
+            }
+          : undefined,
       context: positive(record?.context_length, record?.context_window, record?.max_context_length),
       output: positive(record?.max_output_tokens, record?.max_completion_tokens),
     })
@@ -54,7 +77,7 @@ export function parseModelList(body: unknown): { id: string; name?: string; cont
   return result
 }
 
-export function toModel(entry: ReturnType<typeof parseModelList>[number]): Model {
+export function toModel(entry: ModelEntry): Model {
   return {
     id: ModelV2.ID.make(entry.id),
     providerID: ProviderV2.ID.make(TOKENHARBOR_PROVIDER_ID),
@@ -64,13 +87,17 @@ export function toModel(entry: ReturnType<typeof parseModelList>[number]): Model
     status: "active",
     headers: {},
     options: {},
-    cost: { input: 0, output: 0, cache: { read: 0, write: 0 } },
+    cost: {
+      input: entry.cost?.input ?? 0,
+      output: entry.cost?.output ?? 0,
+      cache: { read: entry.cost?.cacheRead ?? 0, write: entry.cost?.cacheWrite ?? 0 },
+    },
     limit: { context: entry.context ?? DEFAULT_CONTEXT, output: entry.output ?? DEFAULT_OUTPUT },
     capabilities: {
       temperature: true,
       reasoning: false,
       attachment: false,
-      toolcall: true,
+      toolcall: entry.toolcall ?? true,
       input: { text: true, audio: false, image: false, video: false, pdf: false },
       output: { text: true, audio: false, image: false, video: false, pdf: false },
       interleaved: false,

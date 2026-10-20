@@ -8,6 +8,27 @@ describe("tokenharbor model list", () => {
     expect(list[1].context).toBe(64000)
   })
 
+  test("reads label, pricing and tool support from the real catalog shape", () => {
+    const [entry] = parseModelList({
+      object: "list",
+      data: [
+        {
+          id: "claude-sonnet-4.6",
+          object: "model",
+          label: "Claude Sonnet 4.6",
+          pricing: { input_usd_per_1m: 3, output_usd_per_1m: 15, cache_read_usd_per_1m: 0.3, cache_write_usd_per_1m: 3.75 },
+          context_length: null,
+          tool_call: true,
+        },
+      ],
+    })
+    const model = toModel(entry)
+    expect(model.name).toBe("Claude Sonnet 4.6")
+    expect(model.cost).toEqual({ input: 3, output: 15, cache: { read: 0.3, write: 3.75 } })
+    expect(model.capabilities.toolcall).toBe(true)
+    expect(model.limit.context).toBe(128_000)
+  })
+
   test("accepts bare arrays, models key and plain strings", () => {
     expect(parseModelList([{ id: "x" }, "y"]).map((item) => item.id)).toEqual(["x", "y"])
     expect(parseModelList({ models: [{ id: "z" }] }).map((item) => item.id)).toEqual(["z"])
