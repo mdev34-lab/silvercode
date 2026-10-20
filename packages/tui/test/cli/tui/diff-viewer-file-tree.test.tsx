@@ -169,7 +169,7 @@ async function renderOnceSettled(app: Awaited<ReturnType<typeof testRender>>) {
 }
 
 async function captureSettledFrame(app: Awaited<ReturnType<typeof testRender>>) {
-  for (let attempt = 0; attempt < 5; attempt++) {
+  for (let attempt = 0; attempt < 40; attempt++) {
     const frame = app.captureCharFrame()
     if (frame.trim().length > 0) return frame
     await new Promise((resolve) => setTimeout(resolve, 25))
@@ -183,7 +183,9 @@ function withTheme(component: () => JSX.Element) {
     <TestTuiContexts>
       <TuiConfigProvider config={createTuiResolvedConfig()}>
         <KVProvider>
-          <ThemeProvider mode="dark">{component()}</ThemeProvider>
+          <ThemeProvider mode="dark" source={{ discover: async () => ({}) }}>
+            {component()}
+          </ThemeProvider>
         </KVProvider>
       </TuiConfigProvider>
     </TestTuiContexts>
