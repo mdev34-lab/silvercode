@@ -131,6 +131,12 @@ export class ThreadStore {
         for (const thread of parsed.threads) {
           const usable = sanitizeThread(thread)
           if (usable) this.threads.set(usable.id, usable)
+          else {
+            // Name the dropped entry (id only, never its content) so schema drift is
+            // diagnosable; the next flush rewrites the file without it.
+            const id = (thread as { id?: unknown } | null)?.id
+            console.error("[webchat] dropped unusable persisted thread", typeof id === "string" ? id : "(no id)")
+          }
         }
       }
     } catch {
