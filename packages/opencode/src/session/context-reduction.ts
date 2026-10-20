@@ -11,9 +11,9 @@ import { SessionContextReduction } from "@opencode-ai/core/session/context-reduc
 import type { SessionContext } from "@opencode-ai/schema/session-context"
 import type { SessionMessage } from "@opencode-ai/core/session/message"
 import type { ConfigV1 } from "@opencode-ai/core/v1/config/config"
-import type { MessageV2 } from "./message-v2"
+import type { WithParts } from "@opencode-ai/core/v1/session"
 
-type Entry = MessageV2.WithParts
+type Entry = WithParts
 
 const textOf = (parts: readonly { type: string; text?: string }[]) =>
   parts
