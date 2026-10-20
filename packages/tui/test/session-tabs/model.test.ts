@@ -116,7 +116,7 @@ describe("session tab state", () => {
 describe("session tab layout", () => {
   test("a normal width shows every tab with room for full titles", () => {
     const view = SessionTabs.layout({ count: 3, active: 1, width: 120 })
-    expect(view).toEqual({ start: 0, end: 3, titleWidth: 31 })
+    expect(view).toEqual({ start: 0, end: 3, titleWidth: 28 })
   })
 
   test("a narrow width keeps the active tab visible and every visible title readable", () => {

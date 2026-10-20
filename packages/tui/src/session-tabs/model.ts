@@ -112,7 +112,7 @@ export function truncate(title: string, max: number): string {
 }
 
 const MIN_CELL = 12
-const CHROME = 7
+const CHROME = 10
 const RESERVED = 6 // "+" button and overflow markers
 
 // Which tabs fit in the strip and how long their titles may be. Keeps the active

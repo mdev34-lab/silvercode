@@ -10,10 +10,9 @@ import { isDefaultTitle } from "../util/session"
 
 /**
  * One row above the session view: a tab per open session. The active tab is
- * marked with a leading triangle and highlighted, a running session shows a dot,
- * and a background session that needs the user shows a diamond. The marker keeps
- * the active tab identifiable in plain text, not only by colour. Clicking a tab selects it; the "+" starts a
- * new session. Keyboard shortcuts live in app.tsx.
+ * highlighted, bold and carries a close button, a running session shows a dot,
+ * and a background session that needs the user shows a diamond. Clicking a tab
+ * selects it; the "+" starts a new session. Keyboard shortcuts live in app.tsx.
  */
 export function SessionTabsBar() {
   const tabs = useSessionTabs()
@@ -58,8 +57,15 @@ export function SessionTabsBar() {
                 onMouseDown={() => tabs.select(tab.id)}
               >
                 <text fg={active() ? theme.text : theme.textMuted}>
-                  {`${active() ? "▸" : " "}${tab.index} ${SessionTabs.truncate(title(tab.id), layout().titleWidth)}`}
+                  <span style={{ bold: active() }}>
+                    {`${tab.index} ${SessionTabs.truncate(title(tab.id), layout().titleWidth)}`}
+                  </span>
                 </text>
+                <Show when={active()}>
+                  <box onMouseDown={() => tabs.close(tab.id)} paddingLeft={2}>
+                    <text fg={theme.textMuted}>×</text>
+                  </box>
+                </Show>
                 <Show when={tabs.isRunning(tab.id)}>
                   <text fg={theme.success}>{" ●"}</text>
                 </Show>
@@ -73,10 +79,18 @@ export function SessionTabsBar() {
         <Show when={layout().end < tabs.open.length}>
           <text fg={theme.textMuted}>{` ›${tabs.open.length - layout().end}`}</text>
         </Show>
-        <box flexGrow={1} />
-        <box onMouseDown={() => route.navigate({ type: "home" })} paddingLeft={1} paddingRight={1}>
-          <text fg={theme.textMuted}>+</text>
+        <box
+          onMouseDown={() => route.navigate({ type: "home" })}
+          paddingLeft={1}
+          paddingRight={1}
+          marginLeft={1}
+          backgroundColor={theme.backgroundElement}
+        >
+          <text fg={theme.text}>
+            <span style={{ bold: true }}>+</span>
+          </text>
         </box>
+        <box flexGrow={1} />
       </box>
     </Show>
   )
