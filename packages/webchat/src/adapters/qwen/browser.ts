@@ -670,8 +670,9 @@ export class QwenWebBrowser {
     const quick = await quickAuthState(page)
     if (quick === "challenge" || quick === "login") return quick
     if (steer || page.url().startsWith(qwenWebOrigin())) {
-      if (await this.sniffChallenge(page)) return "challenge"
       const probe = await this.probeSession(page).catch(() => "unknown" as const)
+      // An authenticated probe wins: page text may mention "captcha" in chat titles.
+      if (probe !== "authenticated" && (await this.sniffChallenge(page))) return "challenge"
       const state = probe !== "unknown" ? probe : quick
       if (state === "authenticated") markAuthenticated(this.profileDir)
       return state

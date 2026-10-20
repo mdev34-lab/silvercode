@@ -134,7 +134,7 @@ async function mount(options: { width: number; route: Route; sessions: string[];
                             <ExitProvider exit={() => {}}>
                               <SyncProvider>
                                 <DataProvider>
-                                  <ThemeProvider mode="dark">
+                                  <ThemeProvider mode="dark" source={{ discover: async () => ({}) }}>
                                     <LocalProvider>
                                       <SessionTabsProvider>
                                         <PromptStashProvider>
