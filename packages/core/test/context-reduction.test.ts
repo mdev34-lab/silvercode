@@ -339,7 +339,7 @@ describe("SessionContextReduction", () => {
     const oversized = completed("call-1", "read", { file: "/a.ts" }, "small output")
     const messages = [
       user("read it"),
-      assistant([{ ...oversized, state: { ...oversized.state, result: { blob: "y".repeat(100_000) } } }]),
+      assistant([{ ...oversized, state: { ...oversized.state, result: { blob: "y".repeat(100_000) } } as typeof oversized.state }]),
       user("next"),
       assistant([text("ok")]),
     ]

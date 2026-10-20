@@ -3492,7 +3492,7 @@ describe("SessionRunnerLLM", () => {
   const sameTagCalls = (ids: readonly string[]) => bulkCalls(ids.map((id) => ({ id, tag: "same" })))
 
   const reportCollector = (events: EventV2.Interface) => {
-    const reports: (typeof SessionEvent.Context.Prepared.Type)[] = []
+    const reports: (typeof SessionEvent.Context.Prepared.Type)["data"][] = []
     return events
       .listen((event) =>
         Effect.sync(() => {
