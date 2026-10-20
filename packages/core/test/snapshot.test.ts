@@ -1,4 +1,7 @@
-import { $ } from "bun"
+import { describe, expect, setDefaultTimeout } from "bun:test"
+
+// Real Git setup per test; Windows runners intermittently exceed the 5s default (#303).
+setDefaultTimeout(30_000)
 import { describe, expect } from "bun:test"
 import fs from "fs/promises"
 import path from "path"
