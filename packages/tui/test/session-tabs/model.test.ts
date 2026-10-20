@@ -145,3 +145,12 @@ describe("session tab titles", () => {
     expect(SessionTabs.truncate("abc", 0)).toBe("")
   })
 })
+
+describe("plainSelection", () => {
+  test("copies a store-backed selection into values structuredClone accepts", () => {
+    const proxied = new Proxy({ providerID: "p", modelID: "m" }, {})
+    const plain = SessionTabs.plainSelection({ model: proxied, agent: "work", variant: "high" })
+    expect(structuredClone(plain)).toEqual({ model: { providerID: "p", modelID: "m" }, agent: "work", variant: "high" })
+    expect(SessionTabs.plainSelection({})).toEqual({ model: undefined, agent: undefined, variant: undefined })
+  })
+})

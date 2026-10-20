@@ -13,6 +13,16 @@ export type TabSelection = {
   variant?: string
 }
 
+// The selection comes from reactive stores, whose proxies structuredClone cannot copy.
+// Reading the three fields into plain values keeps a tab switch from throwing.
+export function plainSelection(selection: TabSelection): TabSelection {
+  return {
+    model: selection.model ? { providerID: selection.model.providerID, modelID: selection.model.modelID } : undefined,
+    agent: selection.agent,
+    variant: selection.variant,
+  }
+}
+
 export type TabDraft = {
   prompt: PromptInfo
   cursor: number
