@@ -17,9 +17,8 @@ export type TabSelection = {
 // Reading the three fields into plain values keeps a tab switch from throwing.
 export function plainSelection(selection: TabSelection): TabSelection {
   return {
+    ...selection,
     model: selection.model ? { providerID: selection.model.providerID, modelID: selection.model.modelID } : undefined,
-    agent: selection.agent,
-    variant: selection.variant,
   }
 }
 
@@ -92,7 +91,7 @@ export function saveDraft(state: SessionTabsState, key: string, draft: TabDraft)
 }
 
 export function saveSelection(state: SessionTabsState, sessionID: string, selection: TabSelection): SessionTabsState {
-  return { ...state, selections: { ...state.selections, [sessionID]: selection } }
+  return { ...state, selections: { ...state.selections, [sessionID]: plainSelection(selection) } }
 }
 
 // Restored tabs keep their saved order. Sessions that no longer exist are

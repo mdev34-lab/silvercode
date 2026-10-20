@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test"
+import { createStore } from "solid-js/store"
 import { SessionTabs } from "../../src/session-tabs"
 import type { PromptInfo } from "../../src/prompt/history"
 
@@ -146,11 +147,20 @@ describe("session tab titles", () => {
   })
 })
 
-describe("plainSelection", () => {
-  test("copies a store-backed selection into values structuredClone accepts", () => {
-    const proxied = new Proxy({ providerID: "p", modelID: "m" }, {})
-    const plain = SessionTabs.plainSelection({ model: proxied, agent: "work", variant: "high" })
-    expect(structuredClone(plain)).toEqual({ model: { providerID: "p", modelID: "m" }, agent: "work", variant: "high" })
-    expect(SessionTabs.plainSelection({})).toEqual({ model: undefined, agent: undefined, variant: undefined })
+describe("saveSelection", () => {
+  test("stores a store-backed selection as plain values that structuredClone accepts", () => {
+    const [store] = createStore({ model: { providerID: "p", modelID: "m" }, agent: "work", variant: "high" })
+    expect(() => structuredClone(store.model)).toThrow()
+    const next = SessionTabs.saveSelection(SessionTabs.empty(), "ses_1", store)
+    expect(structuredClone(next.selections.ses_1)).toStrictEqual({
+      model: { providerID: "p", modelID: "m" },
+      agent: "work",
+      variant: "high",
+    })
+  })
+
+  test("keeps an absent model absent", () => {
+    const next = SessionTabs.saveSelection(SessionTabs.empty(), "ses_1", { agent: "work" })
+    expect(next.selections.ses_1).toStrictEqual({ model: undefined, agent: "work" })
   })
 })
