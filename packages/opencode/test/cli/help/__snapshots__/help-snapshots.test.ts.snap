@@ -224,10 +224,10 @@ Options:
 `;
 
 exports[`silvercode CLI help-text snapshots every documented command emits stable help text: silvercode web --help 1`] = `
-"      ▄    ▄                               ▄
-▄▀▀   ▄    █   █  █ ▄▀▀  █▀▀▄ ▄▀▀  ▄▀▀▄ ▄▀▀█ ▄▀▀
- ▀▀▄  █    █   █  █ █▀▀▀ █    █    █  █ █  █ █▀▀▀
-▀▀▀   ▀    ▀    ▀▀   ▀▀  ▀     ▀▀   ▀▀   ▀▀▀  ▀▀
+" ▄▄▄ ▄ ▄ ▄  ▄  ▄▄  ▄▄▄   ▄▄▄  ▄▄     ▄  ▄▄
+█    ▄ █ █  █ █  █ █  ▀ █    █  █  ▄▄█ █  █
+ ▀▀▄ █ █ █  █ █▀▀▀ █    █    █  █ █  █ █▀▀▀
+▄▄▄▀ █ █  ▀▄▀ ▀▄▄▄ █    ▀▄▄▄ ▀▄▄▀ ▀▄▄█ ▀▄▄▄
 
 Commands:
   silvercode completion          generate shell completion script
