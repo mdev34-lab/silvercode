@@ -48,7 +48,6 @@ import { ReviewReport } from "@opencode-ai/core/review-report"
 import { useLocal } from "../../context/local"
 import { Locale } from "../../util/locale"
 import { webSearchProviderLabel } from "../../util/tool-display"
-import { finishStatus, finishStatusLines } from "../../util/agent-effort"
 import { useRenderer, useTerminalDimensions, type JSX } from "@opentui/solid"
 import { useSDK } from "../../context/sdk"
 import { useEditorContext } from "../../context/editor"
@@ -2220,6 +2219,7 @@ function Invalid(props: ToolProps) {
 
 function Finish(props: ToolProps) {
   const ctx = use()
+  const { theme } = useTheme()
   const result = createMemo(() => finishResult(props.input, props.output))
   // A completed review subagent delivers its report through a tagged
   // `<silvercode-review>` envelope in the finish result. Render that
@@ -2228,42 +2228,137 @@ function Finish(props: ToolProps) {
   // gate and must not pre-announce its verdict.
   const review = createMemo(() => (props.part.state.status === "completed" ? parseReviewReport(result()) : undefined))
   const [expanded, setExpanded] = createSignal(false)
+  const [errorExpanded, setErrorExpanded] = createSignal(false)
+  // The block shows the agent's own summary; the tool output also carries
+  // runtime bookkeeping lines that are not part of what the agent said.
+  const shown = createMemo(() => stringValue(props.input.result)?.trim() || result())
   const collapsed = createMemo(() =>
     collapseToolOutput(
-      result() ?? "",
+      shown() ?? "",
       COLLAPSED_TOOL_PREVIEW_LINES,
       COLLAPSED_TOOL_PREVIEW_LINES * Math.max(20, ctx.width - 6),
     ),
   )
-  const visible = createMemo(() => (expanded() || !collapsed().overflow ? result() : collapsed().output))
+  const visible = createMemo(() => (expanded() || !collapsed().overflow ? shown() : collapsed().output))
   const view = createMemo(() => finishToolViewForPart(props.part, visible()))
-  const content = createMemo(() => {
-    if (!collapsed().overflow) return view().children
-    return `${view().children}
-  ${expanded() ? "Click to collapse" : "Click to expand"}`
-  })
+  const block = createMemo(() => finishBlockView(props.part, props.input, visible()))
+  const toggle = () => setExpanded((prev) => !prev)
+  const toneColor = (tone: "success" | "waiting" | "failure") =>
+    tone === "success" ? theme.success : tone === "waiting" ? theme.warning : theme.error
 
   return (
     <Show
       when={review()}
       fallback={
-        <InlineTool
-          icon={view().icon}
-          pending={view().pending}
-          complete={view().complete}
-          spinner={view().spinner}
-          failure={view().failure}
-          separate={true}
-          part={props.part}
-          onClick={collapsed().overflow ? () => setExpanded((prev) => !prev) : undefined}
-        >
-          {content()}
-        </InlineTool>
+        <Switch>
+          <Match when={block()?.tone === "quiet"}>
+            <InlineToolRow
+              icon="✕"
+              color={theme.textMuted}
+              errorColor={theme.textMuted}
+              failed={true}
+              complete={true}
+              pending=""
+              separate={false}
+              error={props.part.state.status === "error" ? props.part.state.error : undefined}
+              errorExpanded={errorExpanded()}
+              onMouseUp={() => setErrorExpanded((prev) => !prev)}
+            >
+              Finish call failed
+            </InlineToolRow>
+          </Match>
+          <Match when={block()}>
+            {(item) => (
+              <FinishBlock
+                color={toneColor(item().tone as "success" | "waiting" | "failure")}
+                title={item().title}
+                detail={item().detail}
+                hint={collapsed().overflow ? (expanded() ? "Click to collapse" : "Click to expand") : undefined}
+                onClick={collapsed().overflow ? toggle : undefined}
+              />
+            )}
+          </Match>
+          <Match when={true}>
+            <InlineTool
+              icon={view().icon}
+              pending={view().pending}
+              complete={view().complete}
+              spinner={view().spinner}
+              failure={view().failure}
+              separate={true}
+              part={props.part}
+            >
+              {view().children}
+            </InlineTool>
+          </Match>
+        </Switch>
       }
     >
       {(item) => <ReviewFinish review={item()} part={props.part} />}
     </Show>
   )
+}
+
+/** Blend `color` over `base` so a block gets a dark tint of its own hue. */
+export function tintColor(color: RGBA, base: RGBA, amount: number) {
+  return RGBA.fromValues(
+    base.r + (color.r - base.r) * amount,
+    base.g + (color.g - base.g) * amount,
+    base.b + (color.b - base.b) * amount,
+    base.a,
+  )
+}
+
+function FinishBlock(props: { color: RGBA; title: string; detail?: string; hint?: string; onClick?: () => void }) {
+  const { theme } = useTheme()
+  const renderer = useRenderer()
+  return (
+    <box
+      ref={(el: BoxRenderable) => alwaysSeparate.add(el)}
+      border={["left"]}
+      paddingTop={1}
+      paddingBottom={1}
+      paddingLeft={2}
+      paddingRight={2}
+      marginTop={1}
+      customBorderChars={SplitBorder.customBorderChars}
+      borderColor={props.color}
+      backgroundColor={tintColor(props.color, theme.backgroundPanel, 0.14)}
+      onMouseUp={() => {
+        if (renderer.getSelection()?.getSelectedText()) return
+        props.onClick?.()
+      }}
+    >
+      <text fg={props.color} attributes={TextAttributes.BOLD}>
+        {props.title}
+      </text>
+      <Show when={props.detail}>
+        <text fg={props.color}>{`↳ ${props.detail}`}</text>
+      </Show>
+      <Show when={props.hint}>
+        <text fg={props.color}>{props.hint}</text>
+      </Show>
+    </box>
+  )
+}
+
+/**
+ * How a finished finish call is shown. A failed tool call is a quiet one-line
+ * row; the colored blocks follow the reason the agent declared. Pending and
+ * running calls keep the spinner row (no block).
+ */
+export function finishBlockView(part: ToolPart, input: Record<string, unknown>, result?: string) {
+  if (part.state.status === "error") return { tone: "quiet" as const, title: "Finish call failed", detail: undefined }
+  if (part.state.status !== "completed") return undefined
+  const reason = stringValue(input.reason)
+  const metadata = "metadata" in part.state ? part.state.metadata : undefined
+  const waiting =
+    metadata?.waiting === true || reason === "waiting_for_subagent" || reason === "subagent_wait"
+  if (waiting) return { tone: "waiting" as const, title: `${WAITING_ICON} ${WAITING_LABEL}`, detail: result }
+  if (reason === "failure") return { tone: "failure" as const, title: "✗ Task failed", detail: result }
+  if (reason !== undefined && reason !== "success")
+    return { tone: "waiting" as const, title: `◌ Finish: ${reason}`, detail: result }
+  return { tone: "success" as const, title: "✓ Task completed", detail: result }
 }
 
 type FinishToolStatus = ToolPart["state"]["status"]
@@ -2320,18 +2415,14 @@ export function finishToolView(
       children: "Completing task...",
     }
   }
-  // Completed (or failed) finish results expose their honest review and
-  // validation status inline; transcripts without those fields keep the
-  // original rendering.
   const summary = result ? `${completed}\n↳ ${result}` : completed
-  const statusLines = finishStatus(metadata)
   return {
     icon: waiting ? WAITING_ICON : "✓",
     pending: "Completing task...",
     complete: status === "completed",
     spinner: false,
     failure: "Finish failed",
-    children: statusLines ? `${summary}\n${finishStatusLines(statusLines).join("\n")}` : summary,
+    children: summary,
   }
 }
 

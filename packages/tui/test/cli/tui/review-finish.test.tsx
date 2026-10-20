@@ -459,9 +459,9 @@ describe("review finish rendering", () => {
       }),
       { height: 10 },
     )
-    await app.waitForFrame((frame: string) => frame.includes("Finish failed"))
+    await app.waitForFrame((frame: string) => frame.includes("Finish call failed"))
     const frame = frameOf(app)
-    expect(frame).toContain("Finish failed")
+    expect(frame).toContain("Finish call failed")
     expect(frame).not.toContain("Raw review report")
     expect(frame).not.toContain("Needs fixes")
   })
