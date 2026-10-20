@@ -2228,14 +2228,17 @@ function Finish(props: ToolProps) {
   // gate and must not pre-announce its verdict.
   const review = createMemo(() => (props.part.state.status === "completed" ? parseReviewReport(result()) : undefined))
   const [expanded, setExpanded] = createSignal(false)
+  // The block shows the agent's own summary; the tool output also carries
+  // runtime bookkeeping lines that are not part of what the agent said.
+  const shown = createMemo(() => stringValue(props.input.result)?.trim() || result())
   const collapsed = createMemo(() =>
     collapseToolOutput(
-      result() ?? "",
+      shown() ?? "",
       COLLAPSED_TOOL_PREVIEW_LINES,
       COLLAPSED_TOOL_PREVIEW_LINES * Math.max(20, ctx.width - 6),
     ),
   )
-  const visible = createMemo(() => (expanded() || !collapsed().overflow ? result() : collapsed().output))
+  const visible = createMemo(() => (expanded() || !collapsed().overflow ? shown() : collapsed().output))
   const view = createMemo(() => finishToolViewForPart(props.part, visible()))
   const block = createMemo(() => finishBlockView(props.part, props.input, visible()))
   const toggle = () => setExpanded((prev) => !prev)
