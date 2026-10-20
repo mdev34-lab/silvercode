@@ -13,6 +13,15 @@ export type TabSelection = {
   variant?: string
 }
 
+// The selection comes from reactive stores, whose proxies structuredClone cannot copy.
+// Reading the three fields into plain values keeps a tab switch from throwing.
+export function plainSelection(selection: TabSelection): TabSelection {
+  return {
+    ...selection,
+    model: selection.model ? { providerID: selection.model.providerID, modelID: selection.model.modelID } : undefined,
+  }
+}
+
 export type TabDraft = {
   prompt: PromptInfo
   cursor: number
@@ -82,7 +91,7 @@ export function saveDraft(state: SessionTabsState, key: string, draft: TabDraft)
 }
 
 export function saveSelection(state: SessionTabsState, sessionID: string, selection: TabSelection): SessionTabsState {
-  return { ...state, selections: { ...state.selections, [sessionID]: selection } }
+  return { ...state, selections: { ...state.selections, [sessionID]: plainSelection(selection) } }
 }
 
 // Restored tabs keep their saved order. Sessions that no longer exist are

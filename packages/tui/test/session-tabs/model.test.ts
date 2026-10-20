@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test"
+import { createStore } from "solid-js/store"
 import { SessionTabs } from "../../src/session-tabs"
 import type { PromptInfo } from "../../src/prompt/history"
 
@@ -143,5 +144,23 @@ describe("session tab titles", () => {
     expect(SessionTabs.truncate("short", 10)).toBe("short")
     expect(SessionTabs.truncate("abc", 1)).toBe("…")
     expect(SessionTabs.truncate("abc", 0)).toBe("")
+  })
+})
+
+describe("saveSelection", () => {
+  test("stores a store-backed selection as plain values that structuredClone accepts", () => {
+    const [store] = createStore({ model: { providerID: "p", modelID: "m" }, agent: "work", variant: "high" })
+    expect(() => structuredClone(store.model)).toThrow()
+    const next = SessionTabs.saveSelection(SessionTabs.empty(), "ses_1", store)
+    expect(structuredClone(next.selections.ses_1)).toStrictEqual({
+      model: { providerID: "p", modelID: "m" },
+      agent: "work",
+      variant: "high",
+    })
+  })
+
+  test("keeps an absent model absent", () => {
+    const next = SessionTabs.saveSelection(SessionTabs.empty(), "ses_1", { agent: "work" })
+    expect(next.selections.ses_1).toStrictEqual({ model: undefined, agent: "work" })
   })
 })

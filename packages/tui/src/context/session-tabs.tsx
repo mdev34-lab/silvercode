@@ -119,7 +119,7 @@ function createApi(input: {
       return selection ? structuredClone(selection) : undefined
     },
     setSelection(sessionID: string, selection: SessionTabs.TabSelection) {
-      input.setStore(SessionTabs.saveSelection(unwrap(input.store), sessionID, structuredClone(selection)))
+      input.setStore(SessionTabs.saveSelection(unwrap(input.store), sessionID, selection))
     },
   }
 }
