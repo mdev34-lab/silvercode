@@ -378,6 +378,9 @@ function App(props: { onSnapshot?: () => Promise<string[]>; pluginHost: TuiPlugi
   const tabs = useSessionTabs()
   const dimensions = useTerminalDimensions()
   const renderer = useRenderer()
+  // Every component that reads the terminal size adds its own resize listener, and a busy
+  // session has well over Node's default of 10. The warning would print into the screen.
+  renderer.setMaxListeners(0)
   const dialog = useDialog()
   const local = useLocal()
   const kv = useKV()
