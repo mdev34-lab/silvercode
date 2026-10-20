@@ -500,10 +500,7 @@ export const TaskTool = Tool.define(
         })
 
         yield* projectWrites(result.parts)
-        yield* Ref.set(
-          wroteFiles,
-          result.parts.some((part) => declaresFileWrites(part)),
-        )
+        yield* Ref.update(wroteFiles, (prev) => prev || result.parts.some((part) => declaresFileWrites(part)))
         const finish = result.parts.findLast(
           (item): item is SessionV1.ToolPart =>
             item.type === "tool" && item.tool === FinishTool.id && item.state.status === "completed",

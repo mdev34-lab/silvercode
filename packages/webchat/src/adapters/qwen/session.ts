@@ -750,6 +750,7 @@ export class QwenWebSession implements WebChatProvider {
         if (chatId) lastResponseByChat.delete(chatId)
         chatId = candidate
         thread.providerId = candidate
+        clearAnchors()
         // Carry any response id already seen over to the adopted chat, so a
         // stop request can still reach this generation.
         if (responseId) lastResponseByChat.set(candidate, responseId)
@@ -943,7 +944,7 @@ export class QwenWebSession implements WebChatProvider {
         yield* endText()
         // An empty turn is a failure, not a stop: committing it would hand
         // the caller a silent "finished" with an empty assistant message.
-        if (textParts.length === 0 && toolCalls.length === 0 && !textAccumulated && !reasoningAccumulated) {
+        if (textParts.length === 0 && toolCalls.length === 0 && !textAccumulated && (!reasoningAccumulated || stall !== undefined)) {
           removeById(thread, fid)
           if (seedUsed !== undefined) thread.seedText = seedUsed
           this.store.put(thread)
