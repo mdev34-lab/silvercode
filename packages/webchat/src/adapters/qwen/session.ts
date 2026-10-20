@@ -944,7 +944,7 @@ export class QwenWebSession implements WebChatProvider {
         yield* endText()
         // An empty turn is a failure, not a stop: committing it would hand
         // the caller a silent "finished" with an empty assistant message.
-        if (textParts.length === 0 && toolCalls.length === 0 && !textAccumulated && (!reasoningAccumulated || stall !== undefined)) {
+        if (textParts.length === 0 && toolCalls.length === 0 && !textAccumulated && !reasoningAccumulated) {
           removeById(thread, fid)
           if (seedUsed !== undefined) thread.seedText = seedUsed
           this.store.put(thread)
