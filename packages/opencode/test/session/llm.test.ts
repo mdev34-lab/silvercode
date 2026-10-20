@@ -1521,7 +1521,17 @@ describe("session.llm.stream", () => {
               Stream.fromIterable([
                 LLMEvent.stepStart({ index: 0 }),
                 LLMEvent.textStart({ id: "text-1" }),
-                ...Array.from({ length: 500 }, () => LLMEvent.textDelta({ id: "text-1", text: "x".repeat(1000) })),
+                // Distinct text per delta so the repetition guard (#94) stays quiet and
+                // only the character cap can stop the stream.
+                ...Array.from({ length: 500 }, (_, index) =>
+                  LLMEvent.textDelta({
+                    id: "text-1",
+                    text: Array.from({ length: 100 }, (_, part) => `${index}-${part}:${(index * 7919 + part * 104729) % 99991};`)
+                      .join("")
+                      .slice(0, 1000)
+                      .padEnd(1000, "x"),
+                  }),
+                ),
               ]),
             generate: () => Effect.die(new Error("native generate should not be called in this test")),
           }),
@@ -1536,34 +1546,43 @@ describe("session.llm.stream", () => {
           permission: [{ permission: "*", pattern: "*", action: "allow" }],
         } satisfies Agent.Info
 
-        // Provide the layer in-test (not via drainWith): drainWith's
-        // Effect.promise boundary would convert the guard's Fail into a Die,
-        // hiding the GenerationLimitExceededError identity asserted below.
-        const error = yield* LLM.Service.use((svc) =>
-          svc
-            .stream({
-              user: {
-                id: MessageID.make("msg_user-native-generation-cap"),
-                sessionID,
-                role: "user",
-                time: { created: Date.now() },
-                agent: agent.name,
-                model: { providerID: ProviderV2.ID.make("openai"), modelID: resolved.id, variant: "high" },
-              } satisfies SessionV1.User,
-              sessionID,
-              model: resolved,
-              agent,
-              system: ["You are a helpful assistant."],
-              messages: [{ role: "user", content: "Hello" }],
-              tools: {},
-            })
-            .pipe(Stream.runDrain, Effect.flip),
-        ).pipe(
-          Effect.provide(
-            AppNodeBuilder.build(LLM.node, [
-              [LayerNodePlatform.llmClient, runawayNativeClient],
-              [RuntimeFlags.node, RuntimeFlags.layer({ experimentalNativeLlm: true, generationCharMax: 10_000 })],
-            ]),
+        // Run in a fresh runtime so the flag/client overrides rebuild LLM
+        // instead of reusing the outer test environment's memoized layer
+        // (which ran the AI-SDK path with default flags). The error is flipped
+        // inside the runtime so the guard's Fail keeps its identity across the
+        // promise boundary (drainWith would turn it into a Die).
+        const instanceRef = yield* InstanceRef
+        if (!instanceRef) return yield* Effect.die("InstanceRef not provided")
+        const error = yield* Effect.promise(() =>
+          Effect.runPromise(
+            LLM.Service.use((svc) =>
+              svc
+                .stream({
+                  user: {
+                    id: MessageID.make("msg_user-native-generation-cap"),
+                    sessionID,
+                    role: "user",
+                    time: { created: Date.now() },
+                    agent: agent.name,
+                    model: { providerID: ProviderV2.ID.make("openai"), modelID: resolved.id, variant: "high" },
+                  } satisfies SessionV1.User,
+                  sessionID,
+                  model: resolved,
+                  agent,
+                  system: ["You are a helpful assistant."],
+                  messages: [{ role: "user", content: "Hello" }],
+                  tools: {},
+                })
+                .pipe(Stream.runDrain, Effect.flip),
+            ).pipe(
+              Effect.provide(
+                AppNodeBuilder.build(LLM.node, [
+                  [LayerNodePlatform.llmClient, runawayNativeClient],
+                  [RuntimeFlags.node, RuntimeFlags.layer({ experimentalNativeLlm: true, generationCharMax: 10_000 })],
+                ]),
+              ),
+              Effect.provideService(InstanceRef, instanceRef),
+            ),
           ),
         )
 
