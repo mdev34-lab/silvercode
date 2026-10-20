@@ -199,14 +199,16 @@ describe("Work/Code agent split", () => {
   it.instance("permission-denied tools are hidden while finish remains available", () =>
     Effect.gen(function* () {
       const agent = yield* Agent.Service
-      const plan = yield* agent.get("plan")
-      expect(plan).toBeDefined()
+      // Plan mode keeps edit visible for its plan files (path-scoped allow), so a
+      // blanket-deny agent is what exercises the hidden-tool boundary.
+      const readOnly = yield* agent.get("explore")
+      expect(readOnly).toBeDefined()
 
       const registry = yield* ToolRegistry.Service
       const tools = yield* registry.tools({
         providerID: ProviderV2.ID.make("test"),
         modelID: ModelV2.ID.make("test-model"),
-        agent: plan!,
+        agent: readOnly!,
       })
       const ids = tools.map((tool) => tool.id)
 
