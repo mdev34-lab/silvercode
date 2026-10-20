@@ -64,7 +64,7 @@ const createProjectFixture = async (
   const ctx: InstanceContext = {
     directory: projectDir,
     worktree: projectDir,
-    project: { id: ProjectV2.ID.make("test-project"), root: projectDir },
+    project: { id: ProjectV2.ID.make("test-project"), root: projectDir } as unknown as InstanceContext["project"],
   }
 
   return { projectDir, opencodeDir, ctx }

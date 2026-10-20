@@ -177,10 +177,10 @@ describe("QwenWebBrowser lifecycle", () => {
     const dir = tmpProfile()
     let probe = { status: 403, contentType: "application/json", body: "human verification required" }
     const page = fakePage({
-      evaluate: async (_fn: unknown, arg: unknown) => {
+      evaluate: (async (_fn: unknown, arg: unknown) => {
         if (arg === undefined) return { title: "Qwen", body: "ordinary page" }
         return probe
-      },
+      }) as unknown as QwenWebPage["evaluate"],
     })
     const browser = new QwenWebBrowser({ profileDir: dir, launcher: async () => fakeContext([page]) })
 

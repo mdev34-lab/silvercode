@@ -1146,7 +1146,7 @@ describe("workstream 232 cancellation cleanup (sdk)", () => {
     const ac = new AbortController()
     ac.abort()
     const modelInst = model([CREATED], captured)
-    const err = await modelInst.doStream({ prompt: "test", abortSignal: ac.signal }).catch((e) => e)
+    const err = await modelInst.doStream({ prompt: "test" as never, abortSignal: ac.signal }).catch((e) => e)
     // Must be the abort path, not a generic TypeError from a regression
     const isAbort = (err instanceof APICallError && err.statusCode === 499) || (err instanceof Error && /aborted/i.test(err.message))
     expect(isAbort).toBe(true)
@@ -1164,7 +1164,7 @@ describe("workstream 232 cancellation cleanup (sdk)", () => {
     const modelInst = model([CREATED, textEvent("hello")], captured, {
       sessionBehavior: { stream: stalledByteStream([CREATED, textEvent("hello")], stall) },
     })
-    const { stream } = await modelInst.doStream({ prompt: "test", abortSignal: ac.signal })
+    const { stream } = await modelInst.doStream({ prompt: "test" as never, abortSignal: ac.signal })
     const reader = stream.getReader()
     // Consume first chunk, then abort
     const first = await reader.read()

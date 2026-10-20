@@ -600,11 +600,11 @@ describe("workstream 232 cancellation cleanup (transport) — listener ownership
           const origRemove = signal.signal.removeEventListener.bind(signal.signal)
           signal.signal.addEventListener = ((...args: any[]) => {
             if (args[0] === "abort") installed.add(args[1])
-            return origAdd(...args)
+            return (origAdd as any)(...args)
           }) as typeof signal.signal.addEventListener
           signal.signal.removeEventListener = ((...args: any[]) => {
             if (args[0] === "abort") installed.delete(args[1])
-            return origRemove(...args)
+            return (origRemove as any)(...args)
           }) as typeof signal.signal.removeEventListener
 
           const response = await transport.rawRequestStream("POST", "/x", { signal: signal.signal })

@@ -21,6 +21,10 @@ import { Permission } from "@/permission"
 
 import { FinishTool, type Reason } from "../../src/tool/finish"
 import { TaskTool, type TaskPromptOps } from "../../src/tool/task"
+
+type LooseTaskPromptOps = Omit<TaskPromptOps, "prompt"> & {
+  prompt(input: Parameters<TaskPromptOps["prompt"]>[0]): Effect.Effect<any, any, any>
+}
 import { Truncate } from "@/tool/truncate"
 import { ToolRegistry } from "@/tool/registry"
 import { RuntimeFlags } from "@/effect/runtime-flags"
@@ -3236,7 +3240,7 @@ it.instance(
         },
       }
 
-      const childOps: TaskPromptOps = {
+      const childOps: LooseTaskPromptOps = {
         cancel: () => Effect.void,
         resolvePromptParts: (template) => Effect.succeed([{ type: "text" as const, text: template }]),
         prompt: (input) => {
@@ -3445,7 +3449,7 @@ for (const teardown of [false, true]) {
           },
         }
 
-        const childOps: TaskPromptOps = {
+        const childOps: LooseTaskPromptOps = {
           cancel: () => Effect.void,
           resolvePromptParts: (template) => Effect.succeed([{ type: "text" as const, text: template }]),
           prompt: (input) => {

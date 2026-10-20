@@ -372,6 +372,7 @@ export type QwenWebStreamEvent =
   | { kind: "error"; code: string; message: string }
   | {
       kind: "usage"
+      chatId?: string
       inputTokens?: number
       outputTokens?: number
       totalTokens?: number
