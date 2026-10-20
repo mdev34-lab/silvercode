@@ -1,5 +1,5 @@
 import { $ } from "bun"
-import { describe, expect } from "bun:test"
+import { describe, expect, setDefaultTimeout } from "bun:test"
 import fs from "fs/promises"
 import path from "path"
 import { Effect, Layer } from "effect"
@@ -11,6 +11,9 @@ import { Snapshot } from "@opencode-ai/core/snapshot"
 import { Hash } from "@opencode-ai/core/util/hash"
 import { tmpdir } from "./fixture/tmpdir"
 import { testEffect } from "./lib/effect"
+
+// Real Git setup per test; Windows runners intermittently exceed the 5s default (#303).
+setDefaultTimeout(30_000)
 
 describe("Snapshot", () => {
   testEffect(Layer.empty).live("captures and restores Location-scoped changes", () => {
