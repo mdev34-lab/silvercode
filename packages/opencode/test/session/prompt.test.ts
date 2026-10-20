@@ -4937,7 +4937,7 @@ it.instance("loop sends a reduced context projection and keeps canonical history
             models: {
               "test-model": {
                 ...base.provider.test.models["test-model"],
-                limit: { context: 6000, output: 500 },
+                limit: { context: 12000, output: 500 },
               },
             },
           },
@@ -4985,16 +4985,18 @@ it.instance("loop sends a reduced context projection and keeps canonical history
       yield* llm.text(`reply ${turn}`)
       yield* prompt.loop({ sessionID: chat.id })
       const inputs = turnInputs(yield* llm.inputs)
+      expect(inputs.length).toBeGreaterThan(0)
       const body = JSON.stringify(inputs.at(-1))
       sizes.push(body.length)
-      // the oldest output is reduced in the request, the newest is kept
-      expect(body).not.toContain("OUT0-" + "x".repeat(6000))
-      expect(body).toContain("OUT9-")
+      // the oldest output is reduced in the request, the newest is kept in full
+      expect(body).not.toContain(big(0))
+      expect(body).toContain(big(9))
+      expect(body.split("x".repeat(6000)).length - 1).toBeLessThan(10)
     }
     // canonical history still holds every full output after both turns
     const after = yield* canonical()
     expect(after).toEqual(before)
-    // the request is smaller than the canonical history it was derived from
-    expect(sizes[1]).toBeLessThan(before.join("").length)
+    // the request does not grow with the turn: the projection is re-derived, not accumulated
+    expect(sizes[1]).toBeLessThan(sizes[0] + 2000)
   }),
 )
