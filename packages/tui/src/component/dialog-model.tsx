@@ -8,11 +8,13 @@ import { DialogVariant } from "./dialog-variant"
 import * as fuzzysort from "fuzzysort"
 import { useConnected } from "./use-connected"
 import { useSync } from "../context/sync"
+import { useTheme } from "../context/theme"
 
 export function DialogModel(props: { providerID?: string }) {
   const local = useLocal()
   const sync = useSync()
   const dialog = useDialog()
+  const { theme } = useTheme()
   const [query, setQuery] = createSignal("")
 
   const connected = useConnected()
@@ -25,6 +27,22 @@ export function DialogModel(props: { providerID?: string }) {
     const showSections = showExtra() && needle.length === 0
     const favorites = connected() ? local.model.favorite() : []
     const recents = local.model.recent()
+
+    function healthFooter(model: { providerID: string; modelID: string }) {
+      const { status, checked } = local.model.health(model)
+      const color = {
+        working: theme.success,
+        degraded: theme.warning,
+        failing: theme.error,
+        unknown: theme.textMuted,
+      }[status]
+      return (
+        <>
+          <span style={{ fg: color }}>●</span> {status}
+          {checked ? ` ${checked}` : ""}
+        </>
+      )
+    }
 
     function toOptions(items: typeof favorites, category: string) {
       if (!showSections) return []
@@ -41,7 +59,12 @@ export function DialogModel(props: { providerID?: string }) {
             description: provider.name,
             category,
             disabled: provider.id === "opencode" && model.id.includes("-nano"),
-            footer: model.cost?.input === 0 && provider.id === "opencode" ? "Free" : undefined,
+            footer:
+              category === "Favorites"
+                ? healthFooter({ providerID: provider.id, modelID: model.id })
+                : model.cost?.input === 0 && provider.id === "opencode"
+                  ? "Free"
+                  : undefined,
             onSelect: () => {
               onSelect(provider.id, model.id)
             },

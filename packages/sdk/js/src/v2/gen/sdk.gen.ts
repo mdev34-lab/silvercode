@@ -145,6 +145,8 @@ import type {
   PromptInput,
   ProviderAuthErrors,
   ProviderAuthResponses,
+  ProviderProbeErrors,
+  ProviderProbeResponses,
   ProviderListErrors,
   ProviderListResponses,
   ProviderOauthAuthorizeErrors,
@@ -3326,6 +3328,45 @@ export class Provider extends HeyApiClient {
       url: "/provider",
       ...options,
       ...params,
+    })
+  }
+
+  /**
+   * Probe a model
+   *
+   * Send one tiny request to a model and report whether it answered. Failures that are likely to pass on their own, such as rate limits and network errors, are reported as transient.
+   */
+  public probe<ThrowOnError extends boolean = false>(
+    parameters: {
+      directory?: string
+      workspace?: string
+      providerID: string
+      modelID: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { in: "body", key: "providerID" },
+            { in: "body", key: "modelID" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<ProviderProbeResponses, ProviderProbeErrors, ThrowOnError>({
+      url: "/provider/probe",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
     })
   }
 
