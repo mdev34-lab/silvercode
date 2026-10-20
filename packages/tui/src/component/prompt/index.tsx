@@ -1410,6 +1410,13 @@ export function Prompt(props: PromptProps) {
             flexGrow={1}
             width="100%"
           >
+            <Show when={store.mode === "normal" && local.permission.mode === "yolo"}>
+              <box position="absolute" top={1} right={2} paddingLeft={1} paddingRight={1} backgroundColor={theme.warning}>
+                <text fg={selectedForeground(theme, theme.warning)} attributes={TextAttributes.BOLD}>
+                  YOLO
+                </text>
+              </box>
+            </Show>
             <textarea
               width="100%"
               placeholder={placeholderText()}
@@ -1486,7 +1493,7 @@ export function Prompt(props: PromptProps) {
               syntaxStyle={syntax()}
             />
             <box flexDirection="row" flexShrink={0} paddingTop={1} gap={1} justifyContent="space-between">
-              <box flexDirection="row" gap={1}>
+              <box flexDirection="row" gap={1} flexShrink={1} minWidth={0} height={1} overflow="hidden">
                 <Show when={local.agent.current()} fallback={<box height={1} />}>
                   {(agent) => (
                     <>
@@ -1502,35 +1509,8 @@ export function Prompt(props: PromptProps) {
                           >
                             {local.model.parsed().model}
                           </text>
-                          <text fg={fadeColor(theme.textMuted, modelMetaAlpha())}>{currentProviderLabel()}</text>
-                          {/* Agent effort is its own dial and shows even for
-                              models without thinking variants. Its hue (fast
-                              green, medium orange, thorough red) is drawn
-                              beside the always-visible level name. */}
-                          <text fg={fadeColor(theme.textMuted, modelMetaAlpha())}>·</text>
-                          <text>
-                            <span
-                              style={{
-                                fg: fadeColor(effortColor(local.effort.current(), theme), modelMetaAlpha()),
-                                bold: true,
-                              }}
-                            >
-                              {local.effort.current()}
-                            </span>
-                          </text>
-                          <Show when={showVariant()}>
-                            <text fg={fadeColor(theme.textMuted, variantMetaAlpha())}>·</text>
-                            <text>
-                              <span style={{ fg: fadeColor(theme.warning, variantMetaAlpha()), bold: true }}>
-                                {local.model.variant.current()}
-                              </span>
-                            </text>
-                          </Show>
-                          <Show when={showVision()}>
-                            <text fg={fadeColor(theme.textMuted, visionMetaAlpha())}>·</text>
-                            <text>
-                              <span style={{ fg: fadeColor(theme.accent, visionMetaAlpha()), bold: true }}>vision</span>
-                            </text>
+                          <Show when={dimensions().width >= 72}>
+                            <text fg={fadeColor(theme.textMuted, modelMetaAlpha())}>{currentProviderLabel()}</text>
                           </Show>
                         </box>
                       </Show>
@@ -1538,12 +1518,37 @@ export function Prompt(props: PromptProps) {
                   )}
                 </Show>
               </box>
-              <box flexDirection="row" gap={1} alignItems="center">
-                <Show when={store.mode === "normal" && local.permission.mode === "yolo"}>
-                  <box paddingLeft={1} paddingRight={1} backgroundColor={theme.warning}>
-                    <text fg={selectedForeground(theme, theme.warning)} attributes={TextAttributes.BOLD}>
-                      YOLO
-                    </text>
+              <box flexDirection="row" gap={1} alignItems="center" flexShrink={0}>
+                <Show when={store.mode === "normal"}>
+                  <box flexDirection="row" gap={1} flexShrink={0}>
+                      {/* Agent effort is its own dial and shows even for
+                          models without thinking variants. Its hue (fast
+                          green, medium orange, thorough red) is drawn
+                          beside the always-visible level name. */}
+                      <text>
+                        <span
+                          style={{
+                            fg: fadeColor(effortColor(local.effort.current(), theme), modelMetaAlpha()),
+                            bold: true,
+                          }}
+                        >
+                          {local.effort.current()}
+                        </span>
+                      </text>
+                      <Show when={showVariant()}>
+                        <text fg={fadeColor(theme.textMuted, variantMetaAlpha())}>·</text>
+                        <text>
+                          <span style={{ fg: fadeColor(theme.warning, variantMetaAlpha()), bold: true }}>
+                            {local.model.variant.current()}
+                          </span>
+                        </text>
+                      </Show>
+                      <Show when={showVision()}>
+                        <text fg={fadeColor(theme.textMuted, visionMetaAlpha())}>·</text>
+                        <text>
+                          <span style={{ fg: fadeColor(theme.accent, visionMetaAlpha()), bold: true }}>vision</span>
+                        </text>
+                      </Show>
                   </box>
                 </Show>
                 <Show when={hasRightContent()}>{props.right}</Show>
