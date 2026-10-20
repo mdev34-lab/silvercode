@@ -271,7 +271,6 @@ const layer = Layer.effect(
         yield* session.updatePart(ctx.reasoningMap[reasoningID])
         delete ctx.reasoningMap[reasoningID]
         delete ctx.reasoningLast[reasoningID]
-        delete ctx.reasoningLast[reasoningID]
       })
 
       const ensureToolCall = Effect.fn("SessionProcessor.ensureToolCall")(function* (input: {
@@ -716,7 +715,6 @@ const layer = Layer.effect(
             ctx.currentText = undefined
             ctx.reasoningMap = {}
             ctx.reasoningLast = {}
-        ctx.reasoningLast = {}
             yield* status.set(ctx.sessionID, { type: "busy" })
             const stream = llm.stream(streamInput)
             clock.startRequest(Date.now())
