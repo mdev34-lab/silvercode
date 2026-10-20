@@ -1,4 +1,4 @@
-import { describe, expect } from "bun:test"
+import { describe, expect, setDefaultTimeout } from "bun:test"
 import { $ } from "bun"
 import fs from "fs/promises"
 import path from "path"
@@ -11,6 +11,9 @@ import { tmpdir } from "./fixture/tmpdir"
 import { testEffect } from "./lib/effect"
 
 const it = testEffect(LayerNode.compile(Git.node))
+
+// Real Git clone/push against a local origin; Windows runners intermittently exceed the 5s default (#278).
+setDefaultTimeout(30_000)
 
 describe("Git", () => {
   it.live(
