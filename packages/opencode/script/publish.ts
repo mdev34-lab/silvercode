@@ -92,7 +92,7 @@ await publish(`./dist/${pkg.name}`, pkg.name, version)
 
 for (const [name] of Object.entries(binaries)) {
   await publish(`./dist/${name}`, name, binaries[name])
-  await Bun.sleep(300000)
+  await Bun.sleep(15000)
 }
 
 const image = "ghcr.io/mdev34-lab/silvercode"
@@ -113,8 +113,7 @@ if (!Script.preview && process.env.OPENCODE_PUBLISH_EXTRAS === "1") {
 
   // arch
   const binaryPkgbuild = [
-    "# Maintainer: dax",
-    "# Maintainer: adam",
+    "# Maintainer: mdev34-lab",
     "",
     "pkgname='silvercode-bin'",
     `pkgver=${pkgver}`,
