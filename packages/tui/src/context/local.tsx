@@ -337,12 +337,15 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
         if (!target) return
         probing = true
         const key = healthKey(target)
-        const result = await sdk.client.provider
-          .probe({ providerID: target.providerID, modelID: target.modelID })
-          .then((response) => response.data?.outcome ?? ("transient" as const))
-          .catch(() => "transient" as const)
-        setHealth(key, ModelHealth.next(health[key], result, Date.now()))
-        probing = false
+        try {
+          const result = await sdk.client.provider
+            .probe({ providerID: target.providerID, modelID: target.modelID })
+            .then((response) => response.data?.outcome ?? ("transient" as const))
+            .catch(() => "transient" as const)
+          setHealth(key, ModelHealth.next(health[key], result, Date.now()))
+        } finally {
+          probing = false
+        }
       }
       const probeTimer = setInterval(() => void probeNext(), 15_000)
       onCleanup(() => clearInterval(probeTimer))
