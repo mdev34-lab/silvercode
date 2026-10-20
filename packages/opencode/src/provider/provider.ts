@@ -1706,7 +1706,7 @@ const layer = Layer.effect(
         // *loaded* when its custom loader's autoload gate passes (stored
         // login, authenticated browser profile, or explicit user config).
         catalog[ProviderV2.ID.make(QWEN_WEB_PROVIDER_ID)] = qwenWebProviderInfo()
-        catalog[ProviderV2.ID.make(TOKENHARBOR_PROVIDER_ID)] ??= tokenHarborProviderInfo()
+        catalog[ProviderV2.ID.make(TOKENHARBOR_PROVIDER_ID)] = tokenHarborProviderInfo()
         const database = mapValues(catalog, toPublicInfo)
 
         const providers: Record<ProviderV2.ID, Info> = {} as Record<ProviderV2.ID, Info>

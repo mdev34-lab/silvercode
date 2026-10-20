@@ -22,6 +22,7 @@ describe("tokenharbor model list", () => {
         },
       ],
     })
+    if (!entry) throw new Error("entry missing")
     const model = toModel(entry)
     expect(model.name).toBe("Claude Sonnet 4.6")
     expect(model.cost).toEqual({ input: 3, output: 15, cache: { read: 0.3, write: 3.75 } })
