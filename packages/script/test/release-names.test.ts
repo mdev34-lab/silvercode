@@ -26,8 +26,8 @@ describe("release surface", () => {
     // after pkg.name, so the installer must request that exact prefix.
     expect(app).toBe(pkg.name)
 
-    // Postinstall derives the same base when it fetches the platform package.
-    expect(read("packages/opencode/script/postinstall.mjs")).toContain(`const base = \`${pkg.name}-\${platform}-\${arch}\``)
+    // The npm launcher derives the same base when it fetches the release archive.
+    expect(read("packages/opencode/script/launcher.cjs")).toContain(`const base = \`${pkg.name}-\${platform}-\${arch}\``)
 
     // The published binary keeps the product name.
     expect(Object.keys(pkg.bin)).toEqual(["silvercode"])
