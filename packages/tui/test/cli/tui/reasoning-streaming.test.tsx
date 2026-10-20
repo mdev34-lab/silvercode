@@ -55,6 +55,18 @@ async function settle(app: Awaited<ReturnType<typeof testRender>>) {
   await app.renderOnce()
 }
 
+// The markdown/code renderer draws the body asynchronously (tree-sitter load is
+// slow on cold CI runners), so poll until the text is drawn instead of trusting
+// one fixed delay. The assertions that follow still check the same content.
+async function settleUntilFrame(app: Awaited<ReturnType<typeof testRender>>, text: string, timeout = 8000) {
+  const start = Date.now()
+  await settle(app)
+  while (!frameOfSpans(app).includes(text)) {
+    if (Date.now() - start > timeout) return
+    await settle(app)
+  }
+}
+
 type Setup = Awaited<ReturnType<typeof testRender>>
 type Sync = ReturnType<typeof useSync>
 
@@ -246,7 +258,7 @@ describe("reasoning streaming lifecycle", () => {
 
     const part = setup!.sync.data.part["m1"].find((item) => item.id === "prt_reason") as ReasoningPart
     await waitUntil(() => part.text === "Let me investigate")
-    await settle(app())
+    await settleUntilFrame(app(), "Let me investigate")
 
     // The streamed body is readable while reasoning is still active.
     expect(frameOfSpans(app())).toContain("Let me investigate")
@@ -265,7 +277,7 @@ describe("reasoning streaming lifecycle", () => {
 
   test("show mode: the Thinking body stays open even after the reasoning stream ends", async () => {
     await mount({ thinkingMode: "show", parts: [reasoningPart("m1", BODY, BASE + 5000)] })
-    await settle(app())
+    await settleUntilFrame(app(), "Let me investigate")
 
     const frame = frameOfSpans(app())
     expect(frame).toContain("Thought")
