@@ -265,6 +265,14 @@ const scenarios: Scenario[] = [
   http.protected.get("/provider", "provider.list").json(),
   http.protected.get("/provider/auth", "provider.auth").json(),
   http.protected
+    .post("/provider/probe", "provider.probe")
+    .at((ctx) => ({
+      path: "/provider/probe",
+      headers: ctx.headers(),
+      body: { providerID: "httpapi", modelID: "missing" },
+    }))
+    .json(),
+  http.protected
     .post("/provider/{providerID}/oauth/authorize", "provider.oauth.authorize")
     .at((ctx) => ({
       path: route("/provider/{providerID}/oauth/authorize", { providerID: "httpapi" }),
