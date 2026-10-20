@@ -45,6 +45,7 @@ const npmMock = Layer.mock(Npm.Service)({
 const it = testEffect(LayerNode.compile(LayerNode.group([FSUtil.node]), [[Npm.node, npmMock]]))
 
 let reported: readonly string[] = []
+let afterRetry: readonly string[] = ["unset"]
 const logs: string[] = []
 const captureLog = Logger.make((options) => {
   logs.push(String(options.message))
@@ -79,7 +80,7 @@ const clean = Effect.gen(function* () {
 })
 
 // A TUI config with a plugin makes the loader schedule the background install.
-const run = (mode: "ok" | "fail" | "stall", timeoutMs: string) =>
+const run = (mode: "ok" | "fail" | "stall", timeoutMs: string, retry = false) =>
   withEnv(
     TIMEOUT_KEY,
     timeoutMs,
@@ -96,8 +97,17 @@ const run = (mode: "ok" | "fail" | "stall", timeoutMs: string) =>
           yield* fs.makeDirectory(local, { recursive: true })
           yield* fs.writeJson(path.join(local, "tui.json"), { plugin: ["some-plugin@1.0.0"] })
           const layer = TuiConfig.node
-          yield* TuiConfig.Service.use((svc) => svc.waitForDependencies()).pipe(
-            Effect.tap(() => Effect.sync(() => (reported = TuiConfig.installFailures()))),
+          yield* TuiConfig.Service.use((svc) =>
+            Effect.gen(function* () {
+              yield* svc.waitForDependencies()
+              reported = TuiConfig.installFailures()
+              if (retry) {
+                install.mode = "ok"
+                yield* svc.retryDependencies()
+                afterRetry = TuiConfig.installFailures()
+              }
+            }),
+          ).pipe(
             Effect.provide(
               LayerNode.compile(layer, [[Npm.node, npmMock]]).pipe(
                 Layer.provide(Layer.succeed(CurrentWorkingDirectory, test.directory)),
@@ -113,6 +123,7 @@ const run = (mode: "ok" | "fail" | "stall", timeoutMs: string) =>
 beforeEach(() => {
   logs.length = 0
   reported = []
+  afterRetry = ["unset"]
 })
 
 it.instance(
@@ -156,6 +167,20 @@ it.instance(
           expect(install.calls).toBeGreaterThan(0)
           expect(warned("background dependency install")).toBe(false)
           expect(reported).toEqual([])
+        }),
+      ),
+    ),
+  30_000,
+)
+
+it.instance(
+  "retry installs the failed directories again and clears the failure",
+  () =>
+    run("fail", "5000", true).pipe(
+      Effect.tap(() =>
+        Effect.sync(() => {
+          expect(reported).toEqual(["Could not install @opencode-ai/plugin"])
+          expect(afterRetry).toEqual([])
         }),
       ),
     ),

@@ -6,21 +6,17 @@ import { TuiConfig } from "../../../src/config/tui"
 
 const { TuiPluginRuntime } = await import("../../../src/plugin/tui/runtime")
 
-test("toasts background dependency install failures at startup", async () => {
+test("offers retry, dismiss and log when background installs failed at startup", async () => {
   await using tmp = await tmpdir()
   const wait = spyOn(TuiConfig, "waitForDependencies").mockResolvedValue()
   const failures = spyOn(TuiConfig, "installFailures").mockReturnValue(["Could not install @opencode-ai/plugin"])
   const cwd = spyOn(process, "cwd").mockImplementation(() => tmp.path)
   const api = createTuiPluginApi()
-  const toast = spyOn(api.ui, "toast")
+  const replace = spyOn(api.ui.dialog, "replace")
 
   try {
     await TuiPluginRuntime.init({ api, config: createTuiResolvedConfig({ plugin: [], plugin_origins: [] }) })
-    expect(toast).toHaveBeenCalledWith({
-      variant: "error",
-      title: "Plugin dependency install failed",
-      message: "Could not install @opencode-ai/plugin",
-    })
+    expect(replace).toHaveBeenCalledTimes(1)
   } finally {
     await TuiPluginRuntime.dispose()
     cwd.mockRestore()
