@@ -1363,9 +1363,11 @@ export function Prompt(props: PromptProps) {
   )
   const borderHighlight = createMemo(() => tint(theme.border, highlight(), agentMetaAlpha()))
 
-  // Cells inside the prompt box: terminal width minus the outer margin, left border and padding.
-  const innerWidth = createMemo(() => Math.max(10, dimensions().width - 9))
-  const showProvider = createMemo(() => dimensions().width >= 72)
+  // The prompt measures itself: the session sidebar and the home width cap both make it narrower than the terminal.
+  let boxEl: BoxRenderable | undefined
+  const [boxWidth, setBoxWidth] = createSignal(0)
+  const innerWidth = createMemo(() => Math.max(10, (boxWidth() > 0 ? boxWidth() : dimensions().width - 5) - 4))
+  const showProvider = createMemo(() => innerWidth() >= 60)
   const tagsWidth = createMemo(() => {
     let width = local.effort.current().length
     if (showVariant()) width += 3 + (local.model.variant.current()?.length ?? 0)
@@ -1380,7 +1382,9 @@ export function Prompt(props: PromptProps) {
   })
   const modelLabel = createMemo(() => Locale.truncate(local.model.parsed().model, modelRoom()))
   // The placeholder shares its row with the YOLO tag.
-  const placeholderRoom = createMemo(() => innerWidth() - (local.permission.mode === "yolo" ? 8 : 0))
+  const placeholderRoom = createMemo(() =>
+    innerWidth() - (store.mode === "normal" && local.permission.mode === "yolo" ? 8 : 0),
+  )
 
   const placeholderText = createMemo(() => {
     if (props.showPlaceholder === false) return undefined
@@ -1392,6 +1396,10 @@ export function Prompt(props: PromptProps) {
     if (props.placeholder) return props.placeholder
     if (!list().length) return undefined
     return `Ask anything... "${list()[store.placeholder % list().length]}"`
+  })
+  const clippedPlaceholder = createMemo(() => {
+    const text = placeholderText()
+    return text ? Locale.truncate(text, placeholderRoom()) : undefined
   })
 
   const spinnerDef = createMemo(() => {
@@ -1421,6 +1429,10 @@ export function Prompt(props: PromptProps) {
           }}
         >
           <box
+            ref={(el: BoxRenderable) => {
+              boxEl = el
+            }}
+            onSizeChange={() => boxEl && setBoxWidth(boxEl.width)}
             paddingLeft={2}
             paddingRight={2}
             paddingTop={1}
@@ -1438,7 +1450,7 @@ export function Prompt(props: PromptProps) {
             </Show>
             <textarea
               width="100%"
-              placeholder={placeholderText() ? Locale.truncate(placeholderText()!, placeholderRoom()) : undefined}
+              placeholder={clippedPlaceholder()}
               placeholderColor={theme.textMuted}
               textColor={leader() ? theme.textMuted : theme.text}
               focusedTextColor={leader() ? theme.textMuted : theme.text}
