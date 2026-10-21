@@ -398,4 +398,37 @@ describe("provider HttpApi", () => {
     }),
     { ...projectOptions, init: writeProviderModelsMutationPlugin },
   )
+
+  it.instance(
+    "lists built-in providers missing from models.dev for discovery",
+    Effect.gen(function* () {
+      const directory = (yield* TestInstance).directory
+      const headers = { "x-opencode-directory": directory }
+      const response = yield* request("/provider", { headers })
+
+      expect(response.status).toBe(200)
+      const body = yield* response.json
+      // #346: built-in providers live in the internal catalog, not the remote
+      // models.dev catalog; /connect can only offer what /provider lists.
+      const tokenharbor = providerByID(body, "all", "tokenharbor")
+      expect(isRecord(tokenharbor)).toBe(true)
+      expect(isRecord(tokenharbor) && tokenharbor.name).toBe("Token Harbor")
+      expect(isRecord(providerByID(body, "all", "qwen-web"))).toBe(true)
+    }),
+    projectOptions,
+  )
+
+  it.instance(
+    "honors disabled_providers for built-in providers",
+    Effect.gen(function* () {
+      const directory = (yield* TestInstance).directory
+      const headers = { "x-opencode-directory": directory }
+      const response = yield* request("/provider", { headers })
+
+      expect(response.status).toBe(200)
+      const body = yield* response.json
+      expect(providerByID(body, "all", "tokenharbor")).toBeUndefined()
+    }),
+    { config: { disabled_providers: ["tokenharbor"], formatter: false, lsp: false } },
+  )
 })

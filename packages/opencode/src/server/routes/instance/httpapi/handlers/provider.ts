@@ -3,6 +3,7 @@ import { Config } from "@/config/config"
 import { ModelsDev } from "@opencode-ai/core/models-dev"
 import { Provider } from "@/provider/provider"
 import { providerInfo as qwenWebProviderInfo, QWEN_WEB_PROVIDER_ID } from "@/provider/qwen-web"
+import { providerInfo as tokenHarborProviderInfo, TOKENHARBOR_PROVIDER_ID } from "@/provider/tokenharbor"
 import { Auth } from "@/auth"
 
 import { APICallError, generateText } from "ai"
@@ -53,12 +54,21 @@ export const providerHandlers = HttpApiBuilder.group(InstanceHttpApi, "provider"
       }
       const connected = yield* provider.list()
       const credentials = yield* authStore.all().pipe(Effect.orDie)
-      // The Qwen Web (browser) provider is built in, not part of the remote
-      // catalog: list it for discovery/login while the enabled/disabled
-      // filters allow it. A connected entry (live models) always wins.
-      const qwenWebAllowed = (enabled ? enabled.has(QWEN_WEB_PROVIDER_ID) : true) && !disabled.has(QWEN_WEB_PROVIDER_ID)
+      // Built-in providers are registered in the internal catalog, not in the
+      // remote models.dev catalog: list them for discovery/login while the
+      // enabled/disabled filters allow them. A connected entry (live models)
+      // always wins.
+      const builtins: Record<string, () => Parameters<typeof Provider.toPublicInfo>[0]> = {
+        [QWEN_WEB_PROVIDER_ID]: qwenWebProviderInfo,
+        [TOKENHARBOR_PROVIDER_ID]: tokenHarborProviderInfo,
+      }
+      const allowedBuiltins = Object.fromEntries(
+        Object.entries(builtins)
+          .filter(([id]) => (enabled ? enabled.has(id) : true) && !disabled.has(id))
+          .map(([id, info]) => [id, info()]),
+      )
       const providers = Object.assign(
-        qwenWebAllowed ? { [QWEN_WEB_PROVIDER_ID]: qwenWebProviderInfo() } : {},
+        allowedBuiltins,
         mapValues(filtered, (item) => Provider.fromModelsDevProvider(item)),
         connected,
       )
