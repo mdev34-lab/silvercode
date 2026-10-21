@@ -14,6 +14,7 @@ import { Config } from "@/config/config"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Shell } from "@opencode-ai/core/shell"
 import { ShellID } from "./shell/id"
+import { ToolFailure } from "@opencode-ai/llm"
 
 import * as Truncate from "./truncate"
 import { Plugin } from "@/plugin"
@@ -454,6 +455,7 @@ export const ShellTool = Tool.define(
       let cut = false
       let expired = false
       let aborted = false
+      let signaled: string | undefined
 
       const markOutputProcessed = Effect.sync(() => {
         processing = false
@@ -573,19 +575,43 @@ export const ShellTool = Tool.define(
 
           const timeout = Effect.sleep(`${input.timeout + 100} millis`)
 
+          // A child killed by an external signal fails `exitCode` by design
+          // ("Process interrupted due to receipt of signal"). That is a normal
+          // way for a command to end, so recover it here: the run completes
+          // with the output collected so far and a note about the signal
+          // instead of dying as a defect.
+          const exited = handle.exitCode.pipe(
+            Effect.map((code) => ({ kind: "exit" as const, code: code as number | null, signal: undefined })),
+            Effect.catch((error) => {
+              const message = error instanceof Error ? error.message : String(error)
+              const cause = error instanceof Error && error.cause instanceof Error ? error.cause.message : ""
+              return Effect.succeed({
+                kind: "exit" as const,
+                code: null,
+                signal: /signal: '([^']+)'/.exec(message)?.[1] ?? /signal: '([^']+)'/.exec(cause)?.[1],
+              })
+            }),
+          )
           const exit = yield* Effect.raceAll([
-            handle.exitCode.pipe(Effect.map((code) => ({ kind: "exit" as const, code }))),
-            abort.pipe(Effect.map(() => ({ kind: "abort" as const, code: null }))),
-            timeout.pipe(Effect.map(() => ({ kind: "timeout" as const, code: null }))),
+            exited,
+            abort.pipe(Effect.map(() => ({ kind: "abort" as const, code: null, signal: undefined }))),
+            timeout.pipe(Effect.map(() => ({ kind: "timeout" as const, code: null, signal: undefined }))),
           ])
 
+          // The kill can lose the race against the child exiting on its own
+          // (ESRCH on POSIX, "not found" from taskkill on Windows): the wanted
+          // end state already holds, so tolerate the failure.
+          const kill = handle.kill({ forceKillAfter: "3 seconds" }).pipe(Effect.ignore)
           if (exit.kind === "abort") {
             aborted = true
-            yield* handle.kill({ forceKillAfter: "3 seconds" }).pipe(Effect.orDie)
+            yield* kill
           }
           if (exit.kind === "timeout") {
             expired = true
-            yield* handle.kill({ forceKillAfter: "3 seconds" }).pipe(Effect.orDie)
+            yield* kill
+          }
+          if (exit.kind === "exit" && exit.signal) {
+            signaled = exit.signal
           }
 
           if (exit.kind === "exit") {
@@ -605,7 +631,11 @@ export const ShellTool = Tool.define(
 
           return exit.kind === "exit" ? exit.code : null
         }),
-      ).pipe(Effect.orDie)
+      ).pipe(
+        Effect.mapError(
+          (error) => new ToolFailure({ message: error instanceof Error ? error.message : String(error) }),
+        ),
+      )
 
       const meta: string[] = []
       if (expired) {
@@ -618,6 +648,7 @@ export const ShellTool = Tool.define(
         meta.push(`Could not save the full output to a file (${spillError.message}). The output below may be incomplete.`)
         file = ""
       }
+      if (signaled) meta.push(`Command was terminated by signal ${signaled}`)
       const raw = list.map((item) => item.text).join("")
       const end = tail(raw, limits.maxLines, limits.maxBytes)
       if (end.cut) cut = true
