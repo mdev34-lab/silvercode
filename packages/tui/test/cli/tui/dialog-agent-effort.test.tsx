@@ -7,7 +7,7 @@ import { onCleanup, onMount, type JSX } from "solid-js"
 import { chmod, mkdir } from "node:fs/promises"
 import path from "node:path"
 import { tmpdir } from "../../fixture/fixture"
-import { waitFor, waitUntil } from "../../fixture/frame"
+import { captureFrame, waitFor, waitUntil } from "../../fixture/frame"
 import { createTuiResolvedConfig } from "../../fixture/tui-runtime"
 import { createEventSource, createFetch, directory, json } from "../../fixture/tui-sdk"
 import { TestTuiContexts } from "../../fixture/tui-environment"
@@ -649,7 +649,7 @@ describe("agent effort selector", () => {
       harness.local.effort.set("thorough")
       expect(await fileJson(`${shared.path}/effort.json`)).toEqual({ agentEffort: "thorough" })
       await harness.app.renderOnce()
-      expect(harness.app.captureCharFrame()).not.toContain("Failed to load the agent effort default")
+      expect(await captureFrame(harness.app)).not.toContain("Failed to load the agent effort default")
     } finally {
       await harness.dispose()
     }

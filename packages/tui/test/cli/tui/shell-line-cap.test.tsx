@@ -28,7 +28,7 @@ import { OPENCODE_BASE_MODE, OpencodeKeymapProvider, registerOpencodeKeymap } fr
 import { AssistantMessageRow, SessionContext } from "../../../src/routes/session"
 import { computeActivityGroups } from "../../../src/util/activity"
 import { MAX_OUTPUT_LINE_LENGTH } from "../../../src/util/cap-lines"
-import { waitUntil } from "../../fixture/frame"
+import { captureFrame, waitUntil } from "../../fixture/frame"
 
 const SESSION = "ses_shell_cap"
 const BASE = 1_700_000_000_000
@@ -93,8 +93,8 @@ function seed(sync: Sync, rows: { message: Message; parts: Part[] }[]) {
   }
 }
 
-function frameOf(app: Awaited<ReturnType<typeof testRender>>) {
-  return app.captureCharFrame().split("\n").map((line) => line.trimEnd()).join("\n")
+async function frameOf(app: Awaited<ReturnType<typeof testRender>>) {
+  return (await captureFrame(app)).split("\n").map((line) => line.trimEnd()).join("\n")
 }
 
 function rowOf(frame: string, needle: string): number {
@@ -250,10 +250,10 @@ describe("bash tool output per-line cap", () => {
       await app.waitForFrame((frame: string) => frame.includes("Click to expand"))
       // Expand: before the fix the <text> renderer wrapped the full 4000-char
       // line into dozens of rows past any per-line bound.
-      await app.mockMouse.click(5, rowOf(frameOf(app), "Click to expand"))
+      await app.mockMouse.click(5, rowOf(await frameOf(app), "Click to expand"))
       await app.waitForFrame((frame: string) => frame.includes("[+"))
 
-      const frame = frameOf(app)
+      const frame = await frameOf(app)
       expect(frame).toContain("Click to collapse")
       // The raw 4000-char line must not reach the frame unbroken.
       expect(frame).not.toContain("a".repeat(MAX_OUTPUT_LINE_LENGTH))
@@ -274,10 +274,10 @@ describe("bash tool output per-line cap", () => {
       seed(sync, [{ message: assistant("m1"), parts: [part] }])
 
       await app.waitForFrame((frame: string) => frame.includes("Click to expand"))
-      await app.mockMouse.click(5, rowOf(frameOf(app), "Click to expand"))
+      await app.mockMouse.click(5, rowOf(await frameOf(app), "Click to expand"))
       await app.waitForFrame((frame: string) => frame.includes("[+"))
 
-      const frame = frameOf(app)
+      const frame = await frameOf(app)
       expect(frame).toContain("first short line")
       expect(frame).toContain("third short line")
       expect(frame).not.toContain("b".repeat(MAX_OUTPUT_LINE_LENGTH))
@@ -294,7 +294,7 @@ describe("bash tool output per-line cap", () => {
       seed(sync, [{ message: assistant("m1"), parts: [part] }])
 
       await app.waitForFrame((frame: string) => frame.includes("file3.txt"))
-      const frame = frameOf(app)
+      const frame = await frameOf(app)
       expect(frame).toContain("file1.txt")
       expect(frame).toContain("file2.txt")
       expect(frame).toContain("file3.txt")
@@ -315,10 +315,10 @@ describe("bash tool output per-line cap", () => {
       seed(sync, [{ message: assistant("m1"), parts: [part] }])
 
       await app.waitForFrame((frame: string) => frame.includes("Click to expand"))
-      await app.mockMouse.click(5, rowOf(frameOf(app), "Click to expand"))
+      await app.mockMouse.click(5, rowOf(await frameOf(app), "Click to expand"))
       await app.waitForFrame((frame: string) => frame.includes("[+"))
 
-      const frame = frameOf(app)
+      const frame = await frameOf(app)
       for (const line of frame.split("\n")) {
         // No rendered row can carry a run of capped-length 'c' characters:
         // the visible prefix is bounded by the per-line cap.

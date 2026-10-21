@@ -28,7 +28,7 @@ import { computeActivityGroups, type ActivityGroups } from "../../../src/util/ac
 import { SessionContext, parseReviewReport, reviewFindingLocation, sortReviewFindings, toolRenderer } from "../../../src/routes/session"
 import { ReviewReport } from "@opencode-ai/core/review-report"
 import type { Provider, ToolPart } from "@opencode-ai/sdk/v2"
-import { waitUntil } from "../../fixture/frame"
+import { captureFrame, waitUntil } from "../../fixture/frame"
 
 const SESSION = "ses_review_finish"
 const BASE = 1_700_000_000_000
@@ -177,8 +177,8 @@ afterEach(async () => {
   testSetup = undefined
 })
 
-function frameOf(app: Awaited<ReturnType<typeof testRender>>) {
-  return app.captureCharFrame().split("\n").map((line) => line.trimEnd()).join("\n")
+async function frameOf(app: Awaited<ReturnType<typeof testRender>>) {
+  return (await captureFrame(app)).split("\n").map((line) => line.trimEnd()).join("\n")
 }
 
 function rowOf(frame: string, needle: string): number {
@@ -318,7 +318,7 @@ describe("review finish rendering", () => {
   test("renders a completed review finish as a structured report, not raw JSON", async () => {
     const { app } = await mountSession(finishPart({ status: "completed", result: reviewResult() }), { height: 30 })
     await app.waitForFrame((frame: string) => frame.includes("Needs fixes"))
-    const frame = frameOf(app)
+    const frame = await frameOf(app)
     // Structured verdict, summary, and per-finding rows...
     expect(frame).toContain("Needs fixes")
     expect(frame).toContain("3 findings")
@@ -345,7 +345,7 @@ describe("review finish rendering", () => {
       { height: 30 },
     )
     await app.waitForFrame((frame: string) => frame.includes("Approved"))
-    const frame = frameOf(app)
+    const frame = await frameOf(app)
     expect(frame).toContain("Approved")
     const critical = rowOf(frame, "SQL injection risk")
     const important = rowOf(frame, "Race condition")
@@ -359,7 +359,7 @@ describe("review finish rendering", () => {
   test("keeps finding details collapsed until the block is expanded", async () => {
     const { app } = await mountSession(finishPart({ status: "completed", result: reviewResult() }), { height: 36 })
     await app.waitForFrame((frame: string) => frame.includes("Click to expand"))
-    const collapsed = frameOf(app)
+    const collapsed = await frameOf(app)
     expect(collapsed).toContain("Click to expand")
     // Details stay hidden while collapsed...
     expect(collapsed).not.toContain("Use parameterized queries.")
@@ -367,7 +367,7 @@ describe("review finish rendering", () => {
 
     await app.mockMouse.click(5, rowOf(collapsed, "Click to expand"))
     await app.waitForFrame((frame: string) => frame.includes("Click to collapse"))
-    const expanded = frameOf(app)
+    const expanded = await frameOf(app)
     expect(expanded).toContain("Use parameterized queries.")
     expect(expanded).toContain("Guard the counter")
     expect(expanded).toContain("Remove the variable")
@@ -378,11 +378,11 @@ describe("review finish rendering", () => {
     // visible without scrolling.
     const { app } = await mountSession(finishPart({ status: "completed", result: reviewResult() }), { height: 56 })
     await app.waitForFrame((frame: string) => frame.includes("Raw review report"))
-    expect(frameOf(app)).not.toContain(ReviewReport.TAG)
+    expect(await frameOf(app)).not.toContain(ReviewReport.TAG)
 
-    await app.mockMouse.click(5, rowOf(frameOf(app), "Raw review report"))
+    await app.mockMouse.click(5, rowOf(await frameOf(app), "Raw review report"))
     await app.waitForFrame((frame: string) => frame.includes(ReviewReport.TAG))
-    const frame = frameOf(app)
+    const frame = await frameOf(app)
     expect(frame).toContain(`<${ReviewReport.TAG}>`)
     expect(frame).toContain('"assessment": "needs-fixes"')
 
@@ -391,7 +391,7 @@ describe("review finish rendering", () => {
     await Bun.sleep(600)
     await app.mockMouse.click(5, rowOf(frame, "Click to hide the raw report"))
     await app.waitForFrame((frame: string) => !frame.includes(ReviewReport.TAG))
-    expect(frameOf(app)).toContain("Raw review report")
+    expect(await frameOf(app)).toContain("Raw review report")
   })
 
   test("re-renders with the updated report when the finished part changes", async () => {
@@ -401,7 +401,7 @@ describe("review finish rendering", () => {
     const initial = finishPart({ status: "completed", result: reviewResult() })
     const { app, setPart } = await mountSession(initial, { height: 30 })
     await app.waitForFrame((frame: string) => frame.includes("Needs fixes"))
-    expect(frameOf(app)).toContain("Two issues need attention before merge.")
+    expect(await frameOf(app)).toContain("Two issues need attention before merge.")
 
     const nextResult = reviewResult({ assessment: "approved", summary: "All checks passed." })
     setPart({
@@ -417,7 +417,7 @@ describe("review finish rendering", () => {
     })
 
     await app.waitForFrame((frame: string) => frame.includes("Approved") && frame.includes("All checks passed."))
-    const frame = frameOf(app)
+    const frame = await frameOf(app)
     expect(frame).toContain("Approved")
     expect(frame).toContain("All checks passed.")
     expect(frame).not.toContain("Needs fixes")
@@ -430,7 +430,7 @@ describe("review finish rendering", () => {
       { height: 10 },
     )
     await app.waitForFrame((frame: string) => frame.includes("Task completed"))
-    const frame = frameOf(app)
+    const frame = await frameOf(app)
     expect(frame).toContain("Task completed")
     expect(frame).toContain("Implemented the feature and verified tests.")
     expect(frame).not.toContain("Raw review report")
@@ -439,7 +439,7 @@ describe("review finish rendering", () => {
   test("does not pre-announce the verdict while the finish is still running", async () => {
     const { app } = await mountSession(finishPart({ status: "running", result: reviewResult() }), { height: 10 })
     await app.waitForFrame((frame: string) => frame.includes("Completing task"))
-    const frame = frameOf(app)
+    const frame = await frameOf(app)
     expect(frame).toContain("Completing task")
     expect(frame).not.toContain("Needs fixes")
     expect(frame).not.toContain("Approved")
@@ -456,7 +456,7 @@ describe("review finish rendering", () => {
       { height: 10 },
     )
     await app.waitForFrame((frame: string) => frame.includes("Finish call failed"))
-    const frame = frameOf(app)
+    const frame = await frameOf(app)
     expect(frame).toContain("Finish call failed")
     expect(frame).not.toContain("Raw review report")
     expect(frame).not.toContain("Needs fixes")

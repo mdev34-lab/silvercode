@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test"
+import { captureFrame } from "./fixture/frame"
 import path from "node:path"
 import { testRender } from "@opentui/solid"
 import { abbreviateHome } from "../src/runtime"
@@ -31,7 +32,7 @@ test("provides focused immutable runtime inputs", async () => {
 
   try {
     await app.renderOnce()
-    expect(app.captureCharFrame()).toContain("/work")
+    expect(await captureFrame(app)).toContain("/work")
     expect(Object.isFrozen(paths!)).toBe(true)
   } finally {
     app.renderer.destroy()

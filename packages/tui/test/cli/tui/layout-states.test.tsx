@@ -187,11 +187,11 @@ describe("session layout states (#241)", () => {
       test(`${state} @ ${sizeName} ${size.width}x${size.height}`, async () => {
         const { app } = await mountSessionRoute({ ...scenario(state), ...size })
         await settle(app)
-        const frame = frameOf(app)
+        const frame = await frameOf(app)
         await snapshot(app, `${state}-${sizeName}`)
 
         // Nothing wider than the terminal: every row fits the width exactly.
-        for (const row of rows(app)) expect(row.length).toBe(size.width)
+        for (const row of await rows(app)) expect(row.length).toBe(size.width)
 
         // Model + effort stay discoverable from the prompt meta row in every
         // state that shows the prompt; the permission prompt replaces the

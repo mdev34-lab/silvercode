@@ -5,6 +5,7 @@ import path from "node:path"
 import { testRender } from "@opentui/solid"
 import type { Message, Part, ToolPart } from "@opencode-ai/sdk/v2"
 import { tmpdir } from "../../fixture/fixture"
+import { captureFrame } from "../../fixture/frame"
 import { createTuiResolvedConfig } from "../../fixture/tui-runtime"
 import { createEventSource, createFetch } from "../../fixture/tui-sdk"
 import { TestTuiContexts } from "../../fixture/tui-environment"
@@ -217,7 +218,7 @@ describe("session footer review status", () => {
         await app.renderOnce()
         await app.renderOnce()
 
-        const frame = app.captureCharFrame()
+        const frame = await captureFrame(app)
         const segment = reviewSegment(frame)
 
         // The whole rendered line, not a substring: at 60 columns the footer

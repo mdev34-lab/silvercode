@@ -1,5 +1,6 @@
 /** @jsxImportSource @opentui/solid */
 import { createDefaultOpenTuiKeymap } from "@opentui/keymap/opentui"
+import { captureFrame } from "./frame"
 import { testRender, useRenderer } from "@opentui/solid"
 import { onCleanup } from "solid-js"
 import { mkdir } from "node:fs/promises"
@@ -350,8 +351,8 @@ export async function settle(app: Setup) {
   await app.renderOnce()
 }
 
-export function frameOf(app: Setup) {
-  return app.captureCharFrame()
+export async function frameOf(app: Setup) {
+  return captureFrame(app)
 }
 
 // Visual evidence for layout reviews: when LAYOUT_CAPTURE_DIR is set, dump the
@@ -360,7 +361,7 @@ export async function snapshot(app: Setup, name: string) {
   const dir = process.env.LAYOUT_CAPTURE_DIR
   if (!dir) return
   await mkdir(dir, { recursive: true })
-  await Bun.write(path.join(dir, `${name}.txt`), frameOf(app))
+  await Bun.write(path.join(dir, `${name}.txt`), await frameOf(app))
 }
 
 // Joined span text per row; the streaming markdown/code blocks only show up in
@@ -379,6 +380,6 @@ export function spansMatching(app: Setup, needle: string) {
 
 // Overlap detection on the character grid: a frame row never contains two
 // primary controls drawn over each other, so look for words glued together.
-export function rows(app: Setup) {
-  return frameOf(app).replace(/\n$/, "").split("\n")
+export async function rows(app: Setup) {
+  return (await frameOf(app)).replace(/\n$/, "").split("\n")
 }

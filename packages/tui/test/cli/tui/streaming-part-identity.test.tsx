@@ -18,7 +18,7 @@ import { SDKProvider } from "../../../src/context/sdk"
 import { SyncProvider, useSync } from "../../../src/context/sync"
 import { RouteProvider } from "../../../src/context/route"
 import { TuiConfigProvider } from "../../../src/config"
-import { waitUntil } from "../../fixture/frame"
+import { captureFrame, waitUntil } from "../../fixture/frame"
 
 let mountCount = 0
 
@@ -178,7 +178,7 @@ describe("streaming part identity", () => {
       await app.renderOnce()
 
       expect(mountCount).toBe(1)
-      expect(app.captureCharFrame().split("\n").join("")).toContain("Hello streaming world!")
+      expect((await captureFrame(app)).split("\n").join("")).toContain("Hello streaming world!")
     } finally {
       app.renderer.destroy()
     }
@@ -221,7 +221,7 @@ describe("streaming part identity", () => {
       await app.renderOnce()
 
       expect(mountCount).toBe(1)
-      expect(app.captureCharFrame().split("\n").join("")).toContain("Hello world")
+      expect((await captureFrame(app)).split("\n").join("")).toContain("Hello world")
     } finally {
       app.renderer.destroy()
     }
@@ -244,7 +244,7 @@ describe("streaming part identity", () => {
       await app.renderOnce()
 
       expect(mountCount).toBe(1)
-      expect(app.captureCharFrame().split("\n").join("")).toContain("Hello world!")
+      expect((await captureFrame(app)).split("\n").join("")).toContain("Hello world!")
     } finally {
       app.renderer.destroy()
     }
@@ -277,7 +277,7 @@ describe("streaming part identity", () => {
 
       expect(mountCount).toBe(1)
       expect(textOf(sync, messageID, partID)).toBe("final answer")
-      expect(app.captureCharFrame().split("\n").join("")).toContain("final answer")
+      expect((await captureFrame(app)).split("\n").join("")).toContain("final answer")
     } finally {
       app.renderer.destroy()
     }

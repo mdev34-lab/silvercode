@@ -29,7 +29,7 @@ import { LocationProvider } from "../../../src/context/location"
 import { OPENCODE_BASE_MODE, OpencodeKeymapProvider, registerOpencodeKeymap, useBindings } from "../../../src/keymap"
 import { ActivityGroup, AssistantMessageRow, SessionContext } from "../../../src/routes/session"
 import { computeActivityGroups, resolveActivityExpanded, toggleActivityOverride } from "../../../src/util/activity"
-import { waitUntil } from "../../fixture/frame"
+import { captureFrame, waitUntil } from "../../fixture/frame"
 
 const SESSION = "ses_activity_ui"
 const BASE = 1_700_000_000_000
@@ -121,8 +121,8 @@ function reseedParts(sync: Sync, partsByMessage: Record<string, Part[]>) {
   for (const [messageID, parts] of Object.entries(partsByMessage)) sync.set("part", messageID, parts)
 }
 
-function frameOf(app: Awaited<ReturnType<typeof testRender>>) {
-  return app.captureCharFrame().split("\n").map((line) => line.trimEnd()).join("\n")
+async function frameOf(app: Awaited<ReturnType<typeof testRender>>) {
+  return (await captureFrame(app)).split("\n").map((line) => line.trimEnd()).join("\n")
 }
 
 function rowOf(frame: string, needle: string): number {
@@ -345,7 +345,7 @@ describe("activity group TUI", () => {
       ])
       await app.waitForFrame((frame: string) => frame.includes("Working... 2 tool calls"))
 
-      const frame = frameOf(app)
+      const frame = await frameOf(app)
       expect(frame).toContain("Working... 2 tool calls")
       expect(frame).toContain("▸")
       // Collapsed: no tool detail rows leak into the conversation.
@@ -369,7 +369,7 @@ describe("activity group TUI", () => {
       const t3 = running(m2.id, "bash", { command: "bun test" }, 1200)
       reseedParts(sync, { [m2.id]: [t2, t3] })
       await app.waitForFrame((frame: string) => frame.includes("Working... 3 tool calls"))
-      expect(frameOf(app)).toContain("Working... 3 tool calls")
+      expect(await frameOf(app)).toContain("Working... 3 tool calls")
     } finally {
       app.renderer.destroy()
     }
@@ -385,14 +385,14 @@ describe("activity group TUI", () => {
       ])
       await app.waitForFrame((frame: string) => frame.includes("Working... 2 tool calls"))
 
-      const row = rowOf(frameOf(app), "Working... 2 tool calls")
+      const row = rowOf(await frameOf(app), "Working... 2 tool calls")
       await app.mockMouse.click(5, row)
       await app.waitForFrame((frame: string) => frame.includes(readRow("src/a.ts")) && frame.includes('Grep "todo"'))
-      expect(frameOf(app)).toContain("▾")
+      expect(await frameOf(app)).toContain("▾")
 
-      await app.mockMouse.click(5, rowOf(frameOf(app), "Working... 2 tool calls"))
+      await app.mockMouse.click(5, rowOf(await frameOf(app), "Working... 2 tool calls"))
       await app.waitForFrame((frame: string) => !frame.includes(readRow("src/a.ts")))
-      expect(frameOf(app)).toContain("▸")
+      expect(await frameOf(app)).toContain("▸")
     } finally {
       app.renderer.destroy()
     }
@@ -410,7 +410,7 @@ describe("activity group TUI", () => {
 
       reseedParts(sync, { [m1.id]: [completed(t1, 1000, 4200)], [m2.id]: [completed(t2, 1100, 5200)] })
       await app.waitForFrame((frame: string) => frame.includes("Worked for 4.2s · 2 tool calls"))
-      expect(frameOf(app)).not.toContain("Working...")
+      expect(await frameOf(app)).not.toContain("Working...")
     } finally {
       app.renderer.destroy()
     }
@@ -440,10 +440,10 @@ describe("activity group TUI", () => {
       await app.waitForFrame((frame: string) => frame.includes("Worked for") && frame.includes("1 failed"))
 
       // Expand the group, then the failing row, to reach the error detail.
-      const row = rowOf(frameOf(app), "1 failed")
+      const row = rowOf(await frameOf(app), "1 failed")
       await app.mockMouse.click(5, row)
       await app.waitForFrame((frame: string) => frame.includes("bun test"))
-      await app.mockMouse.click(5, rowOf(frameOf(app), "bun test"))
+      await app.mockMouse.click(5, rowOf(await frameOf(app), "bun test"))
       await app.waitForFrame((frame: string) => frame.includes("command not found"))
     } finally {
       app.renderer.destroy()
@@ -459,15 +459,15 @@ describe("activity group TUI", () => {
         { message: m2, parts: [t2] },
       ])
       await app.waitForFrame((frame: string) => frame.includes("Working... 2 tool calls"))
-      expect(frameOf(app)).not.toContain(readRow("src/a.ts"))
+      expect(await frameOf(app)).not.toContain(readRow("src/a.ts"))
 
       app.mockInput.pressKey("o", { ctrl: true })
       await app.waitForFrame((frame: string) => frame.includes(readRow("src/a.ts")))
-      expect(frameOf(app)).toContain("▾")
+      expect(await frameOf(app)).toContain("▾")
 
       app.mockInput.pressKey("o", { ctrl: true })
       await app.waitForFrame((frame: string) => !frame.includes(readRow("src/a.ts")))
-      expect(frameOf(app)).toContain("▸")
+      expect(await frameOf(app)).toContain("▸")
     } finally {
       app.renderer.destroy()
     }
@@ -496,10 +496,10 @@ describe("activity group TUI", () => {
       )
 
       // Expand only the first group, individually.
-      const firstRow = rowOf(frameOf(app), "Working... 2 tool calls")
+      const firstRow = rowOf(await frameOf(app), "Working... 2 tool calls")
       await app.mockMouse.click(5, firstRow)
       await app.waitForFrame((frame: string) => frame.includes(readRow("src/a.ts")))
-      expect(frameOf(app)).not.toContain(readRow("src/c.ts"))
+      expect(await frameOf(app)).not.toContain(readRow("src/c.ts"))
 
       // Toggle the global state on...
       app.mockInput.pressKey("o", { ctrl: true })
@@ -511,7 +511,7 @@ describe("activity group TUI", () => {
       await app.waitForFrame(
         (frame: string) => !frame.includes(readRow("src/a.ts")) && !frame.includes(readRow("src/c.ts")),
       )
-      const frame = frameOf(app)
+      const frame = await frameOf(app)
       expect(frame).toContain("▸")
       expect(frame).not.toContain("▾")
     } finally {
@@ -541,7 +541,7 @@ describe("activity group TUI", () => {
         (frame: string) => frame.includes("Interim note.") && frame.match(/Working... 2 tool calls/g)?.length === 2,
       )
 
-      const frame = frameOf(app)
+      const frame = await frameOf(app)
       expect(frame).toContain("Interim note.")
       // Both groups are collapsed: no command details leak out.
       expect(frame).not.toContain("pwd")
@@ -550,7 +550,7 @@ describe("activity group TUI", () => {
       const firstRow = rowOf(frame, "Working... 2 tool calls")
       await app.mockMouse.click(5, firstRow)
       await app.waitForFrame((frame: string) => frame.includes(readRow("src/a.ts")))
-      const expanded = frameOf(app)
+      const expanded = await frameOf(app)
       expect(expanded).toContain(readRow("src/a.ts"))
       expect(expanded).toContain(readRow("src/b.ts"))
       expect(expanded).not.toContain("pwd")
@@ -573,11 +573,11 @@ describe("activity group TUI", () => {
         { message: m2, parts: [textPart(m2.id, ""), reasoningPart(m2.id, "thinking"), t2] },
         { message: m3, parts: [textPart(m3.id, ""), reasoningPart(m3.id, "thinking again"), t3] },
       ])
-      const frame = () => frameOf(app)
+      const frame = async () => frameOf(app)
       await app.waitForFrame((f) => f.match(/Working... 3 tool calls/g)?.length === 1)
-      expect(frame()).toContain("Working... 3 tool calls")
-      expect(frame()).not.toContain("Working... 2 tool calls")
-      expect(frame()).not.toContain("Thinking")
+      expect(await frame()).toContain("Working... 3 tool calls")
+      expect(await frame()).not.toContain("Working... 2 tool calls")
+      expect(await frame()).not.toContain("Thinking")
     } finally {
       app.renderer.destroy()
     }
@@ -631,11 +631,11 @@ describe("activity group TUI", () => {
       ])
       // Tool titles render platform path separators; normalize so the
       // membership assertions below read the same everywhere.
-      const frame = () => frameOf(app).replace(/\\/g, "/")
+      const frame = async () => (await frameOf(app)).replace(/\\/g, "/")
       // One container for the whole sequence, not one per batch.
       await app.waitForFrame((f: string) => f.includes("7 tool calls"))
-      expect(countOf(frame(), "tool calls")).toBe(1)
-      expect(frame()).not.toContain("Read src/a.ts")
+      expect(countOf(await frame(), "tool calls")).toBe(1)
+      expect(await frame()).not.toContain("Read src/a.ts")
 
       // State and render agree: every part belongs to the same group.
       const rows = (sync.data.message[SESSION] ?? []).map((message) => ({
@@ -647,7 +647,7 @@ describe("activity group TUI", () => {
       // Expanding nests the whole sequence under that container...
       app.mockInput.pressKey("o", { ctrl: true })
       await app.waitForFrame((f: string) => f.replace(/\\/g, "/").includes("Read src/g.ts"))
-      const expanded = frame()
+      const expanded = await frame()
       for (const title of [
         "Read src/a.ts",
         "Read src/b.ts",
@@ -669,7 +669,7 @@ describe("activity group TUI", () => {
       sync.set("message", SESSION, [...(sync.data.message[SESSION] ?? []), m7])
       sync.set("part", m7.id, [note, lone])
       await app.waitForFrame((f: string) => f.includes("Summarizing now."))
-      const after = frame()
+      const after = await frame()
       expect(after).toContain("Summarizing now.")
       expect(after).toContain("Read src/h.ts")
       expect(countOf(after, "tool calls")).toBe(1)
@@ -698,7 +698,7 @@ describe("activity group TUI", () => {
       ])
       await app.waitForFrame((frame) => frame.includes("Working... 2 tool calls"))
 
-      const collapsed = frameOf(app)
+      const collapsed = await frameOf(app)
       expect(collapsed).not.toContain("Inspecting grouping")
       expect(collapsed).not.toContain("Verifying rendering")
 
@@ -706,7 +706,7 @@ describe("activity group TUI", () => {
       await app.waitForFrame(
         (frame) => frame.includes("Inspecting grouping") && frame.includes("Verifying rendering"),
       )
-      const expanded = frameOf(app)
+      const expanded = await frameOf(app)
       expect(rowOf(expanded, readRow("src/a.ts"))).toBeLessThan(rowOf(expanded, 'Grep "todo"'))
       expect(rowOf(expanded, 'Grep "todo"')).toBeLessThan(rowOf(expanded, "Inspecting grouping"))
       expect(rowOf(expanded, "Inspecting grouping")).toBeLessThan(rowOf(expanded, "Verifying rendering"))
@@ -725,7 +725,7 @@ describe("activity group TUI", () => {
       const t1 = running(m1.id, "read", { filePath: "src/a.ts" }, 1000)
       seed(sync, [{ message: m1, parts: [textPart(m1.id, "One file."), t1] }])
       await app.waitForFrame((frame: string) => frame.includes(readRow("src/a.ts")))
-      const frame = frameOf(app)
+      const frame = await frameOf(app)
       expect(frame).not.toContain("Working...")
       expect(frame).not.toContain("Worked for")
     } finally {
@@ -744,7 +744,7 @@ describe("activity group TUI", () => {
       seed(sync, [{ message: m1, parts: [t1, t2, t3, t4] }])
       await app.waitForFrame((frame: string) => frame.includes("Working... 2 tool calls"))
 
-      const frame = frameOf(app)
+      const frame = await frameOf(app)
       // Only the concrete tools (bash, read) count toward the summary.
       expect(frame).toContain("Working... 2 tool calls")
       expect(frame).not.toContain("Working... 3 tool calls")
@@ -763,7 +763,7 @@ describe("activity group TUI", () => {
       // orchestration rows remain separate and visible.
       await app.mockMouse.click(5, rowOf(frame, "Working... 2 tool calls"))
       await app.waitForFrame((frame: string) => frame.includes(readRow("src/a.ts")))
-      const expanded = frameOf(app)
+      const expanded = await frameOf(app)
       expect(expanded).toContain("bun test")
       expect(expanded).toContain(readRow("src/a.ts"))
       expect(expanded).toContain("Completing task...")
@@ -799,7 +799,7 @@ describe("activity group TUI", () => {
       // work after it opens a fresh block instead of resuming the old one.
       reseedParts(sync, { [m2.id]: [delegation] })
       await app.waitForFrame((frame: string) => countOf(frame, "Working... 2 tool calls") === 2)
-      const frame = frameOf(app)
+      const frame = await frameOf(app)
       expect(frame).not.toContain("Working... 3 tool calls")
       expect(frame).not.toContain("Working... 4 tool calls")
       expect(frame).toContain("Code Task — Investigate the failure")
@@ -817,7 +817,7 @@ describe("activity group TUI", () => {
       // the delegation nor the continued work stretches it.
       reseedParts(sync, { [m1.id]: [completed(t1, 1000, 2400), completed(t2, 1100, 2400)] })
       await app.waitForFrame((frame: string) => frame.includes("Worked for 1.4s · 2 tool calls"))
-      const done = frameOf(app)
+      const done = await frameOf(app)
       expect(done).toContain("Working... 2 tool calls")
       expect(done).not.toContain("Worked for 1.4s · 4 tool calls")
       expect(rowOf(done, "Worked for 1.4s · 2 tool calls")).toBeLessThan(
@@ -851,7 +851,7 @@ describe("activity group TUI", () => {
       // it lands in and the work that follows opens a fresh block.
       reseedParts(sync, { [m2.id]: [finish] })
       await app.waitForFrame((frame: string) => countOf(frame, "Working... 2 tool calls") === 2)
-      const frame = frameOf(app)
+      const frame = await frameOf(app)
       expect(frame).not.toContain("Working... 3 tool calls")
       expect(frame).not.toContain("Working... 4 tool calls")
       expect(frame).toContain("Completing task...")
@@ -873,7 +873,7 @@ describe("activity group TUI", () => {
       seed(sync, [{ message: m1, parts: [t1, t2] }])
       await app.waitForFrame((frame: string) => frame.includes("Completing task..."))
 
-      const frame = frameOf(app)
+      const frame = await frameOf(app)
       expect(frame).not.toContain("Working...")
       expect(frame).not.toContain("Worked for")
       // The excluded calls render as their own native rows regardless.
@@ -911,7 +911,7 @@ describe("activity group TUI", () => {
         { message: m3, parts: [t3, t4] },
       ])
       await app.waitForFrame((frame: string) => countOf(frame, "Working... 2 tool calls") === 2)
-      const frame = frameOf(app)
+      const frame = await frameOf(app)
       expect(frame).not.toContain("Working... 3 tool calls")
       expect(frame).not.toContain("Working... 4 tool calls")
       // The to-do renders as its own top-level block, between the two runs.
@@ -929,7 +929,7 @@ describe("activity group TUI", () => {
         [m2.id]: [completed(t2, 1100, 2400), todo],
       })
       await app.waitForFrame((frame: string) => frame.includes("Worked for 1.4s · 2 tool calls"))
-      const done = frameOf(app)
+      const done = await frameOf(app)
       expect(done).toContain("Worked for 1.4s · 2 tool calls")
       expect(done).toContain("Working... 2 tool calls")
       expect(done).not.toContain("Worked for 1.4s · 3 tool calls")
@@ -957,14 +957,14 @@ describe("activity group TUI", () => {
       // never counts toward the block and does not wait for its own settlement.
       reseedParts(sync, { [m1.id]: [t1, t2, todo] })
       await app.waitForFrame((frame: string) => frame.includes("Updating todos..."))
-      expect(frameOf(app)).not.toContain("Working... 3 tool calls")
+      expect(await frameOf(app)).not.toContain("Working... 3 tool calls")
 
       seed(sync, [
         { message: m1, parts: [t1, t2, todo] },
         { message: m2, parts: [t3, t4] },
       ])
       await app.waitForFrame((frame: string) => countOf(frame, "Working... 2 tool calls") === 2)
-      const frame = frameOf(app)
+      const frame = await frameOf(app)
       expect(frame).not.toContain("Working... 3 tool calls")
       expect(frame).not.toContain("Working... 4 tool calls")
       expect(rowOf(frame, "Working... 2 tool calls")).toBeLessThan(rowOf(frame, "Updating todos..."))
@@ -994,7 +994,7 @@ describe("activity group TUI", () => {
         { message: m4, parts: [t3, t4] },
       ])
       await app.waitForFrame((frame: string) => countOf(frame, "# Todos") === 2)
-      const frame = frameOf(app)
+      const frame = await frameOf(app)
       // Back-to-back to-do calls form no run of their own and leave exactly the
       // two work blocks on either side of them.
       expect(countOf(frame, "Working... 2 tool calls")).toBe(2)
@@ -1029,23 +1029,23 @@ describe("activity group TUI", () => {
 
       // Expanding the first block reveals only its own rows, and the to-do
       // block stays a top-level sibling below them instead of being nested.
-      await app.mockMouse.click(5, rowOf(frameOf(app), "Working... 2 tool calls"))
+      await app.mockMouse.click(5, rowOf(await frameOf(app), "Working... 2 tool calls"))
       await app.waitForFrame((frame: string) => frame.includes(readRow("src/a.ts")))
-      const expanded = frameOf(app)
+      const expanded = await frameOf(app)
       expect(expanded).toContain('Grep "alpha"')
       expect(expanded).not.toContain("bun test")
       expect(rowOf(expanded, 'Grep "alpha"')).toBeLessThan(rowOf(expanded, "# Todos"))
       expect(rowOf(expanded, "# Todos")).toBeLessThan(rowOfNth(expanded, "Working... 2 tool calls", 2))
 
-      await app.mockMouse.click(5, rowOfNth(frameOf(app), "Working... 2 tool calls", 2))
+      await app.mockMouse.click(5, rowOfNth(await frameOf(app), "Working... 2 tool calls", 2))
       await app.waitForFrame((frame: string) => frame.includes("bun test"))
-      expect(frameOf(app)).toContain(readRow("src/a.ts"))
+      expect(await frameOf(app)).toContain(readRow("src/a.ts"))
 
       // Collapsing the first block leaves the second one open: the blocks own
       // separate activity state because they are separate groups.
-      await app.mockMouse.click(5, rowOf(frameOf(app), "Working... 2 tool calls"))
+      await app.mockMouse.click(5, rowOf(await frameOf(app), "Working... 2 tool calls"))
       await app.waitForFrame((frame: string) => !frame.includes(readRow("src/a.ts")))
-      const final = frameOf(app)
+      const final = await frameOf(app)
       expect(final).not.toContain(readRow("src/a.ts"))
       expect(final).toContain("bun test")
       expect(final).toContain("# Todos")
@@ -1089,12 +1089,12 @@ describe("activity group TUI", () => {
       const before = box.scrollTop
       if (before === 0) throw new Error("expected a non-zero scroll offset")
 
-      const row = rowOf(frameOf(app), "Working... 6 tool calls")
+      const row = rowOf(await frameOf(app), "Working... 6 tool calls")
       await app.mockMouse.click(5, row)
       await app.waitForFrame((frame: string) => frame.includes(readRow("src/file0.ts")))
       expect(box.scrollTop).toBe(before)
 
-      await app.mockMouse.click(5, rowOf(frameOf(app), "Working... 6 tool calls"))
+      await app.mockMouse.click(5, rowOf(await frameOf(app), "Working... 6 tool calls"))
       await app.waitForFrame((frame: string) => !frame.includes(readRow("src/file0.ts")))
       expect(box.scrollTop).toBe(before)
     } finally {
@@ -1132,7 +1132,7 @@ describe("activity group TUI", () => {
       }
       seed(sync, [{ message: m1, parts: [t1, t2] }])
       await app.waitForFrame((frame: string) => frame.includes("Worked for 1.4s · 2 tool calls"))
-      const frame = frameOf(app)
+      const frame = await frameOf(app)
       expect(frame).toContain("Worked for 1.4s · 2 tool calls")
       expect(frame).toContain("▸")
     } finally {
@@ -1198,7 +1198,7 @@ describe("activity group TUI", () => {
         { message: finishOnlyMsg, parts: [finishTool] },
       ])
       await app.waitForFrame((frame: string) => frame.includes("Work · model"))
-      const frame = frameOf(app)
+      const frame = await frameOf(app)
       // Exactly one footer marker: the substantive turn's footer.
       // The finish-only turn must not produce a second standalone footer.
       const footerMarkers = (frame.match(/▣/g) || []).length
@@ -1268,7 +1268,7 @@ describe("activity group TUI", () => {
         { message: { ...m3, finish: "stop" }, parts: [textPart(m3.id, "Done."), t3] },
       ])
       await app.waitForFrame((frame: string) => frame.includes("Work · model"))
-      const frame = frameOf(app)
+      const frame = await frameOf(app)
       // Three substantive turns, each with content, each gets its own footer
       const footerMarkers = (frame.match(/▣/g) || []).length
       expect(footerMarkers).toBe(3)
@@ -1286,23 +1286,23 @@ describe("activity group TUI", () => {
         { message: m2, parts: [t2] },
       ])
       await app.waitForFrame((frame: string) => frame.includes("Working... 2 tool calls"))
-      expect(frameOf(app)).toContain("▸")
+      expect(await frameOf(app)).toContain("▸")
 
       // collapsed -> expanded
-      await app.mockMouse.click(5, rowOf(frameOf(app), "Working... 2 tool calls"))
+      await app.mockMouse.click(5, rowOf(await frameOf(app), "Working... 2 tool calls"))
       await app.waitForFrame((frame: string) => frame.includes(readRow("src/a.ts")))
-      expect(frameOf(app)).toContain("▾")
+      expect(await frameOf(app)).toContain("▾")
 
       // expanded -> collapsed
-      await app.mockMouse.click(5, rowOf(frameOf(app), "Working... 2 tool calls"))
+      await app.mockMouse.click(5, rowOf(await frameOf(app), "Working... 2 tool calls"))
       await app.waitForFrame((frame: string) => !frame.includes(readRow("src/a.ts")))
-      expect(frameOf(app)).toContain("▸")
+      expect(await frameOf(app)).toContain("▸")
 
       // Live updates must not reopen a collapsed group.
       const t3 = running(m2.id, "bash", { command: "bun test" }, 1200)
       reseedParts(sync, { [m1.id]: [completed(t1, 1000, 1400)], [m2.id]: [t2, t3] })
       await app.waitForFrame((frame: string) => frame.includes("Working... 3 tool calls"))
-      const collapsed = frameOf(app)
+      const collapsed = await frameOf(app)
       expect(collapsed).toContain("▸")
       expect(collapsed).not.toContain("▾")
       expect(collapsed).not.toContain(readRow("src/a.ts"))
@@ -1311,7 +1311,7 @@ describe("activity group TUI", () => {
       // The toggle still works after updates.
       await app.mockMouse.click(5, rowOf(collapsed, "Working... 3 tool calls"))
       await app.waitForFrame((frame: string) => frame.includes("bun test") && frame.includes(readRow("src/a.ts")))
-      expect(frameOf(app)).toContain("▾")
+      expect(await frameOf(app)).toContain("▾")
     } finally {
       app.renderer.destroy()
     }
@@ -1339,29 +1339,29 @@ describe("activity group TUI", () => {
       )
 
       // Expand only the first group.
-      await app.mockMouse.click(5, rowOf(frameOf(app), "Working... 2 tool calls"))
+      await app.mockMouse.click(5, rowOf(await frameOf(app), "Working... 2 tool calls"))
       await app.waitForFrame((frame: string) => frame.includes(readRow("src/a.ts")))
-      expect(frameOf(app)).not.toContain(readRow("src/c.ts"))
+      expect(await frameOf(app)).not.toContain(readRow("src/c.ts"))
 
       // Updates to both groups preserve each toggle state.
       const t5 = running(m3.id, "read", { filePath: "src/e.ts" }, 1400)
       reseedParts(sync, { [m1.id]: [completed(t1, 1000, 1500)], [m3.id]: [note, t3, t4, t5] })
       await app.waitForFrame((frame: string) => frame.includes("Working... 3 tool calls"))
-      const afterUpdate = frameOf(app)
+      const afterUpdate = await frameOf(app)
       expect(afterUpdate).toContain(readRow("src/a.ts"))
       expect(afterUpdate).toContain(readRow("src/b.ts"))
       expect(afterUpdate).not.toContain(readRow("src/c.ts"))
       expect(afterUpdate).not.toContain(readRow("src/e.ts"))
 
       // Expanding the second group leaves the first expanded.
-      await app.mockMouse.click(5, rowOf(frameOf(app), "Working... 3 tool calls"))
+      await app.mockMouse.click(5, rowOf(await frameOf(app), "Working... 3 tool calls"))
       await app.waitForFrame((frame: string) => frame.includes(readRow("src/c.ts")) && frame.includes(readRow("src/e.ts")))
-      expect(frameOf(app)).toContain(readRow("src/a.ts"))
+      expect(await frameOf(app)).toContain(readRow("src/a.ts"))
 
       // Collapsing the first group leaves the second expanded.
-      await app.mockMouse.click(5, rowOf(frameOf(app), "Working... 2 tool calls"))
+      await app.mockMouse.click(5, rowOf(await frameOf(app), "Working... 2 tool calls"))
       await app.waitForFrame((frame: string) => !frame.includes(readRow("src/a.ts")))
-      const final = frameOf(app)
+      const final = await frameOf(app)
       expect(final).not.toContain(readRow("src/b.ts"))
       expect(final).toContain(readRow("src/c.ts"))
       expect(final).toContain(readRow("src/e.ts"))
@@ -1394,12 +1394,12 @@ describe("activity group TUI", () => {
       // Expand everything globally.
       app.mockInput.pressKey("o", { ctrl: true })
       await app.waitForFrame((frame: string) => frame.includes(readRow("src/a.ts")) && frame.includes(readRow("src/c.ts")))
-      expect(frameOf(app).match(/▾/g)?.length).toBe(2)
+      expect((await frameOf(app)).match(/▾/g)?.length).toBe(2)
 
       // Clicking one group collapses only that group.
-      await app.mockMouse.click(5, rowOf(frameOf(app), "Working... 2 tool calls"))
+      await app.mockMouse.click(5, rowOf(await frameOf(app), "Working... 2 tool calls"))
       await app.waitForFrame((frame: string) => !frame.includes(readRow("src/a.ts")))
-      const oneCollapsed = frameOf(app)
+      const oneCollapsed = await frameOf(app)
       expect(oneCollapsed).not.toContain(readRow("src/b.ts"))
       expect(oneCollapsed).toContain(readRow("src/c.ts"))
       expect(oneCollapsed).toContain(readRow("src/d.ts"))
@@ -1409,7 +1409,7 @@ describe("activity group TUI", () => {
       // Clicking it again re-expands it.
       await app.mockMouse.click(5, rowOf(oneCollapsed, "Working... 2 tool calls"))
       await app.waitForFrame((frame: string) => frame.includes(readRow("src/a.ts")) && frame.includes(readRow("src/c.ts")))
-      expect(frameOf(app).match(/▾/g)?.length).toBe(2)
+      expect((await frameOf(app)).match(/▾/g)?.length).toBe(2)
     } finally {
       app.renderer.destroy()
     }

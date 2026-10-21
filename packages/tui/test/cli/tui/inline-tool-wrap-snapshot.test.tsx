@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test"
+import { captureFrame } from "../../fixture/frame"
 import { createSignal, For, Show } from "solid-js"
 import type { BoxRenderable, ScrollBoxRenderable } from "@opentui/core"
 import { testRender, type JSX } from "@opentui/solid"
@@ -265,8 +266,7 @@ async function renderFrame(component: () => JSX.Element, options: { width: numbe
   await testSetup.renderOnce()
   await testSetup.renderOnce()
 
-  return testSetup
-    .captureCharFrame()
+  return (await captureFrame(testSetup))
     .split("\n")
     .map((line) => line.trimEnd())
     .join("\n")

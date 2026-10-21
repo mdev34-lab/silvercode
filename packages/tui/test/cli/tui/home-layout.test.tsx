@@ -6,7 +6,7 @@ import { describe, expect, test } from "bun:test"
 import { onCleanup } from "solid-js"
 import type { TuiPluginApi, TuiSlotPlugin } from "@opencode-ai/plugin/tui"
 import { tmpdir } from "../../fixture/fixture"
-import { waitFor } from "../../fixture/frame"
+import { captureFrame, waitFor } from "../../fixture/frame"
 import { createTuiResolvedConfig } from "../../fixture/tui-runtime"
 import { createEventSource, createFetch, directory, json } from "../../fixture/tui-sdk"
 import { TestTuiContexts } from "../../fixture/tui-environment"
@@ -294,7 +294,7 @@ describe("home layout", () => {
   test.each([120, 60])("centers the path and version as one footer text at width %i", async (width) => {
     const app = await renderHome({ width })
     try {
-      const frame = app.captureCharFrame()
+      const frame = await captureFrame(app)
       const row = footerRow(frame)
       const path = row.trim().split(" · ")[0]
       expect(path).toContain("/tmp/opencode/packages/tui")
@@ -310,7 +310,7 @@ describe("home layout", () => {
   test.each([120, 60])("centers the agents and commands shortcut row at width %i", async (width) => {
     const app = await renderHome({ width })
     try {
-      const frame = app.captureCharFrame()
+      const frame = await captureFrame(app)
       const row = shortcutRow(frame)
       expect(row).toContain("tab agents")
       expect(row).toContain("ctrl+p commands")
@@ -351,7 +351,7 @@ describe("home layout", () => {
 
       await Bun.sleep(ROTATE_MS + 500)
       await app.renderOnce()
-      const rotated = app.captureCharFrame()
+      const rotated = await captureFrame(app)
       expect(placeholderRow(rotated)).not.toEqual(first)
       expect(promptRows(rotated)).toBe(rows)
 
@@ -359,7 +359,7 @@ describe("home layout", () => {
       await untilFrame(app, (value) => value.includes("draft"))
       await Bun.sleep(ROTATE_MS + 500)
       await app.renderOnce()
-      const typed = app.captureCharFrame()
+      const typed = await captureFrame(app)
       expect(placeholderRow(typed)).toContain("draft")
       expect(promptRows(typed)).toBe(rows)
     } finally {

@@ -270,20 +270,20 @@ describe("session tabs", () => {
       env.emitStatus(B, "busy")
       await waitUntil(() => env.handle.sync!.data.session_status[B]?.type === "busy")
       await settle(env.app)
-      expect(firstLine(env.app.captureCharFrame())).toContain("●")
+      expect(firstLine(await captureFrame(env.app))).toContain("●")
       expect(env.handle.route!.data).toEqual({ type: "session", sessionID: A })
 
       env.emitStatus(B, "idle")
       await waitUntil(() => env.handle.sync!.data.session_status[B]?.type === "idle")
       await settle(env.app)
       expect(env.handle.tabs!.isAttention(B)).toBe(true)
-      expect(firstLine(env.app.captureCharFrame())).toContain("◆")
+      expect(firstLine(await captureFrame(env.app))).toContain("◆")
       // Still on A: attention never steals focus.
       expect(env.handle.route!.data).toEqual({ type: "session", sessionID: A })
 
       await env.go(B)
       expect(env.handle.tabs!.isAttention(B)).toBe(false)
-      expect(firstLine(env.app.captureCharFrame())).not.toContain("◆")
+      expect(firstLine(await captureFrame(env.app))).not.toContain("◆")
     } finally {
       await env.dispose()
     }
@@ -322,7 +322,7 @@ describe("session tabs", () => {
     try {
       await env.go(B)
       await env.go(C)
-      const line = firstLine(env.app.captureCharFrame())
+      const line = firstLine(await captureFrame(env.app))
       expect(line).toContain("1 Investigate flaky tests")
       expect(line).toContain("2 Draft release notes")
       expect(line).toContain("3 Third session")
@@ -338,7 +338,7 @@ describe("session tabs", () => {
     try {
       await env.go(B)
       await env.go(C)
-      const line = firstLine(env.app.captureCharFrame()).trimEnd()
+      const line = firstLine(await captureFrame(env.app)).trimEnd()
       expect(line.length).toBeLessThanOrEqual(40)
       // The active tab is always in the window, with its number and a readable prefix.
       expect(line).toContain("3 Th")

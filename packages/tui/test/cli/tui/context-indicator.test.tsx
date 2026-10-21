@@ -77,8 +77,8 @@ function scenario(state: StateName, child = false): Omit<MountOptions, "width" |
   }
 }
 
-function barRow(app: Parameters<typeof rows>[0]) {
-  return rows(app).find((row) => /[█░]{20}/.test(row))
+async function barRow(app: Parameters<typeof rows>[0]) {
+  return (await rows(app)).find((row) => /[█░]{20}/.test(row))
 }
 
 const SIZES = { normal: { width: 140, height: 40 }, narrow: { width: 80, height: 24 } } as const
@@ -94,13 +94,13 @@ describe("context indicator agreement (#241)", () => {
           // back as an overlay, so the primary indicator is still reachable.
           if (sizeName === "narrow") {
             keymap().dispatchCommand("session.sidebar.toggle")
-            await waitFor(app, () => (frameOf(app).includes("Context") ? true : undefined))
+            await waitFor(app, () => (app.captureCharFrame().includes("Context") ? true : undefined))
             await settle(app)
           }
 
           const usage = expectedUsage(state)
-          const frame = frameOf(app)
-          const bar = barRow(app)
+          const frame = await frameOf(app)
+          const bar = await barRow(app)
           expect(bar).toBeDefined()
           expect(bar).toContain(contextBarGlyphs(usage))
 
@@ -132,7 +132,7 @@ describe("context indicator agreement (#241)", () => {
   test("a subagent footer shows the same compact detail as the status line would", async () => {
     const { app } = await mountSessionRoute({ ...scenario("near-limit", true), ...SIZES.normal })
     await settle(app)
-    const frame = frameOf(app)
+    const frame = await frameOf(app)
     expect(frame).toContain("Explore")
     expect(frame).toContain(compactLabel(expectedUsage("near-limit"))!)
   })
@@ -140,7 +140,7 @@ describe("context indicator agreement (#241)", () => {
   test("a subagent footer with unknown usage shows no count", async () => {
     const { app } = await mountSessionRoute({ ...scenario("unknown", true), ...SIZES.normal })
     await settle(app)
-    const frame = frameOf(app)
+    const frame = await frameOf(app)
     expect(frame).toContain("Explore")
     expect(frame).not.toMatch(/\(\d+%\)/)
     expect(frame).not.toMatch(/\d+(\.\d+)?K\b/)
