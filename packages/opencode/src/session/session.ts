@@ -677,7 +677,7 @@ const layer: Layer.Layer<
         try {
           return JSON.parse(JSON.stringify(value)) as T
         } catch {
-          return Array.isArray(value) ? ([...value] as T) : { ...(value as object) }
+          return Array.isArray(value) ? ([...value] as T) : ({ ...(value as object) } as T)
         }
       }
     }
