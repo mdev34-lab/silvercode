@@ -36,8 +36,8 @@ function transcript(turns: number) {
   return list
 }
 
-function firstVisibleTurn(app: Parameters<typeof frameOf>[0]) {
-  return rows(app)
+async function firstVisibleTurn(app: Parameters<typeof frameOf>[0]) {
+  return (await rows(app))
     .find((row) => row.includes("Question"))
     ?.trim()
 }
@@ -62,27 +62,27 @@ describe("jump to latest (#241)", () => {
       await settle(app)
 
       // Pinned to the newest output: no chip, latest reply visible.
-      expect(frameOf(app)).toContain("Reply 30")
-      expect(frameOf(app)).not.toContain(CHIP)
+      expect(await frameOf(app)).toContain("Reply 30")
+      expect(await frameOf(app)).not.toContain(CHIP)
 
       // A draft in the prompt must survive everything below. (The prompt
       // stashes its draft across mounts, so start from an empty one.)
       keymap().dispatchCommand("prompt.clear")
       await app.mockInput.typeText("draft text")
       await settle(app)
-      expect(rows(app).filter((row) => row.includes("draft text")).length).toBe(1)
+      expect((await rows(app)).filter((row) => row.includes("draft text")).length).toBe(1)
 
       await wheel(app, 6)
       await snapshot(app, `scrolled-away-${sizeName}`)
-      const parked = firstVisibleTurn(app)
-      expect(frameOf(app)).not.toContain("Reply 30")
-      expect(frameOf(app)).toContain(CHIP)
+      const parked = await firstVisibleTurn(app)
+      expect(await frameOf(app)).not.toContain("Reply 30")
+      expect(await frameOf(app)).toContain(CHIP)
       // The chip sits in the gap row above the prompt: one row, fully inside
       // the terminal width, and it does not shift the prompt or the draft.
-      const chipRows = rows(app).filter((row) => row.includes(CHIP))
+      const chipRows = (await rows(app)).filter((row) => row.includes(CHIP))
       expect(chipRows.length).toBe(1)
       expect(chipRows[0]!.length).toBe(size.width)
-      expect(frameOf(app)).toContain("draft text")
+      expect(await frameOf(app)).toContain("draft text")
 
       // New output arrives while the reader is away: the viewport stays put
       // and the chip stays on screen.
@@ -90,24 +90,24 @@ describe("jump to latest (#241)", () => {
       sync.set("message", SESSION.id, (list) => [...list, late])
       sync.set("part", late.id, [textPart("prt_99", late, "Reply 31 arrives late")])
       await settle(app)
-      expect(firstVisibleTurn(app)).toBe(parked)
-      expect(frameOf(app)).not.toContain("Reply 31")
-      expect(frameOf(app)).toContain(CHIP)
+      expect(await firstVisibleTurn(app)).toBe(parked)
+      expect(await frameOf(app)).not.toContain("Reply 31")
+      expect(await frameOf(app)).toContain(CHIP)
 
       // Keyboard path: the existing hidden command the chip advertises.
       keymap().dispatchCommand("session.last")
       await settle(app)
-      expect(frameOf(app)).toContain("Reply 31 arrives late")
-      expect(frameOf(app)).not.toContain(CHIP)
-      expect(frameOf(app)).toContain("draft text")
+      expect(await frameOf(app)).toContain("Reply 31 arrives late")
+      expect(await frameOf(app)).not.toContain(CHIP)
+      expect(await frameOf(app)).toContain("draft text")
 
       // Sticky scrolling is re-engaged: further output follows automatically.
       const later = assistantMessage("msg_99b_assistant", SESSION.id, {})
       sync.set("message", SESSION.id, (list) => [...list, later])
       sync.set("part", later.id, [textPart("prt_99b", later, "Reply 32 follows")])
       await settle(app)
-      expect(frameOf(app)).toContain("Reply 32 follows")
-      expect(frameOf(app)).not.toContain(CHIP)
+      expect(await frameOf(app)).toContain("Reply 32 follows")
+      expect(await frameOf(app)).not.toContain(CHIP)
     })
   }
 
@@ -120,14 +120,14 @@ describe("jump to latest (#241)", () => {
     })
     await settle(app)
     await wheel(app, 6)
-    const row = rows(app).findIndex((line) => line.includes(CHIP))
-    const col = rows(app)[row]!.indexOf(CHIP)
+    const row = (await rows(app)).findIndex((line) => line.includes(CHIP))
+    const col = (await rows(app))[row]!.indexOf(CHIP)
     expect(row).toBeGreaterThan(0)
 
     await app.mockMouse.click(col + 2, row)
     await settle(app)
-    expect(frameOf(app)).toContain("Reply 30")
-    expect(frameOf(app)).not.toContain(CHIP)
+    expect(await frameOf(app)).toContain("Reply 30")
+    expect(await frameOf(app)).not.toContain(CHIP)
   })
 
   test("a short transcript never shows the chip", async () => {
@@ -139,7 +139,7 @@ describe("jump to latest (#241)", () => {
     })
     await settle(app)
     await wheel(app, 3)
-    expect(frameOf(app)).toContain("Reply 1")
-    expect(frameOf(app)).not.toContain(CHIP)
+    expect(await frameOf(app)).toContain("Reply 1")
+    expect(await frameOf(app)).not.toContain(CHIP)
   })
 })

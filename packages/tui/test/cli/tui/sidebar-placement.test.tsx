@@ -5,7 +5,7 @@ import { testRender, useRenderer } from "@opentui/solid"
 import { onCleanup } from "solid-js"
 import type { Message, Part, TextPart } from "@opencode-ai/sdk/v2"
 import { tmpdir } from "../../fixture/fixture"
-import { waitFor } from "../../fixture/frame"
+import { captureFrame, waitFor } from "../../fixture/frame"
 import { createTuiResolvedConfig } from "../../fixture/tui-runtime"
 import { createEventSource, createFetch, directory, json } from "../../fixture/tui-sdk"
 import { TestTuiContexts } from "../../fixture/tui-environment"
@@ -240,6 +240,6 @@ describe("session sidebar placement", () => {
     expect(transcript.screenX).toBeLessThan(panel.screenX + panel.width)
     // ...so the opaque panel hides it from the rendered frame.
     await waitFor(app, () => (app.captureCharFrame().includes(MESSAGE_TEXT) ? undefined : true))
-    expect(app.captureCharFrame()).not.toContain(MESSAGE_TEXT)
+    expect(await captureFrame(app)).not.toContain(MESSAGE_TEXT)
   })
 })

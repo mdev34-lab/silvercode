@@ -5,7 +5,7 @@ import { testRender, useRenderer } from "@opentui/solid"
 import { onCleanup } from "solid-js"
 import type { AssistantMessage, GlobalEvent, Message, Part, ReasoningPart, ToolPart } from "@opencode-ai/sdk/v2"
 import { tmpdir } from "../../fixture/fixture"
-import { waitFor } from "../../fixture/frame"
+import { captureFrame, waitFor } from "../../fixture/frame"
 import { createTuiResolvedConfig } from "../../fixture/tui-runtime"
 import { createEventSource, createFetch, directory, json } from "../../fixture/tui-sdk"
 import { TestTuiContexts } from "../../fixture/tui-environment"
@@ -221,8 +221,8 @@ async function mountSession(seedParts: Part[]) {
   return { app, events, keymap: () => keymapRef! }
 }
 
-function frameOf(app: Setup) {
-  return app.captureCharFrame()
+async function frameOf(app: Setup) {
+  return captureFrame(app)
 }
 
 // The reasoning body renders through the streaming markdown/code block, which
@@ -260,7 +260,7 @@ function deltaEvent(partID: string, delta: string, id: number): GlobalEvent {
 // Two completed tool calls put the reasoning inside a Working block; expand it
 // through the real header click so nested rows are on screen.
 async function expandWorkingBlock(app: Setup, keymap: () => OpenTuiKeymap) {
-  await waitFor(app, () => (frameOf(app).includes("tool call") ? frameOf(app) : undefined))
+  await waitFor(app, () => (app.captureCharFrame().includes("tool call") ? app.captureCharFrame() : undefined))
   keymap().dispatchCommand("session.toggle.activity")
   await settle(app)
 }
@@ -343,7 +343,7 @@ describe("thinking toggle on CoT nested inside a Working block", () => {
 
     // Click-open the collapsed nested thought, like a user reading the CoT
     // while the rest of the run keeps streaming in.
-    const frame = frameOf(app)
+    const frame = await frameOf(app)
     const row = frame.split("\n").findIndex((line) => line.includes("+ Thought"))
     expect(row).toBeGreaterThan(-1)
     await app.mockMouse.click(8, row)
@@ -355,6 +355,6 @@ describe("thinking toggle on CoT nested inside a Working block", () => {
     events.emit(updatedEvent(toolPart("prt_tool_c", BASE + 300), 3))
     await settle(app)
     expect(spansOf(app)).toContain(COT_BODY)
-    expect(frameOf(app)).toContain("- Thought")
+    expect(await frameOf(app)).toContain("- Thought")
   })
 })

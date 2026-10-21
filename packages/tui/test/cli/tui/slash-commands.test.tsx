@@ -1,5 +1,6 @@
 /** @jsxImportSource @opentui/solid */
 import { afterEach, describe, expect, test } from "bun:test"
+import { captureFrame } from "../../fixture/frame"
 import path from "node:path"
 import { createDefaultOpenTuiKeymap } from "@opentui/keymap/opentui"
 import { testRender, useRenderer } from "@opentui/solid"
@@ -278,7 +279,7 @@ describe("session slash commands", () => {
   test("dispatches /details and globally toggles /working without affecting assistant text or thinking", async () => {
     const harness = await mountSlashHarness()
     const entries = harness.slashes()
-    const frame = () => harness.app.captureCharFrame()
+    const frame = () => captureFrame(harness.app)
 
     const details = entries.find((entry) => entry.display === "/details")
     const working = entries.find((entry) => entry.display === "/working")
@@ -292,7 +293,7 @@ describe("session slash commands", () => {
         value.includes("Another ordinary assistant output.") &&
         value.includes("Thought: Planning"),
     )
-    const collapsed = frame()
+    const collapsed = await frame()
     expect(collapsed).not.toContain(readRow("src/a.ts"))
     expect(collapsed).not.toContain('Grep "todo"')
     expect(collapsed).not.toContain(readRow("src/c.ts"))
@@ -312,7 +313,7 @@ describe("session slash commands", () => {
         value.includes(readRow("src/a.ts")) && value.includes('Grep "todo"') && value.includes(readRow("src/c.ts")),
     )
     expect(commandTitle("session.toggle.activity")).toBe("Collapse working blocks")
-    const expanded = frame()
+    const expanded = await frame()
     expect(expanded).toContain(readRow("src/a.ts"))
     expect(expanded).toContain('Grep "todo"')
     expect(expanded).toContain(readRow("src/c.ts"))
@@ -326,10 +327,10 @@ describe("session slash commands", () => {
       (value: string) => !value.includes(readRow("src/a.ts")) && !value.includes(readRow("src/c.ts")),
     )
     expect(commandTitle("session.toggle.activity")).toBe("Expand working blocks")
-    expect(frame()).not.toContain('Grep "todo"')
-    expect(frame()).toContain("Assistant answer remains visible.")
-    expect(frame()).toContain("Another ordinary assistant output.")
-    expect(frame()).toContain("Thought: Planning")
-    expect(frame()).not.toContain("Private reasoning body.")
+    expect(await frame()).not.toContain('Grep "todo"')
+    expect(await frame()).toContain("Assistant answer remains visible.")
+    expect(await frame()).toContain("Another ordinary assistant output.")
+    expect(await frame()).toContain("Thought: Planning")
+    expect(await frame()).not.toContain("Private reasoning body.")
   })
 })

@@ -180,7 +180,7 @@ describe("prompt status indicator", () => {
       await ready
       await waitUntil(() => sync.status === "complete")
       await app.renderOnce()
-      expect(statusRow(app.captureCharFrame())).toBe("")
+      expect(statusRow(await captureFrame(app))).toBe("")
 
       const event: GlobalEvent = {
         directory,

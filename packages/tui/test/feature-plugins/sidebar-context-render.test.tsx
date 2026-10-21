@@ -1,5 +1,6 @@
 /** @jsxImportSource @opentui/solid */
 import { expect, test } from "bun:test"
+import { captureFrame } from "../fixture/frame"
 import { testRender, type JSX } from "@opentui/solid"
 import { RGBA } from "@opentui/core"
 import type { TuiPluginApi } from "@opencode-ai/plugin/tui"
@@ -129,7 +130,7 @@ for (const item of [
     const app = await testRender(() => view(), { width: 40, height: 6 })
     try {
       await app.renderOnce()
-      const frame = app.captureCharFrame()
+      const frame = await captureFrame(app)
       expect(frame).toContain("Context")
       expect(frame).toContain(item.bar)
       expect(frame).toContain(item.detail)

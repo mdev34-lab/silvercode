@@ -13,7 +13,7 @@ function isBusyOutput(error: unknown) {
   return error instanceof Error && error.message.includes("OutputBusy")
 }
 
-/** The current frame, retried while the output buffer is still being flushed. */
+/** The current frame, retried while the output buffer is still being flushed. Raw `captureCharFrame()` is safe only inside `waitFor` probes, which swallow OutputBusy and retry. */
 export async function captureFrame(app: Pick<Setup, "captureCharFrame">) {
   for (let attempt = 0; attempt < 40; attempt++) {
     try {

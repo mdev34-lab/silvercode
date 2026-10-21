@@ -5,7 +5,7 @@ import { testRender, useRenderer } from "@opentui/solid"
 import { onCleanup } from "solid-js"
 import type { GlobalEvent, Message, SessionStatus } from "@opencode-ai/sdk/v2"
 import { tmpdir } from "../../fixture/fixture"
-import { waitFor } from "../../fixture/frame"
+import { captureFrame, waitFor } from "../../fixture/frame"
 import { createTuiResolvedConfig } from "../../fixture/tui-runtime"
 import { createEventSource, createFetch, directory, json } from "../../fixture/tui-sdk"
 import { TestTuiContexts } from "../../fixture/tui-environment"
@@ -351,7 +351,7 @@ describe("subagent double-Esc stop", () => {
     await app.renderOnce()
 
     expect(aborts).toEqual([])
-    expect(app.captureCharFrame()).not.toContain("Cancelling…")
+    expect(await captureFrame(app)).not.toContain("Cancelling…")
   })
 
   test("an accepted but ineffective abort leaves no stale cancellation label", async () => {
@@ -370,14 +370,14 @@ describe("subagent double-Esc stop", () => {
     events.emit(statusEvent({ type: "idle" }))
     await waitFor(app, () => (app.captureCharFrame().includes("Stop subagent") ? undefined : true))
 
-    const finished = app.captureCharFrame()
+    const finished = await captureFrame(app)
     expect(finished).not.toContain("Cancelling…")
     expect(finished).not.toContain("Cancelled")
 
     // The child runs again: the stale request must not resurface as progress.
     events.emit(statusEvent({ type: "busy" }))
     await waitFor(app, () => (app.captureCharFrame().includes("Stop subagent") ? true : undefined))
-    expect(app.captureCharFrame()).not.toContain("Cancelling…")
+    expect(await captureFrame(app)).not.toContain("Cancelling…")
     expect(aborts).toEqual([`/session/${CHILD_ID}/abort`])
   })
 
@@ -398,7 +398,7 @@ describe("subagent double-Esc stop", () => {
       return !current.includes("Cancelling…") && !current.includes("Cancelled") ? true : undefined
     })
     expect(aborts).toEqual([`/session/${CHILD_ID}/abort`])
-    expect(app.captureCharFrame()).toContain("Stop subagent escape escape")
+    expect(await captureFrame(app)).toContain("Stop subagent escape escape")
 
     // The second attempt is a fresh double press, not a re-armed leftover.
     failAbort.current = false
@@ -423,7 +423,7 @@ describe("subagent double-Esc stop", () => {
     await waitFor(app, () => (app.captureCharFrame().includes("again to stop") ? true : undefined))
     expect(aborts).toEqual([])
 
-    await app.mockMouse.click(column, rowOf(app.captureCharFrame(), "Stop subagent"))
+    await app.mockMouse.click(column, rowOf(await captureFrame(app), "Stop subagent"))
     await waitFor(app, () => (app.captureCharFrame().includes("Cancelling…") ? true : undefined))
     expect(aborts).toEqual([`/session/${CHILD_ID}/abort`])
   })
@@ -460,7 +460,7 @@ describe("subagent double-Esc stop", () => {
     app.mockInput.pressEscape()
     await waitFor(app, () => (app.captureCharFrame().includes("Probe dialog") ? undefined : true))
 
-    const closed = app.captureCharFrame()
+    const closed = await captureFrame(app)
     expect(closed).toContain("Stop subagent")
     expect(closed).not.toContain("again to stop")
     expect(aborts).toEqual([])
