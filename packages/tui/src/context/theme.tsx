@@ -313,13 +313,24 @@ export function createSyntaxStyleMemo(factory: (owner: NativeResourceOwner) => S
 
   const release = (style: SyntaxStyle) => {
     retained.add(style)
-    void renderer
-      .idle()
-      .catch(() => {})
-      .finally(() => {
-        if (!retained.delete(style)) return
-        style.destroy()
-      })
+    const destroy = () => {
+      if (!retained.delete(style)) return
+      style.destroy()
+    }
+    if (renderer.isDestroyed) {
+      destroy()
+      return
+    }
+    // Code, markdown and diff renderables keep reading the previous style until the next
+    // frame rebinds them (markdown rebinds its code blocks in that frame's lifecycle pass),
+    // so the native style has to outlive it. `renderer.idle()` can settle before that frame
+    // when nothing is scheduled, destroying a style the renderables still hold (#371).
+    const frame = () => {
+      renderer.off(CliRenderEvents.FRAME, frame)
+      destroy()
+    }
+    renderer.on(CliRenderEvents.FRAME, frame)
+    renderer.requestRender()
   }
 
   onCleanup(() => {
