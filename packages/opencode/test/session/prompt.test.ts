@@ -3999,7 +3999,7 @@ unixNoLLMServer(
         )
         yield* Effect.sync(() => {
           try {
-            process.kill(pid, "SIGKILL")
+            process.kill(Number(pid), "SIGKILL")
           } catch {}
         })
 
