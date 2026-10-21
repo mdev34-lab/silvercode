@@ -1,7 +1,7 @@
 import type { Part } from "@opencode-ai/sdk/v2"
 
 // A pause shorter than this is just normal streaming latency and gets no marker.
-export const PAUSE_MIN_MS = 2000
+export const PAUSE_MIN_MS = 10_000
 
 function startOf(part: Part | undefined): number | undefined {
   if (!part) return undefined

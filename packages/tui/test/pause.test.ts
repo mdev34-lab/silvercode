@@ -9,16 +9,17 @@ const tool = (start?: number) =>
 
 describe("pauseBefore", () => {
   test("marks a long silence after reasoning", () => {
-    expect(pauseBefore([reasoning(0, 1000), tool(9000)], 1)).toBe(8000)
-    expect(pauseBefore([reasoning(0, 1000), text(4000)], 1)).toBe(3000)
+    expect(pauseBefore([reasoning(0, 1000), tool(19000)], 1)).toBe(18000)
+    expect(pauseBefore([reasoning(0, 1000), text(11000)], 1)).toBe(10000)
   })
   test("ignores short gaps and the first part", () => {
     expect(pauseBefore([reasoning(0, 1000), tool(2500)], 1)).toBeUndefined()
+    expect(pauseBefore([reasoning(0, 1000), tool(10999)], 1)).toBeUndefined()
     expect(pauseBefore([reasoning(0, 1000)], 0)).toBeUndefined()
   })
   test("ignores parts that do not follow reasoning or lack timing", () => {
-    expect(pauseBefore([text(0), tool(9000)], 1)).toBeUndefined()
-    expect(pauseBefore([reasoning(0), tool(9000)], 1)).toBeUndefined()
+    expect(pauseBefore([text(0), tool(19000)], 1)).toBeUndefined()
+    expect(pauseBefore([reasoning(0), tool(19000)], 1)).toBeUndefined()
     expect(pauseBefore([reasoning(0, 1000), tool()], 1)).toBeUndefined()
   })
   test("labels seconds and minutes", () => {
