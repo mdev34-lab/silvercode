@@ -15,7 +15,7 @@ import { useEvent } from "../../src/context/event"
 function workspaceStatus(workspaceID: string) {
   return {
     directory,
-    payload: { type: "workspace.status", properties: { workspaceID, status: { type: "idle" } } },
+    payload: { type: "workspace.status", properties: { workspaceID, status: "connected" } },
   } as never
 }
 
@@ -30,24 +30,25 @@ test("disposed provider no longer handles events; live owner still does", async 
   let project!: ReturnType<typeof useProject>
   let disposeInner!: () => void
 
-  const disposeOuter = createRoot((disposeOuter) => {
-    return (
-      <SDKProvider url="http://test" directory={directory} fetch={calls.fetch} events={events.source}>
-        {(() => {
-          event = useEvent()
-          disposeInner = createRoot((dispose) => {
-            ;<ProjectProvider>
-              {(() => {
-                project = useProject()
-                return <></>
-              })()}
-            </ProjectProvider>
-            return dispose
-          })
-          return <></>
-        })()}
-      </SDKProvider>
-    )
+  const disposeOuter = createRoot((dispose) => {
+    // Build the provider tree inside the root (components execute eagerly),
+    // then hand back the dispose handle.
+    ;<SDKProvider url="http://test" directory={directory} fetch={calls.fetch} events={events.source}>
+      {(() => {
+        event = useEvent()
+        disposeInner = createRoot((disposeInnerRoot) => {
+          ;<ProjectProvider>
+            {(() => {
+              project = useProject()
+              return <></>
+            })()}
+          </ProjectProvider>
+          return disposeInnerRoot
+        })
+        return <></>
+      })()}
+    </SDKProvider>
+    return dispose
   })
 
   try {
@@ -63,7 +64,7 @@ test("disposed provider no longer handles events; live owner still does", async 
     events.emit(workspaceStatus("w1"))
     await Bun.sleep(20)
     expect(seen).toEqual(["w1"])
-    expect(project.data.workspace.status["w1"]).toEqual({ type: "idle" })
+    expect(project.data.workspace.status["w1"]).toBe("connected")
 
     disposeInner()
 
