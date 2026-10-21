@@ -8,7 +8,7 @@ import { HttpApiBuilder, HttpApiSchema } from "effect/unstable/httpapi"
 import * as Socket from "effect/unstable/socket/Socket"
 import { Api } from "../api"
 import { CorsConfig, isAllowedRequestOrigin } from "../cors"
-import { ForbiddenError, PtyNotFoundError } from "@opencode-ai/protocol/errors"
+import { ForbiddenError, InvalidRequestError, PtyNotFoundError } from "@opencode-ai/protocol/errors"
 import {
   PTY_CONNECT_TICKET_QUERY,
   PTY_CONNECT_TOKEN_HEADER,
@@ -42,15 +42,27 @@ export const PtyHandler = HttpApiBuilder.group(Api, "server.pty", (handlers) =>
           const location = yield* Location.Service
           const cwd = ctx.payload.cwd || location.directory
           return yield* response(
-            pty.create({
-              ...ctx.payload,
-              args: ctx.payload.args ? [...ctx.payload.args] : undefined,
-              cwd,
-              env: {
-                ...ctx.payload.env,
-                ...(yield* environment.get({ directory: location.directory, cwd })),
-              },
-            }),
+            pty
+              .create({
+                ...ctx.payload,
+                args: ctx.payload.args ? [...ctx.payload.args] : undefined,
+                cwd,
+                env: {
+                  ...ctx.payload.env,
+                  ...(yield* environment.get({ directory: location.directory, cwd })),
+                },
+              })
+              .pipe(
+                Effect.catchTags({
+                  "Pty.CreateFailedError": (error) =>
+                    new InvalidRequestError({ message: error.reason, kind: "pty_create_failed" }),
+                  "Pty.LimitExceededError": (error) =>
+                    new InvalidRequestError({
+                      message: `too many running sessions (limit ${error.limit})`,
+                      kind: "pty_limit_exceeded",
+                    }),
+                }),
+              ),
           )
         }),
       )
@@ -176,12 +188,16 @@ export const PtyHandler = HttpApiBuilder.group(Api, "server.pty", (handlers) =>
           // Outbound frames flow through one queue drained by a single writer so replay, live
           // output, and the close frame keep their order.
           // TODO: Integrate graceful-shutdown socket tracking before clients migrate to this route.
-          const outbox = yield* Queue.unbounded<string | Uint8Array | Socket.CloseEvent>()
+          const outbox = yield* Queue.bounded<string | Uint8Array | Socket.CloseEvent>(4096)
+        // A slow client must not grow this queue without bound; drop the oldest queued frame.
+        const offer = (item: string | Uint8Array | Socket.CloseEvent) => {
+          while (!Queue.offerUnsafe(outbox, item)) Effect.runSync(Queue.poll(outbox))
+        }
           const attachment = yield* pty
             .attach(ctx.params.ptyID, {
               cursor,
-              onData: (chunk) => Queue.offerUnsafe(outbox, chunk),
-              onEnd: () => Queue.offerUnsafe(outbox, new Socket.CloseEvent(1000)),
+              onData: (chunk) => offer(chunk),
+              onEnd: () => offer(new Socket.CloseEvent(1000)),
             })
             .pipe(
               Effect.catchTags({
@@ -193,8 +209,8 @@ export const PtyHandler = HttpApiBuilder.group(Api, "server.pty", (handlers) =>
             )
           if (!attachment) return HttpServerResponse.empty()
 
-          for (const chunk of PtyProtocol.chunks(attachment.replay)) Queue.offerUnsafe(outbox, chunk)
-          Queue.offerUnsafe(outbox, PtyProtocol.metaFrame(attachment.cursor))
+          for (const chunk of PtyProtocol.chunks(attachment.replay)) offer(chunk)
+          offer(PtyProtocol.metaFrame(attachment.cursor))
           attachment.activate()
 
           const drain = Effect.gen(function* () {
