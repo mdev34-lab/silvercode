@@ -698,11 +698,11 @@ describe("tool.finish – availability uses the calling agent's dispatch ruleset
   )
 })
 
-describe("tool.finish – newest-50 routing window parity with task dispatch", () => {
-  // task's unpinned reviewer fallback reads only the newest 50 messages
-  // (sessions.messages({limit:50})); finish takes its fallback from the same
-  // window. These fixtures push the newest user row outside that window the
-  // way a long turn does: one user message, then >50 assistant rows.
+describe("tool.finish – review dispatch permission parity with task dispatch", () => {
+  // Reviewer resolution no longer depends on the parent or the message
+  // window after the specialist consolidation, so task's dispatch and
+  // finish's availability gate must agree on one pattern set: the single
+  // reviewer plus its retired specialist aliases.
   const APPROVED = [
     "<silvercode-review>",
     JSON.stringify({
@@ -788,10 +788,10 @@ describe("tool.finish – newest-50 routing window parity with task dispatch", (
           },
         )
 
-        // task's actual routing: its window holds no user row, so the request
-        // stayed generic — exactly one ask under ["review"] — and task itself
-        // recorded the delivered report for the generic reviewer.
-        expect(asked).toEqual([["review"]])
+        // task's actual ask: the single reviewer plus the retired specialist
+        // aliases that still gate it — and task itself recorded the delivered
+        // report for the reviewer.
+        expect(asked).toEqual([["review", "work-review", "code-review"]])
         expect(present(result.metadata.review).revision).toBe("uncommitted")
         const child = yield* sessions.get(result.metadata.sessionId as SessionID)
         expect(child.agent).toBe("review")
@@ -809,9 +809,9 @@ describe("tool.finish – newest-50 routing window parity with task dispatch", (
           .pipe(Effect.exit)
         expect(Exit.isSuccess(gate)).toBe(true)
 
-        // finish must demand its required review — not claim the specialist
-        // is unavailable while the actual dispatch would ask only generic
-        // review, which the same ruleset allows.
+        // finish must demand its required review — not claim the reviewer is
+        // unavailable while the actual dispatch, which the same ruleset
+        // allows, would run it.
         const attempts: Array<{ review?: Record<string, unknown> }> = []
         const finishTool = yield* FinishTool
         const fdef = yield* finishTool.init()
@@ -837,7 +837,9 @@ describe("tool.finish – newest-50 routing window parity with task dispatch", (
     {
       config: {
         agent: {
-          work: { permission: { task: { "work-review": "deny" } } },
+          // An unrelated deny: the review dispatch must stay allowed so the
+          // probe measures finish's demand, not a permission block.
+          work: { permission: { task: { general: "deny" } } },
           review: { background: false },
         },
       },
@@ -1221,7 +1223,7 @@ for (const effort of ["medium", "thorough"] as const) {
         )
         expect(result.metadata.background).toBe(true)
         const child = yield* sessions.get(result.metadata.sessionId)
-        expect(child.agent).toBe("work-review")
+        expect(child.agent).toBe("review")
         // Even a finished, approved background result is not foreground delivery.
         const completed = yield* jobs.wait({ id: result.metadata.sessionId })
         expect(completed?.info?.status).toBe("completed")

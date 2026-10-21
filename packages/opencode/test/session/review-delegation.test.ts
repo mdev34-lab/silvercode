@@ -589,10 +589,10 @@ it.instance(
       expect(reviewHits).toHaveLength(2)
 
       // The reviewer ran with its own prompt — and no review loop of its own,
-      // so reviews cannot recurse. The default primary is Work, so `review`
-      // resolved to the Work reviewer rather than the generic one.
+      // so reviews cannot recurse. After the consolidation every parent
+      // resolves `review` to the same single reviewer.
       const reviewBody = bodyString(reviewHits[0])
-      expect(reviewBody).toContain("Senior Work Reviewer")
+      expect(reviewBody).toContain("Senior Reviewer")
       expect(reviewBody).not.toContain("## Review Loop")
       expect(reviewBody).toContain("uncommitted working tree")
 
@@ -621,7 +621,7 @@ it.instance(
       const childID = completed.state.metadata?.sessionId
       expect(typeof childID).toBe("string")
       const child = yield* sessions.get(SessionID.make(childID as string))
-      expect(child.agent).toBe("work-review")
+      expect(child.agent).toBe("review")
       expect(child.parentID).toBe(chat.id)
 
       // The real Review runner must record the rejected first finish and then
@@ -745,8 +745,8 @@ it.instance(
 // No reviewer opt-in in these configs. Exercise the real model/tool pipeline,
 // including a failed premature finish, routing, report delivery, and approval.
 for (const [parent, reviewer] of [
-  ["work", "work-review"],
-  ["code", "code-review"],
+  ["work", "review"],
+  ["code", "review"],
   ["custom", "review"],
 ]) {
   for (const effort of ["medium", "thorough"] as const) {

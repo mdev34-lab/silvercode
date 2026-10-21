@@ -38,6 +38,9 @@ export const DEFAULT_COLOR = "#FFFFFF"
  */
 export const LEGACY_IDS: Readonly<Record<string, string | undefined>> = Object.freeze({
   build: "work",
+  // Retired specialist reviewers, consolidated into the single `review` agent.
+  "work-review": "review",
+  "code-review": "review",
 })
 
 /** Maps a legacy agent id onto its canonical id. Unknown ids pass through. */

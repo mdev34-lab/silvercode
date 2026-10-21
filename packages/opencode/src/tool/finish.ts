@@ -8,12 +8,11 @@ import { Effect, Option, Schema } from "effect"
 import { Todo } from "../session/todo"
 import { Session, readAgentEffort } from "../session/session"
 import { NotFoundError } from "@/storage/storage"
-import { ROUTING_WINDOW, routedAgent } from "../session/session-agent"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Config } from "@/config/config"
 import { reviewLoopState } from "../session/review-loop"
 import { BackgroundJob } from "@/background/job"
-import { isReviewAgent, resolveReviewer } from "../agent/review-agents"
+import { isReviewAgent, LEGACY_REVIEW_AGENTS, resolveReviewer } from "../agent/review-agents"
 import { Agent } from "../agent/agent"
 import { Permission } from "@/permission"
 
@@ -293,8 +292,8 @@ export const FinishTool = Tool.define(
           const reviewState = reviewLoopState(messages, { effort })
 
           // Reviewer availability is dispatch evidence taken from the same
-          // context a real `task` dispatch would use: the routed reviewer for
-          // this session's agent, its existence/primary status, the CALLING
+          // context a real `task` dispatch would use: the reviewer's
+          // existence/primary status, the CALLING
           // agent's permission ruleset exactly as `ctx.ask` composes it, the
           // session's rules, and the subagent depth limit. It is only
           // consulted when the policy could actually need a review.
@@ -307,21 +306,10 @@ export const FinishTool = Tool.define(
                       available: false as const, code: "session-unreadable" as const,
                       reason: "the session could not be read to verify reviewer dispatch context",
                     }
-                  // Same routing tier as task(): the pinned session agent,
-                  // falling back to the newest user message's agent — read
-                  // over task's dispatch window: task's fallback reads
-                  // sessions.messages({limit:50}), the newest 50 rows. The
-                  // full-history read above is ascending, so its final 50
-                  // entries are exactly that newest page (same rows, same
-                  // (time_created, id) order), keeping this verdict on the
-                  // window dispatch actually routes from; reviewLoopState
-                  // above still consumes the full history.
-                  const routed = routedAgent(session, messages.slice(-ROUTING_WINDOW))
-                  const resolved = resolveReviewer("review", routed)
-                  // Dispatch parity with task(): only the RESOLVED reviewer must
-                  // exist. The generic `review` request is a routing input, not a
-                  // dispatch target, so a disabled generic reviewer must not block
-                  // a usable specialist.
+                  // One reviewer exists after the specialist consolidation:
+                  // resolution is the identity for a `review` dispatch, so the
+                  // availability check reads the reviewer directly.
+                  const resolved = resolveReviewer("review")
                   const reviewer = yield* agents.get(resolved)
                   if (!reviewer)
                     return {
@@ -348,7 +336,11 @@ export const FinishTool = Tool.define(
                       reason: `running agent "${ctx.agent}" could not be read to verify its dispatch permissions`,
                     }
                   const ruleset = Permission.merge(caller.permission, session.permission ?? [])
-                  const patterns = resolved === "review" ? ["review"] : ["review", resolved]
+                  // The retired specialist names stay valid deny targets: a
+                  // rule written against `work-review`/`code-review` gated the
+                  // reviewer before the consolidation, and there is exactly one
+                  // reviewer to gate now, so it must keep gating.
+                  const patterns = ["review", ...LEGACY_REVIEW_AGENTS]
                   // Same deny verdict as the real dispatch: `Permission.denies`
                   // evaluates this ruleset against the instance-approved grants
                   // exactly as `Permission.ask` does, so an always-grant that

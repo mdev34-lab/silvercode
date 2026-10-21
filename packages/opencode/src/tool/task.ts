@@ -12,7 +12,7 @@ import { SessionStatus } from "@/session/status"
 import { SessionID, MessageID } from "../session/schema"
 import { MessageV2 } from "../session/message-v2"
 import { Agent } from "../agent/agent"
-import { isReviewAgent, resolveReviewer } from "../agent/review-agents"
+import { isReviewAgent, LEGACY_REVIEW_AGENTS, resolveReviewer } from "../agent/review-agents"
 import { deriveSubagentSessionPermission } from "../agent/subagent-permissions"
 import type { SessionPrompt } from "../session/prompt"
 import { Config } from "@/config/config"
@@ -212,21 +212,19 @@ export const TaskTool = Tool.define(
       // read at two different moments, and a parent that switched agent
       // mid-thread is exactly the case this routing exists to handle - and a
       // notification delivered under an agent other than the one that
-      // dispatched the task lands in a session that never asked for it. Cached
-      // rather than hoisted so a task that neither routes a review nor delivers
-      // a background result still never pays for the message read.
+      // Cached
+      // rather than hoisted so a task that never delivers a background result
+      // still never pays for the message read.
       // `Effect.cached` yields the memoized effect rather than its value, so nothing runs here.
-      // Only the `review` routing below and the background delivery yield it.
+      // Only the background delivery below yields it.
       const parentAgentOf = yield* Effect.cached(sessionAgent(sessions, parent))
 
-      // `review` is the request, not the identity. The parent agent decides
-      // which reviewer actually runs, so the report gate, the permission prompt
-      // and the delivered envelope all agree on one resolved name. Parents with
-      // no specialization (plan, general, explore) keep the generic reviewer.
-      // Yielding the read unconditionally would make every delegation pay for it
-      // and hard-fail on an unreadable parent, not just a review.
-      const routedParent = params.subagent_type === "review" ? yield* parentAgentOf : undefined
-      const subagentType = resolveReviewer(params.subagent_type, routedParent)
+      // A retired specialist reviewer (`work-review`, `code-review`) is an
+      // alias for the single `review` agent: the rewrite keeps the report
+      // gate, the permission prompt and the delivered envelope agreed on one
+      // resolved name. The requested name still keys the permission prompt
+      // below, so rules and grants written against a specialist keep applying.
+      const subagentType = resolveReviewer(params.subagent_type)
 
       const next = yield* agent.get(subagentType)
       if (!next) {
@@ -246,15 +244,16 @@ export const TaskTool = Tool.define(
       // child that never finishes, which is the coupling the background path and
       // this configuration exist to make explicit.
       //
-      // A `review` request is rewritten to the parent's specialist reviewer, and
-      // config - like the permission rules keyed on both names below - is usually
-      // written against the name that was asked for, so the requested name counts
-      // as a fallback. Precedence: the agent that actually runs decides, the
-      // requested name decides only when the runner says nothing, and background
-      // decides when neither does. Both names are read through `Agent.get` rather
-      // than off the raw config so a name resolves exactly the way the delegation
-      // itself resolves it, legacy aliases included; the fallback is skipped
-      // entirely when routing left the name alone, which is every other dispatch.
+      // A retired specialist reviewer request is rewritten to the single
+      // reviewer, and config - like the permission rules keyed on both names
+      // below - is usually written against the name that was asked for, so the
+      // requested name counts as a fallback. Precedence: the agent that
+      // actually runs decides, the requested name decides only when the runner
+      // says nothing, and background decides when neither does. Both names are
+      // read through `Agent.get` rather than off the raw config so a name
+      // resolves exactly the way the delegation itself resolves it, legacy
+      // aliases included; the fallback is skipped entirely when resolution
+      // left the name alone, which is every other dispatch.
       const requested = subagentType === params.subagent_type ? undefined : yield* agent.get(params.subagent_type)
       const runInBackground = (next.background ?? requested?.background ?? true) || params.background === true
 
@@ -274,8 +273,18 @@ export const TaskTool = Tool.define(
           // union, so no rule that could reasonably have gated this call is
           // skipped, and the common case - a request routing did not rewrite -
           // still prompts under exactly one name.
-          patterns:
-            subagentType === params.subagent_type ? [params.subagent_type] : [params.subagent_type, subagentType],
+          patterns: [
+            ...(subagentType === params.subagent_type
+              ? [params.subagent_type]
+              : [params.subagent_type, subagentType]),
+            // The retired specialist names stay valid rule targets: a deny or
+            // grant written against `work-review`/`code-review` gated the
+            // reviewer before the consolidation, and there is exactly one
+            // reviewer to gate now, so it must keep matching.
+            ...(subagentType === "review"
+              ? [...LEGACY_REVIEW_AGENTS].filter((name) => name !== params.subagent_type)
+              : []),
+          ],
           always: ["*"],
           metadata: {
             description: params.description,
