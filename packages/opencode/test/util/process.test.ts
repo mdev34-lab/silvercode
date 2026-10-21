@@ -16,6 +16,24 @@ describe("util.process", () => {
     expect(out.stderr.toString()).toBe("err")
   })
 
+  test("caps oversized stdout at the run output limit", async () => {
+    const out = await Process.run(
+      node(`process.stdout.write("x".repeat(${Process.RUN_OUTPUT_LIMIT + 1024 * 1024}))`),
+    )
+    expect(out.code).toBe(0)
+    expect(out.stdout.length).toBe(Process.RUN_OUTPUT_LIMIT)
+  })
+
+  test("abort kills a hanging run", async () => {
+    const started = Date.now()
+    const out = await Process.run(node("setInterval(() => {}, 1000)"), {
+      nothrow: true,
+      abort: AbortSignal.timeout(500),
+    })
+    expect(Date.now() - started).toBeLessThan(20_000)
+    expect(out.code).not.toBe(0)
+  }, 25_000)
+
   test("returns code when nothrow is enabled", async () => {
     const out = await Process.run(node("process.exit(7)"), { nothrow: true })
     expect(out.code).toBe(7)

@@ -1,7 +1,25 @@
 import { type ChildProcess } from "child_process"
 import type { Stream } from "node:stream"
 import launch from "cross-spawn"
-import { buffer } from "node:stream/consumers"
+/** Per-stream cap for {@link run} output: buffers accumulate without a maxBuffer
+ * analogue, so a verbose child would allocate without bound. */
+export const RUN_OUTPUT_LIMIT = 8 * 1024 * 1024
+
+/** Reads a stream like `node:stream/consumers.buffer`, but stops accumulating
+ * once the cap is reached (the child keeps draining; the excess is dropped). */
+async function boundedBuffer(stream: NodeJS.ReadableStream): Promise<Buffer> {
+  const chunks: Buffer[] = []
+  let size = 0
+  for await (const chunk of stream) {
+    const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+    if (size < RUN_OUTPUT_LIMIT) {
+      const kept = buf.subarray(0, RUN_OUTPUT_LIMIT - size)
+      chunks.push(kept)
+      size += kept.length
+    }
+  }
+  return Buffer.concat(chunks)
+}
 import { errorMessage } from "./error"
 
 export type Stdio = "inherit" | "pipe" | "ignore" | number | Stream
@@ -126,7 +144,7 @@ export async function run(cmd: string[], opts: RunOptions = {}): Promise<Result>
 
   if (!proc.stdout || !proc.stderr) throw new Error("Process output not available")
 
-  const out = await Promise.all([proc.exited, buffer(proc.stdout), buffer(proc.stderr)])
+  const out = await Promise.all([proc.exited, boundedBuffer(proc.stdout), boundedBuffer(proc.stderr)])
     .then(([code, stdout, stderr]) => ({
       code,
       stdout,
