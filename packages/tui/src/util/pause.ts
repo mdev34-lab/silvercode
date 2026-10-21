@@ -33,3 +33,11 @@ export function pauseLabel(ms: number): string {
   if (seconds < 60) return `${seconds}s`
   return `${Math.floor(seconds / 60)}m ${seconds % 60}s`
 }
+
+// The marker text. A stall that ends in a new thought is a retried stream.
+export function pauseMarker(parts: readonly Part[], index: number): string | undefined {
+  const ms = pauseBefore(parts, index)
+  if (ms === undefined) return undefined
+  const retried = parts[index]?.type === "reasoning"
+  return `Stalled for ${pauseLabel(ms)}${retried ? ", retrying..." : ""}`
+}

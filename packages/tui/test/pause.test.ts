@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import type { Part } from "@opencode-ai/sdk/v2"
-import { pauseBefore, pauseLabel } from "../src/util/pause"
+import { pauseBefore, pauseLabel, pauseMarker } from "../src/util/pause"
 
 const reasoning = (start: number, end?: number) => ({ type: "reasoning", time: { start, end } }) as unknown as Part
 const text = (start: number) => ({ type: "text", time: { start } }) as unknown as Part
@@ -33,5 +33,16 @@ describe("pauseBefore", () => {
   test("labels seconds and minutes", () => {
     expect(pauseLabel(60000)).toBe("1m 0s")
     expect(pauseLabel(75000)).toBe("1m 15s")
+  })
+})
+
+describe("pauseMarker", () => {
+  test("says retrying when the stall ended in a new thought", () => {
+    const step = { type: "step-start" } as unknown as Part
+    expect(pauseMarker([reasoning(0, 1000), step, reasoning(63000, 64000)], 2)).toBe("Stalled for 1m 2s, retrying...")
+  })
+  test("plain stall before text", () => {
+    expect(pauseMarker([reasoning(0, 1000), text(91000)], 1)).toBe("Stalled for 1m 30s")
+    expect(pauseMarker([reasoning(0, 1000), text(3000)], 1)).toBeUndefined()
   })
 })
