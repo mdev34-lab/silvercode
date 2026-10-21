@@ -631,8 +631,8 @@ const layer = Layer.effect(
           ctx.currentText = undefined
         }
 
-        for (const part of Object.values(ctx.reasoningMap)) {
-          const end = Date.now()
+        for (const [id, part] of Object.entries(ctx.reasoningMap)) {
+          const end = ctx.reasoningLast[id] ?? Date.now()
           yield* session.updatePart({
             ...part,
             time: { start: part.time.start ?? end, end },
@@ -713,6 +713,8 @@ const layer = Layer.effect(
         return yield* Effect.gen(function* () {
           yield* Effect.gen(function* () {
             ctx.currentText = undefined
+            // A retry after a stalled or failed stream must not leave the previous attempt's thought open.
+            yield* Effect.forEach(Object.keys(ctx.reasoningMap), finishReasoning)
             ctx.reasoningMap = {}
             ctx.reasoningLast = {}
             yield* status.set(ctx.sessionID, { type: "busy" })
