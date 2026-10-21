@@ -97,8 +97,9 @@ async function tool(part: ToolPart, printed?: string) {
     if (next.mode === "block" && part.tool === "finish" && printed && next.body) {
       const rest = withoutRepeatedResult(next.body, printed)
       if (rest !== undefined) {
-        if (rest) block({ ...next, mode: undefined, body: undefined }, rest)
-        else inline({ ...next, mode: undefined, body: undefined })
+        const info: Inline = { icon: next.icon, title: next.title, description: next.description }
+        if (rest) block(info, rest)
+        else inline(info)
         return
       }
     }
