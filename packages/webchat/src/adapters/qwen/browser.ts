@@ -201,18 +201,31 @@ function readLockPid(profileDir: string): number | undefined {
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 
-async function acquireProfileLock(profileDir: string, timeoutMs: number, signal?: AbortSignal): Promise<void> {
+// Exported for tests.
+export async function acquireProfileLock(profileDir: string, timeoutMs: number, signal?: AbortSignal): Promise<void> {
   fs.mkdirSync(profileDir, { recursive: true })
+  const file = lockfilePath(profileDir)
   const deadline = Date.now() + timeoutMs
   for (;;) {
     if (signal?.aborted) throw aborted()
+    // Atomic claim: the exclusive create is the only write, so two processes
+    // racing an absent lock cannot both proceed (#428).
+    try {
+      fs.writeFileSync(file, String(process.pid), { encoding: "utf8", flag: "wx" })
+      return
+    } catch {
+      // Claimed by someone else (or the file is stuck); inspect the owner.
+    }
     const owner = readLockPid(profileDir)
-    if (owner === undefined || owner === process.pid || !isPidAlive(owner)) {
+    if (owner === process.pid) return
+    if (owner === undefined || !isPidAlive(owner)) {
+      // Stale or unreadable lock: remove it, then race the exclusive create
+      // again. Losing that race just means the other process owns it now.
       try {
-        fs.writeFileSync(lockfilePath(profileDir), String(process.pid), "utf8")
-        return
+        fs.rmSync(file, { force: true })
+        continue
       } catch {
-        // Lost a race; fall through and retry.
+        // The stale file could not be removed; wait and retry until the deadline.
       }
     }
     if (Date.now() >= deadline) {
