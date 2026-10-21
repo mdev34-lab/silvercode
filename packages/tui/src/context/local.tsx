@@ -238,6 +238,7 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
       const filePath = path.join(paths.state, "model.json")
       const state = {
         pending: false,
+        writes: Promise.resolve() as Promise<unknown>,
       }
 
       function save() {
@@ -246,12 +247,18 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
           return
         }
         state.pending = false
-        void writeJsonAtomic(filePath, {
-          recent: modelStore.recent,
-          favorite: modelStore.favorite,
-          variant: modelStore.variant,
-          coupled: modelStore.coupled,
-        })
+        // Serialize saves and absorb failures: a write that races process
+        // shutdown or a removed state directory must not surface as an
+        // unhandled rejection.
+        const write = state.writes.then(() =>
+          writeJsonAtomic(filePath, {
+            recent: modelStore.recent,
+            favorite: modelStore.favorite,
+            variant: modelStore.variant,
+            coupled: modelStore.coupled,
+          }),
+        )
+        state.writes = write.catch((error) => console.error("Failed to write model state", { error }))
       }
 
       readJson<unknown>(filePath)
@@ -575,6 +582,7 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
       const filePath = path.join(paths.state, "session.json")
       const state = {
         pending: false,
+        writes: Promise.resolve() as Promise<unknown>,
       }
 
       function save() {
@@ -583,9 +591,12 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
           return
         }
         state.pending = false
-        void writeJsonAtomic(filePath, {
-          pinned: sessionStore.pinned,
-        })
+        const write = state.writes.then(() =>
+          writeJsonAtomic(filePath, {
+            pinned: sessionStore.pinned,
+          }),
+        )
+        state.writes = write.catch((error) => console.error("Failed to write session state", { error }))
       }
 
       readJson<unknown>(filePath)
