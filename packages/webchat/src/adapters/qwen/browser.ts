@@ -144,7 +144,8 @@ export function readProfileMetadata(profileDir?: string): QwenWebProfileMetadata
   }
 }
 
-function writeProfileMetadata(profileDir: string, patch: Partial<QwenWebProfileMetadata>): void {
+// Exported for tests.
+export function writeProfileMetadata(profileDir: string, patch: Partial<QwenWebProfileMetadata>): void {
   try {
     const current = readProfileMetadata(profileDir)
     const next: QwenWebProfileMetadata = {
@@ -154,7 +155,12 @@ function writeProfileMetadata(profileDir: string, patch: Partial<QwenWebProfileM
       lastSeenAt: patch.lastSeenAt ?? current?.lastSeenAt,
     }
     fs.mkdirSync(profileDir, { recursive: true })
-    fs.writeFileSync(metadataPath(profileDir), JSON.stringify(next, null, 2), "utf8")
+    // Temp file + atomic rename: an interruption mid-write must not leave
+    // truncated JSON that reads back as "unauthenticated" (#429).
+    const file = metadataPath(profileDir)
+    const tmp = `${file}.tmp`
+    fs.writeFileSync(tmp, JSON.stringify(next, null, 2), "utf8")
+    fs.renameSync(tmp, file)
   } catch (error) {
     debug("browser", "failed to persist profile metadata (non-fatal)", {
       error: error instanceof Error ? error.message : String(error),
