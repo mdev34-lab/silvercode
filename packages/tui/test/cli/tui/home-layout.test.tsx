@@ -6,6 +6,7 @@ import { describe, expect, test } from "bun:test"
 import { onCleanup } from "solid-js"
 import type { TuiPluginApi, TuiSlotPlugin } from "@opencode-ai/plugin/tui"
 import { tmpdir } from "../../fixture/fixture"
+import { waitFor } from "../../fixture/frame"
 import { createTuiResolvedConfig } from "../../fixture/tui-runtime"
 import { createEventSource, createFetch, directory, json } from "../../fixture/tui-sdk"
 import { TestTuiContexts } from "../../fixture/tui-environment"
@@ -117,14 +118,15 @@ function createHomeFetch(options: Options) {
 }
 
 async function untilFrame(app: Setup, predicate: (frame: string) => boolean, maxPasses = 600) {
-  let frame = app.captureCharFrame()
-  for (let pass = 0; pass <= maxPasses; pass++) {
-    frame = app.captureCharFrame()
-    if (predicate(frame)) return frame
-    await app.renderOnce()
-    await Bun.sleep(5)
-  }
-  throw new Error(`frame predicate not satisfied after ${maxPasses} passes:\n${frame}`)
+  return waitFor(
+    app,
+    () => {
+      const frame = app.captureCharFrame()
+      return predicate(frame) ? frame : undefined
+    },
+    maxPasses,
+    `frame predicate not satisfied after ${maxPasses} passes`,
+  )
 }
 
 async function renderHome(options: Options) {

@@ -5,6 +5,7 @@ import { testRender, useRenderer } from "@opentui/solid"
 import { onCleanup } from "solid-js"
 import type { Message, Part, TextPart } from "@opencode-ai/sdk/v2"
 import { tmpdir } from "../../fixture/fixture"
+import { waitFor } from "../../fixture/frame"
 import { createTuiResolvedConfig } from "../../fixture/tui-runtime"
 import { createEventSource, createFetch, directory, json } from "../../fixture/tui-sdk"
 import { TestTuiContexts } from "../../fixture/tui-environment"
@@ -186,17 +187,6 @@ async function mountSession(width: number) {
 
 function find(app: Setup, id: string) {
   return app.renderer.root.findDescendantById(id)
-}
-
-/** Pumps frames until `probe` yields, so measurements read a settled layout. */
-async function waitFor<T>(app: Setup, probe: () => T | undefined, passes = 400): Promise<T> {
-  for (let pass = 0; pass <= passes; pass++) {
-    await app.renderOnce()
-    const value = probe()
-    if (value !== undefined) return value
-    await Bun.sleep(5)
-  }
-  throw new Error(`condition never settled:\n${app.captureCharFrame()}`)
 }
 
 function frameWith(app: Setup, needle: string) {

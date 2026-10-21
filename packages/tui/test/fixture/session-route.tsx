@@ -16,6 +16,7 @@ import type {
   UserMessage,
 } from "@opencode-ai/sdk/v2"
 import { tmpdir } from "./fixture"
+import { waitFor } from "./frame"
 import { createTuiResolvedConfig } from "./tui-runtime"
 import { createEventSource, createFetch, directory, json } from "./tui-sdk"
 import { TestTuiContexts } from "./tui-environment"
@@ -341,15 +342,8 @@ export async function mountSessionRoute(options: MountOptions) {
   return { app, events, sync, keymap: () => keymapRef! }
 }
 
-export async function waitFor<T>(app: Setup, probe: () => T | undefined, passes = 400): Promise<T> {
-  for (let pass = 0; pass <= passes; pass++) {
-    await app.renderOnce()
-    const value = probe()
-    if (value !== undefined) return value
-    await Bun.sleep(5)
-  }
-  throw new Error(`condition never settled:\n${app.captureCharFrame()}`)
-}
+// The frame pump lives in its own module so the tests that mount their own app share it.
+export { waitFor }
 
 export async function settle(app: Setup) {
   await Bun.sleep(150)

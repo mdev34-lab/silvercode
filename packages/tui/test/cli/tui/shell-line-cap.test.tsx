@@ -28,6 +28,7 @@ import { OPENCODE_BASE_MODE, OpencodeKeymapProvider, registerOpencodeKeymap } fr
 import { AssistantMessageRow, SessionContext } from "../../../src/routes/session"
 import { computeActivityGroups } from "../../../src/util/activity"
 import { MAX_OUTPUT_LINE_LENGTH } from "../../../src/util/cap-lines"
+import { waitUntil } from "../../fixture/frame"
 
 const SESSION = "ses_shell_cap"
 const BASE = 1_700_000_000_000
@@ -74,14 +75,6 @@ function shellPart(
       time: { start: at(1), end: at(2) },
       ...state,
     } as ToolPart["state"],
-  }
-}
-
-async function waitUntil(fn: () => boolean, timeout = 5000) {
-  const start = Date.now()
-  while (!fn()) {
-    if (Date.now() - start > timeout) throw new Error("timed out waiting for condition")
-    await Bun.sleep(10)
   }
 }
 

@@ -26,18 +26,11 @@ import { LocationProvider } from "../../../src/context/location"
 import { OpencodeKeymapProvider, registerOpencodeKeymap } from "../../../src/keymap"
 import { AssistantMessageRow, SessionContext } from "../../../src/routes/session"
 import { computeActivityGroups } from "../../../src/util/activity"
+import { waitUntil } from "../../fixture/frame"
 
 const SESSION = "ses_reason_stream"
 const BASE = 1_700_000_000_000
 const BODY = "Let me investigate the bug"
-
-async function waitUntil(fn: () => boolean, timeout = 5000) {
-  const start = Date.now()
-  while (!fn()) {
-    if (Date.now() - start > timeout) throw new Error("timed out waiting for condition")
-    await Bun.sleep(10)
-  }
-}
 
 // A frame with the reasoning body drawn. The reasoning body is rendered by a
 // streaming markdown/code block, which is not captured by `captureCharFrame()`

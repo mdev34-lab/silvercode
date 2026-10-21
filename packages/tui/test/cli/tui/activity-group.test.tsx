@@ -29,6 +29,7 @@ import { LocationProvider } from "../../../src/context/location"
 import { OPENCODE_BASE_MODE, OpencodeKeymapProvider, registerOpencodeKeymap, useBindings } from "../../../src/keymap"
 import { ActivityGroup, AssistantMessageRow, SessionContext } from "../../../src/routes/session"
 import { computeActivityGroups, resolveActivityExpanded, toggleActivityOverride } from "../../../src/util/activity"
+import { waitUntil } from "../../fixture/frame"
 
 const SESSION = "ses_activity_ui"
 const BASE = 1_700_000_000_000
@@ -94,14 +95,6 @@ function todoBlock(messageID: string, content: string, start: number, end: numbe
       time: { start, end },
     },
   )
-}
-
-async function waitUntil(fn: () => boolean, timeout = 5000) {
-  const start = Date.now()
-  while (!fn()) {
-    if (Date.now() - start > timeout) throw new Error("timed out waiting for condition")
-    await Bun.sleep(10)
-  }
 }
 
 let testSetup: { app: Awaited<ReturnType<typeof testRender>>; dispose: () => Promise<void> } | undefined
