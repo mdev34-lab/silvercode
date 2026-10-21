@@ -261,18 +261,42 @@ const layer = Layer.effect(
 
       const legacy = path.join(Global.Path.config, "config")
       if (existsSync(legacy)) {
-        yield* Effect.promise(() =>
-          import(pathToFileURL(legacy).href, { with: { type: "toml" } })
-            .then(async (mod) => {
-              const { provider, model, ...rest } = mod.default
-              if (provider && model) result.model = `${provider}/${model}`
-              result["$schema"] = "https://opencode.ai/config.json"
-              result = mergeConfig(result, rest)
-              await fsNode.writeFile(path.join(Global.Path.config, "config.json"), JSON.stringify(result, null, 2))
-              await fsNode.unlink(legacy)
+        // Migrate step by step so a failure is reported and never silently
+        // loses data (#436): write the converted JSON before touching
+        // in-memory state, and only unlink the legacy file after the write
+        // landed. A failed write keeps the legacy file and leaves the
+        // running process on un-migrated config, so the two never diverge.
+        const migration = yield* Effect.promise(async () => {
+          try {
+            const mod = await import(pathToFileURL(legacy).href, { with: { type: "toml" } })
+            const { provider, model, ...rest } = mod.default
+            const converted = { ...rest, $schema: "https://opencode.ai/config.json" } as Info
+            if (provider && model) converted.model = `${provider}/${model}`
+            const merged = mergeConfig(result, converted)
+            await fsNode.writeFile(
+              path.join(Global.Path.config, "config.json"),
+              JSON.stringify(merged, null, 2),
+            )
+            return { ok: true as const, converted }
+          } catch (error) {
+            return { ok: false as const, error }
+          }
+        })
+        if (migration.ok) {
+          result = mergeConfig(result, migration.converted)
+          const unlinkError = yield* Effect.promise(() => fsNode.unlink(legacy).then(() => undefined, (error) => error))
+          if (unlinkError !== undefined) {
+            yield* Effect.logWarning("legacy config migrated but the legacy file could not be removed", {
+              path: legacy,
+              error: String(unlinkError),
             })
-            .catch(() => {}),
-        )
+          }
+        } else {
+          yield* Effect.logWarning("legacy config migration failed, keeping the legacy file", {
+            path: legacy,
+            error: String(migration.error),
+          })
+        }
       }
 
       return result
