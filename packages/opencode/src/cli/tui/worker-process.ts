@@ -73,6 +73,8 @@ export interface WorkerProcessOptions {
   onExit?: (exit: WorkerExit) => void | Promise<void>
   log?: (message: string) => void
   spawn?: Spawn
+  /** Thread-mode worker factory (tests). Defaults to the global Worker. */
+  spawnWorker?: (target: string, init: { env?: Record<string, string> }) => ThreadWorkerLike
 }
 
 /**
@@ -250,27 +252,58 @@ export function createWorkerProcess(target: string, options: WorkerProcessOption
  * on failure: report the exit and let the caller observe it like any other
  * dead backend.
  */
-function createThreadWorker(target: string, options: WorkerProcessOptions = {}): WorkerProcess {
-  const worker = new Worker(target, {
+type ThreadWorkerLike = {
+  postMessage(data: string): void
+  terminate(): void | Promise<void>
+  onmessage: ((event: MessageEvent<string>) => void) | null
+  onerror: ((event: unknown) => void) | null
+}
+
+export function createThreadWorker(target: string, options: WorkerProcessOptions = {}): WorkerProcess {
+  const spawnWorker =
+    options.spawnWorker ?? ((t: string, init: { env?: Record<string, string> }) => new Worker(t, init) as unknown as ThreadWorkerLike)
+  const worker = spawnWorker(target, {
     env: options.env,
   })
   const log = options.log ?? console.error
+
+  let resolveClosed!: (exit: WorkerExit) => void
+  const closed = new Promise<WorkerExit>((resolve) => {
+    resolveClosed = resolve
+  })
+  // terminate() settles closed itself: a clean thread shutdown never fires
+  // onerror, so resolving closed only there used to hang it forever and leak
+  // the onExit hook (#401). onerror now covers abnormal ends only, once.
+  let finished = false
+  const finish = (exit: WorkerExit) => {
+    if (finished) return
+    finished = true
+    resolveClosed(exit)
+    void Promise.resolve()
+      .then(() => options.onExit?.(exit))
+      .catch((error) => {
+        log(`[silvercode] worker exit hook failed: ${error instanceof Error ? error.message : String(error)}`)
+      })
+  }
 
   const transport = {} as WorkerProcess
   Object.defineProperties(transport, {
     closed: {
       enumerable: true,
-      value: new Promise<WorkerExit>((resolve) => {
-        worker.onerror = () => resolve({ code: 1, signal: null })
-      }),
+      value: closed,
     },
   })
   transport.postMessage = (data) => {
     worker.postMessage(data)
   }
+  // A thread shares the owner's process: there is no signal channel, only
+  // terminate(). Explicit no-op so the WorkerProcess contract holds.
   transport.signal = () => {}
   transport.terminate = async () => {
-    worker.terminate()
+    // Bun's Worker.terminate resolves after the thread finishes flushing;
+    // awaiting it keeps in-flight RPC emits from being cut off (#401).
+    await worker.terminate()
+    finish({ code: 0, signal: null })
   }
   transport.waitForRestart = () => Promise.resolve()
 
@@ -280,11 +313,7 @@ function createThreadWorker(target: string, options: WorkerProcessOptions = {}):
   worker.onerror = (event) => {
     const message = event instanceof MessageEvent ? String(event.data ?? "unknown worker error") : "unknown worker error"
     transport.onclose?.(new Error(`Bun worker exited with error: ${message}`))
-    void Promise.resolve()
-      .then(() => options.onExit?.({ code: 1, signal: null }))
-      .catch((error) => {
-        log(`[silvercode] worker exit hook failed: ${error instanceof Error ? error.message : String(error)}`)
-      })
+    finish({ code: 1, signal: null })
   }
   return transport
 }
