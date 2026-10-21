@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test"
 import { RGBA, type CliRenderer, type TerminalColors } from "@opentui/core"
+import { createTestRenderer } from "@opentui/core/testing"
 import { RUN_THEME_FALLBACK, generateSystem, resolveRunTheme, resolveTheme } from "@/cli/cmd/run/theme"
 
 const palette = ["#15161e", "#f7768e", "#9ece6a", "#e0af68", "#7aa2f7", "#bb9af7", "#7dcfff", "#c0caf5"] as const
@@ -19,6 +20,10 @@ function terminalColors(input: Partial<TerminalColors> = {}): TerminalColors {
   }
 }
 
+// SyntaxStyle allocation needs a native owner, so the stub renderer borrows the
+// scene of a headless renderer instead of faking one.
+const scene = (await createTestRenderer({ width: 80, height: 24 })).renderer.nativeScene
+
 function renderer(
   input: {
     themeMode?: "dark" | "light"
@@ -28,6 +33,7 @@ function renderer(
 ) {
   return {
     themeMode: input.themeMode,
+    nativeScene: scene,
     getPalette: async () => {
       if (input.fail) {
         throw new Error("boom")

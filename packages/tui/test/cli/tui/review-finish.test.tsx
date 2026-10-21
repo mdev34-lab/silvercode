@@ -386,6 +386,9 @@ describe("review finish rendering", () => {
     expect(frame).toContain(`<${ReviewReport.TAG}>`)
     expect(frame).toContain('"assessment": "needs-fixes"')
 
+    // 0.6 counts a second click inside the double-click window as a text selection,
+    // and these blocks ignore clicks that end one, so give the toggle some space.
+    await Bun.sleep(600)
     await app.mockMouse.click(5, rowOf(frame, "Click to hide the raw report"))
     await app.waitForFrame((frame: string) => !frame.includes(ReviewReport.TAG))
     expect(frameOf(app)).toContain("Raw review report")

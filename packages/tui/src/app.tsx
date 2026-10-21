@@ -213,10 +213,10 @@ export const run = Effect.fn("Tui.run")(function* (input: TuiInput) {
             }),
           catch: (error) => (error instanceof Error ? error : new Error(String(error))),
         }),
-        (renderer) =>
-          Effect.sync(() => {
-            destroyRenderer(renderer)
-          }),
+        // Scoped cleanup must await the async destroy: returning from the
+        // acquireRelease finalizer before `closed` settles lets the process
+        // exit with the terminal unrestored (Arena review on #451).
+        (renderer) => Effect.promise(() => destroyRenderer(renderer)),
       )
       win32DisableProcessedInput()
       const keymap = createDefaultOpenTuiKeymap(renderer)
@@ -465,26 +465,34 @@ function App(props: { onSnapshot?: () => Promise<string[]>; pluginHost: TuiPlugi
   // Update terminal window title based on current route and session
   createEffect(() => {
     if (!terminalTitleEnabled() || Flag.OPENCODE_DISABLE_TERMINAL_TITLE) return
+    // Since 0.6 the renderer rejects terminal control writes while its session is closing, and
+    // destroy() finishes asynchronously; a lost title is not worth crashing the UI over.
+    if (renderer.isDestroyed) return
+    const write = (title: string) => {
+      try {
+        renderer.setTerminalTitle(title)
+      } catch {}
+    }
 
     if (route.data.type === "home") {
-      renderer.setTerminalTitle("silvercode")
+      write("silvercode")
       return
     }
 
     if (route.data.type === "session") {
       const session = sync.session.get(route.data.sessionID)
       if (!session || isDefaultTitle(session.title)) {
-        renderer.setTerminalTitle("silvercode")
+        write("silvercode")
         return
       }
 
       const title = session.title.length > 40 ? session.title.slice(0, 37) + "..." : session.title
-      renderer.setTerminalTitle(`α | ${title}`)
+      write(`α | ${title}`)
       return
     }
 
     if (route.data.type === "plugin") {
-      renderer.setTerminalTitle(`α | ${route.data.id}`)
+      write(`α | ${route.data.id}`)
     }
   })
 
@@ -932,13 +940,16 @@ function App(props: { onSnapshot?: () => Promise<string[]>; pluginHost: TuiPlugi
         category: "System",
         hidden: true,
         enabled: process.platform !== "win32",
-        run: () => {
+        run: async () => {
           // SIGTSTP goes to this process group only. The server worker runs
           // detached (worker-process.ts), so the session keeps executing while
           // the UI is stopped; queued events are delivered on SIGCONT and any
           // attention signals fire then. See docs/tui/background.md.
-          renderer.suspend()
-          process.once("SIGCONT", () => renderer.resume())
+          // The terminal is only handed over once suspend() has restored it.
+          await renderer.suspend()
+          process.once("SIGCONT", () => {
+            void renderer.resume().catch(() => {})
+          })
           process.kill(0, "SIGTSTP")
         },
       },

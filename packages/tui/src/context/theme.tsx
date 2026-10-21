@@ -1,4 +1,4 @@
-import { CliRenderEvents, SyntaxStyle, type TerminalColors } from "@opentui/core"
+import { CliRenderEvents, SyntaxStyle, type NativeResourceOwner, type TerminalColors } from "@opentui/core"
 import { useRenderer } from "@opentui/solid"
 import {
   DEFAULT_THEMES,
@@ -271,8 +271,8 @@ export const { use: useTheme, provider: ThemeProvider } = createSimpleContext({
 
     createEffect(() => renderer.setBackgroundColor(values().background))
 
-    const syntax = createSyntaxStyleMemo(() => generateSyntax(values()))
-    const subtleSyntax = createSyntaxStyleMemo(() => generateSubtleSyntax(values()))
+    const syntax = createSyntaxStyleMemo((owner) => generateSyntax(values(), owner))
+    const subtleSyntax = createSyntaxStyleMemo((owner) => generateSubtleSyntax(values(), owner))
 
     return {
       theme: new Proxy(values(), {
@@ -306,7 +306,7 @@ export const { use: useTheme, provider: ThemeProvider } = createSimpleContext({
   },
 })
 
-export function createSyntaxStyleMemo(factory: () => SyntaxStyle) {
+export function createSyntaxStyleMemo(factory: (owner: NativeResourceOwner) => SyntaxStyle) {
   const renderer = useRenderer()
   const retained = new Set<SyntaxStyle>()
   let current: SyntaxStyle | undefined
@@ -328,7 +328,7 @@ export function createSyntaxStyleMemo(factory: () => SyntaxStyle) {
 
   return createMemo(() => {
     const previous = current
-    current = factory()
+    current = factory(renderer.nativeScene)
     if (previous) release(previous)
     return current
   })

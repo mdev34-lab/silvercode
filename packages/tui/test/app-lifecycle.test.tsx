@@ -8,7 +8,7 @@ import { createTuiResolvedConfig } from "./fixture/tui-runtime"
 import { createEventSource, createFetch, directory, json } from "./fixture/tui-sdk"
 
 test("SIGHUP clears title and disposes scoped resources once", async () => {
-  const setup = await createTestRenderer({ width: 80, height: 24, useThread: false })
+  const setup = await createTestRenderer({ width: 80, height: 24 })
   const core = await import("@opentui/core")
   mock.module("@opentui/core", () => ({ ...core, createCliRenderer: async () => setup.renderer }))
   const titles: string[] = []
@@ -61,7 +61,7 @@ test("SIGHUP clears title and disposes scoped resources once", async () => {
 })
 
 test("app.exit prints the session epilogue after scoped cleanup", async () => {
-  const setup = await createTestRenderer({ width: 80, height: 24, useThread: false })
+  const setup = await createTestRenderer({ width: 80, height: 24 })
   const core = await import("@opentui/core")
   mock.module("@opentui/core", () => ({ ...core, createCliRenderer: async () => setup.renderer }))
   const events = createEventSource()
@@ -78,6 +78,18 @@ test("app.exit prints the session epilogue after scoped cleanup", async () => {
           time: { created: 0, updated: 0 },
         },
       ])
+    // The session route bounces back home when the detail request fails, which would clear
+    // the epilogue before app.exit prints it.
+    if (url.pathname === "/session/dummy")
+      return json({
+        id: "dummy",
+        title: "Demo session",
+        slug: "dummy",
+        projectID: "project",
+        directory,
+        version: "0.0.0-test",
+        time: { created: 0, updated: 0 },
+      })
   })
   const originalWrite = process.stdout.write.bind(process.stdout)
   let stdout = ""
