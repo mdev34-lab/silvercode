@@ -88,6 +88,7 @@ import { createTuiAttention } from "./attention"
 import * as TuiAudio from "./audio"
 import { win32DisableProcessedInput, win32FlushInputBuffer } from "./terminal-win32"
 import { destroyRenderer } from "./util/renderer"
+import { createSigcontResume } from "./util/sigcont-resume"
 import { watchTerminalResize } from "./util/resize-watch"
 import { cliErrorMessage, errorFormat } from "./util/error"
 
@@ -448,11 +449,11 @@ function App(props: { onSnapshot?: () => Promise<string[]>; pluginHost: TuiPlugi
     },
     { priority: 1 },
   )
-  let pendingSigcont: (() => void) | undefined
+  const sigcont = createSigcontResume(renderer)
   onCleanup(() => {
     offSelectionKeys()
     attention.dispose()
-    if (pendingSigcont) process.removeListener("SIGCONT", pendingSigcont)
+    sigcont.dispose()
   })
 
   // Wire up console copy-to-clipboard via opentui's onCopySelection callback
@@ -957,16 +958,9 @@ function App(props: { onSnapshot?: () => Promise<string[]>; pluginHost: TuiPlugi
           // The terminal is only handed over once suspend() has restored it.
           await renderer.suspend()
           // A second suspend before SIGCONT would stack another once-listener
-          // and resume twice; drop the pending one first. The renderer can
-          // also be destroyed while stopped, so guard the resume (#426).
-          if (pendingSigcont) process.removeListener("SIGCONT", pendingSigcont)
-          const onSigcont = () => {
-            pendingSigcont = undefined
-            if (renderer.isDestroyed) return
-            void renderer.resume().catch(() => {})
-          }
-          pendingSigcont = onSigcont
-          process.once("SIGCONT", onSigcont)
+          // and resume twice; arm() drops the pending one first. The renderer
+          // can also be destroyed while stopped, so the resume is guarded (#426).
+          sigcont.arm()
           process.kill(0, "SIGTSTP")
         },
       },
