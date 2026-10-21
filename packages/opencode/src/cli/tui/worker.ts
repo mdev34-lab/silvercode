@@ -109,34 +109,31 @@ if (isTuiWorker) {
 
   if (processWorker) {
     stopRpcListener = Rpc.listenProcess(rpc)
-    // Only a subprocess can outlive the UI: POSIX spawns it detached, and on
-    // Windows a non-detached child is still not guaranteed to terminate when
-    // the owner is hard-killed (see worker-process.ts, #442). A thread worker
-    // shares the process, so it always exits with the UI.
-    {
-      const ownerPID = Number.parseInt(process.env["SILVERCODE_TUI_WORKER_OWNER_PID"] ?? "", 10)
-      watchOwnerProcess({
-        subscribeDisconnect: (handler) => {
-          process.on("disconnect", handler)
-          return () => {
-            process.off("disconnect", handler)
-          }
-        },
-        ownerAlive: Number.isFinite(ownerPID) && ownerPID > 0 ? () => probeOwnerAlive(ownerPID) : undefined,
-        onOrphan() {
-          // A hard exit bounds the graceful path so a hung dispose cannot
-          // leave the orphan alive anyway.
-          const force = setTimeout(() => process.exit(0), 5000)
-          force.unref?.()
-          // .then with two branches, not .finally: a shutdown that failed
-          // must not exit 0 and look graceful to a supervisor.
-          void rpc.shutdown().then(
-            () => process.exit(0),
-            () => process.exit(1),
-          )
-        },
-      })
-    }
+    // Only a subprocess can outlive the UI, so it gets the owner-death
+    // watchdog; a thread worker shares the owner's process and always exits
+    // with it (see worker-process.ts, #442).
+    const ownerPID = Number.parseInt(process.env["SILVERCODE_TUI_WORKER_OWNER_PID"] ?? "", 10)
+    watchOwnerProcess({
+      subscribeDisconnect: (handler) => {
+        process.on("disconnect", handler)
+        return () => {
+          process.off("disconnect", handler)
+        }
+      },
+      ownerAlive: Number.isFinite(ownerPID) && ownerPID > 0 ? () => probeOwnerAlive(ownerPID) : undefined,
+      onOrphan() {
+        // A hard exit bounds the graceful path so a hung dispose cannot
+        // leave the orphan alive anyway.
+        const force = setTimeout(() => process.exit(0), 5000)
+        force.unref?.()
+        // .then with two branches, not .finally: a shutdown that failed
+        // must not exit 0 and look graceful to a supervisor.
+        void rpc.shutdown().then(
+          () => process.exit(0),
+          () => process.exit(1),
+        )
+      },
+    })
   } else {
     stopRpcListener = Rpc.listen(rpc)
   }
