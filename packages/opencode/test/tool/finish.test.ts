@@ -505,25 +505,6 @@ describe("tool.finish – review requirement exemptions", () => {
   )
 
   it.instance(
-    "a disabled generic review agent does not block a usable specialist reviewer",
-    () =>
-      Effect.gen(function* () {
-        const { chat, assistant } = yield* seedSession("owner", "work")
-        yield* addToolPart(chat.id, assistant.id, "edit")
-        const def = yield* (yield* FinishTool).init()
-
-        const failure = reviewFailure(
-          yield* def.execute({ reason: "success", result: "done" }, workCtx(chat.id, assistant.id)).pipe(Effect.exit),
-        )
-        // Declines for the missing verdict, exactly as dispatch would allow a
-        // review: never the false reviewer-missing block.
-        expect(failure?.message).toContain("no explicit Approved review")
-        expect(failure?.message).not.toContain("Review blocked")
-      }),
-    { config: { agent: { review: { disable: true } } } },
-  )
-
-  it.instance(
     "a disabled reviewer blocks success but can report failure",
     () =>
       Effect.gen(function* () {
@@ -1397,80 +1378,8 @@ describe("tool.finish – review dispatch owner", () => {
     return { chat, assistant }
   })
 
-  // Newer than the seeded user message, and owned by a different agent: the
-  // message a "newest message of any role" rule would read.
-  const addNewerAssistant = Effect.fn("FinishTest.addNewerAssistant")(function* (
-    sessionID: SessionID,
-    parentID: MessageID,
-    agent: string,
-  ) {
-    const session = yield* Session.Service
-    yield* session.updateMessage({
-      id: MessageID.ascending(),
-      role: "assistant",
-      parentID,
-      sessionID,
-      mode: "work",
-      agent,
-      cost: 0,
-      path: { cwd: "/tmp", root: "/tmp" },
-      tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
-      modelID: "test-model" as any,
-      providerID: "test" as any,
-      time: { created: Date.now() },
-    } as SessionV1.Assistant)
-  })
-
-  // The session is unpinned, so its owner is the newest USER message ("work",
-  // which routes to work-review). The tool runs as "code", which routes to
-  // code-review - the agent disabled here. The old resolver fell back to
-  // `ctx.agent`, resolved the disabled reviewer, and reported the session
-  // blocked; this one resolves the owner's reviewer and declines normally.
-  it.instance(
-    "the newest user message owns the reviewer, not the agent running finish",
-    () =>
-      Effect.gen(function* () {
-        const { chat, assistant } = yield* seedSession("owner", "work")
-        yield* addToolPart(chat.id, assistant.id, "edit")
-        const def = yield* (yield* FinishTool).init()
-
-        const failure = reviewFailure(
-          yield* def
-            .execute({ reason: "success", result: "done" }, workCtx(chat.id, assistant.id, undefined, "code"))
-            .pipe(Effect.exit),
-        )
-        expect(failure?.message).toContain("no explicit Approved review")
-        expect(failure?.message).not.toContain("Review blocked")
-      }),
-    { config: { agent: { "code-review": { disable: true } } } },
-  )
-
-  // Same discrimination, with a newer assistant message owned by the agent
-  // whose reviewer is disabled. A resolver that read the newest message of any
-  // role - or the agent running the tool - would resolve code-review here.
-  it.instance(
-    "a newer assistant message does not own the reviewer",
-    () =>
-      Effect.gen(function* () {
-        const { chat, assistant } = yield* seedSession("owner", "work")
-        yield* addNewerAssistant(chat.id, assistant.parentID!, "code")
-        yield* addToolPart(chat.id, assistant.id, "edit")
-        const def = yield* (yield* FinishTool).init()
-
-        const failure = reviewFailure(
-          yield* def
-            .execute({ reason: "success", result: "done" }, workCtx(chat.id, assistant.id, undefined, "code"))
-            .pipe(Effect.exit),
-        )
-        expect(failure?.message).toContain("no explicit Approved review")
-        expect(failure?.message).not.toContain("Review blocked")
-      }),
-    { config: { agent: { "code-review": { disable: true } } } },
-  )
-
-  // The pinned owner outranks the newest USER message. Pinned "code" routes to
-  // the disabled code-review, so this session is blocked even though its newest
-  // user message would route to an available reviewer.
+  // Disabling a retired specialist name disables the single reviewer it now
+  // aliases, so this session is blocked with reviewer-missing.
   it.instance(
     "a pinned session owner outranks the newest user message",
     () =>
@@ -1490,11 +1399,11 @@ describe("tool.finish – review dispatch owner", () => {
   )
 
   // Permission, both directions. The ruleset is read from the agent running the
-  // tool, but the *pattern* it is matched against is the resolved reviewer - so
-  // a deny only bites when it names the reviewer this session actually routes
-  // to. Owner "work" routes to work-review while the tool runs as "code".
+  // tool, and the patterns it is matched against are the single reviewer plus
+  // the retired specialist names that still alias to it - so a deny written
+  // against `work-review` before the consolidation keeps gating review now.
   it.instance(
-    "a deny aimed at the resolved reviewer blocks success",
+    "a deny aimed at a retired specialist name blocks the single reviewer",
     () =>
       Effect.gen(function* () {
         const { chat, assistant } = yield* seedSession("owner", "work")
@@ -1520,7 +1429,7 @@ describe("tool.finish – review dispatch owner", () => {
   )
 
   it.instance(
-    "a deny aimed at a reviewer this session does not route to does not block",
+    "a deny aimed at an unrelated agent does not block the reviewer",
     () =>
       Effect.gen(function* () {
         const { chat, assistant } = yield* seedSession("owner", "work")
@@ -1535,7 +1444,7 @@ describe("tool.finish – review dispatch owner", () => {
         expect(failure?.message).toContain("no explicit Approved review")
         expect(failure?.message).not.toContain("Review blocked")
       }),
-    { config: { agent: { code: { permission: { task: { "code-review": "deny" } } } } } },
+    { config: { agent: { code: { permission: { task: { general: "deny" } } } } } },
   )
 })
 

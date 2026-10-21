@@ -14,9 +14,7 @@ import PROMPT_CODE from "./prompt/code.txt"
 import PROMPT_COMPACTION from "./prompt/compaction.txt"
 import PROMPT_EXPLORE from "./prompt/explore.txt"
 import PROMPT_REVIEW from "./prompt/review.txt"
-import PROMPT_WORK_REVIEW from "./prompt/work-review.txt"
 import PROMPT_PLAN from "./prompt/plan.txt"
-import PROMPT_CODE_REVIEW from "./prompt/code-review.txt"
 import PROMPT_SUMMARY from "./prompt/summary.txt"
 import PROMPT_TITLE from "./prompt/title.txt"
 import { Permission } from "@/permission"
@@ -167,12 +165,11 @@ const layer = Layer.effect(
         })
 
         /**
-         * Shared by `review`, `work-review` and `code-review` so the three
-         * reviewers cannot drift apart. The seam denies edits and nested
-         * delegation while leaving inspection - including `bash` for
-         * reproducing and verifying runtime behavior - at plan-equivalent
-         * strength, which is what makes the codebase-review contract
-         * (correctness, tests, types, regressions) verifiable at all.
+         * The reviewer seam denies edits and nested delegation while leaving
+         * inspection - including `bash` for reproducing and verifying runtime
+         * behavior - at plan-equivalent strength, which is what makes the
+         * codebase-review contract (correctness, tests, types, regressions)
+         * verifiable at all.
          */
         const reviewPermissions = Permission.fromConfig({
           question: "allow",
@@ -292,31 +289,6 @@ const layer = Layer.effect(
             permission: Permission.merge(defaults, reviewPermissions, user),
             description: `Code reviewer. Use this proactively, without being asked, after any unit of work that changed files and when the user asks for a review.`,
             prompt: PROMPT_REVIEW,
-            options: {},
-            // Mandatory review must deliver its verdict before the parent can finish.
-            background: false,
-            mode: "subagent",
-            native: true,
-          },
-          "work-review": {
-            name: "work-review",
-            permission: Permission.merge(defaults, reviewPermissions, user),
-            // The three reviewers enforce the same standard at the same
-            // permission boundary; they differ only in the domain they are
-            // pointed at, so this description must not advertise a weaker bar.
-            description: `Work reviewer. Use this proactively, without being asked, after any unit of work that changed files and when the user asks for a review.`,
-            prompt: PROMPT_WORK_REVIEW,
-            options: {},
-            // Mandatory review must deliver its verdict before the parent can finish.
-            background: false,
-            mode: "subagent",
-            native: true,
-          },
-          "code-review": {
-            name: "code-review",
-            permission: Permission.merge(defaults, reviewPermissions, user),
-            description: `Code reviewer. Use this proactively, without being asked, after any unit of work that changed files and when the user asks for a review.`,
-            prompt: PROMPT_CODE_REVIEW,
             options: {},
             // Mandatory review must deliver its verdict before the parent can finish.
             background: false,

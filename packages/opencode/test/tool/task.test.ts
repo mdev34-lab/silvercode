@@ -73,31 +73,6 @@ const layer = <R = never>(
 
 const it = testEffect(layer())
 
-// A parent whose session row reads but whose message history does not - the
-// state a deleted or half-migrated parent presents. Routing a `review` request
-// has to read that history, because a default session pins no agent.
-//
-// `Layer.mock` supplies only what the routing step reaches, so every later call
-// - `create`, the permission prompt, the child run - dies with an
-// `UnimplementedError`. That is what turns "the dispatch stopped at the routing
-// step" into an assertion rather than a hope: if the swallow came back, the
-// generic reviewer would resolve and the tool would run on into `create`.
-const unreadableParent = Layer.mock(Session.Service)({
-  get: (id: SessionID) =>
-    Effect.succeed({
-      id,
-      slug: "unreadable",
-      projectID: ProjectV2.ID.make("prj_unreadable"),
-      directory: "/tmp",
-      title: "Unreadable",
-      version: "0.0.0-test",
-      time: { created: Date.now(), updated: Date.now() },
-    } satisfies Session.Info),
-  messages: () => Effect.fail(new NotFoundError({ message: "Session not found" })),
-})
-
-const itUnreadableParent = testEffect(layer({}, [[Session.node, unreadableParent]]))
-
 function defer<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void
   const promise = new Promise<T>((done) => {
@@ -345,10 +320,9 @@ function terminationOf(envelope: string) {
  * Synchronous delegation is opt-in per agent: `agent.<name>.background: false`
  * is what lets a subagent run in its parent's foreground. Tests that exercise the
  * foreground path therefore carry this config, and tests that do not leave it out
- * and get the background default. `review` is configured under the requested name
- * because a generic `review` dispatch is routed to the parent's specialist
- * reviewer (`work-review`), which is itself unconfigured here and so takes the
- * opt-in written for the name the caller used.
+ * and get the background default. `review` is the single reviewer after the
+ * specialist consolidation, so a generic `review` dispatch reads exactly this
+ * entry.
  */
 const FOREGROUND = {
   agent: {
@@ -358,60 +332,6 @@ const FOREGROUND = {
 }
 
 describe("tool.task", () => {
-  // The routing decision is made from the parent session, and an unreadable
-  // parent used to read as "no parent agent" - which resolved a `review` request
-  // to the generic reviewer and ran it with the generic prompt and the generic
-  // permissions, with nothing in the transcript to say the routing had never
-  // happened. A missing parent is a broken session, not a routing decision, so
-  // it must fail the dispatch.
-  //
-  // The child agent is not available as a fallback: on the subtask path
-  // `ctx.agent` is the child's own agent, so resolving by it would pick a
-  // reviewer by the child's identity.
-  itUnreadableParent.instance(
-    "a review request against an unreadable parent fails",
-    () =>
-      Effect.gen(function* () {
-        const tool = yield* TaskTool
-        const def = yield* tool.init()
-        let asked = 0
-
-        const exit = yield* Effect.exit(
-          def.execute(
-            {
-              description: "review the cache fix",
-              prompt: "look into the cache key path",
-              subagent_type: "review",
-              background: false,
-            },
-            {
-              sessionID: SessionID.make("ses_unreadable_parent"),
-              messageID: MessageID.ascending(),
-              agent: "work-review",
-              abort: new AbortController().signal,
-              extra: { promptOps: stubOps() },
-              messages: [],
-              metadata: () => Effect.void,
-              ask: () =>
-                Effect.sync(() => {
-                  asked++
-                }),
-            },
-          ),
-        )
-
-        expect(Exit.isFailure(exit)).toBe(true)
-        if (!Exit.isFailure(exit)) return
-        const error = Cause.pretty(exit.cause)
-        expect(error).toContain("Cannot resolve which reviewer to dispatch")
-        expect(error).toContain("ses_unreadable_parent")
-        // The failure is raised before anything is dispatched, so the user is not
-        // asked to authorise a review that is never going to run.
-        expect(asked).toBe(0)
-      }),
-    30_000,
-  )
-
   it.instance(
     "description sorts subagents by name and is stable across calls",
     () =>
@@ -2374,9 +2294,7 @@ describe("tool.task", () => {
   )
 
   // Opt-in is per subagent: configuring one delegate does not change another, and
-  // an unconfigured reviewer still takes the opt-in written under the name the
-  // caller used, because the runtime rewrites a `review` request onto the parent's
-  // specialist reviewer.
+  // an unconfigured reviewer takes the background default.
   it.instance(
     "synchronous opt-in is configured per subagent",
     () =>
