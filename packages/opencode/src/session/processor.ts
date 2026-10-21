@@ -487,7 +487,13 @@ const layer = Layer.effect(
           }
 
           case "provider-error":
-            throw new Error(value.message)
+            // Preserve the provider's structured classification: a generic
+            // Error would degrade to Unknown in fromError, dropping
+            // context-overflow from the compaction path and explicit
+            // retryability from the retry policy (#409).
+            if (value.classification === "context-overflow")
+              throw new SessionV1.ContextOverflowError({ message: value.message })
+            throw new SessionV1.APIError({ message: value.message, isRetryable: value.retryable ?? false })
 
           case "step-start":
             if (!ctx.snapshot) ctx.snapshot = yield* snapshot.track()
