@@ -490,6 +490,13 @@ export const ShellTool = Tool.define(
         Effect.gen(function* () {
           yield* Effect.addFinalizer(closeSink)
           const handle = yield* spawner.spawn(cmd(input.shell, input.command, input.cwd, input.env))
+          // A heavy command (build, headless browser, busy loop) at normal
+          // priority can starve the TUI of CPU time until the screen stops
+          // rendering. Run tool commands below normal priority; children
+          // inherit it, and on an idle machine it costs nothing. Best effort.
+          try {
+            os.setPriority(handle.pid, os.constants.priority.PRIORITY_BELOW_NORMAL)
+          } catch {}
 
           const output = yield* Effect.forkScoped(
             Stream.runForEach(Stream.decodeText(handle.all), (chunk) => {
