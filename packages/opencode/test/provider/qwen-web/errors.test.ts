@@ -47,9 +47,12 @@ describe("QwenWebError", () => {
     expect(QwenWebError.isInstance(new Error("x"))).toBe(false)
   })
 
-  test("login helpers point at /auth", () => {
+  test("login helpers point at /connect", () => {
     expect(loginRequiredError().code).toBe("login_required")
-    expect(loginRequiredError().message).toContain("/auth")
+    expect(loginRequiredError().message).toContain("/connect")
+    expect(loginRequiredError().message).not.toContain("`/auth`")
+    expect(sessionExpiredError().message).toContain("/connect")
+    expect(sessionExpiredError().message).not.toContain("`/auth`")
     expect(loginRequiredError().retryable).toBe(false)
     expect(sessionExpiredError().code).toBe("session_expired")
     expect(sessionExpiredError().status).toBe(401)
