@@ -128,6 +128,9 @@ const EFFORT_PROCESS: Record<AgentEffort.Level, string> = {
   ].join("\n\n"),
 }
 
+/** Wall-clock bound for a custom command's `!` template block. */
+const SHELL_BLOCK_TIMEOUT_MS = 60_000
+
 const STRUCTURED_OUTPUT_DESCRIPTION = `Use this tool to return your final response in the requested structured format.
 
 IMPORTANT:
@@ -1877,7 +1880,13 @@ const layer = Layer.effect(
         const sh = Shell.preferred(cfg.shell)
         const results = yield* Effect.promise(() =>
           Promise.all(
-            shellMatches.map(async ([, cmd]) => (await Process.text([cmd], { shell: sh, nothrow: true })).text),
+            shellMatches.map(
+              async ([, cmd]) =>
+                // A `!` block that hangs would wedge command expansion forever;
+                // kill it instead and let nothrow surface the failure as text.
+                (await Process.text([cmd], { shell: sh, nothrow: true, abort: AbortSignal.timeout(SHELL_BLOCK_TIMEOUT_MS) }))
+                  .text,
+            ),
           ),
         )
         let index = 0
