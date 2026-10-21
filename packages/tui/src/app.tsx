@@ -88,6 +88,7 @@ import { createTuiAttention } from "./attention"
 import * as TuiAudio from "./audio"
 import { win32DisableProcessedInput, win32FlushInputBuffer } from "./terminal-win32"
 import { destroyRenderer } from "./util/renderer"
+import { watchTerminalResize } from "./util/resize-watch"
 import { cliErrorMessage, errorFormat } from "./util/error"
 
 registerOpencodeSpinner()
@@ -219,6 +220,12 @@ export const run = Effect.fn("Tui.run")(function* (input: TuiInput) {
         (renderer) => Effect.promise(() => destroyRenderer(renderer)),
       )
       win32DisableProcessedInput()
+      // ConPTY-hosted window resizes never reach OpenTUI's SIGWINCH-derived
+      // RESIZE event on Bun (#439); poll the console size and synthesize it.
+      yield* Effect.acquireRelease(
+        Effect.sync(() => watchTerminalResize(renderer)),
+        (stop) => Effect.sync(stop),
+      )
       const keymap = createDefaultOpenTuiKeymap(renderer)
       yield* Effect.acquireRelease(
         Effect.sync(() => registerOpencodeKeymap(keymap, renderer, input.config)),

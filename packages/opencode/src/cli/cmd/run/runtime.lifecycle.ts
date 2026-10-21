@@ -14,6 +14,7 @@ import { createDefaultOpenTuiKeymap } from "@opentui/keymap/opentui"
 import { Global } from "@opencode-ai/core/global"
 import { openEditor } from "@opencode-ai/tui/editor"
 import { registerOpencodeKeymap } from "@opencode-ai/tui/keymap"
+import { watchTerminalResize } from "@opencode-ai/tui/util/resize-watch"
 import { Session as SessionApi } from "@/session/session"
 import * as Locale from "@/util/locale"
 import { resolveInteractiveStdin } from "./runtime.stdin"
@@ -176,6 +177,7 @@ function queueSplash(
 export async function createRuntimeLifecycle(input: LifecycleInput): Promise<Lifecycle> {
   const source = resolveInteractiveStdin()
   let unregisterKeymap: (() => void) | undefined
+  let stopResizeWatch: (() => void) | undefined
 
   try {
     const renderer = await createCliRenderer({
@@ -193,6 +195,10 @@ export async function createRuntimeLifecycle(input: LifecycleInput): Promise<Lif
       consoleMode: "disabled",
       clearOnShutdown: false,
     })
+    // ConPTY-hosted window resizes never reach OpenTUI's SIGWINCH-derived
+    // RESIZE event on Bun (#439); poll the console size and synthesize it so
+    // onResize subscribers keep fresh geometry.
+    stopResizeWatch = watchTerminalResize(renderer)
     const theme = await resolveRunTheme(renderer)
     renderer.setBackgroundColor(theme.background)
     const keymap = createDefaultOpenTuiKeymap(renderer)
@@ -342,6 +348,7 @@ export async function createRuntimeLifecycle(input: LifecycleInput): Promise<Lif
         await footer.idle().catch(() => {})
         footer.destroy()
         unregisterKeymap?.()
+        stopResizeWatch?.()
         shutdown(renderer)
         if (!wroteExit) {
           process.stdout.write("\n")
@@ -400,6 +407,7 @@ export async function createRuntimeLifecycle(input: LifecycleInput): Promise<Lif
     }
   } catch (error) {
     unregisterKeymap?.()
+    stopResizeWatch?.()
     source.cleanup?.()
     throw error
   }
