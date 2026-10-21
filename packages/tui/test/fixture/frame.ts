@@ -1,3 +1,5 @@
+// Waiting helpers shared by the tui tests: frame pumps and store polls.
+
 import type { testRender } from "@opentui/solid"
 
 type Setup = Awaited<ReturnType<typeof testRender>>
@@ -47,4 +49,17 @@ export async function waitFor<T>(
     await Bun.sleep(5)
   }
   throw new Error(`${label}:\n${await captureFrame(app)}`)
+}
+
+/**
+ * Polls a data condition, for assertions about store state rather than a painted frame. The
+ * budget is deliberately loose: on a loaded runner a mount's first render can take seconds, and
+ * a test should fail on its own assertion rather than on a tight clock.
+ */
+export async function waitUntil(fn: () => boolean, timeout = 15_000) {
+  const start = Date.now()
+  while (!fn()) {
+    if (Date.now() - start > timeout) throw new Error("timed out waiting for condition")
+    await Bun.sleep(10)
+  }
 }

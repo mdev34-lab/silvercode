@@ -27,6 +27,7 @@ import { LocationProvider } from "../../../src/context/location"
 import { OPENCODE_BASE_MODE, OpencodeKeymapProvider, registerOpencodeKeymap } from "../../../src/keymap"
 import { AssistantMessageRow, SessionContext } from "../../../src/routes/session"
 import { computeActivityGroups } from "../../../src/util/activity"
+import { waitUntil } from "../../fixture/frame"
 
 const SESSION = "ses_error_ui"
 const BASE = 1_700_000_000_000
@@ -48,14 +49,6 @@ function assistant(id: string, error?: unknown): AssistantMessage {
     tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
     finish: "error",
     error: error as any,
-  }
-}
-
-async function waitUntil(fn: () => boolean, timeout = 5000) {
-  const start = Date.now()
-  while (!fn()) {
-    if (Date.now() - start > timeout) throw new Error("timed out waiting for condition")
-    await Bun.sleep(10)
   }
 }
 

@@ -28,6 +28,7 @@ import { computeActivityGroups, type ActivityGroups } from "../../../src/util/ac
 import { SessionContext, parseReviewReport, reviewFindingLocation, sortReviewFindings, toolRenderer } from "../../../src/routes/session"
 import { ReviewReport } from "@opencode-ai/core/review-report"
 import type { Provider, ToolPart } from "@opencode-ai/sdk/v2"
+import { waitUntil } from "../../fixture/frame"
 
 const SESSION = "ses_review_finish"
 const BASE = 1_700_000_000_000
@@ -175,14 +176,6 @@ afterEach(async () => {
   await testSetup?.dispose()
   testSetup = undefined
 })
-
-async function waitUntil(fn: () => boolean, timeout = 5000) {
-  const start = Date.now()
-  while (!fn()) {
-    if (Date.now() - start > timeout) throw new Error("timed out waiting for condition")
-    await Bun.sleep(10)
-  }
-}
 
 function frameOf(app: Awaited<ReturnType<typeof testRender>>) {
   return app.captureCharFrame().split("\n").map((line) => line.trimEnd()).join("\n")

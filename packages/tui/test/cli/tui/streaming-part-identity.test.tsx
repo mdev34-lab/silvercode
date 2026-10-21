@@ -18,6 +18,7 @@ import { SDKProvider } from "../../../src/context/sdk"
 import { SyncProvider, useSync } from "../../../src/context/sync"
 import { RouteProvider } from "../../../src/context/route"
 import { TuiConfigProvider } from "../../../src/config"
+import { waitUntil } from "../../fixture/frame"
 
 let mountCount = 0
 
@@ -65,14 +66,6 @@ function updatedEvent(sessionID: string, messageID: string, part: Part, id: numb
     type: "message.part.updated",
     properties: { sessionID, time: id, part },
   })
-}
-
-async function waitUntil(fn: () => boolean, timeout = 5000) {
-  const start = Date.now()
-  while (!fn()) {
-    if (Date.now() - start > timeout) throw new Error("timed out waiting for condition")
-    await Bun.sleep(10)
-  }
 }
 
 type Sync = ReturnType<typeof useSync>
