@@ -4,7 +4,14 @@
  * Only edges reachable from this run's root count toward its pending work.
  */
 export const make = (rootSessionID: string) => {
-  const launched = new Map<string, string>()
+  // Pending deliveries keyed by run (`sessionID@started_at`, #400): a resumed
+  // subagent (task_id) reuses its session ID, so keying by session alone lets
+  // one run's terminal envelope settle another run's row, and two launches of
+  // one session collapse into a single pending entry. Launches observed
+  // without a run id (older servers, attach mode) fall back to the session ID.
+  const launched = new Map<string, { sessionID: string; parentSessionID: string }>()
+  // Latest launch attribution per session, for the reachability walk.
+  const parents = new Map<string, string>()
   const resolved = new Set<string>()
 
   const known = (sessionID: string): boolean => {
@@ -12,29 +19,36 @@ export const make = (rootSessionID: string) => {
     while (sessionID !== rootSessionID) {
       if (seen.has(sessionID)) return false
       seen.add(sessionID)
-      const parent = launched.get(sessionID)
+      const parent = parents.get(sessionID)
       if (!parent) return false
       sessionID = parent
     }
     return true
   }
-  const pending = () => [...launched.keys()].filter((id) => known(id) && !resolved.has(id))
+  const pending = () =>
+    [...launched.entries()]
+      .filter(([key, entry]) => known(entry.sessionID) && !resolved.has(key))
+      .map(([, entry]) => entry.sessionID)
 
   return {
-    launch(input: { sessionID: string; parentSessionID: string }) {
+    launch(input: { sessionID: string; parentSessionID: string; run?: string }) {
       if (input.sessionID === rootSessionID) return false
-      // A session already launched and still pending is the same run. One that
-      // already resolved was resumed (task_id): a new run, so it is pending again.
-      if (launched.has(input.sessionID)) {
-        if (!resolved.has(input.sessionID)) return false
-        resolved.delete(input.sessionID)
+      parents.set(input.sessionID, input.parentSessionID)
+      const key = input.run ?? input.sessionID
+      // A launch re-emitted for a run still pending is the same run. One whose
+      // delivery already arrived was resumed (task_id): a new run, so it is
+      // pending again.
+      if (launched.has(key)) {
+        if (!resolved.has(key)) return false
+        resolved.delete(key)
       }
-      launched.set(input.sessionID, input.parentSessionID)
-      return known(input.sessionID) && !resolved.has(input.sessionID)
+      launched.set(key, { sessionID: input.sessionID, parentSessionID: input.parentSessionID })
+      return known(input.sessionID) && !resolved.has(key)
     },
-    // A fast delivery may arrive before its launch part.
-    resolve(sessionID: string) {
-      resolved.add(sessionID)
+    // A fast delivery may arrive before its launch part. The key is the run id
+    // when the envelope carries one, the session ID otherwise.
+    resolve(run: string) {
+      resolved.add(run)
     },
     pending,
     settled: () => pending().length === 0,

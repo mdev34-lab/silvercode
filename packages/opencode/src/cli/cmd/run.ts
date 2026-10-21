@@ -751,13 +751,17 @@ export const RunCommand = effectCmd({
                   typeof part.state.output === "string" &&
                   part.state.output.includes(`state="running"`)
                 ) {
-                  background.launch({ sessionID: taskID!, parentSessionID: part.sessionID })
+                  const run =
+                    "metadata" in part.state && typeof part.state.metadata?.runId === "string"
+                      ? part.state.metadata.runId
+                      : undefined
+                  background.launch({ sessionID: taskID!, parentSessionID: part.sessionID, run })
                 }
               }
               if (part.type === "text") {
-                const match = part.text.match(/<task id="([^"]+)" state="(?:completed|error|cancelled)">/)
+                const match = part.text.match(/<task id="([^"]+)"(?: run="([^"]+)")? state="(?:completed|error|cancelled)">/)
                 if (match?.[1] && !/<termination reason="waiting_for_subagent">/.test(part.text)) {
-                  background.resolve(match[1])
+                  background.resolve(match[2] ?? match[1])
                   // A normal notification is about to wake the root. Do not
                   // exit in the gap between its user part and busy status.
                   if (part.sessionID === sessionID && part.synthetic && part.metadata?.backgroundNoReply !== true)

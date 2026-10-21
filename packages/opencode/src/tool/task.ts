@@ -127,10 +127,13 @@ function renderOutput(input: {
   summary?: string
   text: string
   termination?: TerminationReason
+  // The run key (sessionID@started_at) of the job this envelope reports, so a
+  // resumed session's deliveries settle their own run and no other (#400).
+  run?: string
 }) {
   const tag = input.state === "error" ? "task_error" : "task_result"
   return [
-    `<task id="${input.sessionID}" state="${input.state}">`,
+    `<task id="${input.sessionID}"${input.run ? ` run="${input.run}"` : ""} state="${input.state}">`,
     ...(input.summary ? [`<summary>${input.summary}</summary>`] : []),
     `<${tag}>`,
     input.text,
@@ -606,6 +609,7 @@ export const TaskTool = Tool.define(
                 text: renderOutput({
                   sessionID: nextSession.id,
                   state,
+                  run: receiptKey,
                   summary:
                     state === "completed"
                       ? `Background task completed: ${params.description}`
@@ -737,6 +741,7 @@ export const TaskTool = Tool.define(
             text: renderOutput({
               sessionID: descendant,
               state,
+              run: runKey(job),
               summary:
                 state === "completed"
                   ? `Background task completed: ${job.title ?? "subagent"}`
@@ -835,12 +840,14 @@ export const TaskTool = Tool.define(
         )
 
       if (yield* background.extend({ id: nextSession.id, run: runWithEvidence() })) {
+        const extended = yield* background.get(nextSession.id)
         return {
           title: params.description,
           metadata: {
             ...metadata,
             background: true,
             jobId: nextSession.id,
+            ...(extended ? { runId: runKey(extended) } : {}),
           },
           output: renderOutput({
             sessionID: nextSession.id,
@@ -859,9 +866,17 @@ export const TaskTool = Tool.define(
         title: params.description,
         metadata,
         onPromote: Effect.all([
-          ctx.metadata({
-            title: params.description,
-            metadata: { ...metadata, background: true, jobId: nextSession.id },
+          Effect.gen(function* () {
+            const promoted = yield* background.get(nextSession.id)
+            yield* ctx.metadata({
+              title: params.description,
+              metadata: {
+                ...metadata,
+                background: true,
+                jobId: nextSession.id,
+                ...(promoted ? { runId: runKey(promoted) } : {}),
+              },
+            })
           }),
           notify(nextSession.id),
         ]),
@@ -875,6 +890,7 @@ export const TaskTool = Tool.define(
             ...metadata,
             background: true,
             jobId: info.id,
+            runId: runKey(info),
           },
           output: renderOutput({
             sessionID: nextSession.id,
