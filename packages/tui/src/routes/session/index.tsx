@@ -1890,7 +1890,7 @@ function ReasoningPart(props: { last: boolean; part: ReasoningPart; message: Ass
     return end === undefined ? 0 : Math.max(0, end - props.part.time.start)
   })
   const summary = createMemo(() => reasoningSummary(content()))
-  const syntax = createSyntaxStyleMemo(() => generateSubtleSyntax(theme))
+  const syntax = createSyntaxStyleMemo((owner) => generateSubtleSyntax(theme, owner))
   // The block stays open while the reasoning stream is active so the streamed
   // content is readable (regardless of the display mode). It only transitions
   // to its completed/collapsed state when the reasoning stream actually ends

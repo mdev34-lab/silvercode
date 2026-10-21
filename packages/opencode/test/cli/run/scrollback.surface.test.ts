@@ -47,7 +47,9 @@ function render(commits: ClaimedCommit[]) {
 }
 
 function renderRows(commit: ClaimedCommit, width = 80) {
-  const raw = decoder.decode(commit.snapshot.getRealCharBytes(true))
+  // Rows are sliced straight off the grid, so the line breaks are left out and every row
+  // occupies exactly `width` cells.
+  const raw = decoder.decode(commit.snapshot.getRealCharBytes(false))
   return Array.from({ length: commit.snapshot.height }, (_, index) =>
     raw.slice(index * width, (index + 1) * width).trimEnd(),
   )
@@ -63,7 +65,7 @@ async function setup(
   input: {
     width?: number
     wrote?: boolean
-    theme?: RunTheme
+    theme?: RunTheme | ((renderer: TestRenderer) => RunTheme)
     onThemeRelease?: (theme: RunTheme) => void
   } = {},
 ) {
@@ -76,12 +78,17 @@ async function setup(
   })
   active.push(out.renderer)
 
+  // Syntax styles belong to a native context, so a theme that carries one is
+  // built from the renderer it will be drawn with.
+  const theme = (typeof input.theme === "function" ? input.theme(out.renderer) : input.theme) ?? RUN_THEME_FALLBACK
+
   const treeSitterClient = new MockTreeSitterClient({ autoResolveTimeout: 0 })
   treeSitterClient.setMockResult({ highlights: [] })
 
   return {
     renderer: out.renderer,
-    scrollback: new RunScrollbackStream(out.renderer, input.theme ?? RUN_THEME_FALLBACK, {
+    theme,
+    scrollback: new RunScrollbackStream(out.renderer, theme, {
       treeSitterClient,
       wrote: input.wrote ?? false,
       onThemeRelease: input.onThemeRelease,
@@ -129,16 +136,20 @@ test("turn summary starts at the left edge", async () => {
 })
 
 test("theme swaps restyle active reasoning without resetting the stream", async () => {
-  const previousSyntax = SyntaxStyle.fromStyles({ default: { fg: "#123456" } })
-  const nextSyntax = SyntaxStyle.fromStyles({ default: { fg: "#abcdef" } })
   const released: RunTheme[] = []
-  const previous = {
-    ...RUN_THEME_FALLBACK,
-    block: {
-      ...RUN_THEME_FALLBACK.block,
-      subtleSyntax: previousSyntax,
-    },
-  }
+  const out = await setup({
+    theme: (renderer) => ({
+      ...RUN_THEME_FALLBACK,
+      block: {
+        ...RUN_THEME_FALLBACK.block,
+        subtleSyntax: SyntaxStyle.fromStyles({ default: { fg: "#123456" } }, renderer.nativeScene),
+      },
+    }),
+    onThemeRelease: (theme) => released.push(theme),
+  })
+  const previous = out.theme
+  const previousSyntax = previous.block.subtleSyntax!
+  const nextSyntax = SyntaxStyle.fromStyles({ default: { fg: "#abcdef" } }, out.renderer.nativeScene)
   const next = {
     ...RUN_THEME_FALLBACK,
     block: {
@@ -146,7 +157,6 @@ test("theme swaps restyle active reasoning without resetting the stream", async 
       subtleSyntax: nextSyntax,
     },
   }
-  const out = await setup({ theme: previous, onThemeRelease: (theme) => released.push(theme) })
 
   try {
     await out.scrollback.append(reasoning("before"))

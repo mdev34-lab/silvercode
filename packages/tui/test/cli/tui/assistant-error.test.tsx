@@ -327,7 +327,9 @@ describe("AssistantMessageError rendering and truncation", () => {
       expect(expandedFrame).toContain("Detail row 4: extra diagnostics not visible in collapsed state")
       expect(expandedFrame).toContain("Click to collapse")
 
-      // Click again to collapse
+      // Click again to collapse. 0.6 counts a second click inside the double-click window as a
+      // text selection, and the block ignores clicks that end one, so give the toggle some space.
+      await Bun.sleep(600)
       const collapseRow = rowOf(frameOf(app), "Click to collapse")
       await app.mockMouse.click(5, collapseRow)
 
@@ -362,7 +364,8 @@ describe("AssistantMessageError rendering and truncation", () => {
       await app.mockMouse.click(2, row)
 
       await app.waitForFrame((frame: string) => frame.includes("Click to collapse"))
-      expect(frameOf(app)).toContain("upstream connection")
+      // Line breaks are decided by the native layout, so compare the reflowed text.
+      expect(frameOf(app).replace(/[\u2502\u2503]/g, " ").replace(/\s+/g, " ")).toContain("upstream connection refused")
     } finally {
       app.renderer.destroy()
     }
