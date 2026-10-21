@@ -1838,9 +1838,13 @@ const layer = Layer.effect(
       // rather than spinning on a superseded prompt.
       while (true) {
         const result = yield* state.ensureRunning(input.sessionID, lastAssistant(input.sessionID), runLoop(input.sessionID))
-        if (!input.messageID || result.info.parentID === input.messageID) return result
+        if (!input.messageID || (result.info.role === "assistant" && result.info.parentID === input.messageID))
+          return result
 
-        const msgs = yield* sessions.messages({ sessionID: input.sessionID })
+        const msgs = yield* sessions
+          .messages({ sessionID: input.sessionID })
+          .pipe(Effect.catch(() => Effect.succeed(null)))
+        if (!msgs) return result
         const ours = msgs.findIndex((msg) => msg.info.id === input.messageID)
         const newerUser = msgs.slice(ours + 1).find((msg) => msg.info.role === "user")
         if (!newerUser) continue
