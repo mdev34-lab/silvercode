@@ -291,6 +291,32 @@ describe("login behavior", () => {
     await browser.close()
   })
 
+  test("openLoginPage relaunches a probe-started headless browser headed (#483)", async () => {
+    delete process.env["QWEN_WEB_HEADLESS"]
+    if (process.platform !== "darwin" && process.platform !== "win32") process.env["DISPLAY"] = ":1"
+    const dir = tmpProfile()
+    const page = fakePage({ url: () => "https://chat.qwen.ai/auth" }) as QwenWebPage & { navigations: string[] }
+    const launches: boolean[] = []
+    const browser = new QwenWebBrowser({
+      profileDir: dir,
+      launcher: async (_profileDir, options) => {
+        launches.push(Boolean(options.headless))
+        return fakeContext([page])
+      },
+    })
+    // A non-login probe (for example validating a saved session) starts the
+    // shared browser headless, which is the default.
+    await browser.detectAuthState()
+    expect(launches).toEqual([true])
+    // A headed login is still possible: the running headless browser is
+    // relaunched headed instead of trapping the login headless.
+    expect(browser.loginHeaded).toBe(true)
+    await browser.openLoginPage()
+    expect(launches).toEqual([true, false])
+    expect(page.navigations[page.navigations.length - 1]).toBe("https://chat.qwen.ai/auth")
+    await browser.close()
+  })
+
   test("openLoginPage skips navigation when already authenticated", async () => {
     const dir = tmpProfile()
     const page = fakePage() as QwenWebPage & { navigations: string[] }

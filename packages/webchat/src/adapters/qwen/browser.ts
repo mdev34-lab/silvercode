@@ -455,7 +455,9 @@ export class QwenWebBrowser {
    */
   get loginHeaded(): boolean {
     if (!this.headless) return true
-    if (this.isRunning() || this.headlessExplicit) return false
+    // A running headless browser does not block a headed login: the login
+    // path relaunches it headed (see openLoginPage).
+    if (this.headlessExplicit) return false
     return hasDisplay()
   }
 
@@ -504,9 +506,29 @@ export class QwenWebBrowser {
    * return immediately without navigating.
    */
   async openLoginPage(signal?: AbortSignal): Promise<QwenWebPage> {
-    if (!this.isRunning() && !this.headlessExplicit && hasDisplay() && this.headless) {
-      debug("browser", "switching to headed mode for interactive login")
-      this.headless = false
+    if (!this.headlessExplicit && hasDisplay() && this.headless) {
+      if (this.isRunning()) {
+        // The shared browser was launched headless by an earlier probe (for
+        // example validating a saved or expired session). Relaunch it headed
+        // or the login would be trapped headless with no window (#483).
+        debug("browser", "relaunching headed for interactive login")
+        const inFlightLaunch = this.launching
+        if (inFlightLaunch) {
+          await inFlightLaunch.catch(() => {})
+          if (this.launching === inFlightLaunch) this.launching = undefined
+        }
+        try {
+          await this.restartWithHeadless(signal, false)
+        } catch (error) {
+          // Roll back the logical mode and clean up any partially-created headed context.
+          await this.close()
+          throw error
+        }
+        this.headless = false
+      } else {
+        debug("browser", "switching to headed mode for interactive login")
+        this.headless = false
+      }
     }
     const page = await this.ensureOnOrigin(signal)
     try {

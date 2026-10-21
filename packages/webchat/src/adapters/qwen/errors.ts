@@ -144,7 +144,7 @@ export function loginRequiredError(detail?: string): QwenWebError {
     status: 401,
     detail,
     message:
-      "Qwen Web login required. Run `/auth`, choose `qwen-web`, and complete the login in the browser window. " +
+      "Qwen Web login required. Run `/connect`, choose `qwen-web`, and complete the login in the browser window. " +
       (detail ?? "No authenticated Qwen session was found."),
   })
 }
@@ -162,7 +162,7 @@ export function sessionExpiredError(
     upstreamCode: options?.upstreamCode,
     detail,
     message:
-      "Qwen Web session expired. Run `/auth`, choose `qwen-web`, and log in again. " +
+      "Qwen Web session expired. Run `/connect`, choose `qwen-web`, and log in again. " +
       (detail ?? "The stored browser session is no longer valid."),
   })
 }
