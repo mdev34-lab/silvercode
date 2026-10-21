@@ -235,6 +235,29 @@ export const run = Effect.fn("Tui.run")(function* (input: TuiInput) {
       )
       yield* Effect.addFinalizer(() => Effect.sync(TuiAudio.dispose))
       const shutdown = yield* Deferred.make<unknown>()
+      // opentui 0.6.6 catches render/process errors, but with its console overlay disabled
+      // they are not visible. Stop cleanly so the terminal is restored before reporting them.
+      const stopOnError = (error: unknown) => {
+        exit.reason = error
+        void destroyRenderer(renderer)
+      }
+      const onRenderError = (event: { error: Error }) => stopOnError(event.error)
+      const onUncaughtException = (error: Error) => stopOnError(error)
+      const onUnhandledRejection = (reason: unknown) =>
+        stopOnError(reason instanceof Error ? reason : new Error(String(reason)))
+      yield* Effect.acquireRelease(
+        Effect.sync(() => {
+          renderer.on("render:error", onRenderError)
+          process.on("uncaughtException", onUncaughtException)
+          process.on("unhandledRejection", onUnhandledRejection)
+        }),
+        () =>
+          Effect.sync(() => {
+            renderer.off("render:error", onRenderError)
+            process.off("uncaughtException", onUncaughtException)
+            process.off("unhandledRejection", onUnhandledRejection)
+          }),
+      )
       const onSighup = () => destroyRenderer(renderer)
       yield* Effect.acquireRelease(
         Effect.sync(() => process.on("SIGHUP", onSighup)),

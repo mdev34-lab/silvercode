@@ -60,6 +60,56 @@ test("SIGHUP clears title and disposes scoped resources once", async () => {
   }
 })
 
+test("render failures restore the terminal and report the error after cleanup", async () => {
+  const setup = await createTestRenderer({ width: 80, height: 24 })
+  const core = await import("@opentui/core")
+  mock.module("@opentui/core", () => ({ ...core, createCliRenderer: async () => setup.renderer }))
+  const events = createEventSource()
+  const calls = createFetch()
+  const originalWrite = process.stderr.write.bind(process.stderr)
+  let stderr = ""
+  let started!: () => void
+  const ready = new Promise<void>((resolve) => {
+    started = resolve
+  })
+
+  process.stderr.write = ((chunk: string | Uint8Array) => {
+    stderr += String(chunk)
+    return true
+  }) as typeof process.stderr.write
+
+  try {
+    const { run } = await import("../src/app")
+    const task = Effect.runPromise(
+      run({
+        url: "http://test",
+        directory,
+        config: createTuiResolvedConfig({ plugin_enabled: {} }),
+        fetch: calls.fetch,
+        events: events.source,
+        args: {},
+        pluginHost: {
+          async start() {
+            started()
+          },
+          async dispose() {},
+        },
+      }).pipe(Effect.provide(AppNodeBuilder.build(Global.node))),
+    )
+
+    await ready
+    setup.renderer.emit("render:error", { error: new Error("render failed"), renderable: undefined })
+    await task
+
+    expect(setup.renderer.isDestroyed).toBe(true)
+    expect(stderr).toContain("render failed")
+  } finally {
+    process.stderr.write = originalWrite
+    if (!setup.renderer.isDestroyed) setup.renderer.destroy()
+    mock.restore()
+  }
+})
+
 test("app.exit prints the session epilogue after scoped cleanup", async () => {
   const setup = await createTestRenderer({ width: 80, height: 24 })
   const core = await import("@opentui/core")
