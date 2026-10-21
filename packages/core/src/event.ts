@@ -438,42 +438,93 @@ export const layerWith = (options?: LayerOptions) =>
         })
       }
 
+      // Resolve and validate a stored event for replay: definition lookup,
+      // payload decode against the current durable schema, and the aggregate
+      // checks commitDurableEvent would run. Failures die with an
+      // InvalidDurableEventError naming the event, and running this ahead of
+      // any commit lets replayAll reject a legacy or unknown shape without
+      // partially applying the batch (#433).
+      function resolveReplayEvent(event: SerializedEvent) {
+        return Effect.gen(function* () {
+          const definition = Durable.get(event.type)
+          if (!definition?.durable) {
+            return yield* Effect.die(
+              new InvalidDurableEventError({
+                type: event.type,
+                message: `Unknown durable event type ${event.type} at aggregate ${event.aggregateID} sequence ${event.seq}`,
+              }),
+            )
+          }
+          const durable = definition.durable
+          const data = yield* Effect.try({
+            try: () => Schema.decodeUnknownSync(definition.data)(event.data),
+            catch: (cause) =>
+              new InvalidDurableEventError({
+                type: event.type,
+                message: `Durable event ${event.type} at aggregate ${event.aggregateID} sequence ${event.seq} does not match its current schema: ${cause instanceof Error ? cause.message : String(cause)}`,
+              }),
+          }).pipe(Effect.orDie)
+          const aggregateID = (data as Record<string, unknown>)[durable.aggregate]
+          if (typeof aggregateID !== "string") {
+            return yield* Effect.die(
+              new InvalidDurableEventError({
+                type: event.type,
+                message: `Expected string aggregate field ${durable.aggregate}`,
+              }),
+            )
+          }
+          if (aggregateID !== event.aggregateID) {
+            return yield* Effect.die(
+              new InvalidDurableEventError({
+                type: event.type,
+                message: `Aggregate mismatch: expected ${event.aggregateID}, got ${aggregateID}`,
+              }),
+            )
+          }
+          return { definition, durable, data }
+        })
+      }
+
+      function commitReplay(
+        resolved: { definition: Definition; durable: NonNullable<Definition["durable"]>; data: unknown },
+        event: SerializedEvent,
+        options?: { readonly publish?: boolean; readonly ownerID?: string; readonly strictOwner?: boolean },
+      ) {
+        return Effect.gen(function* () {
+          const payload = {
+            id: event.id,
+            type: resolved.definition.type,
+            data: resolved.data,
+          } as Payload
+          const committed = yield* commitDurableEvent(resolved.definition, payload, {
+            seq: event.seq,
+            aggregateID: event.aggregateID,
+            ownerID: options?.ownerID,
+            strictOwner: options?.strictOwner,
+          })
+          if (committed && options?.publish) {
+            yield* notify(
+              {
+                ...payload,
+                durable: {
+                  aggregateID: committed.aggregateID,
+                  seq: committed.seq,
+                  version: resolved.durable.version,
+                },
+              },
+              true,
+            )
+          }
+        })
+      }
+
       function replay(
         event: SerializedEvent,
         options?: { readonly publish?: boolean; readonly ownerID?: string; readonly strictOwner?: boolean },
       ) {
         return Effect.gen(function* () {
-          const definition = Durable.get(event.type)
-          if (!definition?.durable) {
-            yield* Effect.die(
-              new InvalidDurableEventError({ type: event.type, message: `Unknown durable event type ${event.type}` }),
-            )
-          } else {
-            const payload = {
-              id: event.id,
-              type: definition.type,
-              data: Schema.decodeUnknownSync(definition.data)(event.data),
-            } as Payload
-            const committed = yield* commitDurableEvent(definition, payload, {
-              seq: event.seq,
-              aggregateID: event.aggregateID,
-              ownerID: options?.ownerID,
-              strictOwner: options?.strictOwner,
-            })
-            if (committed && options?.publish) {
-              yield* notify(
-                {
-                  ...payload,
-                  durable: {
-                    aggregateID: committed.aggregateID,
-                    seq: committed.seq,
-                    version: definition.durable.version,
-                  },
-                },
-                true,
-              )
-            }
-          }
+          const resolved = yield* resolveReplayEvent(event)
+          yield* commitReplay(resolved, event, options)
         })
       }
 
@@ -504,8 +555,19 @@ export const layerWith = (options?: LayerOptions) =>
               )
             }
           }
+          // Preflight the whole batch before committing any event, so a
+          // legacy or unknown shape anywhere in it fails the replay without
+          // leaving earlier events applied (#433).
+          const resolved: {
+            definition: Definition
+            durable: NonNullable<Definition["durable"]>
+            data: unknown
+          }[] = []
           for (const event of events) {
-            yield* replay(event, options)
+            resolved.push(yield* resolveReplayEvent(event))
+          }
+          for (const [index, event] of events.entries()) {
+            yield* commitReplay(resolved[index]!, event, options)
           }
           return source
         })

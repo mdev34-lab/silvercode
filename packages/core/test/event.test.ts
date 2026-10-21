@@ -773,6 +773,86 @@ describe("EventV2", () => {
     }),
   )
 
+  it.effect("replayAll rejects an unknown event type without committing earlier events", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const { db } = yield* Database.Service
+      const aggregateID = Session.ID.create()
+      const exit = yield* events
+        .replayAll([
+          {
+            id: EventV2.ID.create(),
+            type: EventV2.versionedType(DurableMessage.type, 1),
+            seq: 0,
+            aggregateID,
+            data: durableData(aggregateID, "one"),
+          },
+          {
+            id: EventV2.ID.create(),
+            type: "test.unknown@1",
+            seq: 1,
+            aggregateID,
+            data: { sessionID: aggregateID },
+          },
+        ])
+        .pipe(Effect.exit)
+
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isFailure(exit)) {
+        const defect = Cause.squash(exit.cause)
+        expect(defect).toBeInstanceOf(EventV2.InvalidDurableEventError)
+        expect((defect as Error).message).toContain("Unknown durable event type test.unknown@1")
+      }
+      const rows = yield* db
+        .select()
+        .from(EventTable)
+        .where(eq(EventTable.aggregate_id, aggregateID))
+        .all()
+        .pipe(Effect.orDie)
+      expect(rows).toEqual([])
+    }),
+  )
+
+  it.effect("replayAll rejects a legacy payload shape without committing earlier events", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const { db } = yield* Database.Service
+      const aggregateID = Session.ID.create()
+      const exit = yield* events
+        .replayAll([
+          {
+            id: EventV2.ID.create(),
+            type: EventV2.versionedType(DurableMessage.type, 1),
+            seq: 0,
+            aggregateID,
+            data: durableData(aggregateID, "one"),
+          },
+          {
+            id: EventV2.ID.create(),
+            type: EventV2.versionedType(DurableMessage.type, 1),
+            seq: 1,
+            aggregateID,
+            data: { sessionID: aggregateID },
+          },
+        ])
+        .pipe(Effect.exit)
+
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isFailure(exit)) {
+        const defect = Cause.squash(exit.cause)
+        expect(defect).toBeInstanceOf(EventV2.InvalidDurableEventError)
+        expect((defect as Error).message).toContain("does not match its current schema")
+      }
+      const rows = yield* db
+        .select()
+        .from(EventTable)
+        .where(eq(EventTable.aggregate_id, aggregateID))
+        .all()
+        .pipe(Effect.orDie)
+      expect(rows).toEqual([])
+    }),
+  )
+
   it.effect("claim fences replay owners", () =>
     Effect.gen(function* () {
       const events = yield* EventV2.Service
