@@ -68,12 +68,23 @@ type Cursor = typeof Cursor.Type
 
 const decodeCursor = Schema.decodeUnknownSync(Cursor)
 
+export class InvalidCursorError extends Schema.TaggedErrorClass<InvalidCursorError>()(
+  "MessageV2.InvalidCursorError",
+  { message: Schema.String },
+) {}
+
 export const cursor = {
   encode(input: Cursor) {
     return Buffer.from(JSON.stringify(input)).toString("base64url")
   },
   decode(input: string) {
     return decodeCursor(JSON.parse(Buffer.from(input, "base64url").toString("utf8")))
+  },
+  decodeEffect(input: string) {
+    return Effect.try({
+      try: () => cursor.decode(input),
+      catch: () => new InvalidCursorError({ message: "Invalid cursor" }),
+    })
   },
 }
 
@@ -428,7 +439,7 @@ export const page = Effect.fn("MessageV2.page")(function* (input: {
   before?: string
 }) {
   const { db } = yield* Database.Service
-  const before = input.before ? cursor.decode(input.before) : undefined
+  const before = input.before ? yield* cursor.decodeEffect(input.before) : undefined
   const where = before
     ? and(eq(MessageTable.session_id, input.sessionID), older(before))
     : eq(MessageTable.session_id, input.sessionID)
