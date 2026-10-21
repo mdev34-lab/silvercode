@@ -60,7 +60,7 @@ test("SIGHUP clears title and disposes scoped resources once", async () => {
   }
 })
 
-test("render failures restore the terminal and report the error after cleanup", async () => {
+test("handler failures restore the terminal and report cached console logs", async () => {
   const setup = await createTestRenderer({ width: 80, height: 24 })
   const core = await import("@opentui/core")
   mock.module("@opentui/core", () => ({ ...core, createCliRenderer: async () => setup.renderer }))
@@ -98,11 +98,14 @@ test("render failures restore the terminal and report the error after cleanup", 
     )
 
     await ready
-    setup.renderer.emit("render:error", { error: new Error("render failed"), renderable: undefined })
+    setup.renderer.console.getCachedLogs = () => "cached console failure"
+    expect(setup.renderer.listenerCount("handler:error")).toBeGreaterThan(0)
+    setup.renderer.emit("handler:error", { error: new Error("handler failed"), event: undefined })
     await task
 
     expect(setup.renderer.isDestroyed).toBe(true)
-    expect(stderr).toContain("render failed")
+    expect(stderr).toContain("handler failed")
+    expect(stderr).toContain("cached console failure")
   } finally {
     process.stderr.write = originalWrite
     if (!setup.renderer.isDestroyed) setup.renderer.destroy()
