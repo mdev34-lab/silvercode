@@ -1952,6 +1952,38 @@ describe("OPENCODE_CONFIG_CONTENT token substitution", () => {
   )
 })
 
+describe("legacy TOML config migration", () => {
+  const toml = 'provider = "openai"\nmodel = "gpt-4o"\n'
+
+  it.instance("migrates the legacy TOML config, writes JSON, and removes the legacy file", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped()
+      yield* FSUtil.use.writeWithDirs(path.join(dir, "config"), toml)
+      const config = yield* withGlobalConfigDir(dir, Config.use.get())
+      expect(config.model).toBe("openai/gpt-4o")
+      const legacyExists = yield* FSUtil.use.existsSafe(path.join(dir, "config"))
+      expect(legacyExists).toBe(false)
+      const written = JSON.parse(yield* Effect.promise(() => fs.readFile(path.join(dir, "config.json"), "utf8")))
+      expect(written.model).toBe("openai/gpt-4o")
+    }),
+  )
+
+  it.instance("keeps the legacy file and un-migrated in-memory config when the converted write fails", () =>
+    Effect.gen(function* () {
+      if (process.platform === "win32") return
+      const dir = yield* tmpdirScoped()
+      yield* FSUtil.use.writeWithDirs(path.join(dir, "config"), toml)
+      // A read-only config dir makes the converted config.json write fail
+      yield* FSUtil.use.chmod(dir, 0o555)
+      yield* Effect.addFinalizer(() => FSUtil.use.chmod(dir, 0o755).pipe(Effect.ignore))
+      const config = yield* withGlobalConfigDir(dir, Config.use.get())
+      expect(config.model).not.toBe("openai/gpt-4o")
+      const legacyExists = yield* FSUtil.use.existsSafe(path.join(dir, "config"))
+      expect(legacyExists).toBe(true)
+    }),
+  )
+})
+
 // parseManagedPlist unit tests — pure function, no OS interaction
 
 test("parseManagedPlist strips MDM metadata keys", async () => {
