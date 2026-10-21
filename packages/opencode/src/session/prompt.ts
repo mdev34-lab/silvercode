@@ -24,6 +24,13 @@ import { MCP } from "../mcp"
 import { LSP } from "@/lsp/lsp"
 import { ulid } from "ulid"
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process"
+
+// User `!` shell commands: live output is flushed as a bounded tail preview at
+// a bounded rate; after the process exits, streaming stops once the output has
+// been quiet for this window (a detached descendant can hold stdio open).
+const BANG_STREAM_PREVIEW_BYTES = 64 * 1024
+const BANG_STREAM_FLUSH_MS = 100
+const BANG_STREAM_QUIET = "500 millis"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import * as Stream from "effect/Stream"
 import { Command } from "../command"
@@ -45,7 +52,7 @@ import { Truncate } from "@/tool/truncate"
 import { Image } from "@/image/image"
 import { decodeDataUrl } from "@/util/data-url"
 import { Process } from "@/util/process"
-import { Cause, DateTime, Effect, Exit, Latch, Layer, Option, Scope, Context, Schema, Types } from "effect"
+import { Cause, DateTime, Effect, Exit, Fiber, Latch, Layer, Option, Scope, Context, Schema, Types } from "effect"
 import { InstanceState } from "@/effect/instance-state"
 import { TaskTool, type TaskPromptOps } from "@/tool/task"
 import { FinishTool, readTermination } from "@/tool/finish"
@@ -628,16 +635,45 @@ const layer = Layer.effect(
                 forceKillAfter: "3 seconds",
               })
               const handle = yield* spawner.spawn(cmd)
-              yield* Stream.runForEach(Stream.decodeText(handle.all), (chunk) =>
-                Effect.gen(function* () {
-                  output += chunk
-                  if (part.state.status === "running") {
-                    part.state.metadata = { output }
-                    yield* sessions.updatePart(part)
-                  }
-                }),
+              // Keep the UI responsive under heavy commands; see the shell tool.
+              try {
+                os.setPriority(handle.pid, os.constants.priority.PRIORITY_BELOW_NORMAL)
+              } catch {}
+              let bytes = 0
+              let preview = ""
+              let lastFlush = 0
+              const collect = yield* Effect.forkScoped(
+                Stream.runForEach(Stream.decodeText(handle.all), (chunk) =>
+                  Effect.gen(function* () {
+                    bytes += chunk.length
+                    output += chunk
+                    preview = (preview + chunk).slice(-BANG_STREAM_PREVIEW_BYTES)
+                    // Re-persisting and re-emitting the whole output per chunk is
+                    // O(n^2) on verbose commands; flush a bounded preview at a
+                    // bounded rate instead. The final update keeps everything.
+                    const now = Date.now()
+                    if (part.state.status === "running" && now - lastFlush >= BANG_STREAM_FLUSH_MS) {
+                      lastFlush = now
+                      part.state.metadata = { output: preview }
+                      yield* sessions.updatePart(part)
+                    }
+                  }),
+                ),
               )
-              yield* handle.exitCode
+              // Do not wait for stdio EOF: a detached descendant can hold the
+              // inherited pipes open forever. Wait for the process to exit,
+              // then stop once the output has been quiet for a short window.
+              // A signal death fails `exitCode` by design; the command still ran.
+              yield* handle.exitCode.pipe(Effect.catch(() => Effect.succeed(null)))
+              const settle = Effect.gen(function* () {
+                let seen = bytes
+                while (true) {
+                  yield* Effect.sleep(BANG_STREAM_QUIET)
+                  if (bytes === seen) return
+                  seen = bytes
+                }
+              })
+              yield* Effect.raceAll([Fiber.join(collect).pipe(Effect.ignore), settle])
             }).pipe(Effect.scoped, Effect.orDie),
           ).pipe(Effect.exit)
 

@@ -3961,6 +3961,61 @@ unixNoLLMServer(
   30_000,
 )
 
+unixNoLLMServer(
+  "shell returns promptly when a command leaves a detached child holding stdio open",
+  () =>
+    withSh(() =>
+      Effect.gen(function* () {
+        const { prompt, chat } = yield* boot()
+        const pidFile = path.join(
+          Global.Path.data,
+          `bang-detached-${Date.now()}-${Math.random().toString(36).slice(2)}.pid`,
+        )
+        const squote = (text: string) => `'${text}'`
+        const bin = `"${process.execPath.replaceAll("\\", "/")}"`
+        // Spawn a long-lived detached child that inherits stdio (keeps the
+        // shell's stdout pipe open), print, then exit immediately.
+        const code =
+          'const cp=require("node:child_process");const fs=require("node:fs");' +
+          'const d=cp.spawn(process.execPath,["-e","setTimeout(()=>{},60000)"],{detached:true,stdio:"inherit"});' +
+          "d.unref();fs.writeFileSync(Bun.argv[1],String(d.pid));process.stdout.write(\"STARTED\");process.exit(0)"
+        const command = `${bin} -e ${squote(code)} ${squote(pidFile)}`
+
+        const start = Date.now()
+        const result = yield* prompt.shell({ sessionID: chat.id, agent: "work", command })
+        const elapsed = Date.now() - start
+
+        // Reap the detached daemon so the pipe closes and it does not leak.
+        const pid = yield* pollWithTimeout(
+          Effect.promise(async () => {
+            try {
+              const value = await readFile(pidFile, "utf-8")
+              return value ? Number(value) : false
+            } catch {
+              return false
+            }
+          }),
+          "timed out waiting for the detached child pid file",
+        )
+        yield* Effect.sync(() => {
+          try {
+            process.kill(pid, "SIGKILL")
+          } catch {}
+        })
+
+        const text = result.parts
+          .map((part) => (part.type === "tool" && part.state.status === "completed" ? part.state.output : ""))
+          .join("")
+        expect(text).toContain("STARTED")
+        // Returned after a bounded post-exit idle window, not by waiting on the
+        // daemon's inherited pipe (60s).
+        expect(elapsed).toBeLessThan(20_000)
+      }),
+    ),
+  { config: cfg },
+  40_000,
+)
+
 it.instance(
   "loop waits while shell runs and starts after shell exits",
   () =>
