@@ -623,9 +623,10 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
         })
       }
 
-      event.on("session.deleted", (evt) => {
+      const offDeleted = event.on("session.deleted", (evt) => {
         prune(evt.properties.info.id)
       })
+      onCleanup(offDeleted)
 
       return {
         get ready() {
