@@ -8,10 +8,13 @@ import { Rpc } from "../../src/util/rpc"
 const workerSource = `
 process.on("message", (message) => {
   if (message === "ping") process.send?.("pong")
-  // process.abort() dies abnormally on every platform: SIGABRT where POSIX
-  // signals exist, exit code 134 where they do not (Windows). Both classify
-  // as a crash; process.kill(pid, "SIGSEGV") throws on Windows instead.
-  if (message === "crash") process.abort()
+  // Exit code 134 is the crash classification on every platform (the
+  // SIGABRT exit-code counterpart). process.abort() would raise SIGABRT
+  // instead, and a signal death goes through the host's core-dump path,
+  // which can stall the process for tens of seconds on a loaded CI runner
+  // and starve the test's restart budget (#468). A plain exit(134) is
+  // immediate and classifies identically.
+  if (message === "crash") process.exit(134)
 })
 setTimeout(() => process.send?.("ready"), 50)
 setInterval(() => {}, 1000)
@@ -20,7 +23,7 @@ setInterval(() => {}, 1000)
 const rpcWorkerSource = `
 process.on("message", (message) => {
   if (message === "crash") {
-    process.abort()
+    process.exit(134)
     return
   }
   let parsed
