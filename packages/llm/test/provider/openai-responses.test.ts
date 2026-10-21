@@ -754,6 +754,36 @@ describe("OpenAI Responses route", () => {
     }),
   )
 
+  it.effect("fails the stream when EOF arrives without a terminal event", () =>
+    Effect.gen(function* () {
+      const body = sseEvents(
+        { type: "response.output_text.delta", item_id: "msg_1", delta: "Hello" },
+        { type: "response.output_text.delta", item_id: "msg_1", delta: "!" },
+      )
+      const error = yield* LLMClient.stream(request).pipe(
+        Stream.runCollect,
+        Effect.flip,
+        Effect.provide(fixedResponse(body)),
+      )
+
+      expect(error.message).toContain("Provider stream ended without a terminal finish event")
+    }),
+  )
+
+  it.effect("streams cleanly when a terminal event closes the response", () =>
+    Effect.gen(function* () {
+      const body = sseEvents(
+        { type: "response.output_text.delta", item_id: "msg_1", delta: "Hello" },
+        { type: "response.completed", response: { id: "resp_1" } },
+      )
+      const events = Array.from(
+        yield* LLMClient.stream(request).pipe(Stream.runCollect, Effect.provide(fixedResponse(body))),
+      )
+
+      expect(events[events.length - 1]).toMatchObject({ type: "finish", reason: "stop" })
+    }),
+  )
+
   it.effect("parses reasoning summary stream fixtures", () =>
     Effect.gen(function* () {
       const body = sseEvents(

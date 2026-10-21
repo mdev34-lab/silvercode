@@ -278,10 +278,19 @@ function makeFromTransport<Body, Prepared, Frame, Event, State>(
         }),
       streamPrepared: (prepared: Prepared, request: LLMRequest, runtime: TransportRuntime) => {
         const route = `${request.model.provider}/${request.model.route.id}`
+        // Tracks whether a protocol-terminal event was seen, so a clean EOF
+        // without one (proxy/gateway truncation) fails into the retry pipeline
+        // instead of completing silently and looping generation (#407).
+        let sawTerminal = false
         const events = routeInput.transport
           .frames(prepared, request, runtime)
           .pipe(
             Stream.mapEffect(decodeEvent(route)),
+            Stream.tap((event) =>
+              Effect.sync(() => {
+                if (protocol.stream.terminal?.(event)) sawTerminal = true
+              }),
+            ),
             protocol.stream.terminal ? Stream.takeUntil(protocol.stream.terminal) : (stream) => stream,
           )
         return events.pipe(
@@ -291,6 +300,17 @@ function makeFromTransport<Body, Prepared, Frame, Event, State>(
             protocol.stream.onHalt ? { onHalt: protocol.stream.onHalt } : undefined,
           ),
           Stream.catchCause((cause) => Stream.fail(streamError(route, `Failed to read ${route} stream`, cause))),
+          (stream) =>
+            Stream.concat(
+              stream,
+              Stream.fromEffect(
+                Effect.suspend(() =>
+                  protocol.stream.terminal === undefined || sawTerminal
+                    ? Effect.void
+                    : ProviderShared.eventError(route, "Provider stream ended without a terminal finish event"),
+                ),
+              ).pipe(Stream.drain),
+            ),
         )
       },
     } satisfies Route<Body, Prepared>

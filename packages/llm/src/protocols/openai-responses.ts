@@ -610,7 +610,10 @@ const NO_EVENTS: StepResult["1"] = []
 // `finish` event; `response.failed` is a hard failure that emits a
 // `provider-error`. All three end the stream — kept in one set so `step` and
 // the protocol's `terminal` predicate stay in sync.
-const TERMINAL_TYPES = new Set(["response.completed", "response.incomplete", "response.failed"])
+// `error` is terminal too: the provider emits it as the last event before
+// closing a failed stream, and treating EOF after it as truncation would mask
+// the real provider error (#407).
+const TERMINAL_TYPES = new Set(["response.completed", "response.incomplete", "response.failed", "error"])
 
 const onOutputTextDelta = (state: ParserState, event: OpenAIResponsesEvent): StepResult => {
   if (!event.delta) return [state, NO_EVENTS]
