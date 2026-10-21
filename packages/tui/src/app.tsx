@@ -415,6 +415,11 @@ function App(props: { onSnapshot?: () => Promise<string[]>; pluginHost: TuiPlugi
   // Every component that reads the terminal size adds its own resize listener, and a busy
   // session has well over Node's default of 10. The warning would print into the screen.
   renderer.setMaxListeners(0)
+  // Keyboard and paste hooks share a single emitter (renderer.keyInput) for the whole tree, so
+  // every component and plugin calling useKeyboard/usePaste adds a listener there. Past Node's
+  // default of 10 per event that trips MaxListenersExceededWarning, which opentui routes into its
+  // console cache instead of the terminal, so the cap has to be lifted on this emitter too.
+  renderer.keyInput.setMaxListeners(0)
   const dialog = useDialog()
   const local = useLocal()
   const kv = useKV()
