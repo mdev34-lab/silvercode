@@ -71,7 +71,11 @@ const decodeCursor = Schema.decodeUnknownSync(Cursor)
 export class InvalidCursorError extends Schema.TaggedErrorClass<InvalidCursorError>()(
   "MessageV2.InvalidCursorError",
   { message: Schema.String },
-) {}
+) {
+  static isInstance(input: unknown): input is InvalidCursorError {
+    return input instanceof InvalidCursorError
+  }
+}
 
 export const cursor = {
   encode(input: Cursor) {
@@ -487,6 +491,9 @@ export function stream(sessionID: SessionID) {
         Effect.catchIf(NotFoundError.isInstance, () =>
           Effect.succeed({ items: [] as WithParts[], more: false, cursor: undefined }),
         ),
+        // stream pages with cursors it generated itself, so a decode failure
+        // is an internal invariant breach, not user input: keep it a defect.
+        Effect.catchIf(InvalidCursorError.isInstance, (error) => Effect.die(error)),
       )
       if (next.items.length === 0) break
       for (let i = next.items.length - 1; i >= 0; i--) {

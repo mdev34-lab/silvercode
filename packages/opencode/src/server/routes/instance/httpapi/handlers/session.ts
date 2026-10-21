@@ -127,7 +127,10 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
           sessionID: ctx.params.sessionID,
           limit: ctx.query.limit,
           before: ctx.query.before,
-        }),
+        }).pipe(
+          // Pre-validated above; keep the typed error out of mapStorageNotFound.
+          Effect.catchIf(MessageV2.InvalidCursorError.isInstance, () => new HttpApiError.BadRequest({})),
+        ),
       )
       if (!page.cursor) return page.items
 
