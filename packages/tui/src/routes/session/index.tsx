@@ -76,6 +76,7 @@ import { PermissionPrompt } from "./permission"
 import { QuestionPrompt } from "./question"
 import { DialogExportOptions } from "../../ui/dialog-export-options"
 import * as Model from "../../util/model"
+import { pauseMarker } from "../../util/pause"
 import { elapsed, useClock } from "../../util/clock"
 import { formatTranscript } from "../../util/transcript"
 import { formatGenerationMetrics } from "../../util/generation-metrics"
@@ -1718,7 +1719,20 @@ export function AssistantMessageRow(props: { message: AssistantMessage; parts: P
             return { groupID, owner: info.parts[0]?.part.id === part.id }
           })
           const component = createMemo(() => PART_MAPPING[part.type as keyof typeof PART_MAPPING])
+          const pause = createMemo(() => (group() && !group()!.owner ? undefined : pauseMarker(props.parts, index())))
           return (
+            <>
+            <Show when={pause()}>
+              {(text) => (
+                <box
+                  marginTop={1}
+                  border={["top"]}
+                  title={` ↻ ${text()} `}
+                  titleAlignment="center"
+                  borderColor={theme.border}
+                />
+              )}
+            </Show>
             <Switch>
               <Match when={group()?.owner === true}>
                 <ActivityGroup groupID={group()!.groupID} />
@@ -1737,6 +1751,7 @@ export function AssistantMessageRow(props: { message: AssistantMessage; parts: P
                 </Show>
               </Match>
             </Switch>
+            </>
           )
         }}
       </For>

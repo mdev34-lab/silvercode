@@ -75,6 +75,8 @@ interface ProcessorContext extends Input {
   needsCompaction: boolean
   currentText: SessionV1.TextPart | undefined
   reasoningMap: Record<string, SessionV1.ReasoningPart>
+  // Time of the last reasoning delta per part, so a thought ends when the model stopped thinking, not when the next chunk arrived.
+  reasoningLast: Record<string, number>
 }
 
 type StreamEvent = LLMEvent
@@ -114,6 +116,7 @@ const layer = Layer.effect(
         needsCompaction: false,
         currentText: undefined,
         reasoningMap: {},
+        reasoningLast: {},
       }
       let aborted = false
       const clock = createGenerationClock()
@@ -261,9 +264,13 @@ const layer = Layer.effect(
         if (!(reasoningID in ctx.reasoningMap)) return
         // oxlint-disable-next-line no-self-assign -- reactivity trigger
         ctx.reasoningMap[reasoningID].text = ctx.reasoningMap[reasoningID].text
-        ctx.reasoningMap[reasoningID].time = { ...ctx.reasoningMap[reasoningID].time, end: Date.now() }
+        ctx.reasoningMap[reasoningID].time = {
+          ...ctx.reasoningMap[reasoningID].time,
+          end: ctx.reasoningLast[reasoningID] ?? Date.now(),
+        }
         yield* session.updatePart(ctx.reasoningMap[reasoningID])
         delete ctx.reasoningMap[reasoningID]
+        delete ctx.reasoningLast[reasoningID]
       })
 
       const ensureToolCall = Effect.fn("SessionProcessor.ensureToolCall")(function* (input: {
@@ -342,6 +349,7 @@ const layer = Layer.effect(
               time: { start: Date.now() },
               metadata: value.providerMetadata,
             }
+            ctx.reasoningLast[value.id] = Date.now()
             yield* session.updatePart(ctx.reasoningMap[value.id])
             return
 
@@ -349,6 +357,7 @@ const layer = Layer.effect(
             // Match dev: silently drop orphan deltas (no preceding reasoning-start).
             if (!(value.id in ctx.reasoningMap)) return
             ctx.reasoningMap[value.id].text += value.text
+            ctx.reasoningLast[value.id] = Date.now()
             if (value.providerMetadata) ctx.reasoningMap[value.id].metadata = value.providerMetadata
             yield* session.updatePartDelta({
               sessionID: ctx.reasoningMap[value.id].sessionID,
@@ -622,14 +631,15 @@ const layer = Layer.effect(
           ctx.currentText = undefined
         }
 
-        for (const part of Object.values(ctx.reasoningMap)) {
-          const end = Date.now()
+        for (const [id, part] of Object.entries(ctx.reasoningMap)) {
+          const end = ctx.reasoningLast[id] ?? Date.now()
           yield* session.updatePart({
             ...part,
             time: { start: part.time.start ?? end, end },
           })
         }
         ctx.reasoningMap = {}
+        ctx.reasoningLast = {}
 
         yield* Effect.forEach(
           Object.values(ctx.toolcalls),
@@ -703,7 +713,10 @@ const layer = Layer.effect(
         return yield* Effect.gen(function* () {
           yield* Effect.gen(function* () {
             ctx.currentText = undefined
+            // A retry after a stalled or failed stream must not leave the previous attempt's thought open.
+            yield* Effect.forEach(Object.keys(ctx.reasoningMap), finishReasoning)
             ctx.reasoningMap = {}
+            ctx.reasoningLast = {}
             yield* status.set(ctx.sessionID, { type: "busy" })
             const stream = llm.stream(streamInput)
             clock.startRequest(Date.now())
