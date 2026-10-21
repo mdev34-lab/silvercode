@@ -4,10 +4,22 @@ import type { Opts, Proc } from "./pty"
 export type { Disp, Exit, Opts, Proc } from "./pty"
 
 export function spawn(file: string, args: string[], opts: Opts): Proc {
-  const proc = pty.spawn(file, args, {
-    ...opts,
-    ...(process.platform === "win32" ? { useConptyDll: true } : {}),
-  })
+  // On Windows the bundled ConPTY DLL is preferred, but a blocked or corrupt
+  // DLL must not make terminal creation impossible: fall back to the
+  // operating system's own ConPTY (#443). @lydell/node-pty ships no winpty
+  // backend, so system ConPTY is the only degradation path available.
+  const backends: Record<string, unknown>[] = process.platform === "win32" ? [{ useConptyDll: true }, { useConptyDll: false }] : [{}]
+  let lastError: unknown
+  let proc: ReturnType<typeof pty.spawn> | undefined
+  for (const backend of backends) {
+    try {
+      proc = pty.spawn(file, args, { ...opts, ...backend })
+      break
+    } catch (error) {
+      lastError = error
+    }
+  }
+  if (!proc) throw lastError
   return {
     pid: proc.pid,
     onData(listener) {
