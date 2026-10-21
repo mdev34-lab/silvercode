@@ -1433,7 +1433,12 @@ export function toPublicInfo(provider: Info): Info {
 }
 
 export function defaultModelIDs<T extends { models: Record<string, { id: string }> }>(providers: Record<string, T>) {
-  return mapValues(providers, (item) => sort(Object.values(item.models))[0].id)
+  // Providers whose models are discovered after auth (e.g. Token Harbor) can
+  // be listed with no models yet; they have no default to offer.
+  const withModels = Object.fromEntries(
+    Object.entries(providers).filter(([, provider]) => Object.keys(provider.models).length > 0),
+  )
+  return mapValues(withModels, (item) => sort(Object.values(item.models))[0].id)
 }
 
 export class ModelNotFoundError extends Schema.TaggedErrorClass<ModelNotFoundError>()("ProviderModelNotFoundError", {
