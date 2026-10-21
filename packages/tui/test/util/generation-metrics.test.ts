@@ -3,7 +3,7 @@ import { formatGenerationMetrics } from "../../src/util/generation-metrics"
 
 describe("formatGenerationMetrics", () => {
   test("formats both metrics compactly", () => {
-    expect(formatGenerationMetrics({ tokensPerSecond: 48.7, ttft: 842.4 })).toBe("48.7 tok/s · TTFT 842 ms")
+    expect(formatGenerationMetrics({ tokensPerSecond: 48.7, ttft: 842.4 })).toBe("48.7 tok/s · TTFT 842ms")
   })
 
   test("formats tokens/sec without TTFT", () => {
@@ -11,7 +11,12 @@ describe("formatGenerationMetrics", () => {
   })
 
   test("formats TTFT without tokens/sec", () => {
-    expect(formatGenerationMetrics({ ttft: 842 })).toBe("TTFT 842 ms")
+    expect(formatGenerationMetrics({ ttft: 842 })).toBe("TTFT 842ms")
+  })
+
+  test("formats a long TTFT with the same duration format as the rest of the TUI", () => {
+    expect(formatGenerationMetrics({ ttft: 1234 })).toBe("TTFT 1.2s")
+    expect(formatGenerationMetrics({ ttft: 785768 })).toBe("TTFT 13m 5s")
   })
 
   test("omits missing or invalid metrics", () => {
