@@ -446,6 +446,7 @@ export const ShellTool = Tool.define(
       let processing = false
       let file = ""
       let sink: ReturnType<typeof createWriteStream> | undefined
+      let spillError: Error | undefined
       let cut = false
       let expired = false
       let aborted = false
@@ -517,6 +518,16 @@ export const ShellTool = Tool.define(
                         file = next
                         cut = true
                         sink = createWriteStream(next, { flags: "a" })
+                        // Listen right away: a mid-command failure (ENOSPC, EACCES,
+                        // EMFILE) with no listener is an uncaughtException that kills
+                        // a bare server process. On failure, stop spilling and keep the
+                        // truncated in-memory output instead of taking down the runtime.
+                        const stream = sink
+                        stream.on("error", (error) => {
+                          spillError = error instanceof Error ? error : new Error(String(error))
+                          if (sink === stream) sink = undefined
+                          stream.destroy()
+                        })
                         full = ""
                       }),
                     ),
@@ -592,10 +603,14 @@ export const ShellTool = Tool.define(
         )
       }
       if (aborted) meta.push("User aborted the command")
+      if (spillError) {
+        meta.push(`Could not save the full output to a file (${spillError.message}). The output below may be incomplete.`)
+        file = ""
+      }
       const raw = list.map((item) => item.text).join("")
       const end = tail(raw, limits.maxLines, limits.maxBytes)
       if (end.cut) cut = true
-      if (!file && end.cut) {
+      if (!file && end.cut && !spillError) {
         file = yield* trunc.write(raw)
       }
 
