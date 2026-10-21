@@ -897,6 +897,9 @@ const layer: Layer.Layer<
     const messages: Interface["messages"] = Effect.fn("Session.messages")(function* (input) {
       if (input.limit) {
         return (yield* MessageV2.page({ sessionID: input.sessionID, limit: input.limit }).pipe(
+          // No cursor is passed here, so a decode failure is impossible input;
+          // keep it out of the typed channel.
+          Effect.catchIf(MessageV2.InvalidCursorError.isInstance, (error) => Effect.die(error)),
           Effect.provideService(Database.Service, database),
         )).items
       }
@@ -906,6 +909,9 @@ const layer: Layer.Layer<
       let before: string | undefined
       while (true) {
         const page = yield* MessageV2.page({ sessionID: input.sessionID, limit: size, before }).pipe(
+          // messages pages with cursors it generated itself, so a decode
+          // failure is an internal invariant breach, not user input.
+          Effect.catchIf(MessageV2.InvalidCursorError.isInstance, (error) => Effect.die(error)),
           Effect.provideService(Database.Service, database),
         )
         if (page.items.length === 0) break
@@ -959,6 +965,9 @@ const layer: Layer.Layer<
       let before: string | undefined
       while (true) {
         const page = yield* MessageV2.page({ sessionID, limit: size, before }).pipe(
+          // findMessage pages with cursors it generated itself, so a decode
+          // failure is an internal invariant breach, not user input.
+          Effect.catchIf(MessageV2.InvalidCursorError.isInstance, (error) => Effect.die(error)),
           Effect.provideService(Database.Service, database),
         )
         if (page.items.length === 0) break
