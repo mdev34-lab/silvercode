@@ -448,9 +448,11 @@ function App(props: { onSnapshot?: () => Promise<string[]>; pluginHost: TuiPlugi
     },
     { priority: 1 },
   )
+  let pendingSigcont: (() => void) | undefined
   onCleanup(() => {
     offSelectionKeys()
     attention.dispose()
+    if (pendingSigcont) process.removeListener("SIGCONT", pendingSigcont)
   })
 
   // Wire up console copy-to-clipboard via opentui's onCopySelection callback
@@ -954,9 +956,17 @@ function App(props: { onSnapshot?: () => Promise<string[]>; pluginHost: TuiPlugi
           // attention signals fire then. See docs/tui/background.md.
           // The terminal is only handed over once suspend() has restored it.
           await renderer.suspend()
-          process.once("SIGCONT", () => {
+          // A second suspend before SIGCONT would stack another once-listener
+          // and resume twice; drop the pending one first. The renderer can
+          // also be destroyed while stopped, so guard the resume (#426).
+          if (pendingSigcont) process.removeListener("SIGCONT", pendingSigcont)
+          const onSigcont = () => {
+            pendingSigcont = undefined
+            if (renderer.isDestroyed) return
             void renderer.resume().catch(() => {})
-          })
+          }
+          pendingSigcont = onSigcont
+          process.once("SIGCONT", onSigcont)
           process.kill(0, "SIGTSTP")
         },
       },
