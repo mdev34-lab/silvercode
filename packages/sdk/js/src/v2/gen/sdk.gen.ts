@@ -1324,10 +1324,11 @@ export class Config extends HeyApiClient {
 }
 
 
-// HAND-EDIT (#435): runtime envelope check for SSE events. The generated SSE
-// parser casts parsed JSON to the event type unchecked, so both event
-// subscriptions reject frames whose payload is not a shaped event (the bad
-// frame is reported through onSseError and skipped, the stream continues).
+// HAND-EDIT (#435, reapplied by script/build.ts): runtime envelope check
+// for SSE events. The generated SSE parser casts parsed JSON to the event
+// type unchecked, so both event subscriptions reject frames whose payload is
+// not a shaped event (the bad frame is reported through onSseError and
+// skipped, the stream continues).
 const validateSseEvent = async (data: unknown) => {
   const payload = (data as { payload?: { type?: unknown } } | null)?.payload
   if (typeof data !== "object" || data === null || typeof payload?.type !== "string") {
