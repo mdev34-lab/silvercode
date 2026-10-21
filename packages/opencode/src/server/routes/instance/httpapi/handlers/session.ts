@@ -178,6 +178,24 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
     })
 
     const remove = Effect.fn("SessionHttpApi.remove")(function* (ctx: { params: { sessionID: SessionID } }) {
+      // Stop foreground runs before deleting: stream/tool work would
+      // otherwise keep writing to rows the delete cascade removes and fail
+      // mid-turn after the session is gone (#412). remove() deletes child
+      // sessions recursively, so their runners go first. Runner.cancel waits
+      // for the interruption to land, so persistence has stopped before the
+      // cascade runs. Cancellation is best-effort: a stuck runner must not
+      // block deletion.
+      const runState = yield* SessionRunState.Service
+      const kids = yield* session.children(ctx.params.sessionID).pipe(Effect.orElseSucceed(() => []))
+      for (const child of [...kids.map((kid) => kid.id), ctx.params.sessionID]) {
+        yield* runState
+          .cancel(child)
+          .pipe(
+            Effect.catch((error) =>
+              Effect.logWarning("failed to cancel session run before delete", { sessionID: child, error }),
+            ),
+          )
+      }
       yield* SessionError.mapStorageNotFound(session.remove(ctx.params.sessionID))
       return true
     })
