@@ -323,8 +323,15 @@ export const make = Effect.gen(function* () {
     signal: NodeJS.Signals,
   ) =>
     Effect.suspend(() => {
-      if (proc.kill(signal)) return Effect.void
-      return Effect.fail(toPlatformError("kill", new Error("Failed to kill child process"), command))
+      // kill() returns false when the pid is already gone: the child exited
+      // between the caller's decision to kill and the kill itself. An
+      // idempotent kill treats that as success, not as an error.
+      try {
+        proc.kill(signal)
+      } catch (err) {
+        return Effect.fail(toPlatformError("kill", toError(err), command))
+      }
+      return Effect.void
     })
 
   const terminate = (
