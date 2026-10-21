@@ -88,6 +88,7 @@ import { createTuiAttention } from "./attention"
 import * as TuiAudio from "./audio"
 import { win32DisableProcessedInput, win32FlushInputBuffer } from "./terminal-win32"
 import { destroyRenderer } from "./util/renderer"
+import { createSigcontResume } from "./util/sigcont-resume"
 import { cliErrorMessage, errorFormat } from "./util/error"
 
 registerOpencodeSpinner()
@@ -441,9 +442,11 @@ function App(props: { onSnapshot?: () => Promise<string[]>; pluginHost: TuiPlugi
     },
     { priority: 1 },
   )
+  const sigcont = createSigcontResume(renderer)
   onCleanup(() => {
     offSelectionKeys()
     attention.dispose()
+    sigcont.dispose()
   })
 
   // Wire up console copy-to-clipboard via opentui's onCopySelection callback
@@ -947,9 +950,10 @@ function App(props: { onSnapshot?: () => Promise<string[]>; pluginHost: TuiPlugi
           // attention signals fire then. See docs/tui/background.md.
           // The terminal is only handed over once suspend() has restored it.
           await renderer.suspend()
-          process.once("SIGCONT", () => {
-            void renderer.resume().catch(() => {})
-          })
+          // A second suspend before SIGCONT would stack another once-listener
+          // and resume twice; arm() drops the pending one first. The renderer
+          // can also be destroyed while stopped, so the resume is guarded (#426).
+          sigcont.arm()
           process.kill(0, "SIGTSTP")
         },
       },
