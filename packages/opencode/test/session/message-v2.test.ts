@@ -1444,6 +1444,14 @@ describe("session.message-v2.fromError", () => {
     })
   })
 
+  test("passes through named session errors thrown upstream", () => {
+    const overflow = new SessionV1.ContextOverflowError({ message: "too many tokens" })
+    expect(MessageV2.fromError(overflow, { providerID })).toBe(overflow)
+
+    const api = new SessionV1.APIError({ message: "rate limited", isRetryable: true })
+    expect(MessageV2.fromError(api, { providerID })).toBe(api)
+  })
+
   test("serializes response error codes", () => {
     const cases = [
       {

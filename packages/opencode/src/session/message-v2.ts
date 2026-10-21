@@ -702,6 +702,11 @@ export function fromError(
         },
         { cause: e },
       ).toObject()
+    // Named session errors thrown upstream (e.g. from a provider-error stream
+    // event, #409) keep their classification instead of degrading to Unknown.
+    case ContextOverflowError.isInstance(e):
+    case APIError.isInstance(e):
+      return e
     case e instanceof Error:
       return new NamedError.Unknown({ message: errorMessage(e) }, { cause: e }).toObject()
     default:
