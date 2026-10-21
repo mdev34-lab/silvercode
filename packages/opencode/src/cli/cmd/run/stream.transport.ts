@@ -905,6 +905,23 @@ function createLayer(input: StreamInput) {
         }
 
         const applyEvent = Effect.fn("RunStreamTransport.applyEvent")(function* (event: Event) {
+          // The server's replay log could not prove completeness for our
+          // resume cursor (events evicted during a long disconnect), so the
+          // gap is real: surface it rather than running on silently stale
+          // state.
+          if (event.type === "server.resync") {
+            input.trace?.write("recv.resync", {
+              sessionID: input.sessionID,
+              reason: event.properties.reason,
+            })
+            input.footer.append({
+              kind: "error",
+              text: "event stream resumed with gaps after a disconnect; displayed state may be stale",
+              phase: "start",
+              source: "system",
+            })
+            return
+          }
           if (event.type === "message.part.delta" && event.properties.sessionID === input.sessionID) {
             if (replayedParts.has(event.properties.partID)) {
               const seen = state.data.text.get(event.properties.partID) ?? ""
