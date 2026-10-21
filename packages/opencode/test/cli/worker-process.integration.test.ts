@@ -148,7 +148,12 @@ describe("TUI worker process integration", () => {
       )
       worker.postMessage("crash")
       const restarted = worker.waitForRestart()
-      await bounded(expect(hanging).rejects.toThrow(/exited with/), "stranded call never rejected")
+      await bounded(
+        (async () => {
+          await expect(hanging).rejects.toThrow(/exited with/)
+        })(),
+        "stranded call never rejected",
+      )
       expect(hangingSettled).toBe("rejected")
       await bounded(restarted, "restart never settled")
 
