@@ -68,6 +68,23 @@ describe("TUI worker process", () => {
     await worker.terminate()
   })
 
+  test("rejects waitForRestart called after the worker is gone for good", async () => {
+    const children: FakeProcess[] = []
+    const spawn = () => {
+      const child = fakeProcess()
+      children.push(child)
+      return child
+    }
+
+    const worker = createWorkerProcess("worker.ts", { spawn, log: () => {} })
+    // Clean exit: no restart, closed resolves.
+    children[0].resolveExit(0)
+    await expect(worker.closed).resolves.toMatchObject({ code: 0 })
+    // A waiter registered now must not queue for a cycle that can never start.
+    await expect(worker.waitForRestart()).rejects.toThrow(/no restart will follow/)
+    await worker.terminate()
+  })
+
   test("restarts a crashed worker without replaying messages", async () => {
     const children: FakeProcess[] = []
     const spawn = () => {

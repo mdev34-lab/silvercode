@@ -128,6 +128,10 @@ export function createWorkerProcess(target: string, options: WorkerProcessOption
   // crashes fan their waiters out to the matching cycles.
   let openCycles: RestartCycle[] = []
   let queuedWaiters: RestartWaiter[] = []
+  // Set once the worker exits with no restart following (clean exit, spent
+  // restart budget, or shutdown): later waitForRestart calls reject
+  // immediately instead of queueing for a cycle that can never start.
+  let terminalExit: WorkerExit | undefined
   let resolveClosed!: (exit: WorkerExit) => void
   const closed = new Promise<WorkerExit>((resolve) => {
     resolveClosed = resolve
@@ -144,6 +148,10 @@ export function createWorkerProcess(target: string, options: WorkerProcessOption
   transport.onclose = null
   transport.waitForRestart = () => {
     const waiter = new Promise<void>((resolve, reject) => {
+      if (terminalExit) {
+        reject(new Error(`Bun worker exited with ${describeExit(terminalExit)}; no restart will follow`))
+        return
+      }
       const open = openCycles[0]
       if (open) open.waiters.push({ resolve, reject })
       else queuedWaiters.push({ resolve, reject })
@@ -169,6 +177,7 @@ export function createWorkerProcess(target: string, options: WorkerProcessOption
   }
 
   const finish = (exit: WorkerExit) => {
+    terminalExit = exit
     // No restart follows (clean exit, shutdown, or the restart budget is
     // spent): settle every pending restart waiter instead of leaving it
     // queued forever. A waiter that hangs past its caller's patience turns
