@@ -93,6 +93,17 @@ it.instance("code agent cannot delegate to work or itself", () =>
   }),
 )
 
+it.instance("plan agent is a mixed-mode delegation target", () =>
+  Effect.gen(function* () {
+    const plan = yield* load((svc) => svc.get("plan"))
+    expect(plan).toBeDefined()
+    // mode "all": usable as a primary session agent AND delegable via the task tool
+    expect(plan!.mode).toBe("all")
+    const work = yield* load((svc) => svc.get("work"))
+    expect(Permission.evaluate("task", "plan", work!.permission).action).toBe("allow")
+  }),
+)
+
 it.instance("plan agent denies the general subagent by default", () =>
   Effect.gen(function* () {
     const plan = yield* load((svc) => svc.get("plan"))
@@ -800,7 +811,7 @@ it.instance(
     Effect.gen(function* () {
       const plan = yield* load((svc) => svc.get("plan"))
       const code = yield* load((svc) => svc.get("code"))
-      expect(plan?.mode).toBe("primary")
+      expect(plan?.mode).toBe("all")
       expect(code?.mode).toBe("all")
       expect(yield* load((svc) => svc.defaultAgent())).toBe("plan")
     }),

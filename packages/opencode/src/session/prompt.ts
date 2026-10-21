@@ -1718,6 +1718,12 @@ const layer = Layer.effect(
               // Reviewer sessions keep their own structured-report contract and
               // must not recursively review themselves.
               ...(isReviewAgent(agent.name) || !sessionWroteFiles ? [] : [EFFORT_PROCESS[effort]]),
+              // Plan scales research depth and candidate count by effort, but it does
+              // not write code, so the write-gated process line above rarely reaches
+              // it. Surface the bare level whenever the process line did not fire.
+              ...(agent.name === "plan" && (isReviewAgent(agent.name) || !sessionWroteFiles)
+                ? [`## Agent effort: ${effort}`]
+                : []),
             ]
             const format = lastUser.format ?? { type: "text" as const }
             if (format.type === "json_schema") system.push(STRUCTURED_OUTPUT_SYSTEM_PROMPT)

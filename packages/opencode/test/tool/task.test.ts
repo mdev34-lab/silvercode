@@ -678,7 +678,7 @@ describe("tool.task", () => {
       const { chat, assistant } = yield* seed()
       const tool = yield* TaskTool
       const def = yield* tool.init()
-      for (const subagent_type of ["work", "plan"]) {
+      for (const subagent_type of ["work"]) {
         let asked = 0
         const exit = yield* def
           .execute(
