@@ -87,6 +87,9 @@ afterEach(async () => {
 })
 
 describe("Config Dependency Install Integration with MockRegistry", () => {
+  // The windows CI runner pays a heavy per-process spawn cost (CreateProcess + AV
+  // scan), and this test shells out to a real package install, so it gets double the
+  // suite's 30s budget instead of flaking at the bound.
   test("installs @opencode-ai/plugin in background and waitForDependencies joins successfully", async () => {
     await using tmp = await tmpdir()
     await using registry = await MockRegistry.start([
@@ -133,7 +136,7 @@ describe("Config Dependency Install Integration with MockRegistry", () => {
     // Verify mock registry received requests
     const urls = registry.requests.map((r) => r.url)
     expect(urls.some((u) => u.includes("@opencode-ai") || u.includes("plugin"))).toBe(true)
-  })
+  }, 60_000)
 
   test("config loads successfully and waitForDependencies recovers when mock registry returns HTTP 500", async () => {
     await using tmp = await tmpdir()
