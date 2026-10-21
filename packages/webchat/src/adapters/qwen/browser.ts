@@ -521,7 +521,10 @@ export class QwenWebBrowser {
         // or the login would be trapped headless with no window (#483).
         debug("browser", "relaunching headed for interactive login")
         try {
-          await this.restartWithHeadless(signal, false)
+          // Holds the launch lock: other launch paths wait in ensureInternal
+          // while the old context closes and the headed one starts.
+          await this.close()
+          await this.ensureInternal(signal, false, true)
         } catch (error) {
           // Roll back the logical mode and clean up any partially-created headed context.
           await this.close()
@@ -579,7 +582,15 @@ export class QwenWebBrowser {
   private async ensureInternal(
     signal?: AbortSignal,
     headlessOverride?: boolean,
+    skipTransitionGate = false,
   ): Promise<{ context: QwenWebContext; page: QwenWebPage }> {
+    // A login relaunch holds a launch lock: while the old context is closing,
+    // this.context is already cleared but this.headless still reads true, so
+    // an unblocked launch here would start headless and get reused by the
+    // relaunch as it flips to headed (#483). Wait the transition out.
+    if (this.loginRelaunch && !skipTransitionGate) {
+      await this.loginRelaunch.catch(() => {})
+    }
     if (this.context && !this.contextDead) {
       const page = await this.ensurePage()
       return { context: this.context, page }
