@@ -112,6 +112,78 @@ if (sseTypesPatched === sseTypesSource) {
 }
 await Bun.write(sseTypesPath, sseTypesPatched)
 
+// Patch #435: the generated SSE parser yields parsed JSON cast to the event
+// type unchecked, so a syntactically valid frame with missing or changed
+// fields reached subscribers as a real event. Two parts: the parser reports
+// a rejected frame through onSseError and skips it (a throw through the
+// existing call path would be caught as a connection error and reconnect-
+// replay the same bad frame forever), and both v2 event subscriptions pass
+// an envelope validator that rejects frames whose payload is not a shaped
+// event. The patches run on the raw generator output, so they match with
+// flexible whitespace and let the prettier pass below normalize the result;
+// keep them in sync with the committed generated files.
+const sseParserPath = "./src/v2/gen/core/serverSentEvents.gen.ts"
+const sseParserSource = await Bun.file(sseParserPath).text()
+const sseParserPatched = sseParserSource.replace(
+  /if \(responseValidator\) \{\s*await responseValidator\(data\);?\s*\}/,
+  `if (responseValidator) {
+                  // HAND-EDIT (#435, reapplied by script/build.ts): a
+                  // malformed event is a bad frame, not a dead connection.
+                  // Report it through onSseError and skip the frame; throwing
+                  // here would be caught below as a connection error and
+                  // trigger a reconnect that replays the same bad frame
+                  // forever.
+                  try {
+                    await responseValidator(data)
+                  } catch (error) {
+                    onSseError?.(error)
+                    continue
+                  }
+                }`,
+)
+if (sseParserPatched === sseParserSource) {
+  throw new Error(`SSE frame-validation patch did not apply; @hey-api/openapi-ts output may have changed (${sseParserPath})`)
+}
+await Bun.write(sseParserPath, sseParserPatched)
+
+const sseSdkPath = "./src/v2/gen/sdk.gen.ts"
+const sseSdkSource = await Bun.file(sseSdkPath).text()
+const wireValidator = (match: string, quote: string, gap: string, comma: string) =>
+  match.replace(/\.\.\.options,?/, `responseValidator: validateSseEvent,${gap}...options${comma}`)
+const sseSdkPatched = sseSdkSource
+  .replace(
+    /export class Global extends HeyApiClient \{/,
+    `// HAND-EDIT (#435, reapplied by script/build.ts): runtime envelope check
+// for SSE events. The generated SSE parser casts parsed JSON to the event
+// type unchecked, so both event subscriptions reject frames that are not a
+// shaped event (instance events carry a top-level type, global events wrap
+// it in payload; a bad frame is reported through onSseError and skipped,
+// the stream continues).
+const validateSseEvent = async (data: unknown) => {
+  if (typeof data !== "object" || data === null) {
+    const preview = JSON.stringify(data)?.slice(0, 200)
+    throw new Error(\`Malformed SSE event frame: \${preview}\`)
+  }
+  // Instance events carry a top-level type; global events wrap it in payload.
+  const envelope = data as { type?: unknown; payload?: { type?: unknown } }
+  if (typeof envelope.type !== "string" && typeof envelope.payload?.type !== "string") {
+    const preview = JSON.stringify(data)?.slice(0, 200)
+    throw new Error(\`Malformed SSE event frame: \${preview}\`)
+  }
+}
+
+export class Global extends HeyApiClient {`,
+  )
+  .replace(/url: (["'])\/global\/event\1,(\s*)\.\.\.options(,?)/, wireValidator)
+  .replace(/url: (["'])\/event\1,(\s*)\.\.\.options(,?)/, wireValidator)
+if (
+  !sseSdkPatched.includes("const validateSseEvent") ||
+  (sseSdkPatched.match(/responseValidator: validateSseEvent/g) ?? []).length !== 2
+) {
+  throw new Error(`SSE event-validator SDK patch did not apply; @hey-api/openapi-ts output may have changed (${sseSdkPath})`)
+}
+await Bun.write(sseSdkPath, sseSdkPatched)
+
 await $`bun prettier --write src/gen`
 await $`bun prettier --write src/v2`
 await $`rm -rf dist`

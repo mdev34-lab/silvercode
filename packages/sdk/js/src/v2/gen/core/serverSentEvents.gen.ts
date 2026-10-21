@@ -192,7 +192,18 @@ export const createSseClient = <TData = unknown>({
 
               if (parsedJson) {
                 if (responseValidator) {
-                  await responseValidator(data)
+                  // HAND-EDIT (#435, reapplied by script/build.ts): a
+                  // malformed event is a bad frame, not a dead connection.
+                  // Report it through onSseError and skip the frame; throwing
+                  // here would be caught below as a connection error and
+                  // trigger a reconnect that replays the same bad frame
+                  // forever.
+                  try {
+                    await responseValidator(data)
+                  } catch (error) {
+                    onSseError?.(error)
+                    continue
+                  }
                 }
 
                 if (responseTransformer) {
