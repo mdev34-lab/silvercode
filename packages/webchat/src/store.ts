@@ -112,6 +112,10 @@ export class ThreadStore {
   private readonly file: string
   private readonly threads = new Map<string, WebChatThread>()
   private loaded = false
+  // True when the persisted file exists but could not be read or parsed.
+  // While degraded the store keeps working in memory but never flushes, so a
+  // partial in-memory view can never overwrite recoverable threads (#427).
+  private degraded = false
 
   constructor(options: ThreadStoreOptions = {}) {
     this.file = options.file ?? path.join(Global.Path.data, DEFAULT_SUBDIR)
@@ -124,24 +128,42 @@ export class ThreadStore {
   private open(): void {
     if (this.loaded) return
     this.loaded = true
+    let raw: string
     try {
-      const raw = fs.readFileSync(this.file, "utf8")
-      const parsed = JSON.parse(raw) as { threads: WebChatThread[] }
-      if (parsed && Array.isArray(parsed.threads)) {
-        for (const thread of parsed.threads) {
-          const usable = sanitizeThread(thread)
-          if (usable) this.threads.set(usable.id, usable)
-          else {
-            // Name the dropped entry (id only, never its content) so schema drift is
-            // diagnosable; the next flush rewrites the file without it.
-            const id = (thread as { id?: unknown } | null)?.id
-            console.error("[webchat] dropped unusable persisted thread", typeof id === "string" ? id : "(no id)")
-          }
+      raw = fs.readFileSync(this.file, "utf8")
+    } catch (error) {
+      // A missing file is a first run; anything else means the store exists
+      // but is unreadable and must not be flushed over.
+      if ((error as { code?: unknown })?.code !== "ENOENT") this.degrade(error)
+      return
+    }
+    let parsed: { threads: WebChatThread[] }
+    try {
+      parsed = JSON.parse(raw) as { threads: WebChatThread[] }
+    } catch (error) {
+      this.degrade(error)
+      return
+    }
+    if (parsed && Array.isArray(parsed.threads)) {
+      for (const thread of parsed.threads) {
+        const usable = sanitizeThread(thread)
+        if (usable) this.threads.set(usable.id, usable)
+        else {
+          // Name the dropped entry (id only, never its content) so schema drift is
+          // diagnosable; the next flush rewrites the file without it.
+          const id = (thread as { id?: unknown } | null)?.id
+          console.error("[webchat] dropped unusable persisted thread", typeof id === "string" ? id : "(no id)")
         }
       }
-    } catch {
-      // First run / corrupt state: start empty.
     }
+  }
+
+  private degrade(error: unknown): void {
+    this.degraded = true
+    console.error(
+      `[webchat] thread store at ${this.file} is unreadable or corrupt; keeping the file untouched and running in memory only`,
+      error,
+    )
   }
 
   get(id: string): WebChatThread | undefined {
@@ -171,6 +193,7 @@ export class ThreadStore {
   }
 
   private flush(): void {
+    if (this.degraded) return
     try {
       fs.mkdirSync(path.dirname(this.file), { recursive: true })
       const payload = { threads: [...this.threads.values()] }
