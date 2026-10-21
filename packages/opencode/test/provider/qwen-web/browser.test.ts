@@ -408,7 +408,7 @@ describe("login behavior", () => {
     await login
     const { context } = await ensured
     expect(launches).toEqual([true, false])
-    expect(context.closed).toBe(false)
+    expect((context as unknown as { closed: boolean }).closed).toBe(false)
     expect(page.navigations[page.navigations.length - 1]).toBe("https://chat.qwen.ai/auth")
     await browser.close()
   })
