@@ -26,6 +26,19 @@ export async function captureFrame(app: Pick<Setup, "captureCharFrame">) {
   return app.captureCharFrame()
 }
 
+/** The current span frame, retried while the output buffer is still being flushed. Same OutputBusy exposure as `captureFrame`. */
+export async function captureSpans(app: Pick<Setup, "captureSpans">) {
+  for (let attempt = 0; attempt < 40; attempt++) {
+    try {
+      return app.captureSpans()
+    } catch (error) {
+      if (!isBusyOutput(error)) throw error
+      await Bun.sleep(5)
+    }
+  }
+  return app.captureSpans()
+}
+
 /**
  * Pumps frames until `probe` yields a value, so assertions read a settled layout. The render
  * comes first because probes read live layout, which is meaningless before it has run. Probes

@@ -7,7 +7,7 @@ import { onCleanup, onMount, type JSX } from "solid-js"
 import { chmod, mkdir } from "node:fs/promises"
 import path from "node:path"
 import { tmpdir } from "../../fixture/fixture"
-import { captureFrame, waitFor, waitUntil } from "../../fixture/frame"
+import { captureFrame, captureSpans, waitFor, waitUntil } from "../../fixture/frame"
 import { createTuiResolvedConfig } from "../../fixture/tui-runtime"
 import { createEventSource, createFetch, directory, json } from "../../fixture/tui-sdk"
 import { TestTuiContexts } from "../../fixture/tui-environment"
@@ -357,8 +357,8 @@ function hexOf(color: { r: number; g: number; b: number }) {
 }
 
 /** The filled ` Level ` chip a selector row paints, with its ink. */
-function chipHex(app: Setup, level: string) {
-  const spans = app.captureSpans()
+async function chipHex(app: Setup, level: string) {
+  const spans = await captureSpans(app)
   for (const line of spans.lines) {
     const chip = line.spans.find((span) => span.text === ` ${level} `)
     if (chip) return { fg: hexOf(chip.fg), bg: hexOf(chip.bg) }
@@ -461,10 +461,10 @@ describe("agent effort selector", () => {
       await frameWhere(harness.app, (f) => f.includes("Agent effort"), "dialog title")
       // Fast green, medium orange, thorough red; the names stay visible so the
       // levels never depend on color alone.
-      expect(chipHex(harness.app, "Fast").bg).toBe("#3fb950")
-      expect(chipHex(harness.app, "Medium").bg).toBe("#f0883e")
-      expect(chipHex(harness.app, "Thorough").bg).toBe("#f85149")
-      for (const label of ["Fast", "Medium", "Thorough"]) expect(chipHex(harness.app, label).fg).toBe("#000000")
+      expect((await chipHex(harness.app, "Fast")).bg).toBe("#3fb950")
+      expect((await chipHex(harness.app, "Medium")).bg).toBe("#f0883e")
+      expect((await chipHex(harness.app, "Thorough")).bg).toBe("#f85149")
+      for (const label of ["Fast", "Medium", "Thorough"]) expect((await chipHex(harness.app, label)).fg).toBe("#000000")
 
       const frame = await frameWhere(harness.app, () => true, "settled dialog")
       expect(frame).toContain("Fast")

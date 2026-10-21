@@ -222,7 +222,7 @@ describe("session layout states (#241)", () => {
 
         if (state === "working") {
           // Work state: live reasoning label plus the interrupt affordance.
-          expectWholeWords(spansOf(app), ["Thinking", "esc interrupt"])
+          expectWholeWords(await spansOf(app), ["Thinking", "esc interrupt"])
         }
         if (state === "error") {
           // Failure cannot hide behind an idle-looking screen: the status line

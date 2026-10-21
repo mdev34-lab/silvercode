@@ -113,27 +113,27 @@ describe("thinking labels are themeable (#241)", () => {
       test(`${name}: streaming label uses thinkingStreaming @ ${sizeName}`, async () => {
         const { app } = await mountSessionRoute({ ...scenario("streaming"), ...size, theme: name })
         await settle(app)
-        const label = spansMatching(app, "Thinking: Planning the fix")
+        const label = await spansMatching(app, "Thinking: Planning the fix")
         expect(label.length).toBeGreaterThan(0)
         for (const span of label) {
           expect(hex(span.fg)).toBe(expected.streaming)
           expect(span.attributes & expected.streamingBits).toBe(expected.streamingBits)
           expect(span.attributes & expected.completedBits).toBe(0)
         }
-        expect(spansMatching(app, "Thought").length).toBe(0)
+        expect((await spansMatching(app, "Thought")).length).toBe(0)
       })
 
       test(`${name}: completed label uses thinkingCompleted and keeps its duration @ ${sizeName}`, async () => {
         const { app } = await mountSessionRoute({ ...scenario("completed"), ...size, theme: name })
         await settle(app)
-        const label = spansMatching(app, "Thought: Planning the fix · 3.0s")
+        const label = await spansMatching(app, "Thought: Planning the fix · 3.0s")
         expect(label.length).toBeGreaterThan(0)
         for (const span of label) {
           expect(hex(span.fg)).toBe(expected.completed)
           expect(span.attributes & expected.completedBits).toBe(expected.completedBits)
           expect(span.attributes & expected.streamingBits).toBe(0)
         }
-        expect(spansMatching(app, "Thinking").length).toBe(0)
+        expect((await spansMatching(app, "Thinking")).length).toBe(0)
       })
     }
   }
@@ -142,7 +142,7 @@ describe("thinking labels are themeable (#241)", () => {
     const warning = hex(resolveTheme(DEFAULT_THEMES.opencode!, "dark").warning)
     const done = await mountSessionRoute({ ...scenario("completed"), ...SIZES.normal })
     await settle(done.app)
-    const completed = spansMatching(done.app, "Thought: Planning the fix · 3.0s")
+    const completed = await spansMatching(done.app, "Thought: Planning the fix · 3.0s")
     expect(completed.length).toBeGreaterThan(0)
     for (const span of completed) {
       expect(hex(span.fg)).toBe(warning)
@@ -156,7 +156,7 @@ describe("thinking labels are themeable (#241)", () => {
     const theme = resolveTheme(DEFAULT_THEMES.opencode!, "dark")
     const { app } = await mountSessionRoute({ ...scenario("streaming"), ...SIZES.normal })
     await settle(app)
-    const streaming = spansMatching(app, "Thinking: Planning the fix")
+    const streaming = await spansMatching(app, "Thinking: Planning the fix")
     expect(streaming.length).toBeGreaterThan(0)
     for (const span of streaming) {
       // Blended towards the background at the default 0.6 opacity: same hue
