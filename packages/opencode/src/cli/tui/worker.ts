@@ -118,10 +118,11 @@ if (isTuiWorker) {
 
   if (processWorker) {
     stopRpcListener = Rpc.listenProcess(rpc)
-    // Only a subprocess can outlive the UI, and only POSIX spawns it detached
-    // (see worker-process.ts). A thread worker shares the process, so it
-    // always exits with the UI.
-    if (process.platform !== "win32") {
+    // Only a subprocess can outlive the UI: POSIX spawns it detached, and on
+    // Windows a non-detached child is still not guaranteed to terminate when
+    // the owner is hard-killed (see worker-process.ts, #442). A thread worker
+    // shares the process, so it always exits with the UI.
+    {
       const ownerPID = Number.parseInt(process.env["SILVERCODE_TUI_WORKER_OWNER_PID"] ?? "", 10)
       watchOwnerProcess({
         subscribeDisconnect: (handler) => {
