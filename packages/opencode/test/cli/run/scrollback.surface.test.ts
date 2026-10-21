@@ -87,6 +87,7 @@ async function setup(
 
   return {
     renderer: out.renderer,
+    externalOutput: out.externalOutput,
     theme,
     scrollback: new RunScrollbackStream(out.renderer, theme, {
       treeSitterClient,
@@ -507,40 +508,29 @@ test("inserts spacers for new visible groups", async () => {
   }
 })
 
-test(
-  "renders replayed user, reasoning, and assistant output after completion",
-  async () => {
-    const out = await setup()
+test("renders replayed user, reasoning, and assistant output after completion", async () => {
+  const out = await setup()
 
-    try {
-      const lines: string[] = []
-      const take = () => {
-        const commits = claim(out.renderer)
-        try {
-          lines.push(...commits.flatMap((commit) => renderRows(commit).flatMap((row) => row.split("\n"))))
-        } finally {
-          destroy(commits)
-        }
-      }
+  try {
+    await out.scrollback.append(user("Hello you"))
+    await out.scrollback.append(reasoning("Thinking: **Plan**\n\nSay hello.", "progress"))
+    await out.scrollback.complete()
+    await out.scrollback.append(assistant("Hello.", "progress"))
+    await out.scrollback.complete()
 
-      await out.scrollback.append(user("Hello you"))
-      take()
-      await out.scrollback.append(reasoning("Thinking: **Plan**\n\nSay hello.", "progress"))
-      await out.scrollback.complete()
-      take()
-      await out.scrollback.append(assistant("Hello.", "progress"))
-      await out.scrollback.complete()
-      take()
-
-      const output = lines.join("\n")
-      expect(output).toContain("› Hello you")
-      expect(output).toContain("Say hello.")
-      expect(output).toContain("Hello.")
-    } finally {
-      out.scrollback.destroy()
-    }
-  },
-)
+    // externalOutput.takeText() reads the committed scrollback text through
+    // the 0.6.6 testing API. Asserting the FIRST reasoning paragraph (the
+    // "Thinking:" label) is the #440 check: it was the paragraph the Windows
+    // render thread dropped from committed rows before the upgrade.
+    const output = out.externalOutput.takeText()
+    expect(output).toContain("› Hello you")
+    expect(output).toContain("Thinking:")
+    expect(output).toContain("Say hello.")
+    expect(output).toContain("Hello.")
+  } finally {
+    out.scrollback.destroy()
+  }
+})
 
 test("coalesces same-line tool progress into one snapshot", async () => {
   const out = await setup()
