@@ -15,6 +15,7 @@ import PROMPT_COMPACTION from "./prompt/compaction.txt"
 import PROMPT_EXPLORE from "./prompt/explore.txt"
 import PROMPT_REVIEW from "./prompt/review.txt"
 import PROMPT_WORK_REVIEW from "./prompt/work-review.txt"
+import PROMPT_PLAN from "./prompt/plan.txt"
 import PROMPT_CODE_REVIEW from "./prompt/code-review.txt"
 import PROMPT_SUMMARY from "./prompt/summary.txt"
 import PROMPT_TITLE from "./prompt/title.txt"
@@ -235,10 +236,12 @@ const layer = Layer.effect(
           },
           plan: {
             name: "plan",
-            description: "Plan mode. Disallows all edit tools.",
+            description:
+              "Planning specialist. Researches the codebase and the web, then drafts an implementation plan. Disallows all edit tools.",
+            prompt: PROMPT_PLAN,
             options: {},
             permission: Permission.merge(defaults, planPermissions, user),
-            mode: "primary",
+            mode: "all",
             native: true,
           },
           general: {
