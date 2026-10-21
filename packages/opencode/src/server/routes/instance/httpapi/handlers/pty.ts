@@ -71,12 +71,19 @@ export const ptyHandlers = HttpApiBuilder.group(InstanceHttpApi, "pty", (handler
       const shell = yield* plugin.trigger("shell.env", { cwd }, { env: {} as Record<string, string> })
       return yield* pty(
         Pty.Service.use((service) =>
-          service.create({
-            ...ctx.payload,
-            args: ctx.payload.args ? [...ctx.payload.args] : undefined,
-            cwd,
-            env: { ...ctx.payload.env, ...shell.env },
-          }),
+          service
+            .create({
+              ...ctx.payload,
+              args: ctx.payload.args ? [...ctx.payload.args] : undefined,
+              cwd,
+              env: { ...ctx.payload.env, ...shell.env },
+            })
+            .pipe(
+              Effect.catchTags({
+                "Pty.CreateFailedError": () => new HttpApiError.BadRequest({}),
+                "Pty.LimitExceededError": () => new HttpApiError.BadRequest({}),
+              }),
+            ),
         ),
       )
     })
@@ -225,14 +232,14 @@ export const ptyConnectHandlers = HttpApiBuilder.group(PtyConnectApi, "pty-conne
         const outbox = yield* Queue.bounded<string | Uint8Array | Socket.CloseEvent>(4096)
         // A slow client must not grow this queue without bound; drop the oldest queued frame.
         const offer = (item: string | Uint8Array | Socket.CloseEvent) => {
-          while (!offer( item)) Effect.runSync(Queue.poll(outbox))
+          while (!Queue.offerUnsafe(outbox, item)) Effect.runSync(Queue.poll(outbox))
         }
         const attachment = yield* pty(
           Pty.Service.use((service) =>
             service.attach(ctx.params.ptyID, {
               cursor,
-              onData: (chunk) => offer( chunk),
-              onEnd: () => offer( new Socket.CloseEvent(1000)),
+              onData: (chunk) => offer(chunk),
+              onEnd: () => offer(new Socket.CloseEvent(1000)),
             }),
           ),
         ).pipe(
@@ -245,8 +252,8 @@ export const ptyConnectHandlers = HttpApiBuilder.group(PtyConnectApi, "pty-conne
         )
         if (!attachment) return HttpServerResponse.empty()
 
-        for (const chunk of PtyProtocol.chunks(attachment.replay)) offer( chunk)
-        offer( PtyProtocol.metaFrame(attachment.cursor))
+        for (const chunk of PtyProtocol.chunks(attachment.replay)) offer(chunk)
+        offer(PtyProtocol.metaFrame(attachment.cursor))
         attachment.activate()
 
         const drain = Effect.gen(function* () {
