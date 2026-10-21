@@ -1991,6 +1991,51 @@ noLLMServer.instance(
 )
 
 it.instance(
+  "run exit settles crash-orphaned running parts",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Pinned" })
+      const seeded = yield* seed(chat.id, { finish: "tool-calls" })
+      const orphanPartID = PartID.ascending()
+      yield* sessions.updatePart({
+        id: orphanPartID,
+        messageID: seeded.assistant.id,
+        sessionID: chat.id,
+        type: "tool",
+        callID: "stuck-bash",
+        tool: "bash",
+        state: {
+          status: "running",
+          input: { command: "sleep 100" },
+          title: "sleep",
+          metadata: {},
+          time: { start: 1 },
+        },
+      })
+
+      yield* llm.text("recovered")
+      const result = yield* prompt.loop({ sessionID: chat.id })
+      expect(result.info.role).toBe("assistant")
+
+      const msgs = yield* sessions.messages({ sessionID: chat.id })
+      const seededMsg = msgs.find((msg) => msg.info.id === seeded.assistant.id)
+      if (!seededMsg || seededMsg.info.role !== "assistant") throw new Error("expected seeded assistant")
+      expect(seededMsg.info.time.completed).toBeDefined()
+      const orphan = seededMsg.parts.find((part) => part.id === orphanPartID)
+      if (!orphan || orphan.type !== "tool" || orphan.state.status !== "error")
+        throw new Error("expected orphaned tool to settle as error")
+      expect(orphan.state.metadata?.interrupted).toBe(true)
+      const seededText = seededMsg.parts.find((part) => part.type === "text")
+      if (!seededText || seededText.type !== "text") throw new Error("expected seeded text part")
+      expect(seededText.time?.end).toBeDefined()
+    }),
+  { timeout: 30_000 },
+)
+
+it.instance(
   "finish does not end the turn while another tool call is still running",
   () =>
     Effect.gen(function* () {
