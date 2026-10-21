@@ -155,12 +155,18 @@ const sseSdkPatched = sseSdkSource
     /export class Global extends HeyApiClient \{/,
     `// HAND-EDIT (#435, reapplied by script/build.ts): runtime envelope check
 // for SSE events. The generated SSE parser casts parsed JSON to the event
-// type unchecked, so both event subscriptions reject frames whose payload is
-// not a shaped event (the bad frame is reported through onSseError and
-// skipped, the stream continues).
+// type unchecked, so both event subscriptions reject frames that are not a
+// shaped event (instance events carry a top-level type, global events wrap
+// it in payload; a bad frame is reported through onSseError and skipped,
+// the stream continues).
 const validateSseEvent = async (data: unknown) => {
-  const payload = (data as { payload?: { type?: unknown } } | null)?.payload
-  if (typeof data !== "object" || data === null || typeof payload?.type !== "string") {
+  if (typeof data !== "object" || data === null) {
+    const preview = JSON.stringify(data)?.slice(0, 200)
+    throw new Error(\`Malformed SSE event frame: \${preview}\`)
+  }
+  // Instance events carry a top-level type; global events wrap it in payload.
+  const envelope = data as { type?: unknown; payload?: { type?: unknown } }
+  if (typeof envelope.type !== "string" && typeof envelope.payload?.type !== "string") {
     const preview = JSON.stringify(data)?.slice(0, 200)
     throw new Error(\`Malformed SSE event frame: \${preview}\`)
   }

@@ -23,12 +23,14 @@ test("malformed event frames are reported and skipped, valid frames still stream
     fetch: (async () =>
       sse([
         'data: {"payload":{"type":"server.connected","properties":{}}}\n\n',
+        'data: {"type":"session.idle","properties":{}}\n\n',
         'data: {"unexpected":"shape"}\n\n',
         'data: {"payload":{"type":"server.heartbeat","properties":{}}}\n\n',
       ])) as typeof fetch,
     responseValidator: (data) => {
-      const payload = (data as { payload?: { type?: unknown } } | null)?.payload
-      if (typeof data !== "object" || data === null || typeof payload?.type !== "string") {
+      if (typeof data !== "object" || data === null) throw new Error("Malformed SSE event frame")
+      const envelope = data as { type?: unknown; payload?: { type?: unknown } }
+      if (typeof envelope.type !== "string" && typeof envelope.payload?.type !== "string") {
         throw new Error("Malformed SSE event frame")
       }
     },
@@ -37,10 +39,14 @@ test("malformed event frames are reported and skipped, valid frames still stream
   })
 
   const received: string[] = []
-  for await (const event of client.stream) received.push(event.payload.type)
+  for await (const event of client.stream) received.push(event as { payload: { type: string } })
 
-  expect(received).toEqual(["server.connected", "server.heartbeat"])
-  expect(events).toEqual(["server.connected", "server.heartbeat"])
+  expect(received.map((event) => (event as Record<string, unknown>).type ?? (event as { payload: { type: string } }).payload.type)).toEqual([
+    "server.connected",
+    "session.idle",
+    "server.heartbeat",
+  ])
+  expect(events).toEqual(["server.connected", "", "server.heartbeat"])
   expect(errors.length).toBe(1)
   expect(String(errors[0])).toContain("Malformed SSE event frame")
 })
