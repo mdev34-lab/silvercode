@@ -1243,7 +1243,7 @@ const layer = Layer.effect(
       }
 
       if (input.noReply === true) return message
-      return yield* loop({ sessionID: input.sessionID })
+      return yield* loop({ sessionID: input.sessionID, messageID: message.info.id })
     })
 
     const lastAssistant = Effect.fnUntraced(function* (sessionID: SessionID) {
@@ -1829,7 +1829,26 @@ const layer = Layer.effect(
     const loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.loop")(function* (
       input: LoopInput,
     ) {
-      return yield* state.ensureRunning(input.sessionID, lastAssistant(input.sessionID), runLoop(input.sessionID))
+      // A loop call arriving while another run is active joins that run and
+      // its own runLoop work never executes (the runner keeps a single run),
+      // so the caller's freshly persisted user message could stay unanswered
+      // while the caller received the old run's result (#410). Re-enter until
+      // a run has actually answered this caller's message; if a newer user
+      // message overtook it and got answered instead, return the latest state
+      // rather than spinning on a superseded prompt.
+      while (true) {
+        const result = yield* state.ensureRunning(input.sessionID, lastAssistant(input.sessionID), runLoop(input.sessionID))
+        if (!input.messageID || result.info.parentID === input.messageID) return result
+
+        const msgs = yield* sessions.messages({ sessionID: input.sessionID })
+        const ours = msgs.findIndex((msg) => msg.info.id === input.messageID)
+        const newerUser = msgs.slice(ours + 1).find((msg) => msg.info.role === "user")
+        if (!newerUser) continue
+        const superseded = msgs.some(
+          (msg) => msg.info.role === "assistant" && msg.info.parentID === newerUser.info.id,
+        )
+        if (superseded) return result
+      }
     })
 
     const shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError> = Effect.fn(
@@ -2016,6 +2035,9 @@ export type PromptInput = Schema.Schema.Type<typeof PromptInput>
 
 export class LoopInput extends Schema.Class<LoopInput>("SessionPrompt.LoopInput")({
   sessionID: SessionID,
+  // The user message this loop call must answer; used to detect a joined run
+  // that never processed it (#410).
+  messageID: Schema.optional(MessageID),
 }) {}
 
 export const ShellInput = Schema.Struct({
