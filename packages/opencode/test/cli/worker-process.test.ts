@@ -43,6 +43,48 @@ function fakeProcess(): FakeProcess {
 }
 
 describe("TUI worker process", () => {
+  test("rejects pending restart waiters when the restart budget is spent (#468)", async () => {
+    const children: FakeProcess[] = []
+    const spawn = () => {
+      const child = fakeProcess()
+      children.push(child)
+      return child
+    }
+
+    const worker = createWorkerProcess("worker.ts", { spawn, log: () => {}, maxRestarts: 1 })
+
+    // First crash consumes the single restart.
+    children[0].resolveExit(1, "SIGSEGV")
+    await worker.waitForRestart()
+    expect(children).toHaveLength(2)
+
+    // Second crash exceeds the budget: a waiter registered before it must
+    // reject, not hang queued forever.
+    const stranded = worker.waitForRestart()
+    children[1].resolveExit(1, "SIGSEGV")
+    await expect(stranded).rejects.toThrow(/no restart will follow/)
+    await expect(worker.closed).resolves.toMatchObject({ signal: "SIGSEGV" })
+    expect(children).toHaveLength(2)
+    await worker.terminate()
+  })
+
+  test("rejects waitForRestart called after the worker is gone for good", async () => {
+    const children: FakeProcess[] = []
+    const spawn = () => {
+      const child = fakeProcess()
+      children.push(child)
+      return child
+    }
+
+    const worker = createWorkerProcess("worker.ts", { spawn, log: () => {} })
+    // Clean exit: no restart, closed resolves.
+    children[0].resolveExit(0)
+    await expect(worker.closed).resolves.toMatchObject({ code: 0 })
+    // A waiter registered now must not queue for a cycle that can never start.
+    await expect(worker.waitForRestart()).rejects.toThrow(/no restart will follow/)
+    await worker.terminate()
+  })
+
   test("restarts a crashed worker without replaying messages", async () => {
     const children: FakeProcess[] = []
     const spawn = () => {
