@@ -6,7 +6,7 @@ import { testRender, useRenderer } from "@opentui/solid"
 import { onCleanup, onMount, type JSX } from "solid-js"
 import { chmod, mkdir } from "node:fs/promises"
 import { tmpdir } from "../../fixture/fixture"
-import { waitFor } from "../../fixture/frame"
+import { waitFor, waitUntil } from "../../fixture/frame"
 import { createTuiResolvedConfig } from "../../fixture/tui-runtime"
 import { createEventSource, createFetch, directory, json } from "../../fixture/tui-sdk"
 import { TestTuiContexts } from "../../fixture/tui-environment"
@@ -37,7 +37,6 @@ import { PromptStashProvider } from "../../../src/prompt/stash"
 import { DialogProvider, useDialog } from "../../../src/ui/dialog"
 import { Toast, ToastProvider } from "../../../src/ui/toast"
 import { effortBadge, effortColor, METADATA_KEY } from "../../../src/util/agent-effort"
-import { wait } from "../cmd/tui/sync-fixture"
 
 type Setup = Awaited<ReturnType<typeof testRender>>
 
@@ -310,7 +309,7 @@ async function mountEffort(input: {
   )
 
   await ready
-  await wait(() => captured!.sync.status === "complete")
+  await waitUntil(() => captured!.sync.status === "complete")
 
   return {
     app,
@@ -412,7 +411,7 @@ describe("agent effort selector", () => {
       expect(harness.local.effort.current()).toBe("fast")
       harness.app.mockInput.pressArrow("down")
       harness.app.mockInput.pressEnter()
-      await wait(() => harness.updates.length >= 1, 3000)
+      await waitUntil(() => harness.updates.length >= 1)
       const [update] = harness.updates
       expect(update.sessionID).toBe(SESSION_FAST)
       expect(update.body.metadata).toEqual({ agentEffort: "medium", task: "keep-me" })
@@ -497,7 +496,7 @@ describe("agent effort selector", () => {
         harness.app.mockInput.pressArrow("down")
         harness.app.mockInput.pressEnter()
 
-        await wait(() => harness.local.effort.current() === "thorough", 3000)
+        await waitUntil(() => harness.local.effort.current() === "thorough")
         // Visible immediately: the composer label follows the new default
         // before the write settles, and the selector marks it when reopened.
         await frameWhere(harness.app, (f) => f.includes("thorough"), "composer label")
@@ -522,7 +521,7 @@ describe("agent effort selector", () => {
         state: shared.path,
       })
       try {
-        await wait(() => restarted.local.effort.current() === "thorough", 3000)
+        await waitUntil(() => restarted.local.effort.current() === "thorough")
         await frameWhere(restarted.app, (f) => f.includes("thorough"), "restart composer label")
         expect(restarted.local.effort.scoped()).toBe(false)
         expect(restarted.local.effort.newSessionMetadata()).toEqual({ agentEffort: "thorough" })
@@ -546,14 +545,14 @@ describe("agent effort selector", () => {
       harness.app.mockInput.pressArrow("down")
       harness.app.mockInput.pressArrow("down")
       harness.app.mockInput.pressEnter()
-      await wait(() => harness.local.effort.current() === "thorough")
+      await waitUntil(() => harness.local.effort.current() === "thorough")
       await harness.app.renderOnce()
       harness.app.mockInput.typeText("Check the project")
       await frameWhere(harness.app, (f) => f.includes("Check the project"), "home prompt")
       harness.app.mockInput.pressEnter()
-      await wait(() => harness.creates.length === 1)
+      await waitUntil(() => harness.creates.length === 1)
       expect(harness.creates[0].metadata).toEqual({ agentEffort: "thorough" })
-      await wait(() => harness.route.data.type === "session")
+      await waitUntil(() => harness.route.data.type === "session")
       const sessionID = harness.route.data.type === "session" ? harness.route.data.sessionID : ""
       expect(sessionID).toBe("ses_created_1")
       // The create response has not been emitted as a session.updated event.
@@ -583,7 +582,7 @@ describe("agent effort selector", () => {
       await frameWhere(harness.app, (f) => f.includes("Failed to save the agent effort default"), "failure toast")
       // The selection rolls back to what is really stored instead of claiming
       // a level that never landed.
-      await wait(() => harness.local.effort.current() === "fast", 3000)
+      await waitUntil(() => harness.local.effort.current() === "fast")
       expect(harness.local.effort.newSessionMetadata()).toBeUndefined()
       expect(harness.local.effort.scoped()).toBe(false)
     } finally {
@@ -687,7 +686,7 @@ describe("agent effort selector", () => {
       try {
         if (ordering === "before selection") {
           release({ agentEffort: "medium" })
-          await wait(() => harness.local.effort.current() === "medium")
+          await waitUntil(() => harness.local.effort.current() === "medium")
         }
         harness.local.effort.set("thorough")
         expect(harness.local.effort.current()).toBe("thorough")
@@ -699,7 +698,7 @@ describe("agent effort selector", () => {
           expect(await Bun.file(file).json()).toEqual({ agentEffort: "medium" })
           release({ agentEffort: "medium" })
         }
-        await wait(() => written.length === 1)
+        await waitUntil(() => written.length === 1)
         expect(await fileJson(file, "thorough")).toEqual({ agentEffort: "thorough" })
         expect(harness.local.effort.current()).toBe("thorough")
         harness.local.effort.set("fast")
@@ -710,7 +709,7 @@ describe("agent effort selector", () => {
         expect(await Bun.file(file).json()).toEqual({ agentEffort: "thorough" })
         // A failed write must not poison the queue for the next selection.
         harness.local.effort.set("medium")
-        await wait(() => written.length === 3)
+        await waitUntil(() => written.length === 3)
         expect(await fileJson(file, "medium")).toEqual({ agentEffort: "medium" })
         expect(harness.local.effort.current()).toBe("medium")
       } finally {
@@ -737,17 +736,17 @@ describe("agent effort selector", () => {
       harness.app.mockInput.pressArrow("down")
       harness.app.mockInput.pressArrow("down")
       harness.app.mockInput.pressEnter()
-      await wait(() => harness.local.effort.current() === "thorough", 3000)
+      await waitUntil(() => harness.local.effort.current() === "thorough")
 
       // An existing session keeps the level it was created with.
       harness.route.navigate({ type: "session", sessionID: SESSION_FAST })
-      await wait(() => harness.local.effort.current() === "fast", 3000)
+      await waitUntil(() => harness.local.effort.current() === "fast")
       await frameWhere(harness.app, (f) => f.includes("Stored on this session"), "session footer")
 
       // An override on that session is written to the session only: the home
       // default for new sessions stays what the user picked on home.
       harness.local.effort.set("medium")
-      await wait(() => harness.updates.length >= 1, 3000)
+      await waitUntil(() => harness.updates.length >= 1)
       expect(harness.updates[0]).toEqual({
         sessionID: SESSION_FAST,
         body: { metadata: { agentEffort: "medium", task: "keep-me" } },
@@ -757,7 +756,7 @@ describe("agent effort selector", () => {
       // A plain session still falls back to the configured default rather than
       // silently inheriting another session's override.
       harness.route.navigate({ type: "session", sessionID: SESSION_PLAIN })
-      await wait(() => harness.local.effort.current() === "fast", 3000)
+      await waitUntil(() => harness.local.effort.current() === "fast")
     } finally {
       await harness.dispose()
       await shared[Symbol.asyncDispose]()
@@ -792,7 +791,7 @@ describe("agent effort selector", () => {
       await frameWhere(harness.app, (f) => lineOf(f, "VariantModel").includes("high"), "variant label")
 
       harness.local.effort.set("fast")
-      await wait(() => harness.updates.length >= 1, 3000)
+      await waitUntil(() => harness.updates.length >= 1)
       expect(harness.updates[0].body.metadata).toEqual({ agentEffort: "fast", task: "keep-me" })
       expect(harness.local.effort.current()).toBe("fast")
       expect(harness.local.model.variant.current()).toBe("high")
@@ -831,7 +830,7 @@ describe("agent effort selector", () => {
       harness.local.effort.set("fast")
       expect(harness.local.model.variant.current()).toBeUndefined()
 
-      await wait(() => harness.updates.length >= 3, 3000)
+      await waitUntil(() => harness.updates.length >= 3)
       expect(harness.updates.map((update) => update.body.metadata)).toEqual([
         { agentEffort: "fast", task: "keep-me" },
         { agentEffort: "thorough", task: "keep-me" },
@@ -862,7 +861,7 @@ describe("agent effort selector", () => {
       harness.local.effort.set("thorough")
       expect(harness.local.model.variant.current()).toBe("medium")
 
-      await wait(() => harness.updates.length >= 2, 3000)
+      await waitUntil(() => harness.updates.length >= 2)
       expect(harness.updates.map((update) => update.body.metadata)).toEqual([
         { agentEffort: "fast", task: "keep-me" },
         { agentEffort: "thorough", task: "keep-me" },
@@ -885,7 +884,7 @@ describe("agent effort selector", () => {
       harness.local.effort.set("fast")
       expect(harness.local.model.variant.current()).toBe("high")
       expect(harness.local.model.variant.selected()).toBeUndefined()
-      await wait(() => harness.updates.length >= 1, 3000)
+      await waitUntil(() => harness.updates.length >= 1)
       expect(harness.local.effort.current()).toBe("fast")
     } finally {
       await harness.dispose()
@@ -903,7 +902,7 @@ describe("agent effort selector", () => {
       expect(harness.local.model.variant.list()).toEqual([])
       harness.local.effort.set("fast")
       expect(harness.local.model.variant.current()).toBeUndefined()
-      await wait(() => harness.updates.length >= 1, 3000)
+      await waitUntil(() => harness.updates.length >= 1)
       expect(harness.updates[0].body.metadata).toEqual({ agentEffort: "fast", task: "keep-me" })
       expect(harness.local.effort.current()).toBe("fast")
     } finally {
@@ -921,7 +920,7 @@ describe("agent effort selector", () => {
     try {
       harness.local.effort.set("fast")
       harness.local.effort.set("thorough")
-      await wait(() => harness.updates.length >= 1, 3000)
+      await waitUntil(() => harness.updates.length >= 1)
       // The second PATCH must not be in flight while the first is pending:
       // that concurrency is what let a stale write land last.
       await Bun.sleep(100)
@@ -929,7 +928,7 @@ describe("agent effort selector", () => {
       expect(harness.local.effort.current()).toBe("thorough")
 
       harness.release(0)
-      await wait(() => harness.updates.length >= 2, 3000)
+      await waitUntil(() => harness.updates.length >= 2)
       expect(harness.local.effort.current()).toBe("thorough")
       harness.release(1)
       await Bun.sleep(100)
@@ -957,9 +956,9 @@ describe("agent effort selector", () => {
     try {
       harness.local.effort.set("fast")
       harness.local.effort.set("thorough")
-      await wait(() => harness.updates.length >= 1, 3000)
+      await waitUntil(() => harness.updates.length >= 1)
       harness.release(0, "fail")
-      await wait(() => harness.updates.length >= 2, 3000)
+      await waitUntil(() => harness.updates.length >= 2)
       harness.release(1)
       await Bun.sleep(100)
       expect(harness.local.effort.current()).toBe("thorough")
