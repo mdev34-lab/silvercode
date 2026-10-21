@@ -191,3 +191,62 @@ test("app.exit prints the session epilogue after scoped cleanup", async () => {
     mock.restore()
   }
 })
+
+test("app lifts the key emitter listener cap for keyboard and paste hooks", async () => {
+  const setup = await createTestRenderer({ width: 80, height: 24 })
+  const core = await import("@opentui/core")
+  mock.module("@opentui/core", () => ({ ...core, createCliRenderer: async () => setup.renderer }))
+  const events = createEventSource()
+  const calls = createFetch()
+  let started!: () => void
+  const ready = new Promise<void>((resolve) => {
+    started = resolve
+  })
+
+  try {
+    const { run } = await import("../src/app")
+    const task = Effect.runPromise(
+      run({
+        url: "http://test",
+        directory,
+        config: createTuiResolvedConfig({ plugin_enabled: {} }),
+        fetch: calls.fetch,
+        events: events.source,
+        args: {},
+        pluginHost: {
+          async start() {
+            started()
+          },
+          async dispose() {},
+        },
+      }).pipe(Effect.provide(AppNodeBuilder.build(Global.node))),
+    )
+
+    await ready
+    // Node's default cap is 10 listeners per event, and useKeyboard/usePaste each mount one on
+    // this shared emitter, so a plain `expect(...getMaxListeners()).toBe(0)` already fails
+    // without the fix. Mounting past the cap must stay silent as well.
+    expect(setup.renderer.keyInput.getMaxListeners()).toBe(0)
+    const added = Array.from({ length: 11 }, () => () => {})
+    for (const listener of added) setup.renderer.keyInput.on("keypress", listener)
+    expect(setup.renderer.keyInput.listenerCount("keypress")).toBeGreaterThan(10)
+
+    let warned = false
+    const onWarning = (warning: Error) => {
+      if (warning.name === "MaxListenersExceededWarning") warned = true
+    }
+    process.on("warning", onWarning)
+    setup.renderer.keyInput.on("keypress", () => {})
+    await new Promise((resolve) => setImmediate(resolve))
+    process.off("warning", onWarning)
+    expect(warned).toBe(false)
+
+    for (const listener of added) setup.renderer.keyInput.off("keypress", listener)
+    process.emit("SIGHUP")
+    await task
+    expect(setup.renderer.isDestroyed).toBe(true)
+  } finally {
+    if (!setup.renderer.isDestroyed) setup.renderer.destroy()
+    mock.restore()
+  }
+})
