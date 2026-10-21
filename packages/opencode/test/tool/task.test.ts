@@ -2040,6 +2040,80 @@ describe("tool.task", () => {
     }),
   )
 
+  // Session removal is a teardown too: the whole tree is going away, so the
+  // jobs it sweeps must carry the same marker the run-state path sets (#413).
+  it.instance("removing a session sweeps a background subagent without notifying the parent", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const sessions = yield* Session.Service
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const injections: string[] = []
+      const silent: SessionPrompt.PromptInput[] = []
+      const started = defer<SessionID>()
+      const promptOps: TaskPromptOps = {
+        cancel: () => Effect.void,
+        resolvePromptParts: (template) => Effect.succeed([{ type: "text" as const, text: template }]),
+        prompt: (input) =>
+          input.sessionID === chat.id
+            ? Effect.sync(() => {
+                if (input.noReply) {
+                  silent.push(input)
+                  return reply(input, "recorded without waking")
+                }
+                const part = input.parts[0]
+                injections.push(part?.type === "text" ? part.text : "")
+                return reply(input, "notified")
+              })
+            : Effect.sync(() => {
+                started.resolve(input.sessionID)
+              }).pipe(Effect.andThen(Effect.never)),
+      }
+
+      const result = yield* def.execute(
+        {
+          description: "inspect bug",
+          prompt: "look into the cache key path",
+          subagent_type: "general",
+        },
+        {
+          sessionID: chat.id,
+          messageID: assistant.id,
+          agent: "work",
+          abort: new AbortController().signal,
+          extra: { promptOps },
+          messages: [],
+          metadata: () => Effect.void,
+          ask: () => Effect.void,
+        },
+      )
+      const child = result.metadata.sessionId
+      yield* Effect.promise(() => started.promise)
+
+      yield* sessions.remove(chat.id)
+
+      const swept = yield* jobs.wait({ id: child, timeout: 1_000 })
+      expect(swept.info?.status).toBe("cancelled")
+      expect(swept.info?.cancelledByTeardown).toBe(true)
+
+      // The job has settled, so the watcher has everything it needs to deliver
+      // a notification. It must never wake the parent; the envelope is
+      // recorded silently to resolve the row.
+      const notified = yield* pollWithTimeout(
+        Effect.sync(() => (injections.length > 0 ? injections.join("\n") : undefined)),
+        "a removal cancel notified the parent",
+        "250 millis",
+      ).pipe(Effect.exit)
+      expect(Exit.isFailure(notified)).toBe(true)
+      expect(injections).toEqual([])
+      expect(silent).toHaveLength(1)
+      const receipt = silent[0]?.parts[0]
+      expect(receipt?.type === "text" && receipt.text).toContain('state="cancelled"')
+      expect(receipt?.type === "text" && receipt.metadata?.backgroundNoReply).toBe(true)
+    }),
+  )
+
   // Double-Esc is scoped to the trace it is pressed in. Cancelling one child
   // must not reach the sibling's job or the parent's own run, and the parent
   // must still be driven by the sibling's completion afterwards.

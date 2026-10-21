@@ -1012,7 +1012,10 @@ const cancelBackgroundJobs = Effect.fn("Session.cancelBackgroundJobs")(function*
   const jobs = yield* background.list()
   yield* Effect.forEach(
     jobs.filter((job) => job.status === "running" && BackgroundJob.belongsToSession(job, sessionID)),
-    (job) => background.cancel(job.id),
+    // Removal is always a teardown: the session is going away, so a delivery
+    // from any job it owned would prompt a deleted session (#413). The marker
+    // keeps TaskTool's watcher from injecting a spurious notification.
+    (job) => background.cancel(job.id, { teardown: true }),
     { concurrency: "unbounded", discard: true },
   )
 })
