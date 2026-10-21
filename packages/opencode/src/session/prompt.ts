@@ -44,6 +44,7 @@ import { PASTE_INLINE_MAX_BYTES, pastePreview, writePasteFile } from "./paste-fi
 import { Tool } from "@/tool/tool"
 import { Permission } from "@/permission"
 import { SessionStatus } from "./status"
+import { isRecord } from "@/util/record"
 import { LLM } from "./llm"
 import { Shell } from "@opencode-ai/core/shell"
 import { ShellID } from "@/tool/shell/id"
@@ -1826,6 +1827,51 @@ const layer = Layer.effect(
       },
     )
 
+    // A crash mid-run leaves tool parts marked pending/running, text and
+    // reasoning parts without an end time, and assistant messages without a
+    // completion time, with no surviving fiber or background job to settle
+    // them (#411). Runners serialize per session, so when a run exits nothing
+    // in this process can still own those parts: settle them so replay,
+    // transport and status never rehydrate them as active forever.
+    const settleOrphanedParts = Effect.fn("SessionPrompt.settleOrphanedParts")(function* (sessionID: SessionID) {
+      const msgs = yield* sessions.messages({ sessionID }).pipe(Effect.catch(() => Effect.succeed(null)))
+      if (!msgs) return
+      const now = Date.now()
+      for (const msg of msgs) {
+        // Only assistant messages: user text parts never carry a time in
+        // normal flow, and touching them would re-publish them as updates.
+        if (msg.info.role !== "assistant") continue
+        for (const part of msg.parts) {
+          if (part.type === "tool" && (part.state.status === "pending" || part.state.status === "running")) {
+            const metadata = "metadata" in part.state && isRecord(part.state.metadata) ? part.state.metadata : {}
+            yield* sessions
+              .updatePart({
+                ...part,
+                state: {
+                  ...part.state,
+                  status: "error",
+                  error: "Tool execution aborted",
+                  metadata: { ...metadata, interrupted: true },
+                  time: { start: "time" in part.state ? part.state.time.start : now, end: now },
+                },
+              } as SessionV1.Part)
+              .pipe(Effect.catch((error) => Effect.logWarning("failed to settle orphaned tool part", { error })))
+            continue
+          }
+          if ((part.type === "text" || part.type === "reasoning") && part.time?.end === undefined) {
+            yield* sessions
+              .updatePart({ ...part, time: { start: part.time?.start ?? now, end: now } } as SessionV1.Part)
+              .pipe(Effect.catch((error) => Effect.logWarning("failed to settle orphaned text part", { error })))
+          }
+        }
+        if (msg.info.role === "assistant" && msg.info.time.completed === undefined) {
+          yield* sessions
+            .updateMessage({ ...msg.info, time: { ...msg.info.time, completed: now } })
+            .pipe(Effect.catch((error) => Effect.logWarning("failed to settle orphaned message", { error })))
+        }
+      }
+    })
+
     const loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.loop")(function* (
       input: LoopInput,
     ) {
@@ -1837,7 +1883,11 @@ const layer = Layer.effect(
       // message overtook it and got answered instead, return the latest state
       // rather than spinning on a superseded prompt.
       while (true) {
-        const result = yield* state.ensureRunning(input.sessionID, lastAssistant(input.sessionID), runLoop(input.sessionID))
+        const result = yield* state.ensureRunning(
+          input.sessionID,
+          lastAssistant(input.sessionID),
+          runLoop(input.sessionID).pipe(Effect.ensuring(settleOrphanedParts(input.sessionID))),
+        )
         if (!input.messageID || (result.info.role === "assistant" && result.info.parentID === input.messageID))
           return result
 
