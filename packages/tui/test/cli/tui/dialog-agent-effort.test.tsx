@@ -5,6 +5,7 @@ import { createDefaultOpenTuiKeymap } from "@opentui/keymap/opentui"
 import { testRender, useRenderer } from "@opentui/solid"
 import { onCleanup, onMount, type JSX } from "solid-js"
 import { chmod, mkdir } from "node:fs/promises"
+import path from "node:path"
 import { tmpdir } from "../../fixture/fixture"
 import { waitFor, waitUntil } from "../../fixture/frame"
 import { createTuiResolvedConfig } from "../../fixture/tui-runtime"
@@ -658,7 +659,10 @@ describe("agent effort selector", () => {
     "orders a deferred initial read %s before writes and rolls back to the latest saved value",
     async (ordering) => {
       await using shared = await tmpdir()
-      const file = `${shared.path}/effort.json`
+      // Join like the implementation does: a forward-slash template path never
+      // equals path.join's all-backslashes result on Windows, so the readJson /
+      // writeJsonAtomic spies below would silently pass every call through.
+      const file = path.join(shared.path, "effort.json")
       await Bun.write(file, '{"agentEffort":"medium"}')
       const persistence = await import("../../../src/util/persistence")
       const readJson = persistence.readJson
