@@ -2,6 +2,7 @@ export * as Pty from "./pty"
 
 import { makeLocationNode } from "./effect/app-node"
 import type { Disp, Proc } from "#pty"
+import * as NodeFS from "node:fs"
 import { Context, Effect, Layer, Schema, Types } from "effect"
 import { Pty } from "@opencode-ai/schema/pty"
 import { Config } from "./config"
@@ -15,6 +16,12 @@ const BUFFER_LIMIT = 1024 * 1024 * 2
 // Exited sessions stay observable (status, exit code, retained output) until removed explicitly.
 // Cap retention so abandoned terminals do not accumulate unbounded buffers.
 const EXITED_LIMIT = 25
+
+/** Maximum number of concurrently running sessions. Beyond this, create() fails with LimitExceededError. */
+const RUNNING_LIMIT = 25
+
+/** Per-subscriber cap on bytes buffered while a subscriber is inactive; beyond it the subscriber is dropped. */
+const PENDING_LIMIT = 1024 * 1024 * 2
 const pty = lazy(() => import("#pty"))
 
 type Subscriber = {
@@ -23,6 +30,7 @@ type Subscriber = {
   active: boolean
   detached: boolean
   pending: string[]
+  pendingSize: number
   end?: { exitCode?: number }
 }
 
@@ -77,10 +85,18 @@ export class ExitedError extends Schema.TaggedErrorClass<ExitedError>()("Pty.Exi
   ptyID: PtyID,
 }) {}
 
+export class CreateFailedError extends Schema.TaggedErrorClass<CreateFailedError>()("Pty.CreateFailedError", {
+  reason: Schema.String,
+}) {}
+
+export class LimitExceededError extends Schema.TaggedErrorClass<LimitExceededError>()("Pty.LimitExceededError", {
+  limit: Schema.Int,
+}) {}
+
 export interface Interface {
   readonly list: () => Effect.Effect<Info[]>
   readonly get: (id: PtyID) => Effect.Effect<Info, NotFoundError>
-  readonly create: (input: CreateInput) => Effect.Effect<Info>
+  readonly create: (input: CreateInput) => Effect.Effect<Info, CreateFailedError | LimitExceededError>
   readonly update: (id: PtyID, input: UpdateInput) => Effect.Effect<Info, NotFoundError>
   readonly remove: (id: PtyID) => Effect.Effect<void, NotFoundError>
   readonly write: (id: PtyID, data: string) => Effect.Effect<void, NotFoundError>
@@ -178,9 +194,19 @@ const layer = Layer.effect(
         env.LC_CTYPE = "C.UTF-8"
         env.LANG = "C.UTF-8"
       }
+      const running = Array.from(sessions.values()).filter((session) => session.info.status === "running").length
+      if (running >= RUNNING_LIMIT) {
+        return yield* new LimitExceededError({ limit: RUNNING_LIMIT })
+      }
+      if (!NodeFS.existsSync(cwd)) {
+        return yield* new CreateFailedError({ reason: `cwd does not exist: ${cwd}` })
+      }
       yield* Effect.logInfo("creating session", { id, cmd: command, args, cwd })
       const { spawn } = yield* Effect.promise(() => pty())
-      const proc = yield* Effect.sync(() => spawn(command, args, { name: "xterm-256color", cwd, env }))
+      const proc = yield* Effect.try({
+        try: () => spawn(command, args, { name: "xterm-256color", cwd, env }),
+        catch: (error) => new CreateFailedError({ reason: error instanceof Error ? error.message : String(error) }),
+      })
       const info: Info = {
         id,
         title: input.title || `Terminal ${id.slice(-4)}`,
@@ -205,6 +231,11 @@ const layer = Layer.effect(
           session.cursor += chunk.length
           for (const [token, subscriber] of session.subscribers.entries()) {
             if (!subscriber.active) {
+              subscriber.pendingSize += chunk.length
+              if (subscriber.pendingSize > PENDING_LIMIT) {
+                session.subscribers.delete(token)
+                continue
+              }
               subscriber.pending.push(chunk)
               continue
             }
@@ -246,14 +277,27 @@ const layer = Layer.effect(
     const update = Effect.fn("Pty.update")(function* (id: PtyID, input: UpdateInput) {
       const session = yield* requireSession(id)
       if (input.title) session.info.title = input.title
-      if (input.size && session.info.status === "running") session.process.resize(input.size.cols, input.size.rows)
+      if (input.size && session.info.status === "running") {
+        // The process may exit between the status check and the call (Windows teardown window).
+        try {
+          session.process.resize(input.size.cols, input.size.rows)
+        } catch {
+          // process exited concurrently; nothing to resize
+        }
+      }
       yield* events.publish(Event.Updated, { info: session.info })
       return session.info
     })
 
     const write = Effect.fn("Pty.write")(function* (id: PtyID, data: string) {
       const session = yield* requireSession(id)
-      if (session.info.status === "running") session.process.write(data)
+      if (session.info.status === "running") {
+        try {
+          session.process.write(data)
+        } catch {
+          // process exited concurrently; drop the input
+        }
+      }
     })
 
     const attach = Effect.fn("Pty.attach")(function* (id: PtyID, input: AttachInput) {
@@ -267,6 +311,7 @@ const layer = Layer.effect(
         active: false,
         detached: false,
         pending: [],
+        pendingSize: 0,
       }
       session.subscribers.set(token, subscriber)
       const start = session.bufferCursor
@@ -287,7 +332,12 @@ const layer = Layer.effect(
         replay,
         cursor: end,
         write: (data: string) => {
-          if (session.info.status === "running") session.process.write(data)
+          if (session.info.status !== "running") return
+          try {
+            session.process.write(data)
+          } catch {
+            // process exited concurrently; drop the input
+          }
         },
         activate: () => {
           if (subscriber.active || subscriber.detached) return
@@ -295,6 +345,7 @@ const layer = Layer.effect(
           try {
             for (const chunk of subscriber.pending) subscriber.onData(chunk)
             subscriber.pending.length = 0
+            subscriber.pendingSize = 0
             if (subscriber.end) subscriber.onEnd(subscriber.end)
           } catch {
             session.subscribers.delete(token)
@@ -303,6 +354,7 @@ const layer = Layer.effect(
         detach: () => {
           subscriber.detached = true
           subscriber.pending.length = 0
+          subscriber.pendingSize = 0
           subscriber.end = undefined
           session.subscribers.delete(token)
         },

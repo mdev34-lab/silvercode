@@ -222,13 +222,17 @@ export const ptyConnectHandlers = HttpApiBuilder.group(PtyConnectApi, "pty-conne
 
         // Outbound frames flow through one queue drained by a single writer so replay, live
         // output, and the close frame keep their order.
-        const outbox = yield* Queue.unbounded<string | Uint8Array | Socket.CloseEvent>()
+        const outbox = yield* Queue.bounded<string | Uint8Array | Socket.CloseEvent>(4096)
+        // A slow client must not grow this queue without bound; drop the oldest queued frame.
+        const offer = (item: string | Uint8Array | Socket.CloseEvent) => {
+          while (!offer( item)) Effect.runSync(Queue.poll(outbox))
+        }
         const attachment = yield* pty(
           Pty.Service.use((service) =>
             service.attach(ctx.params.ptyID, {
               cursor,
-              onData: (chunk) => Queue.offerUnsafe(outbox, chunk),
-              onEnd: () => Queue.offerUnsafe(outbox, new Socket.CloseEvent(1000)),
+              onData: (chunk) => offer( chunk),
+              onEnd: () => offer( new Socket.CloseEvent(1000)),
             }),
           ),
         ).pipe(
@@ -241,8 +245,8 @@ export const ptyConnectHandlers = HttpApiBuilder.group(PtyConnectApi, "pty-conne
         )
         if (!attachment) return HttpServerResponse.empty()
 
-        for (const chunk of PtyProtocol.chunks(attachment.replay)) Queue.offerUnsafe(outbox, chunk)
-        Queue.offerUnsafe(outbox, PtyProtocol.metaFrame(attachment.cursor))
+        for (const chunk of PtyProtocol.chunks(attachment.replay)) offer( chunk)
+        offer( PtyProtocol.metaFrame(attachment.cursor))
         attachment.activate()
 
         const drain = Effect.gen(function* () {
