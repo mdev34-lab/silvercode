@@ -1,4 +1,10 @@
-import { CliRenderEvents, SyntaxStyle, type NativeResourceOwner, type TerminalColors } from "@opentui/core"
+import {
+  CliRenderEvents,
+  SyntaxStyle,
+  type CliRendererFrameEvent,
+  type NativeResourceOwner,
+  type TerminalColors,
+} from "@opentui/core"
 import { useRenderer } from "@opentui/solid"
 import {
   DEFAULT_THEMES,
@@ -325,7 +331,12 @@ export function createSyntaxStyleMemo(factory: (owner: NativeResourceOwner) => S
     // frame rebinds them (markdown rebinds its code blocks in that frame's lifecycle pass),
     // so the native style has to outlive it. `renderer.idle()` can settle before that frame
     // when nothing is scheduled, destroying a style the renderables still hold (#371).
-    const frame = () => {
+    // The FRAME event of a frame already in flight at release time carries the frameId the
+    // renderer had when the style was released, and that frame can still read the style -
+    // wait for a strictly later frame (#371 review).
+    const releasedAt = renderer.frameId
+    const frame = (event: CliRendererFrameEvent) => {
+      if (event.frameId <= releasedAt) return
       renderer.off(CliRenderEvents.FRAME, frame)
       destroy()
     }
