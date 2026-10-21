@@ -298,6 +298,9 @@ function cmd(shell: string, command: string, cwd: string, env: NodeJS.ProcessEnv
       env,
       stdin: "ignore",
       detached: false,
+      // Bound scope-teardown kills: without this, a child that ignores SIGTERM
+      // hangs the finalizer forever and the session never leaves "running".
+      forceKillAfter: "3 seconds",
     })
   }
 
@@ -307,6 +310,7 @@ function cmd(shell: string, command: string, cwd: string, env: NodeJS.ProcessEnv
     env,
     stdin: "ignore",
     detached: process.platform !== "win32",
+    forceKillAfter: "3 seconds",
   })
 }
 const parser = lazy(async () => {
