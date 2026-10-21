@@ -71,6 +71,40 @@ describe("headless background task tracking", () => {
     expect(tasks.settled()).toBe(true)
   })
 
+  test("two runs of one session are both pending until each reports", () => {
+    const tasks = BackgroundTasks.make(root)
+    expect(tasks.launch({ ...launch(root, child), run: `${child}@1` })).toBe(true)
+    expect(tasks.launch({ ...launch(root, child), run: `${child}@2` })).toBe(true)
+    // Keyed by session alone, the second launch deduped into the first and the
+    // run exited while a child still ran (#400).
+    expect(tasks.pending()).toEqual([child, child])
+    tasks.resolve(`${child}@1`)
+    expect(tasks.settled()).toBe(false)
+    tasks.resolve(`${child}@2`)
+    expect(tasks.settled()).toBe(true)
+  })
+
+  test("a terminal envelope for an earlier run does not settle a resumed run", () => {
+    const tasks = BackgroundTasks.make(root)
+    tasks.launch({ ...launch(root, child), run: `${child}@1` })
+    tasks.resolve(`${child}@1`)
+    // task_id resume: same session, new run, tracked on its own key.
+    expect(tasks.launch({ ...launch(root, child), run: `${child}@2` })).toBe(true)
+    expect(tasks.settled()).toBe(false)
+    // A late duplicate of the first run's envelope must not settle the second.
+    tasks.resolve(`${child}@1`)
+    expect(tasks.settled()).toBe(false)
+    tasks.resolve(`${child}@2`)
+    expect(tasks.settled()).toBe(true)
+  })
+
+  test("a re-emitted launch part for the same run still dedupes", () => {
+    const tasks = BackgroundTasks.make(root)
+    expect(tasks.launch({ ...launch(root, child), run: `${child}@1` })).toBe(true)
+    expect(tasks.launch({ ...launch(root, child), run: `${child}@1` })).toBe(false)
+    expect(tasks.pending()).toEqual([child])
+  })
+
   test("a session that reported before its task part arrived stays settled", () => {
     const tasks = BackgroundTasks.make(root)
     tasks.resolve(child)

@@ -1956,7 +1956,7 @@ describe("tool.task", () => {
       const notification = yield* Effect.promise(() => injected.promise)
       const text = notification.parts[0]?.type === "text" ? notification.parts[0].text : ""
       expect(notification.sessionID).toBe(chat.id)
-      expect(text).toContain(`<task id="${child}" state="cancelled">`)
+      expect(text).toMatch(new RegExp(`<task id="${child}" run="${child}@\\d+" state="cancelled">`))
       expect(text).toContain("<summary>Background task cancelled: inspect bug</summary>")
       expect(text).toContain('<termination reason="cancelled">')
       expect(text).toContain("cancelled by the user")
@@ -3229,7 +3229,7 @@ it.instance("a child that yields for its own subagents keeps its job running and
     const delivery = parentPrompts[0]
     const delivered = delivery?.parts[0]?.type === "text" ? delivery.parts[0].text : ""
     expect(delivery?.sessionID).toBe(chat.id)
-    expect(delivered).toContain(`<task id="${child}" state="completed">`)
+    expect(delivered).toMatch(new RegExp(`<task id="${child}" run="${child}@\\d+" state="completed">`))
     expect(delivered).toContain("child final result")
     expect(delivered).toContain('<termination reason="success">')
 
@@ -3238,7 +3238,7 @@ it.instance("a child that yields for its own subagents keeps its job running and
     const resume = childPrompts[1]
     const resumed = resume?.parts[0]?.type === "text" ? resume.parts[0].text : ""
     expect(childPrompts).toHaveLength(2)
-    expect(resumed).toContain(`<task id="${grandchild}" state="completed">`)
+    expect(resumed).toMatch(new RegExp(`<task id="${grandchild}" run="${grandchild}@\\d+" state="completed">`))
     expect(resumed).toContain("grandchild result")
     expect(resumed).toContain("Background task completed: grandchild work")
 
@@ -3437,7 +3437,7 @@ it.instance(
         "the child's final result was not delivered to the parent",
       )
       const delivered = parentPrompts[0]?.parts[0]?.type === "text" ? parentPrompts[0].parts[0].text : ""
-      expect(delivered).toContain(`<task id="${child}" state="completed">`)
+      expect(delivered).toMatch(new RegExp(`<task id="${child}" run="${child}@\\d+" state="completed">`))
       expect(delivered).toContain("child final result")
 
       // The child was resumed by the parked job with the settled report, and
@@ -3665,7 +3665,7 @@ for (const teardown of [false, true]) {
           "the child's final result was not delivered to the parent",
         )
         const delivered = parentPrompts[0]?.parts[0]?.type === "text" ? parentPrompts[0].parts[0].text : ""
-        expect(delivered).toContain(`<task id="${child}" state="completed">`)
+        expect(delivered).toMatch(new RegExp(`<task id="${child}" run="${child}@\\d+" state="completed">`))
         expect(delivered).toContain("AFTER_PARK")
 
         // The settled report was delivered by the park, with no second prompt from
