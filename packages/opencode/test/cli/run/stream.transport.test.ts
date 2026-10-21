@@ -2271,6 +2271,61 @@ describe("run stream transport", () => {
     }
   })
 
+  test("rejects the active turn when the buffered event queue overflows", async () => {
+    const ui = footer()
+    const ready = defer()
+
+    const transport = await createSessionTransport({
+      sdk: sdk({
+        globalEvent: () =>
+          globalSse(
+            (async function* (): GlobalEventStream {
+              await ready.promise
+              // Events for a session the transport does not track stay
+              // buffered; unbounded growth used to stall the process (#399).
+              // Flood past the capacity, then end the stream so close()
+              // cannot hang on a parked generator.
+              for (let n = 1; n <= 150; n++) {
+                yield globalEvent({
+                  id: `evt-untracked-${n}`,
+                  type: "session.status",
+                  properties: {
+                    sessionID: "session-untracked",
+                    status: { type: "busy" },
+                  },
+                })
+              }
+            })(),
+          ),
+        promptAsync: async () => {
+          ready.resolve()
+          return ok(undefined)
+        },
+        status: async () => ok({ "session-1": { type: "busy" } }),
+      }),
+      sessionID: "session-1",
+      thinking: true,
+      limits: () => ({}),
+      bufferCapacity: 50,
+      footer: ui.api,
+    })
+
+    try {
+      await expect(
+        transport.runPromptTurn({
+          agent: undefined,
+          model: undefined,
+          variant: undefined,
+          prompt: { text: "hello", parts: [] },
+          files: [],
+          includeFiles: false,
+        }),
+      ).rejects.toThrow("event buffer overflow")
+    } finally {
+      await transport.close()
+    }
+  })
+
   test("rejects the active turn when the backing instance is disposed", async () => {
     const ui = footer()
     const ready = defer()

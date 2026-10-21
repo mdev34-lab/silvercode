@@ -73,6 +73,10 @@ type StreamInput = {
   thinking: boolean
   replay?: boolean
   replayLimit?: number
+  // Cap on buffered events held while booting/replaying or waiting for an
+  // untracked session; overflow faults the transport instead of growing
+  // without bound (#399). Injectable for tests.
+  bufferCapacity?: number
   limits: () => Record<string, number>
   providers?: () => RunProvider[]
   footer: FooterApi
@@ -458,6 +462,7 @@ function createLayer(input: StreamInput) {
         let replayDisabled = false
         let replayPending: SessionResizeReplayInput | undefined
         const buffered: Event[] = []
+        const bufferCapacity = input.bufferCapacity ?? 10_000
         const replayedParts = new Set<string>()
         const recovering = new Set<string>()
         const tracked = (sessionID: string | undefined) =>
@@ -826,6 +831,23 @@ function createLayer(input: StreamInput) {
           yield* Deferred.fail(next.done, error).pipe(Effect.ignore)
         })
 
+        // Like EventV2.allBounded: past the cap the buffer faults the
+        // transport with an overflow error instead of growing until the
+        // process stalls (#399). The buffer is cleared so a faulted
+        // transport stops accumulating.
+        const bufferEvent = Effect.fn("RunStreamTransport.bufferEvent")(function* (event: Event) {
+          if (buffered.length >= bufferCapacity) {
+            buffered.length = 0
+            yield* fail(
+              new Error(
+                `event buffer overflow: more than ${bufferCapacity} events buffered while booting, replaying, or waiting for a session to be tracked`,
+              ),
+            )
+            return
+          }
+          buffered.push(event)
+        })
+
         const touch = (event: Event) => {
           const next = state.wait
           if (!next || !active(event, input.sessionID)) {
@@ -1153,7 +1175,7 @@ function createLayer(input: StreamInput) {
                 if (booting || replaying) {
                   if (sessionID) {
                     input.trace?.write("recv.event", event)
-                    buffered.push(event)
+                    yield* bufferEvent(event)
                   }
                   return
                 }
@@ -1161,7 +1183,7 @@ function createLayer(input: StreamInput) {
                 if (!tracked(sessionID)) {
                   if (sessionID) {
                     input.trace?.write("recv.event", event)
-                    buffered.push(event)
+                    yield* bufferEvent(event)
                   }
                   return
                 }
