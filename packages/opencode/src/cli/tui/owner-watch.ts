@@ -54,3 +54,18 @@ export function watchOwnerProcess(input: {
     if (timer !== undefined) clearInterval(timer)
   }
 }
+
+/**
+ * Liveness probe for the owner PID. Only ESRCH ("no such process") counts as
+ * death: EPERM (the owner exists but we may not signal it) or any other probe
+ * error must not read as death, or a transient probe failure would orphan -
+ * and kill - a worker whose owner is fine (#442).
+ */
+export function probeOwnerAlive(pid: number, kill: (pid: number, signal?: number) => void = process.kill.bind(process)) {
+  try {
+    kill(pid, 0)
+    return true
+  } catch (err) {
+    return (err as NodeJS.ErrnoException)?.code !== "ESRCH"
+  }
+}

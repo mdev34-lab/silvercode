@@ -1,6 +1,6 @@
 import { Server } from "@/server/server"
 import { InstanceRuntime } from "@/project/instance-runtime"
-import { watchOwnerProcess } from "@/cli/tui/owner-watch"
+import { probeOwnerAlive, watchOwnerProcess } from "@/cli/tui/owner-watch"
 import { Rpc } from "@/util/rpc"
 import { Config } from "@/config/config"
 import { GlobalBus } from "@/bus/global"
@@ -46,15 +46,6 @@ export function resolveIsTuiWorker(env: NodeJS.ProcessEnv, hasProcessSend: boole
 
 // Signal-0 probe: the only portable liveness check that does not depend on
 // `process.ppid`, which a detached Bun child cannot trust (see owner-watch.ts).
-function processAlive(pid: number) {
-  try {
-    process.kill(pid, 0)
-    return true
-  } catch {
-    return false
-  }
-}
-
 let server: Awaited<ReturnType<typeof Server.listen>> | undefined
 let stopRpcListener: (() => void) | undefined
 
@@ -131,7 +122,7 @@ if (isTuiWorker) {
             process.off("disconnect", handler)
           }
         },
-        ownerAlive: Number.isFinite(ownerPID) && ownerPID > 0 ? () => processAlive(ownerPID) : undefined,
+        ownerAlive: Number.isFinite(ownerPID) && ownerPID > 0 ? () => probeOwnerAlive(ownerPID) : undefined,
         onOrphan() {
           // A hard exit bounds the graceful path so a hung dispose cannot
           // leave the orphan alive anyway.

@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test"
-import { watchOwnerProcess } from "../../../src/cli/tui/owner-watch"
+import { probeOwnerAlive, watchOwnerProcess } from "../../../src/cli/tui/owner-watch"
 
 const tick = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 
@@ -80,4 +80,23 @@ test("a subscriber that fires synchronously during subscribe does not trip the T
   expect(orphaned).toBe(1)
   unwatch()
   expect(orphaned).toBe(1)
+})
+
+test("probeOwnerAlive reads only ESRCH as death", async () => {
+  // A live process (this one) probes alive.
+  expect(probeOwnerAlive(process.pid)).toBe(true)
+  // A killed child is gone: the probe must answer dead via ESRCH.
+  const child = Bun.spawn([process.execPath, "-e", "setInterval(() => {}, 100)"], { stdout: "ignore", stderr: "ignore" })
+  child.kill("SIGKILL")
+  await child.exited
+  expect(probeOwnerAlive(child.pid)).toBe(false)
+  // Any probe error that is not "no such process" must NOT read as death:
+  // EPERM means the owner exists but we may not signal it, and a transient
+  // probe failure must never orphan - and kill - a live owner's worker.
+  const throwing = (err: object) => () => {
+    throw err
+  }
+  expect(probeOwnerAlive(12345, throwing(Object.assign(new Error("operation not permitted"), { code: "EPERM" })))).toBe(true)
+  expect(probeOwnerAlive(12345, throwing(Object.assign(new Error("no such process"), { code: "ESRCH" })))).toBe(false)
+  expect(probeOwnerAlive(12345, throwing(new Error("something else entirely")))).toBe(true)
 })

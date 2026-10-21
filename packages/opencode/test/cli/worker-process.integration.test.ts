@@ -202,7 +202,7 @@ describe("TUI worker process integration", () => {
     const log = join(dir, "ticks.log")
     await Bun.write(
       target,
-      `import { watchOwnerProcess } from ${JSON.stringify(new URL("../../src/cli/tui/owner-watch.ts", import.meta.url).pathname)}
+      `import { probeOwnerAlive, watchOwnerProcess } from ${JSON.stringify(new URL("../../src/cli/tui/owner-watch.ts", import.meta.url).pathname)}
 const log = ${JSON.stringify(log)}
 const note = (message) => require("fs").appendFileSync(log, message + "\\n")
 // Exit when the owner dies so the test never leaks this process.
@@ -214,14 +214,7 @@ process.on("message", (message) => {
   if (typeof message === "string" && message.startsWith("ownerpid=")) {
     const ownerPID = Number(message.slice("ownerpid=".length))
     watchOwnerProcess({
-      ownerAlive: () => {
-        try {
-          process.kill(ownerPID, 0)
-          return true
-        } catch {
-          return false
-        }
-      },
+      ownerAlive: () => probeOwnerAlive(ownerPID),
       interval: 50,
       onOrphan() {
         note("orphaned")
@@ -311,27 +304,25 @@ setInterval(() => {}, 1000)
   })
 
   test("a detached worker shuts itself down when its owner dies without shutdown", async () => {
-    // Gated off win32: un-gated in #480 the test hung until the 30s timeout -
-    // the worker never observed the owner's death (no IPC disconnect delivery
-    // after a hard kill on Windows). The watchdog's win32 path is therefore
-    // covered only by the unit tests in test/cli/tui/owner-watch.test.ts and
-    // needs real-Windows validation (#442).
-    if (process.platform === "win32") return
     const dir = await mkdtemp(join(tmpdir(), "silvercode-worker-orphan-"))
     const target = join(dir, "worker.ts")
     const log = join(dir, "worker.log")
     await Bun.write(
       target,
-      `import { watchOwnerProcess } from ${JSON.stringify(new URL("../../src/cli/tui/owner-watch.ts", import.meta.url).pathname)}
+      `import { probeOwnerAlive, watchOwnerProcess } from ${JSON.stringify(new URL("../../src/cli/tui/owner-watch.ts", import.meta.url).pathname)}
 const log = ${JSON.stringify(log)}
 const note = (message) => require("fs").appendFileSync(log, message + "\\n")
 note("start pid=" + process.pid + " ppid=" + process.ppid)
-// Mirrors worker.ts: IPC disconnect is the primary owner-death signal.
+// Mirrors worker.ts: IPC disconnect is the primary owner-death signal, the
+// PID probe the backup - on Windows the disconnect may never be delivered
+// after a hard kill, so the probe is what observes the death there.
+const ownerPID = Number(process.env["SILVERCODE_TUI_WORKER_OWNER_PID"])
 watchOwnerProcess({
   subscribeDisconnect: (handler) => {
     process.on("disconnect", handler)
     return () => process.off("disconnect", handler)
   },
+  ownerAlive: Number.isFinite(ownerPID) && ownerPID > 0 ? () => probeOwnerAlive(ownerPID) : undefined,
   interval: 50,
   onOrphan() {
     note("orphaned")
