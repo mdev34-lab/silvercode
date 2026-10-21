@@ -664,11 +664,29 @@ const layer: Layer.Layer<
         return msg
       }).pipe(Effect.withSpan("Session.updateMessage"))
 
+    // Plugin-supplied parts and session metadata are user-extensible records
+    // and can carry values structuredClone rejects (functions, class instances
+    // with methods, AbortSignals). A DataCloneError here used to escape as a
+    // fiber defect that killed the session service mid-turn (#395); fall back
+    // to a JSON clone, then to a shallow copy if even JSON fails (circular
+    // refs, BigInt), so persistence degrades instead of freezing the turn.
+    function clonePersistable<T>(value: T): T {
+      try {
+        return structuredClone(value)
+      } catch {
+        try {
+          return JSON.parse(JSON.stringify(value)) as T
+        } catch {
+          return Array.isArray(value) ? ([...value] as T) : ({ ...(value as object) } as T)
+        }
+      }
+    }
+
     const persistPart = <T extends SessionV1.Part>(part: T): Effect.Effect<T> =>
       Effect.gen(function* () {
         yield* events.publish(SessionV1.Event.PartUpdated, {
           sessionID: part.sessionID,
-          part: structuredClone(part),
+          part: clonePersistable(part),
           time: Date.now(),
         })
         return part
@@ -748,7 +766,7 @@ const layer: Layer.Layer<
         path: sessionPath(ctx.worktree, ctx.directory),
         workspaceID: original.workspaceID,
         title,
-        metadata: structuredClone(original.metadata),
+        metadata: original.metadata === undefined ? undefined : clonePersistable(original.metadata),
       })
       const msgs = yield* messages({ sessionID: input.sessionID })
       const idMap = new Map<string, MessageID>()
