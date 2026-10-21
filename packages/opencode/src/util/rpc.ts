@@ -110,7 +110,15 @@ export function client<T extends Definition>(target: {
       const requestId = id++
       return new Promise((resolve, reject) => {
         pending.set(requestId, { resolve, reject })
-        target.postMessage(JSON.stringify({ type: "rpc.request", method, input, id: requestId }))
+        try {
+          target.postMessage(JSON.stringify({ type: "rpc.request", method, input, id: requestId }))
+        } catch (error) {
+          // postMessage throws synchronously when the worker is terminated or
+          // in its crash-restart window; settle the call instead of leaking
+          // the pending entry and hanging the caller forever (#397).
+          pending.delete(requestId)
+          reject(error instanceof Error ? error : new Error(String(error)))
+        }
       })
     },
     on<Data>(event: string, handler: (data: Data) => void) {
