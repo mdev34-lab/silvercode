@@ -19,6 +19,33 @@ describe("GlobalBus replay log", () => {
     expect(a.payload.id < b.payload.id).toBe(true)
   })
 
+  test("normalizes present-but-unusable ids so every event is resumable", () => {
+    const cursor = published("test.cursor")
+
+    const undef: GlobalEvent = { payload: { id: undefined, type: "test.undef", properties: {} } }
+    GlobalBus.emitEvent(undef)
+    expect(typeof undef.payload.id).toBe("string")
+
+    const numeric: GlobalEvent = { payload: { id: 42, type: "test.numeric", properties: {} } }
+    GlobalBus.emitEvent(numeric)
+    expect(typeof numeric.payload.id).toBe("string")
+
+    // A usable id is kept as-is. This one deliberately sorts OLDER than
+    // any generated id so it cannot leak into other tests' replays.
+    const kept: GlobalEvent = {
+      payload: { id: "evt_000000000001aaaaaaaaaaaaaa", type: "test.kept", properties: {} },
+    }
+    GlobalBus.emitEvent(kept)
+    expect(kept.payload.id).toBe("evt_000000000001aaaaaaaaaaaaaa")
+
+    // And the normalized events replay from a real cursor like any other.
+    const replay = GlobalBus.sinceEvents(cursor.payload.id)
+    expect(replay.complete).toBe(true)
+    const types = replay.events.map((event) => event.payload.type)
+    expect(types).toContain("test.undef")
+    expect(types).toContain("test.numeric")
+  })
+
   test("sinceEvents replays exactly the events after the cursor", async () => {
     const before = published("test.before")
     await sleep(2)

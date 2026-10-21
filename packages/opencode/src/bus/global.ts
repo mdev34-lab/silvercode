@@ -20,7 +20,11 @@ class GlobalBusEmitter extends EventEmitter<{
   private recent: GlobalEvent[] = []
 
   emitEvent(event: GlobalEvent): boolean {
-    if (event.payload && typeof event.payload === "object" && !("id" in event.payload)) {
+    // Normalize on "usable string", not property presence: a present but
+    // undefined/non-string id would otherwise survive, the SSE frame would
+    // omit its id (handlers/global.ts eventData), and the client could not
+    // resume from that event.
+    if (event.payload && typeof event.payload === "object" && typeof event.payload.id !== "string") {
       event.payload.id = event.payload.syncEvent?.id ?? Identifier.create("evt", "ascending")
     }
     this.recent.push(event)
