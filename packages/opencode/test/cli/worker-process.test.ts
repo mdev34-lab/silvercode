@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { createTuiWorker, createWorkerProcess, isWorkerCrash } from "../../src/cli/tui/worker-process"
+import { createThreadWorker, createTuiWorker, createWorkerProcess, isWorkerCrash, type WorkerExit } from "../../src/cli/tui/worker-process"
 
 type FakeProcess = {
   exitCode: number | null
@@ -209,5 +209,75 @@ describe("TUI worker process", () => {
     expect(options).toHaveLength(2)
     expect(options[1].detached).toBe(true)
     await worker.terminate()
+  })
+})
+
+describe("TUI thread worker", () => {
+  test("terminate awaits the thread flush and settles closed", async () => {
+    let flushed = false
+    const fake = {
+      onmessage: null,
+      onerror: null,
+      posted: [] as string[],
+      postMessage(data: string) {
+        this.posted.push(data)
+      },
+      async terminate() {
+        await new Promise((resolve) => setTimeout(resolve, 20))
+        flushed = true
+      },
+    }
+    const exits: WorkerExit[] = []
+    const worker = createThreadWorker("worker.ts", {
+      spawnWorker: () => fake as never,
+      log: () => {},
+      onExit: (exit) => {
+        exits.push(exit)
+      },
+    })
+
+    worker.postMessage("ping")
+    expect(fake.posted).toEqual(["ping"])
+    await worker.terminate()
+    expect(flushed).toBe(true)
+    await expect(worker.closed).resolves.toEqual({ code: 0, signal: null })
+    await Bun.sleep(0)
+    expect(exits).toEqual([{ code: 0, signal: null }])
+  })
+
+  test("onerror settles closed and the exit hook fires once", async () => {
+    const fake = {
+      onmessage: null as null | ((event: { data: unknown }) => void),
+      onerror: null as null | ((event: unknown) => void),
+      terminated: false,
+      postMessage() {},
+      terminate() {
+        this.terminated = true
+      },
+    }
+    const closes: Error[] = []
+    const exits: WorkerExit[] = []
+    const worker = createThreadWorker("worker.ts", {
+      spawnWorker: () => fake as never,
+      log: () => {},
+      onExit: (exit) => {
+        exits.push(exit)
+      },
+    })
+    worker.onclose = (error) => {
+      closes.push(error)
+    }
+
+    fake.onerror?.(new Error("boom"))
+    await expect(worker.closed).resolves.toEqual({ code: 1, signal: null })
+    await Bun.sleep(0)
+    expect(closes).toHaveLength(1)
+    expect(exits).toEqual([{ code: 1, signal: null }])
+
+    // A later clean terminate must not double-fire the exit hook (#401).
+    await worker.terminate()
+    expect(fake.terminated).toBe(true)
+    await Bun.sleep(0)
+    expect(exits).toHaveLength(1)
   })
 })
