@@ -1838,6 +1838,9 @@ const layer = Layer.effect(
       if (!msgs) return
       const now = Date.now()
       for (const msg of msgs) {
+        // Only assistant messages: user text parts never carry a time in
+        // normal flow, and touching them would re-publish them as updates.
+        if (msg.info.role !== "assistant") continue
         for (const part of msg.parts) {
           if (part.type === "tool" && (part.state.status === "pending" || part.state.status === "running")) {
             const metadata = "metadata" in part.state && isRecord(part.state.metadata) ? part.state.metadata : {}
