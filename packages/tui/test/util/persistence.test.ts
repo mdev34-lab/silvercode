@@ -27,14 +27,24 @@ describe("renameReplace", () => {
     ])
   })
 
-  test("treats EBUSY and EACCES as transient too", async () => {
+  test("treats EBUSY as transient too", async () => {
     let calls = 0
     await renameReplace("a.tmp", "b.json", async () => {
       calls++
-      if (calls === 1) throw transient("EBUSY")
-      if (calls === 2) throw transient("EACCES")
+      if (calls < 3) throw transient("EBUSY")
     })
     expect(calls).toBe(3)
+  })
+
+  test("does not retry EACCES, which signals a real permission problem", async () => {
+    let calls = 0
+    await expect(
+      renameReplace("a.tmp", "b.json", async () => {
+        calls++
+        throw transient("EACCES")
+      }),
+    ).rejects.toThrow("renaming refused")
+    expect(calls).toBe(1)
   })
 
   test("does not retry a permanent error like ENOENT", async () => {

@@ -19,7 +19,8 @@ export async function appendText(filePath: string, content: string) {
   await appendFile(filePath, content)
 }
 
-const TRANSIENT_RENAME_CODES = new Set(["EPERM", "EBUSY", "EACCES"])
+// EPERM/EBUSY: a reader, the search indexer or a virus scanner transiently holds the destination.
+const TRANSIENT_RENAME_CODES = new Set(["EPERM", "EBUSY"])
 
 /**
  * Rename `source` over `dest`, retrying transient refusals. Windows cannot

@@ -258,7 +258,7 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
             coupled: modelStore.coupled,
           }),
         )
-        state.writes = write.catch(() => {})
+        state.writes = write.catch((error) => console.error("Failed to write model state", { error }))
       }
 
       readJson<unknown>(filePath)
@@ -596,7 +596,7 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
             pinned: sessionStore.pinned,
           }),
         )
-        state.writes = write.catch(() => {})
+        state.writes = write.catch((error) => console.error("Failed to write session state", { error }))
       }
 
       readJson<unknown>(filePath)
