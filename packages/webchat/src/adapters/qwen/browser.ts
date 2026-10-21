@@ -410,6 +410,7 @@ export class QwenWebBrowser {
   private page: QwenWebPage | undefined
   private launching: Promise<QwenWebContext> | undefined
   private challengeReveal: Promise<boolean> | undefined
+  private loginRelaunch: Promise<void> | undefined
   private contextDead = false
   private pageDead = false
   private lockHeldFor: string | undefined
@@ -500,23 +501,25 @@ export class QwenWebBrowser {
   }
 
   /**
-   * Open the Qwen login page on the main page for an interactive login.
-   * The user logs in normally; callers poll `detectAuthState` (or use
-   * `waitForLogin`) to observe completion. Already-authenticated profiles
-   * return immediately without navigating.
+   * Ensure the browser runs headed for an interactive login. Concurrent
+   * callers share exactly one relaunch. A launch that is still in flight is
+   * awaited first: `isRunning()` alone misses it and the login would attach
+   * to the in-flight headless context with no window (#483).
    */
-  async openLoginPage(signal?: AbortSignal): Promise<QwenWebPage> {
-    if (!this.headlessExplicit && hasDisplay() && this.headless) {
+  private relaunchHeadedForLogin(signal?: AbortSignal): Promise<void> {
+    if (this.loginRelaunch) return this.loginRelaunch
+    const operation = (async () => {
+      const inFlightLaunch = this.launching
+      if (inFlightLaunch) {
+        await inFlightLaunch.catch(() => {})
+        if (this.launching === inFlightLaunch) this.launching = undefined
+      }
+      if (!this.headless) return
       if (this.isRunning()) {
         // The shared browser was launched headless by an earlier probe (for
         // example validating a saved or expired session). Relaunch it headed
         // or the login would be trapped headless with no window (#483).
         debug("browser", "relaunching headed for interactive login")
-        const inFlightLaunch = this.launching
-        if (inFlightLaunch) {
-          await inFlightLaunch.catch(() => {})
-          if (this.launching === inFlightLaunch) this.launching = undefined
-        }
         try {
           await this.restartWithHeadless(signal, false)
         } catch (error) {
@@ -524,11 +527,26 @@ export class QwenWebBrowser {
           await this.close()
           throw error
         }
-        this.headless = false
       } else {
         debug("browser", "switching to headed mode for interactive login")
-        this.headless = false
       }
+      this.headless = false
+    })()
+    this.loginRelaunch = operation.finally(() => {
+      this.loginRelaunch = undefined
+    })
+    return this.loginRelaunch
+  }
+
+  /**
+   * Open the Qwen login page on the main page for an interactive login.
+   * The user logs in normally; callers poll `detectAuthState` (or use
+   * `waitForLogin`) to observe completion. Already-authenticated profiles
+   * return immediately without navigating.
+   */
+  async openLoginPage(signal?: AbortSignal): Promise<QwenWebPage> {
+    if (!this.headlessExplicit && hasDisplay() && this.headless) {
+      await this.relaunchHeadedForLogin(signal)
     }
     const page = await this.ensureOnOrigin(signal)
     try {

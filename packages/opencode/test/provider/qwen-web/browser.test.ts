@@ -317,6 +317,59 @@ describe("login behavior", () => {
     await browser.close()
   })
 
+  test("openLoginPage waits out an in-flight headless launch and relaunches headed (#483)", async () => {
+    delete process.env["QWEN_WEB_HEADLESS"]
+    if (process.platform !== "darwin" && process.platform !== "win32") process.env["DISPLAY"] = ":1"
+    const dir = tmpProfile()
+    const page = fakePage({ url: () => "https://chat.qwen.ai/auth" }) as QwenWebPage & { navigations: string[] }
+    const launches: boolean[] = []
+    let calls = 0
+    let releaseFirst!: () => void
+    const firstGate = new Promise<void>((resolve) => (releaseFirst = resolve))
+    const browser = new QwenWebBrowser({
+      profileDir: dir,
+      launcher: async (_profileDir, options) => {
+        calls++
+        launches.push(Boolean(options.headless))
+        const context = fakeContext([page])
+        // Hold the first (headless) launch so the login starts while it is
+        // still in flight.
+        if (calls === 1) await firstGate
+        return context
+      },
+    })
+    const probe = browser.detectAuthState().catch(() => "unknown" as const)
+    const login = browser.openLoginPage()
+    releaseFirst()
+    await probe
+    await login
+    // Headless probe launch, then exactly one headed relaunch - the login
+    // must not attach to the in-flight headless context.
+    expect(launches).toEqual([true, false])
+    expect(page.navigations[page.navigations.length - 1]).toBe("https://chat.qwen.ai/auth")
+    await browser.close()
+  })
+
+  test("concurrent openLoginPage calls share exactly one headed relaunch (#483)", async () => {
+    delete process.env["QWEN_WEB_HEADLESS"]
+    if (process.platform !== "darwin" && process.platform !== "win32") process.env["DISPLAY"] = ":1"
+    const dir = tmpProfile()
+    const page = fakePage({ url: () => "https://chat.qwen.ai/auth" }) as QwenWebPage & { navigations: string[] }
+    const launches: boolean[] = []
+    const browser = new QwenWebBrowser({
+      profileDir: dir,
+      launcher: async (_profileDir, options) => {
+        launches.push(Boolean(options.headless))
+        return fakeContext([page])
+      },
+    })
+    await browser.detectAuthState()
+    expect(launches).toEqual([true])
+    await Promise.all([browser.openLoginPage(), browser.openLoginPage()])
+    expect(launches).toEqual([true, false])
+    await browser.close()
+  })
+
   test("openLoginPage skips navigation when already authenticated", async () => {
     const dir = tmpProfile()
     const page = fakePage() as QwenWebPage & { navigations: string[] }
