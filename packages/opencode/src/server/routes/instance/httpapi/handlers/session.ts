@@ -37,7 +37,8 @@ import {
   SummarizePayload,
   UpdatePayload,
 } from "../groups/session"
-import { PermissionNotFoundError } from "../errors"
+import { PermissionNotFoundError, notFound } from "../errors"
+import { NotFoundError as StorageNotFoundError } from "@/storage/storage"
 import * as SessionError from "./session-errors"
 
 const tryParseJson = (text: string) =>
@@ -122,15 +123,14 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
         return yield* SessionError.mapStorageNotFound(session.messages({ sessionID: ctx.params.sessionID }))
       }
 
-      const page = yield* SessionError.mapStorageNotFound(
-        MessageV2.page({
-          sessionID: ctx.params.sessionID,
-          limit: ctx.query.limit,
-          before: ctx.query.before,
-        }).pipe(
-          // Pre-validated above; keep the typed error out of mapStorageNotFound.
-          Effect.catchIf(MessageV2.InvalidCursorError.isInstance, () => new HttpApiError.BadRequest({})),
-        ),
+      const page = yield* MessageV2.page({
+        sessionID: ctx.params.sessionID,
+        limit: ctx.query.limit,
+        before: ctx.query.before,
+      }).pipe(
+        // The cursor is pre-validated above; keep the typed error graceful.
+        Effect.catchIf(MessageV2.InvalidCursorError.isInstance, () => new HttpApiError.BadRequest({})),
+        Effect.catchIf(StorageNotFoundError.isInstance, (error) => Effect.fail(notFound(error.message))),
       )
       if (!page.cursor) return page.items
 
