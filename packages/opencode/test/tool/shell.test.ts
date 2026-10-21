@@ -1162,25 +1162,37 @@ describe("tool.shell abort", () => {
         // regression now fails instead of flaking on a 0.1s race.
         const wait =
           'const fs=require("node:fs");const p=Bun.argv[1];const t=Date.now();' +
-          "while(!fs.existsSync(p)){if(Date.now()-t>10000)process.exit(1);Bun.sleepSync(10)}"
+          "while(!fs.existsSync(p)){if(Date.now()-t>2000)process.exit(1);Bun.sleepSync(10)}"
+        // evalarg() quoting plus the PowerShell call operator, same as fill()
+        const waitFor = (file: string) => {
+          const text = `${bin} -e ${evalarg(wait)} ${evalarg(file)}`
+          if (PS.has(sh())) return `& ${text}`
+          return text
+        }
         const result = yield* run(
           {
-            command: `echo first && ${bin} -e ${squote(wait)} ${squote(gate1)} && echo second && ${bin} -e ${squote(wait)} ${squote(gate2)} && echo done`,
+            command: `echo first && ${waitFor(gate1)} && echo second && ${waitFor(gate2)} && echo done`,
           },
           {
             ...ctx,
             metadata: (input) =>
               Effect.sync(() => {
                 const output = (input.metadata as { output?: string })?.output
-                if (output === undefined) return
+                if (!output) return
                 updates.push(output)
                 if (output.includes("second")) writeFileSync(gate2, "")
                 else if (output.includes("first")) writeFileSync(gate1, "")
               }),
           },
         )
+        expect(result.metadata.exit).toBe(0)
+        expect(result.output).toContain("first")
+        expect(result.output).toContain("second")
         expect(result.output).toContain("done")
-        expect(updates.some((output) => output.includes("first") && !output.includes("second"))).toBe(true)
+        expect(
+          updates.some((output) => output.includes("first") && !output.includes("second")),
+          `expected an intermediate flush containing "first" before "second" arrived, observed flushes: ${JSON.stringify(updates)}`,
+        ).toBe(true)
         expect(updates.length).toBeGreaterThan(1)
       }),
     ),
