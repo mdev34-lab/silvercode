@@ -223,7 +223,9 @@ export function activityHeader(
   const marker = options.expanded ? "▾" : "▸"
   const calls = `${summary.count} tool call${summary.count === 1 ? "" : "s"}`
   const failed = summary.failed > 0 ? `${summary.failed} failed` : undefined
-  if (summary.working) return { marker, main: `Working... ${calls}`, failed, note: undefined }
+  if (summary.working) {
+    return { marker, main: `Working... ${calls}${options.duration ? ` · ${options.duration}` : ""}`, failed, note: undefined }
+  }
   const main = options.duration ? `Worked for ${options.duration} · ${calls}` : calls
   const note = summary.interrupted ? "interrupted" : summary.denied ? "denied" : undefined
   return { marker, main, failed, note }

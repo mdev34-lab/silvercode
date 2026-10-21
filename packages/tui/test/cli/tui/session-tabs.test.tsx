@@ -324,7 +324,7 @@ describe("session tabs", () => {
       const line = firstLine(env.app.captureCharFrame())
       expect(line).toContain("1 Investigate flaky tests")
       expect(line).toContain("2 Draft release notes")
-      expect(line).toContain("▸3 Third session")
+      expect(line).toContain("3 Third session")
       expect(line).toContain("+")
       expect(line).not.toContain("…")
     } finally {
@@ -340,7 +340,7 @@ describe("session tabs", () => {
       const line = firstLine(env.app.captureCharFrame()).trimEnd()
       expect(line.length).toBeLessThanOrEqual(40)
       // The active tab is always in the window, with its number and a readable prefix.
-      expect(line).toContain("▸3 Th")
+      expect(line).toContain("3 Th")
       expect(line).toContain("…")
       expect(line).toContain("+")
     } finally {

@@ -1363,6 +1363,29 @@ export function Prompt(props: PromptProps) {
   )
   const borderHighlight = createMemo(() => tint(theme.border, highlight(), agentMetaAlpha()))
 
+  // The prompt measures itself: the session sidebar and the home width cap both make it narrower than the terminal.
+  let boxEl: BoxRenderable | undefined
+  const [boxWidth, setBoxWidth] = createSignal(0)
+  const innerWidth = createMemo(() => Math.max(10, (boxWidth() > 0 ? boxWidth() : dimensions().width - 5) - 4))
+  const showProvider = createMemo(() => innerWidth() >= 60)
+  const tagsWidth = createMemo(() => {
+    let width = local.effort.current().length
+    if (showVariant()) width += 3 + (local.model.variant.current()?.length ?? 0)
+    if (showVision()) width += 3 + "vision".length
+    return width
+  })
+  // Room left for the model name on the footer row, with a gap before the tags.
+  const modelRoom = createMemo(() => {
+    const agentName = store.mode === "shell" ? "Shell".length : (local.agent.current()?.name.length ?? 0)
+    const provider = showProvider() ? currentProviderLabel().length + 1 : 0
+    return Math.max(4, innerWidth() - tagsWidth() - 2 - agentName - 3 - provider)
+  })
+  const modelLabel = createMemo(() => Locale.truncate(local.model.parsed().model, modelRoom()))
+  // The placeholder shares its row with the YOLO tag.
+  const placeholderRoom = createMemo(() =>
+    innerWidth() - (store.mode === "normal" && local.permission.mode === "yolo" ? 8 : 0),
+  )
+
   const placeholderText = createMemo(() => {
     if (props.showPlaceholder === false) return undefined
     if (store.mode === "shell") {
@@ -1373,6 +1396,10 @@ export function Prompt(props: PromptProps) {
     if (props.placeholder) return props.placeholder
     if (!list().length) return undefined
     return `Ask anything... "${list()[store.placeholder % list().length]}"`
+  })
+  const clippedPlaceholder = createMemo(() => {
+    const text = placeholderText()
+    return text ? Locale.truncate(text, placeholderRoom()) : undefined
   })
 
   const spinnerDef = createMemo(() => {
@@ -1402,6 +1429,10 @@ export function Prompt(props: PromptProps) {
           }}
         >
           <box
+            ref={(el: BoxRenderable) => {
+              boxEl = el
+            }}
+            onSizeChange={() => boxEl && setBoxWidth(boxEl.width)}
             paddingLeft={2}
             paddingRight={2}
             paddingTop={1}
@@ -1410,9 +1441,16 @@ export function Prompt(props: PromptProps) {
             flexGrow={1}
             width="100%"
           >
+            <Show when={store.mode === "normal" && local.permission.mode === "yolo"}>
+              <box position="absolute" top={1} right={2} paddingLeft={1} paddingRight={1} backgroundColor={theme.warning}>
+                <text fg={selectedForeground(theme, theme.warning)} attributes={TextAttributes.BOLD}>
+                  YOLO
+                </text>
+              </box>
+            </Show>
             <textarea
               width="100%"
-              placeholder={placeholderText()}
+              placeholder={clippedPlaceholder()}
               placeholderColor={theme.textMuted}
               textColor={leader() ? theme.textMuted : theme.text}
               focusedTextColor={leader() ? theme.textMuted : theme.text}
@@ -1486,7 +1524,7 @@ export function Prompt(props: PromptProps) {
               syntaxStyle={syntax()}
             />
             <box flexDirection="row" flexShrink={0} paddingTop={1} gap={1} justifyContent="space-between">
-              <box flexDirection="row" gap={1}>
+              <box flexDirection="row" gap={1} flexShrink={1} minWidth={0} height={1} overflow="hidden">
                 <Show when={local.agent.current()} fallback={<box height={1} />}>
                   {(agent) => (
                     <>
@@ -1500,37 +1538,10 @@ export function Prompt(props: PromptProps) {
                             flexShrink={0}
                             fg={fadeColor(leader() ? theme.textMuted : theme.text, modelMetaAlpha())}
                           >
-                            {local.model.parsed().model}
+                            {modelLabel()}
                           </text>
-                          <text fg={fadeColor(theme.textMuted, modelMetaAlpha())}>{currentProviderLabel()}</text>
-                          {/* Agent effort is its own dial and shows even for
-                              models without thinking variants. Its hue (fast
-                              green, medium orange, thorough red) is drawn
-                              beside the always-visible level name. */}
-                          <text fg={fadeColor(theme.textMuted, modelMetaAlpha())}>·</text>
-                          <text>
-                            <span
-                              style={{
-                                fg: fadeColor(effortColor(local.effort.current(), theme), modelMetaAlpha()),
-                                bold: true,
-                              }}
-                            >
-                              {local.effort.current()}
-                            </span>
-                          </text>
-                          <Show when={showVariant()}>
-                            <text fg={fadeColor(theme.textMuted, variantMetaAlpha())}>·</text>
-                            <text>
-                              <span style={{ fg: fadeColor(theme.warning, variantMetaAlpha()), bold: true }}>
-                                {local.model.variant.current()}
-                              </span>
-                            </text>
-                          </Show>
-                          <Show when={showVision()}>
-                            <text fg={fadeColor(theme.textMuted, visionMetaAlpha())}>·</text>
-                            <text>
-                              <span style={{ fg: fadeColor(theme.accent, visionMetaAlpha()), bold: true }}>vision</span>
-                            </text>
+                          <Show when={showProvider()}>
+                            <text fg={fadeColor(theme.textMuted, modelMetaAlpha())}>{currentProviderLabel()}</text>
                           </Show>
                         </box>
                       </Show>
@@ -1538,12 +1549,37 @@ export function Prompt(props: PromptProps) {
                   )}
                 </Show>
               </box>
-              <box flexDirection="row" gap={1} alignItems="center">
-                <Show when={store.mode === "normal" && local.permission.mode === "yolo"}>
-                  <box paddingLeft={1} paddingRight={1} backgroundColor={theme.warning}>
-                    <text fg={selectedForeground(theme, theme.warning)} attributes={TextAttributes.BOLD}>
-                      YOLO
-                    </text>
+              <box flexDirection="row" gap={1} alignItems="center" flexShrink={0}>
+                <Show when={store.mode === "normal"}>
+                  <box flexDirection="row" gap={1} flexShrink={0}>
+                      {/* Agent effort is its own dial and shows even for
+                          models without thinking variants. Its hue (fast
+                          green, medium orange, thorough red) is drawn
+                          beside the always-visible level name. */}
+                      <text>
+                        <span
+                          style={{
+                            fg: fadeColor(effortColor(local.effort.current(), theme), modelMetaAlpha()),
+                            bold: true,
+                          }}
+                        >
+                          {local.effort.current()}
+                        </span>
+                      </text>
+                      <Show when={showVariant()}>
+                        <text fg={fadeColor(theme.textMuted, variantMetaAlpha())}>·</text>
+                        <text>
+                          <span style={{ fg: fadeColor(theme.warning, variantMetaAlpha()), bold: true }}>
+                            {local.model.variant.current()}
+                          </span>
+                        </text>
+                      </Show>
+                      <Show when={showVision()}>
+                        <text fg={fadeColor(theme.textMuted, visionMetaAlpha())}>·</text>
+                        <text>
+                          <span style={{ fg: fadeColor(theme.accent, visionMetaAlpha()), bold: true }}>vision</span>
+                        </text>
+                      </Show>
                   </box>
                 </Show>
                 <Show when={hasRightContent()}>{props.right}</Show>

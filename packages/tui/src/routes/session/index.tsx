@@ -77,6 +77,7 @@ import { QuestionPrompt } from "./question"
 import { DialogExportOptions } from "../../ui/dialog-export-options"
 import * as Model from "../../util/model"
 import { pauseMarker } from "../../util/pause"
+import { elapsed, useClock } from "../../util/clock"
 import { formatTranscript } from "../../util/transcript"
 import { formatGenerationMetrics } from "../../util/generation-metrics"
 import { sessionEpilogue } from "../../util/presentation"
@@ -1661,6 +1662,19 @@ export function AssistantMessageRow(props: { message: AssistantMessage; parts: P
     return props.message.time.completed - user.time.created
   })
 
+  // The last turn counts up while it runs, and stays highlighted until it ends.
+  const running = createMemo(
+    () => props.last && !final() && !props.message.time.completed && !props.message.error && !isFinishOnly(),
+  )
+  const clock = useClock(running)
+  const liveDuration = createMemo(() => {
+    if (!running()) return undefined
+    const user = messages().find((x) => x.role === "user" && x.id === props.message.parentID)
+    if (!user || !user.time) return undefined
+    return elapsed(clock() - user.time.created)
+  })
+  const footerMuted = createMemo(() => (running() ? theme.text : theme.textMuted))
+
   const metrics = createMemo(() => formatGenerationMetrics(props.message))
 
   // A mid-task model/thinking-effort switch becomes visible on the first
@@ -1785,7 +1799,10 @@ export function AssistantMessageRow(props: { message: AssistantMessage; parts: P
                 ▣{" "}
               </span>{" "}
               <span style={{ fg: theme.text }}>{Locale.titlecase(props.message.mode)}</span>
-              <span style={{ fg: theme.textMuted }}> · {model()}</span>
+              <span style={{ fg: footerMuted() }}> · {model()}</span>
+              <Show when={liveDuration()}>
+                <span style={{ fg: footerMuted() }}> · {liveDuration()}</span>
+              </Show>
               <Show when={duration()}>
                 <span style={{ fg: theme.textMuted }}> · {Locale.duration(duration())}</span>
               </Show>
@@ -1999,10 +2016,27 @@ export function ActivityGroup(props: { groupID: string }) {
   const parts = createMemo(() => group()?.parts ?? [])
   const summary = createMemo(() => summarizeActivity(items().map((item) => item.part)))
   const expanded = createMemo(() => ctx.activityExpanded(props.groupID))
+  // A running block counts up once a second, from its first started tool call.
+  const startedAt = createMemo(() => {
+    let start: number | undefined
+    for (const item of items()) {
+      const state = item.part.state
+      if (state.status === "pending") continue
+      start = start === undefined ? state.time.start : Math.min(start, state.time.start)
+    }
+    return start
+  })
+  const clock = useClock(() => summary().working && startedAt() !== undefined)
   const header = createMemo(() =>
     activityHeader(summary(), {
       expanded: expanded(),
-      duration: summary().durationMs === undefined ? undefined : Locale.duration(summary().durationMs!),
+      duration: summary().working
+        ? startedAt() === undefined
+          ? undefined
+          : elapsed(clock() - startedAt()!)
+        : summary().durationMs === undefined
+          ? undefined
+          : Locale.duration(summary().durationMs!),
     }),
   )
   const baseFg = createMemo(() => {
