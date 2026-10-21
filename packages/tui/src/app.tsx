@@ -193,7 +193,7 @@ function isVersionGreater(left: string, right: string) {
 
 export const run = Effect.fn("Tui.run")(function* (input: TuiInput) {
   const global = yield* Global.Service
-  const exit = { epilogue: undefined as string | undefined, reason: undefined as unknown }
+  const exit = { epilogue: undefined as string | undefined, reason: undefined as unknown, consoleLogs: "" }
   const result = yield* Effect.scoped(
     Effect.gen(function* () {
       const renderer = yield* Effect.acquireRelease(
@@ -236,6 +236,38 @@ export const run = Effect.fn("Tui.run")(function* (input: TuiInput) {
       )
       yield* Effect.addFinalizer(() => Effect.sync(TuiAudio.dispose))
       const shutdown = yield* Deferred.make<unknown>()
+      // opentui 0.6.6 catches renderer/process errors, but with its console overlay disabled
+      // those errors and cached console output are not visible. Restore the terminal before reporting.
+      let stoppingOnError = false
+      const stopOnError = (error: unknown) => {
+        if (stoppingOnError) return
+        stoppingOnError = true
+        exit.reason = error
+        try {
+          exit.consoleLogs = renderer.console.getCachedLogs()
+        } catch {}
+        void destroyRenderer(renderer)
+      }
+      const onRenderError = (event: { error: Error }) => stopOnError(event.error)
+      const onHandlerError = (event: { error: unknown }) => stopOnError(event.error)
+      const onUncaughtException = (error: Error) => stopOnError(error)
+      const onUnhandledRejection = (reason: unknown) =>
+        stopOnError(reason instanceof Error ? reason : new Error(String(reason)))
+      yield* Effect.acquireRelease(
+        Effect.sync(() => {
+          renderer.on("render:error", onRenderError)
+          renderer.on("handler:error", onHandlerError)
+          process.on("uncaughtException", onUncaughtException)
+          process.on("unhandledRejection", onUnhandledRejection)
+        }),
+        () =>
+          Effect.sync(() => {
+            renderer.off("render:error", onRenderError)
+            renderer.off("handler:error", onHandlerError)
+            process.off("uncaughtException", onUncaughtException)
+            process.off("unhandledRejection", onUnhandledRejection)
+          }),
+      )
       const onSighup = () => destroyRenderer(renderer)
       yield* Effect.acquireRelease(
         Effect.sync(() => process.on("SIGHUP", onSighup)),
@@ -361,13 +393,14 @@ export const run = Effect.fn("Tui.run")(function* (input: TuiInput) {
         }, renderer)
       })
       yield* Deferred.await(shutdown)
-      return { epilogue: exit.epilogue, reason: exit.reason }
+      return { epilogue: exit.epilogue, reason: exit.reason, consoleLogs: exit.consoleLogs }
     }),
   )
   yield* Effect.sync(() => {
     win32FlushInputBuffer()
     if (result.reason !== undefined)
       process.stderr.write((cliErrorMessage(result.reason) ?? errorFormat(result.reason)) + "\n")
+    if (result.consoleLogs) process.stderr.write("Renderer console cache:\n" + result.consoleLogs + "\n")
     if (result.epilogue) process.stdout.write(result.epilogue + "\n")
   })
 })

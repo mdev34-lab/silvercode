@@ -60,6 +60,59 @@ test("SIGHUP clears title and disposes scoped resources once", async () => {
   }
 })
 
+test("handler failures restore the terminal and report cached console logs", async () => {
+  const setup = await createTestRenderer({ width: 80, height: 24 })
+  const core = await import("@opentui/core")
+  mock.module("@opentui/core", () => ({ ...core, createCliRenderer: async () => setup.renderer }))
+  const events = createEventSource()
+  const calls = createFetch()
+  const originalWrite = process.stderr.write.bind(process.stderr)
+  let stderr = ""
+  let started!: () => void
+  const ready = new Promise<void>((resolve) => {
+    started = resolve
+  })
+
+  process.stderr.write = ((chunk: string | Uint8Array) => {
+    stderr += String(chunk)
+    return true
+  }) as typeof process.stderr.write
+
+  try {
+    const { run } = await import("../src/app")
+    const task = Effect.runPromise(
+      run({
+        url: "http://test",
+        directory,
+        config: createTuiResolvedConfig({ plugin_enabled: {} }),
+        fetch: calls.fetch,
+        events: events.source,
+        args: {},
+        pluginHost: {
+          async start() {
+            started()
+          },
+          async dispose() {},
+        },
+      }).pipe(Effect.provide(AppNodeBuilder.build(Global.node))),
+    )
+
+    await ready
+    setup.renderer.console.getCachedLogs = () => "cached console failure"
+    expect(setup.renderer.listenerCount("handler:error")).toBeGreaterThan(0)
+    setup.renderer.emit("handler:error", { error: new Error("handler failed"), event: undefined })
+    await task
+
+    expect(setup.renderer.isDestroyed).toBe(true)
+    expect(stderr).toContain("handler failed")
+    expect(stderr).toContain("cached console failure")
+  } finally {
+    process.stderr.write = originalWrite
+    if (!setup.renderer.isDestroyed) setup.renderer.destroy()
+    mock.restore()
+  }
+})
+
 test("app.exit prints the session epilogue after scoped cleanup", async () => {
   const setup = await createTestRenderer({ width: 80, height: 24 })
   const core = await import("@opentui/core")
