@@ -16,6 +16,7 @@ import { InstanceBootstrap } from "../../src/project/bootstrap"
 import { InstanceStore } from "../../src/project/instance-store"
 import { MessageID, PartID, SessionID } from "../../src/session/schema"
 import { MessageV2 } from "../../src/session/message-v2"
+import { GlobalBus } from "@/bus/global"
 
 import type { Config } from "@/config/config"
 import { Session as SessionNs } from "@/session/session"
@@ -218,8 +219,12 @@ function httpapiInstance<A, E>(
   )
 }
 
-function serverPathParity<A, E>(name: string, scenario: (serverPath: ServerPath) => Effect.Effect<A, E, TestScope>) {
-  it.live(name, scenario("raw"))
+function serverPathParity<A, E>(
+  name: string,
+  scenario: (serverPath: ServerPath) => Effect.Effect<A, E, TestScope>,
+  timeout?: number,
+) {
+  it.live(name, scenario("raw"), timeout)
 }
 
 function withProject<A, E, E2 = never>(
@@ -730,6 +735,116 @@ describe("HttpApi SDK", () => {
         const properties = record(record(event).properties)
         expect(record(properties.part)).toMatchObject({ id: seeded.part.id, type: "text" })
         return { type: record(event).type, partType: record(properties.part).type }
+      }),
+    ),
+  )
+
+  // #399: the SSE stream is a resume protocol. A reconnecting subscriber sends
+  // Last-Event-ID (the SDK tracks it from each frame's id field) and the server
+  // replays what the disconnect window missed from the GlobalBus replay log; an
+  // expired cursor is answered with server.resync instead of a silent gap.
+  serverPathParity("resumes /global/event from a Last-Event-ID cursor", (serverPath) =>
+    withStandardProject(serverPath, ({ sdk }) =>
+      Effect.gen(function* () {
+        // Connection 1: learn the id of a real bus event, then disconnect.
+        const first = new AbortController()
+        yield* Effect.addFinalizer(() => Effect.sync(() => first.abort()))
+        const sub1 = yield* call(() => sdk.global.event({ signal: first.signal }))
+        yield* Effect.addFinalizer(() =>
+          call(async () => void (await sub1.stream.return?.(undefined))).pipe(Effect.ignore),
+        )
+        const firstID = yield* Deferred.make<string>()
+        const ready = yield* Deferred.make<void>()
+        yield* call(async () => {
+          for await (const event of sub1.stream) {
+            const payload = record(event).payload ?? event
+            if (record(payload).type === "server.connected") Deferred.doneUnsafe(ready, Effect.void)
+            if (record(payload).type === "test.resume.first") {
+              Deferred.doneUnsafe(firstID, Effect.succeed(String(record(payload).id)))
+              return
+            }
+          }
+        }).pipe(Effect.forkScoped)
+        // The SDK promise resolves before the server handler has subscribed
+        // to the bus; server.connected is the first server-sent frame and
+        // proves the subscription is live.
+        yield* awaitWithTimeout(Deferred.await(ready), "timed out waiting for server.connected", "5 seconds")
+        GlobalBus.emitEvent({ payload: { type: "test.resume.first", properties: {} } })
+        const cursor = yield* awaitWithTimeout(
+          Deferred.await(firstID),
+          "timed out waiting for the first /global/event payload",
+          "5 seconds",
+        )
+        first.abort()
+
+        // Published while no subscriber is connected: only the replay log has it.
+        GlobalBus.emitEvent({ payload: { type: "test.resume.missed", properties: {} } })
+
+        // Connection 2 resumes from the cursor: the missed event is replayed
+        // ahead of anything live, exactly once.
+        const second = new AbortController()
+        yield* Effect.addFinalizer(() => Effect.sync(() => second.abort()))
+        const sub2 = yield* call(() =>
+          sdk.global.event({ signal: second.signal, headers: { "Last-Event-ID": cursor } }),
+        )
+        yield* Effect.addFinalizer(() =>
+          call(async () => void (await sub2.stream.return?.(undefined))).pipe(Effect.ignore),
+        )
+        const seen: string[] = []
+        const done = yield* Deferred.make<void>()
+        yield* call(async () => {
+          for await (const event of sub2.stream) {
+            const payload = record(event).payload ?? event
+            const type = String(record(payload).type)
+            if (!type.startsWith("test.resume.")) continue
+            seen.push(type)
+            if (type === "test.resume.missed") {
+              // A live event published after resubscription must arrive after
+              // the replay, not before it.
+              GlobalBus.emitEvent({ payload: { type: "test.resume.live", properties: {} } })
+            }
+            if (type === "test.resume.live") {
+              Deferred.doneUnsafe(done, Effect.void)
+              return
+            }
+          }
+        }).pipe(Effect.forkScoped)
+        yield* awaitWithTimeout(Deferred.await(done), "timed out waiting for replayed + live events", "5 seconds")
+
+        expect(seen.indexOf("test.resume.missed")).toBeGreaterThanOrEqual(0)
+        expect(seen.indexOf("test.resume.missed")).toBeLessThan(seen.indexOf("test.resume.live"))
+        expect(seen.filter((type) => type === "test.resume.missed")).toHaveLength(1)
+        expect(seen).not.toContain("test.resume.first")
+      }),
+    ),
+    20000,
+  )
+
+  serverPathParity("answers an expired /global/event resume cursor with server.resync", (serverPath) =>
+    withStandardProject(serverPath, ({ sdk }) =>
+      Effect.gen(function* () {
+        const controller = new AbortController()
+        yield* Effect.addFinalizer(() => Effect.sync(() => controller.abort()))
+        const sub = yield* call(() =>
+          sdk.global.event({
+            signal: controller.signal,
+            headers: { "Last-Event-ID": "evt_000000000001aaaaaaaaaaaaaa" },
+          }),
+        )
+        yield* Effect.addFinalizer(() =>
+          call(async () => void (await sub.stream.return?.(undefined))).pipe(Effect.ignore),
+        )
+        const resync = yield* Deferred.make<void>()
+        yield* call(async () => {
+          for await (const event of sub.stream) {
+            const payload = record(event).payload ?? event
+            if (record(payload).type === "server.resync") {
+              Deferred.doneUnsafe(resync, Effect.void)
+              return
+            }
+          }
+        }).pipe(Effect.forkScoped)
+        yield* awaitWithTimeout(Deferred.await(resync), "timed out waiting for server.resync", "5 seconds")
       }),
     ),
   )

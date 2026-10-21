@@ -94,6 +94,7 @@ export type Event =
   | EventWorktreeFailed
   | EventServerConnected
   | EventGlobalDisposed
+  | EventServerResync
   | EventServerInstanceDisposed
 
 export type QuestionReplied = {
@@ -1618,6 +1619,13 @@ export type GlobalEvent = {
         type: "global.disposed"
         properties: {
           [key: string]: unknown
+        }
+      }
+    | {
+        id: string
+        type: "server.resync"
+        properties: {
+          reason: "resume-cursor-expired"
         }
       }
     | EventServerInstanceDisposed
@@ -3227,6 +3235,14 @@ export type ProjectTime = {
   created: number
   updated: number
   initialized?: number
+}
+
+export type EventServerResync = {
+  id: string
+  type: "server.resync"
+  properties: {
+    reason: "resume-cursor-expired"
+  }
 }
 
 export type EventServerInstanceDisposed = {
