@@ -3,6 +3,7 @@ import { describe, expect } from "bun:test"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Cause, Effect, Exit, Layer } from "effect"
 import type * as Scope from "effect/Scope"
+import { writeFileSync } from "node:fs"
 import fs from "node:fs/promises"
 import os from "os"
 import path from "path"
@@ -1151,21 +1152,35 @@ describe("tool.shell abort", () => {
       projectRoot,
       Effect.gen(function* () {
         const updates: string[] = []
+        const dir = yield* tmpdirScoped()
+        const gate1 = path.join(dir, "gate1")
+        const gate2 = path.join(dir, "gate2")
+        // Deterministic progressive streaming (#468): the command cannot
+        // print "second" until a metadata update containing "first" was
+        // delivered (the callback opens the gate), and cannot finish until
+        // one containing "second" was delivered too. A flush-only-at-exit
+        // regression now fails instead of flaking on a 0.1s race.
+        const wait =
+          'const fs=require("node:fs");const p=Bun.argv[1];const t=Date.now();' +
+          "while(!fs.existsSync(p)){if(Date.now()-t>10000)process.exit(1);Bun.sleepSync(10)}"
         const result = yield* run(
           {
-            command: `echo first && sleep 0.1 && echo second`,
+            command: `echo first && ${bin} -e ${squote(wait)} ${squote(gate1)} && echo second && ${bin} -e ${squote(wait)} ${squote(gate2)} && echo done`,
           },
           {
             ...ctx,
             metadata: (input) =>
               Effect.sync(() => {
                 const output = (input.metadata as { output?: string })?.output
-                if (output) updates.push(output)
+                if (output === undefined) return
+                updates.push(output)
+                if (output.includes("second")) writeFileSync(gate2, "")
+                else if (output.includes("first")) writeFileSync(gate1, "")
               }),
           },
         )
-        expect(result.output).toContain("first")
-        expect(result.output).toContain("second")
+        expect(result.output).toContain("done")
+        expect(updates.some((output) => output.includes("first") && !output.includes("second"))).toBe(true)
         expect(updates.length).toBeGreaterThan(1)
       }),
     ),
