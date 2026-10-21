@@ -18,7 +18,7 @@ import { isRecord } from "@/util/record"
 import type { ConsoleState } from "@opencode-ai/core/v1/config/console-state"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { InstanceState } from "@/effect/instance-state"
-import { Context, Duration, Effect, Exit, Fiber, Layer, Option, Schema } from "effect"
+import { Cause, Context, Duration, Effect, Exit, Fiber, Layer, Option, Schema } from "effect"
 import { FetchHttpClient, HttpClient, HttpClientRequest } from "effect/unstable/http"
 import { EffectFlock } from "@opencode-ai/core/util/effect-flock"
 import { containsPath, type InstanceContext } from "../project/instance-context"
@@ -423,8 +423,20 @@ const layer = Layer.effect(
         yield* merge(Global.Path.config, global, "global")
 
         if (Flag.OPENCODE_CONFIG) {
-          yield* merge(Flag.OPENCODE_CONFIG, yield* loadFile(Flag.OPENCODE_CONFIG, authEnv))
-          yield* Effect.logDebug("loaded custom config", { path: Flag.OPENCODE_CONFIG })
+          // An invalid custom config file (JSONC syntax error or schema
+          // mismatch) must not abort config loading: warn and fall back to
+          // defaults (#434). Parse/schema failures escape loadFile as
+          // defects, so recover from the full cause rather than typed errors.
+          const custom = yield* loadFile(Flag.OPENCODE_CONFIG, authEnv).pipe(
+            Effect.tap(() => Effect.logDebug("loaded custom config", { path: Flag.OPENCODE_CONFIG })),
+            Effect.catchCause((cause) =>
+              Effect.logWarning("failed to load custom config, using defaults", {
+                path: Flag.OPENCODE_CONFIG,
+                cause: Cause.pretty(cause),
+              }).pipe(Effect.as({} as Info)),
+            ),
+          )
+          yield* merge(Flag.OPENCODE_CONFIG, custom)
         }
 
         if (!Flag.OPENCODE_DISABLE_PROJECT_CONFIG) {
