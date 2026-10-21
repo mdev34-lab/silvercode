@@ -169,6 +169,15 @@ export function createWorkerProcess(target: string, options: WorkerProcessOption
   }
 
   const finish = (exit: WorkerExit) => {
+    // No restart follows (clean exit, shutdown, or the restart budget is
+    // spent): settle every pending restart waiter instead of leaving it
+    // queued forever. A waiter that hangs past its caller's patience turns
+    // a diagnosable exhausted-budget exit into a silent deadlock (#468).
+    const stranded = [...openCycles, { waiters: queuedWaiters }]
+    openCycles = []
+    queuedWaiters = []
+    const error = new Error(`Bun worker exited with ${describeExit(exit)}; no restart will follow`)
+    for (const cycle of stranded) for (const waiter of cycle.waiters) waiter.reject(error)
     resolveClosed(exit)
     if (stopping) return
     void Promise.resolve()

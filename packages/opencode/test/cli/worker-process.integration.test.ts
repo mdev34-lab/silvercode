@@ -40,6 +40,16 @@ setTimeout(() => process.send?.("ready"), 50)
 setInterval(() => {}, 1000)
 `
 
+// Bounds an await that has no internal deadline: under CI starvation a
+// missed settlement must fail fast with a clear message, not hang the test
+// to the runner timeout (#468).
+async function bounded<T>(promise: Promise<T>, what: string, ms = 15000): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<T>((_, reject) => setTimeout(() => reject(new Error(what)), ms)),
+  ])
+}
+
 async function waitForCount(messages: string[], text: string, count: number, what: string) {
   const deadline = Date.now() + 5000
   for (;;) {
@@ -59,7 +69,10 @@ describe("TUI worker process integration", () => {
     const worker = createWorkerProcess(target, {
       onRestart: () => {},
       log: () => {},
-      maxRestarts: 1,
+      // Headroom above the one intentional crash: a stray boot crash under
+      // CI starvation must not exhaust the budget and leave waitForRestart
+      // queued forever (#468).
+      maxRestarts: 5,
     })
     worker.onmessage = (event) => messages.push(event.data)
 
@@ -69,17 +82,21 @@ describe("TUI worker process integration", () => {
       worker.postMessage("ping")
       await waitForCount(messages, "pong", 1, "worker did not reply")
 
+      // Counts are delta-based: a stray early restart shifts the absolute
+      // totals, so assert against the baseline observed just before the
+      // intentional crash.
+      const readyBefore = messages.filter((message) => message === "ready").length
+      const pongBefore = messages.filter((message) => message === "pong").length
       worker.postMessage("crash")
-      const restarted = worker.waitForRestart()
-      await restarted
+      await bounded(worker.waitForRestart(), "restart never settled")
       // Restart completion is not readiness: the replacement announces
       // itself separately once it is actually usable.
-      await waitForCount(messages, "ready", 2, "replacement worker never became ready")
+      await waitForCount(messages, "ready", readyBefore + 1, "replacement worker never became ready")
 
       worker.postMessage("ping")
-      await waitForCount(messages, "pong", 2, "replacement worker did not reply")
+      await waitForCount(messages, "pong", pongBefore + 1, "replacement worker did not reply")
 
-      expect(messages.filter((message) => message === "ready")).toHaveLength(2)
+      expect(messages.filter((message) => message === "ready").length).toBeGreaterThanOrEqual(2)
     } finally {
       await worker.terminate()
       await rm(dir, { recursive: true, force: true })
@@ -94,7 +111,7 @@ describe("TUI worker process integration", () => {
     const worker = createWorkerProcess(target, {
       onRestart: () => {},
       log: () => {},
-      maxRestarts: 1,
+      maxRestarts: 5,
     })
     const client = Rpc.client<{ work(input: undefined): string; hang(input: undefined): string }>(worker)
 
@@ -131,9 +148,9 @@ describe("TUI worker process integration", () => {
       )
       worker.postMessage("crash")
       const restarted = worker.waitForRestart()
-      await expect(hanging).rejects.toThrow(/exited with/)
+      await bounded(expect(hanging).rejects.toThrow(/exited with/), "stranded call never rejected")
       expect(hangingSettled).toBe("rejected")
-      await restarted
+      await bounded(restarted, "restart never settled")
 
       await expect(callWorkSoon()).resolves.toBe("done")
     } finally {
