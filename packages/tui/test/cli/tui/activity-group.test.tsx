@@ -635,7 +635,7 @@ describe("activity group TUI", () => {
       // One container for the whole sequence, not one per batch.
       await app.waitForFrame((f: string) => f.includes("7 tool calls"))
       expect(countOf(frame(), "tool calls")).toBe(1)
-      expect(frame()).not.toContain(readRow("src/a.ts"))
+      expect(frame()).not.toContain("Read src/a.ts")
 
       // State and render agree: every part belongs to the same group.
       const rows = (sync.data.message[SESSION] ?? []).map((message) => ({
@@ -646,16 +646,16 @@ describe("activity group TUI", () => {
 
       // Expanding nests the whole sequence under that container...
       app.mockInput.pressKey("o", { ctrl: true })
-      await app.waitForFrame((f: string) => f.replace(/\\/g, "/").includes(readRow("src/g.ts")))
+      await app.waitForFrame((f: string) => f.replace(/\\/g, "/").includes("Read src/g.ts"))
       const expanded = frame()
       for (const title of [
-        readRow("src/a.ts"),
-        readRow("src/b.ts"),
+        "Read src/a.ts",
+        "Read src/b.ts",
         'Grep "alpha"',
         'Grep "beta"',
-        readRow("src/e.ts"),
-        readRow("src/f.ts"),
-        readRow("src/g.ts"),
+        "Read src/e.ts",
+        "Read src/f.ts",
+        "Read src/g.ts",
       ]) {
         expect(expanded).toContain(title)
       }
@@ -671,7 +671,7 @@ describe("activity group TUI", () => {
       await app.waitForFrame((f: string) => f.includes("Summarizing now."))
       const after = frame()
       expect(after).toContain("Summarizing now.")
-      expect(after).toContain(readRow("src/h.ts"))
+      expect(after).toContain("Read src/h.ts")
       expect(countOf(after, "tool calls")).toBe(1)
     } finally {
       app.renderer.destroy()
