@@ -1802,3 +1802,12 @@ export function toolFiletype(input?: string): string | undefined {
 
   return lang
 }
+
+// A finish body is the result, then a blank line and the effort/review status
+// line. When the result only repeats text the run already printed, return what
+// is left (possibly empty); otherwise undefined.
+export function withoutRepeatedResult(body: string, printed: string): string | undefined {
+  const [result = "", ...rest] = body.split(/\n\s*\n/)
+  if (result.trim() !== printed.trim()) return undefined
+  return rest.join("\n\n").trim()
+}

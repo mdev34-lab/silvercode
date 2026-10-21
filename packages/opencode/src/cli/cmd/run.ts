@@ -88,10 +88,20 @@ function formatRunError(error: unknown) {
   return FormatError(error) ?? FormatUnknownError(error)
 }
 
-async function tool(part: ToolPart) {
+// `printed` is the last text the run already showed. A finish result that only
+// repeats it is left out, so the answer is not printed twice.
+async function tool(part: ToolPart, printed?: string) {
   try {
-    const { toolInlineInfo } = await import("./run/tool")
+    const { toolInlineInfo, withoutRepeatedResult } = await import("./run/tool")
     const next = toolInlineInfo(part)
+    if (next.mode === "block" && part.tool === "finish" && printed && next.body) {
+      const rest = withoutRepeatedResult(next.body, printed)
+      if (rest !== undefined) {
+        if (rest) block({ ...next, mode: undefined, body: undefined }, rest)
+        else inline({ ...next, mode: undefined, body: undefined })
+        return
+      }
+    }
     if (next.mode === "block") {
       block(next, next.body)
       return
@@ -704,6 +714,7 @@ export const RunCommand = effectCmd({
           // all of their results are surfaced.
           const background = BackgroundTasks.make(sessionID)
           let rootIdle = false
+          let lastText = ""
           let error: string | undefined
 
           for await (const event of events.stream) {
@@ -760,7 +771,7 @@ export const RunCommand = effectCmd({
               if (part.type === "tool" && (part.state.status === "completed" || part.state.status === "error")) {
                 if (emit("tool_use", { part })) continue
                 if (part.state.status === "completed") {
-                  await tool(part)
+                  await tool(part, lastText)
                   continue
                 }
                 await toolError(part)
@@ -790,6 +801,7 @@ export const RunCommand = effectCmd({
                 if (emit("text", { part })) continue
                 const text = part.text.trim()
                 if (!text) continue
+                lastText = text
                 if (!process.stdout.isTTY) {
                   process.stdout.write(text + EOL)
                   continue
