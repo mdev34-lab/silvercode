@@ -14,6 +14,7 @@ import { Config } from "@/config/config"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Shell } from "@opencode-ai/core/shell"
 import { ShellID } from "./shell/id"
+import { ToolFailure } from "@opencode-ai/llm"
 
 import * as Truncate from "./truncate"
 import { Plugin } from "@/plugin"
@@ -630,7 +631,11 @@ export const ShellTool = Tool.define(
 
           return exit.kind === "exit" ? exit.code : null
         }),
-      ).pipe(Effect.catch((error) => Effect.fail(error instanceof Error ? error : new Error(String(error)))))
+      ).pipe(
+        Effect.mapError(
+          (error) => new ToolFailure({ message: error instanceof Error ? error.message : String(error) }),
+        ),
+      )
 
       const meta: string[] = []
       if (expired) {
