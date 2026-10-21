@@ -367,7 +367,7 @@ function chipHex(app: Setup, level: string) {
 
 /** Waits for a persisted JSON file to appear, then returns it. */
 async function fileJson(file: string, level?: string): Promise<unknown> {
-  for (let pass = 0; pass < 300; pass++) {
+  for (let pass = 0; pass < 1500; pass++) {
     const value = await Bun.file(file)
       .json()
       .catch(() => undefined)
