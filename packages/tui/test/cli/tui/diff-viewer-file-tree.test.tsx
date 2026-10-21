@@ -3,6 +3,7 @@ import { describe, expect, test } from "bun:test"
 import { RGBA } from "@opentui/core"
 import { testRender } from "@opentui/solid"
 import type { JSX } from "solid-js"
+import { captureFrame } from "../../fixture/frame"
 import { createTuiResolvedConfig } from "../../fixture/tui-runtime"
 import { KVProvider } from "../../../src/context/kv"
 import { ThemeProvider } from "../../../src/context/theme"
@@ -170,12 +171,12 @@ async function renderOnceSettled(app: Awaited<ReturnType<typeof testRender>>) {
 
 async function captureSettledFrame(app: Awaited<ReturnType<typeof testRender>>) {
   for (let attempt = 0; attempt < 40; attempt++) {
-    const frame = app.captureCharFrame()
+    const frame = await captureFrame(app)
     if (frame.trim().length > 0) return frame
     await new Promise((resolve) => setTimeout(resolve, 25))
     await app.renderOnce()
   }
-  return app.captureCharFrame()
+  return await captureFrame(app)
 }
 
 function withTheme(component: () => JSX.Element) {

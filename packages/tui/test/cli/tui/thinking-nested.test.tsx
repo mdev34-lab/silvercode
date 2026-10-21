@@ -5,6 +5,7 @@ import { testRender, useRenderer } from "@opentui/solid"
 import { onCleanup } from "solid-js"
 import type { AssistantMessage, GlobalEvent, Message, Part, ReasoningPart, ToolPart } from "@opencode-ai/sdk/v2"
 import { tmpdir } from "../../fixture/fixture"
+import { waitFor } from "../../fixture/frame"
 import { createTuiResolvedConfig } from "../../fixture/tui-runtime"
 import { createEventSource, createFetch, directory, json } from "../../fixture/tui-sdk"
 import { TestTuiContexts } from "../../fixture/tui-environment"
@@ -54,7 +55,6 @@ const COT_BODY = "Step one: inspect the files carefully."
 const STREAMED_BODY = "Second pass: verify the diff end to end."
 
 type Setup = Awaited<ReturnType<typeof testRender>>
-
 
 const setups: { app: Setup; dispose: () => Promise<void> }[] = []
 
@@ -219,16 +219,6 @@ async function mountSession(seedParts: Part[]) {
 
   await waitFor(app, () => (keymapRef ? keymapRef : undefined))
   return { app, events, keymap: () => keymapRef! }
-}
-
-async function waitFor<T>(app: Setup, probe: () => T | undefined, passes = 400): Promise<T> {
-  for (let pass = 0; pass <= passes; pass++) {
-    await app.renderOnce()
-    const value = probe()
-    if (value !== undefined) return value
-    await Bun.sleep(5)
-  }
-  throw new Error(`condition never settled:\n${app.captureCharFrame()}`)
 }
 
 function frameOf(app: Setup) {

@@ -5,6 +5,7 @@ import { describe, expect, test } from "bun:test"
 import { onCleanup, Show } from "solid-js"
 import type { GlobalEvent } from "@opencode-ai/sdk/v2"
 import { tmpdir } from "../../fixture/fixture"
+import { captureFrame } from "../../fixture/frame"
 import { createEventSource, createFetch, directory, json } from "../../fixture/tui-sdk"
 import { TestTuiContexts } from "../../fixture/tui-environment"
 import { ArgsProvider } from "../../../src/context/args"
@@ -248,12 +249,12 @@ describe("session tabs", () => {
       for (let round = 0; round < 3; round++) {
         await env.go(A)
         expect(env.handle.refs[A]!.current.input).toBe("draft for A")
-        expect(env.app.captureCharFrame()).toContain("draft for A")
-        expect(env.app.captureCharFrame()).not.toContain("draft for B")
+        expect(await captureFrame(env.app)).toContain("draft for A")
+        expect(await captureFrame(env.app)).not.toContain("draft for B")
 
         await env.go(B)
         expect(env.handle.refs[B]!.current.input).toBe("draft for B")
-        expect(env.app.captureCharFrame()).not.toContain("draft for A")
+        expect(await captureFrame(env.app)).not.toContain("draft for A")
       }
     } finally {
       await env.dispose()

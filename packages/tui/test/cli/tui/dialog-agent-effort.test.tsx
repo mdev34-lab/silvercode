@@ -6,6 +6,7 @@ import { testRender, useRenderer } from "@opentui/solid"
 import { onCleanup, onMount, type JSX } from "solid-js"
 import { chmod, mkdir } from "node:fs/promises"
 import { tmpdir } from "../../fixture/fixture"
+import { waitFor } from "../../fixture/frame"
 import { createTuiResolvedConfig } from "../../fixture/tui-runtime"
 import { createEventSource, createFetch, directory, json } from "../../fixture/tui-sdk"
 import { TestTuiContexts } from "../../fixture/tui-environment"
@@ -331,13 +332,15 @@ async function mountEffort(input: {
 }
 
 async function frameWhere(app: Setup, predicate: (frame: string) => boolean, label: string) {
-  for (let pass = 0; pass < 200; pass++) {
-    await app.renderOnce()
-    const frame = app.captureCharFrame()
-    if (predicate(frame)) return frame
-    await Bun.sleep(10)
-  }
-  throw new Error(`timed out waiting for frame: ${label}`)
+  return waitFor(
+    app,
+    () => {
+      const frame = app.captureCharFrame()
+      return predicate(frame) ? frame : undefined
+    },
+    200,
+    `timed out waiting for frame: ${label}`,
+  )
 }
 
 function lineOf(frame: string, needle: string) {

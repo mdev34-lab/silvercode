@@ -5,6 +5,7 @@ import { testRender, useRenderer } from "@opentui/solid"
 import { onCleanup } from "solid-js"
 import type { GlobalEvent, Message, SessionStatus } from "@opencode-ai/sdk/v2"
 import { tmpdir } from "../../fixture/fixture"
+import { waitFor } from "../../fixture/frame"
 import { createTuiResolvedConfig } from "../../fixture/tui-runtime"
 import { createEventSource, createFetch, directory, json } from "../../fixture/tui-sdk"
 import { TestTuiContexts } from "../../fixture/tui-environment"
@@ -266,17 +267,6 @@ async function mountChildTrace(status: SessionStatus, options: { sibling?: boole
     navigate: (sessionID: string) => navigate?.(sessionID),
     openDialog: () => openDialog?.(),
   }
-}
-
-/** Pumps frames until `probe` yields, so assertions read a settled layout. */
-async function waitFor<T>(app: Setup, probe: () => T | undefined, passes = 400): Promise<T> {
-  for (let pass = 0; pass <= passes; pass++) {
-    await app.renderOnce()
-    const value = probe()
-    if (value !== undefined) return value
-    await Bun.sleep(5)
-  }
-  throw new Error(`condition never settled:\n${app.captureCharFrame()}`)
 }
 
 describe("subagent double-Esc stop", () => {
