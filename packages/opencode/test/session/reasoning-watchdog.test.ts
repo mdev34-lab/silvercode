@@ -107,29 +107,56 @@ describe("reasoning inactivity watchdog", () => {
     }),
   )
 
-  it.effect("disarms when the matching reasoning trace closes", () =>
+  it.effect("stays armed after the matching reasoning trace closes", () =>
     Effect.gen(function* () {
       const fiber = yield* ReasoningWatchdog.guard(hanging(start(), delta("done"), end())).pipe(
         Stream.runDrain,
         Effect.forkScoped({ startImmediately: true }),
       )
 
-      yield* adjust("2 minutes")
-      yield* pending(fiber)
-      yield* Fiber.interrupt(fiber)
+      yield* adjust(TIMEOUT)
+      const error = yield* Fiber.join(fiber).pipe(Effect.flip)
+      expect(error).toBeInstanceOf(ProviderError.ResponseStreamError)
     }),
   )
 
-  it.effect("does not arm until a non-empty reasoning delta arrives", () =>
+  it.effect("fails when the provider holds the stream open with zero events", () =>
+    Effect.gen(function* () {
+      const fiber = yield* ReasoningWatchdog.guard(hanging()).pipe(
+        Stream.runDrain,
+        Effect.forkScoped({ startImmediately: true }),
+      )
+
+      yield* adjust(TIMEOUT)
+      const error = yield* Fiber.join(fiber).pipe(Effect.flip)
+      expect(error).toBeInstanceOf(ProviderError.ResponseStreamError)
+      expect(error.message).toContain("reasoning stream timed out")
+    }),
+  )
+
+  it.effect("fails when text-only generation stalls", () =>
+    Effect.gen(function* () {
+      const fiber = yield* ReasoningWatchdog.guard(hanging(text("partial answer"))).pipe(
+        Stream.runDrain,
+        Effect.forkScoped({ startImmediately: true }),
+      )
+
+      yield* adjust(TIMEOUT)
+      const error = yield* Fiber.join(fiber).pipe(Effect.flip)
+      expect(error).toBeInstanceOf(ProviderError.ResponseStreamError)
+    }),
+  )
+
+  it.effect("does not reset the deadline for empty reasoning deltas", () =>
     Effect.gen(function* () {
       const fiber = yield* ReasoningWatchdog.guard(hanging(start(), delta(""))).pipe(
         Stream.runDrain,
         Effect.forkScoped({ startImmediately: true }),
       )
 
-      yield* adjust("2 minutes")
-      yield* pending(fiber)
-      yield* Fiber.interrupt(fiber)
+      yield* adjust(TIMEOUT)
+      const error = yield* Fiber.join(fiber).pipe(Effect.flip)
+      expect(error).toBeInstanceOf(ProviderError.ResponseStreamError)
     }),
   )
 

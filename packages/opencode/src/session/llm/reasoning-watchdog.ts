@@ -16,41 +16,33 @@ export function guard<E, R>(self: Stream.Stream<LLMEvent, E, R>, options: Option
   const timeoutMillis = Duration.toMillis(timeout)
 
   return Stream.transformPull(Stream.rechunk(self, 1), (pull) =>
-    Effect.sync(() => {
-      const open = new Set<string>()
-      const deadlines = new Map<string, number>()
+    Effect.gen(function* () {
+      // General inactivity deadline, armed from stream start: a provider that
+      // holds the stream open with zero events, or stalls during text-only
+      // generation, now trips the retry pipeline instead of leaving the
+      // session busy until the user cancels (#408). Only visible token
+      // deltas count as activity; control events never reset the deadline.
+      let deadline = (yield* Clock.currentTimeMillis) + timeoutMillis
 
       return Effect.gen(function* () {
-        const deadline = deadlines.size === 0 ? undefined : Math.min(...deadlines.values())
-        const now = deadline === undefined ? undefined : yield* Clock.currentTimeMillis
-        const events = yield* deadline === undefined
-          ? pull
-          : pull.pipe(
-              Effect.timeoutOrElse({
-                duration: Duration.millis(Math.max(0, deadline - now!)),
-                orElse: () =>
-                  Effect.fail(
-                    new ProviderError.ResponseStreamError(
-                      `reasoning stream timed out after ${Duration.format(timeout)} without new tokens`,
-                    ),
-                  ),
-              }),
-            )
+        const now = yield* Clock.currentTimeMillis
+        const events = yield* pull.pipe(
+          Effect.timeoutOrElse({
+            duration: Duration.millis(Math.max(0, deadline - now)),
+            orElse: () =>
+              Effect.fail(
+                new ProviderError.ResponseStreamError(
+                  `reasoning stream timed out after ${Duration.format(timeout)} without new tokens`,
+                ),
+              ),
+          }),
+        )
         const event = events[0]
 
-        if (event.type === "reasoning-start") open.add(event.id)
         const streamedToken =
           (event.type === "reasoning-delta" || event.type === "text-delta" || event.type === "tool-input-delta") &&
           event.text.length > 0
-        if (streamedToken && (deadlines.size > 0 || (event.type === "reasoning-delta" && open.has(event.id)))) {
-          const next = (yield* Clock.currentTimeMillis) + timeoutMillis
-          deadlines.forEach((_, id) => deadlines.set(id, next))
-          if (event.type === "reasoning-delta" && open.has(event.id)) deadlines.set(event.id, next)
-        }
-        if (event.type === "reasoning-end") {
-          open.delete(event.id)
-          deadlines.delete(event.id)
-        }
+        if (streamedToken) deadline = (yield* Clock.currentTimeMillis) + timeoutMillis
 
         return events
       })
