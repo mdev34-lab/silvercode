@@ -213,10 +213,10 @@ export const run = Effect.fn("Tui.run")(function* (input: TuiInput) {
             }),
           catch: (error) => (error instanceof Error ? error : new Error(String(error))),
         }),
-        (renderer) =>
-          Effect.sync(() => {
-            destroyRenderer(renderer)
-          }),
+        // Scoped cleanup must await the async destroy: returning from the
+        // acquireRelease finalizer before `closed` settles lets the process
+        // exit with the terminal unrestored (Arena review on #451).
+        (renderer) => Effect.promise(() => destroyRenderer(renderer)),
       )
       win32DisableProcessedInput()
       const keymap = createDefaultOpenTuiKeymap(renderer)
