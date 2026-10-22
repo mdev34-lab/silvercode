@@ -1,5 +1,5 @@
 import { TextAttributes } from "@opentui/core"
-import { useTerminalDimensions } from "@opentui/solid"
+import { useTerminalDimensions } from "../util/terminal-dimensions"
 import { For } from "solid-js"
 import { BRAND_NAME } from "../brand"
 import { useTheme } from "../context/theme"

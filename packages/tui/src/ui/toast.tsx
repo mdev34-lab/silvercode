@@ -1,7 +1,7 @@
 import { createContext, onCleanup, useContext, type ParentProps, Show } from "solid-js"
 import { createStore } from "solid-js/store"
 import { useTheme } from "../context/theme"
-import { useTerminalDimensions } from "@opentui/solid"
+import { useTerminalDimensions } from "../util/terminal-dimensions"
 import { SplitBorder } from "./border"
 import { TextAttributes } from "@opentui/core"
 export type ToastOptions = {
