@@ -247,8 +247,19 @@ describe("opencode run with a report deferred during a successful child turn", (
           },
           reply().tool("finish", { reason: "success", result: "late report received" }),
         )
+        // The root's resume must not assume WHICH result the child ended with:
+        // on slow runners the child absorbs the deferred report itself (its own
+        // "grandchild dispatch" call satisfies the report matcher above) and
+        // completes with "late report received", so a CHILD_EARLY_DONE-keyed
+        // matcher never fires and the root nudge-stops (#511). Accept any
+        // child-completion notification; the deliveredGate still orders the
+        // recovery after the report.
         yield* llm.pushMatch(
-          (hit) => lastText(hit.body as Body).includes("CHILD_EARLY_DONE"),
+          (hit) => {
+            const body = hit.body as Body
+            if (lastText(body).includes("CHILD_EARLY_DONE")) return true
+            return lastText(body).includes("<task id=") && raw(body).includes("child dispatch")
+          },
           reply()
             .wait(deliveredGate)
             .text("ROOT_RECOVERED_DEFERRED_REPORT")
