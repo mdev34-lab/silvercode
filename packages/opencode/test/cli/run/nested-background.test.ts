@@ -248,7 +248,10 @@ describe("opencode run with a report deferred during a successful child turn", (
         )
 
         const result = yield* opencode.run(ROOT_PROMPT, {
-          timeoutMs: 15_000,
+          // The nested root->child->grandchild gate sequence needs more than
+              // 15s of wall clock on the windows runner; the harness deadline
+              // above is the regression bound, not this budget (#505).
+              timeoutMs: 25_000,
           extraArgs: ["--dangerously-skip-permissions"],
           env: {
             OPENCODE_CONFIG_CONTENT: JSON.stringify({
