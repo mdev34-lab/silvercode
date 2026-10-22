@@ -230,7 +230,9 @@ export function Prompt(props: PromptProps) {
   let promptPartTypeId = 0
   const event = useEvent()
 
-  event.on("tui.prompt.append", (evt, { workspace }) => {
+  // Prompt mounts per session/home and on every tab switch; without the
+  // unsubscribe each stale mount inserts the appended text again (#417).
+  const offPromptAppend = event.on("tui.prompt.append", (evt, { workspace }) => {
     if (workspace !== project.workspace.current()) return
     if (!input || input.isDestroyed) return
     input.insertText(evt.properties.text)
@@ -242,6 +244,7 @@ export function Prompt(props: PromptProps) {
       renderer.requestRender()
     }, 0)
   })
+  onCleanup(offPromptAppend)
 
   createEffect(() => {
     if (!input || input.isDestroyed) return
