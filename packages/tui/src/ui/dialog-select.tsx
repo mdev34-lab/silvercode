@@ -275,8 +275,12 @@ export function DialogSelect<T>(props: DialogSelectProps<T>) {
   // The deferred filter reset kept no handle, so closing the dialog inside
   // the tick still moved selection on a destroyed scrollbox (#422).
   let filterTimer: ReturnType<typeof setTimeout> | undefined
+  // The deferred input focus below kept no handle either; closing the dialog
+  // inside the tick still focused a destroyed input (#422).
+  let focusTimer: ReturnType<typeof setTimeout> | undefined
   onCleanup(() => {
     if (filterTimer !== undefined) clearTimeout(filterTimer)
+    if (focusTimer !== undefined) clearTimeout(focusTimer)
   })
 
   createEffect(
@@ -594,7 +598,9 @@ export function DialogSelect<T>(props: DialogSelectProps<T>) {
               ref={(r) => {
                 input = r
                 input.traits = { status: "FILTER" }
-                setTimeout(() => {
+                if (focusTimer !== undefined) clearTimeout(focusTimer)
+                focusTimer = setTimeout(() => {
+                  focusTimer = undefined
                   if (!input) return
                   if (input.isDestroyed) return
                   input.focus()

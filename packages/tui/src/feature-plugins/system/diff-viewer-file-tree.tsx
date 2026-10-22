@@ -52,10 +52,13 @@ export function DiffViewerFileTree(props: DiffViewerFileTreeProps) {
 
   createEffect(() => {
     const node = props.highlightedNode
+    // Advance the generation before any early return: every re-run must
+    // invalidate a frame queued by the previous run, even when this run
+    // queues nothing (selection cleared or not yet in the rows).
+    const generation = ++scrollGeneration
     if (node === undefined) return
     const selectedIndex = rows().findIndex((row) => row.id === node)
     if (selectedIndex === -1) return
-    const generation = ++scrollGeneration
     const scrollSelectedIntoView = () => scrollFileTreeRowIntoView(scroll, selectedIndex)
     scrollSelectedIntoView()
     renderer.requestAnimationFrame(() => {
