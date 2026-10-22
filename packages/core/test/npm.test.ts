@@ -36,6 +36,9 @@ describe("Npm.sanitize", () => {
 })
 
 describe("Npm.add", () => {
+  // This test shells out to a real package install; give it an explicit
+  // budget instead of the suite's 15s flag, which a slow CI runner exceeds
+  // (#518).
   test("reifies when package cache directory exists without the package installed", async () => {
     await using tmp = await tmpdir()
     await fs.mkdir(path.join(tmp.path, "fixture-provider"))
@@ -54,10 +57,11 @@ describe("Npm.add", () => {
     }).pipe(Effect.scoped, Effect.provide(npmLayer(path.join(tmp.path, "cache"))), Effect.runPromise)
 
     expect(entry.entrypoint).toBeDefined()
-  })
+  }, 60_000)
 })
 
 describe("Npm.install", () => {
+  // Real install as well: explicit budget for the same reason (#518).
   test("respects omit from project .npmrc", async () => {
     await using tmp = await tmpdir()
 
@@ -80,5 +84,5 @@ describe("Npm.install", () => {
 
     await expect(fs.stat(path.join(tmp.path, "node_modules", "prod-pkg"))).resolves.toBeDefined()
     await expect(fs.stat(path.join(tmp.path, "node_modules", "dev-pkg"))).rejects.toThrow()
-  })
+  }, 60_000)
 })
