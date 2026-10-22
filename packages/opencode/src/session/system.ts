@@ -233,11 +233,9 @@ const layer = Layer.effect(
           ].join("\n")
         }
         return [
-          `Delegate by default: you coordinate, ${names(plannersToAdvertise)} plans, and ${names(implementersToAdvertise)} implements.`,
-          `For anything beyond a small task, delegate planning to ${names(plannersToAdvertise)} once, at the start, with the task tool, then delegate each implementation step to ${names(implementersToAdvertise)}.`,
-          ...(scopeNote ? [scopeNote] : []),
-          "Direct work is the exception, reserved for small tasks - a quick lookup, a tiny edit, a short answer.",
-          "You stay responsible for the outcome: give each subagent complete context, then verify and integrate what it returns instead of re-deriving or re-planning it at every tool call.",
+          `When a request needs non-trivial implementation planning, delegate that planning to ${names} once, at the start, with the task tool.`,
+          "Then work the plan step by step, carrying it forward instead of re-deriving or re-planning it at every tool call.",
+          "If the session has a plan file, it is a living scratchpad: update it at milestones (completed steps, discoveries, revised remaining steps), never after every tool call, and never let maintaining it block the work itself.",
         ].join("\n")
       }),
 
