@@ -5,9 +5,20 @@ const previousByParent = new WeakMap<
   { frameID: number; previous: WeakMap<BaseRenderable, BaseRenderable | undefined> }
 >()
 
+// The pre-wrap handler per element, so a repeated setup replaces the first
+// wrapper instead of wrapping it again and stacking the callbacks (#379
+// review). Only the very first pre-wrap handler is ever chained.
+const originalByElement = new WeakMap<BoxRenderable, (() => void) | undefined>()
+
 export function setPreLayoutSiblingMargin(el: BoxRenderable, margin: (previous?: BaseRenderable) => number) {
   // Run before Yoga layout so scroll geometry matches the rendered frame.
+  // Chain any handler the renderable (or a Renderable subclass) already has
+  // instead of clobbering it (#379); since 0.6.x the onLifecyclePass setter
+  // registers the pass even when this ref runs after insertion.
+  const original = originalByElement.has(el) ? originalByElement.get(el) : el.onLifecyclePass?.bind(el)
+  originalByElement.set(el, original)
   el.onLifecyclePass = () => {
+    original?.()
     const parent = el.parent
     if (!parent) return
     const cached = previousByParent.get(parent)
