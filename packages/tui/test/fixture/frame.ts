@@ -13,30 +13,27 @@ function isBusyOutput(error: unknown) {
   return error instanceof Error && error.message.includes("OutputBusy")
 }
 
-/** The current frame, retried while the output buffer is still being flushed. Raw `captureCharFrame()` is safe only inside `waitFor` probes, which swallow OutputBusy and retry. */
-export async function captureFrame(app: Pick<Setup, "captureCharFrame">) {
+/** Runs `fn`, retrying while the output buffer is still being flushed (OutputBusy). */
+async function retryBusy<T>(fn: () => T): Promise<T> {
   for (let attempt = 0; attempt < 40; attempt++) {
     try {
-      return app.captureCharFrame()
+      return fn()
     } catch (error) {
       if (!isBusyOutput(error)) throw error
       await Bun.sleep(5)
     }
   }
-  return app.captureCharFrame()
+  return fn()
+}
+
+/** The current frame, retried while the output buffer is still being flushed. Raw `captureCharFrame()` is safe only inside `waitFor` probes, which swallow OutputBusy and retry. */
+export async function captureFrame(app: Pick<Setup, "captureCharFrame">) {
+  return retryBusy(() => app.captureCharFrame())
 }
 
 /** The current span frame, retried while the output buffer is still being flushed. Same OutputBusy exposure as `captureFrame`. */
 export async function captureSpans(app: Pick<Setup, "captureSpans">) {
-  for (let attempt = 0; attempt < 40; attempt++) {
-    try {
-      return app.captureSpans()
-    } catch (error) {
-      if (!isBusyOutput(error)) throw error
-      await Bun.sleep(5)
-    }
-  }
-  return app.captureSpans()
+  return retryBusy(() => app.captureSpans())
 }
 
 /**
