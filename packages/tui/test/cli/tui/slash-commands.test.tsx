@@ -288,7 +288,7 @@ describe("session slash commands", () => {
 
     await harness.app.waitForFrame(
       (value: string) =>
-        value.split("\n").filter((line) => line.includes("Working... 2 tool calls")).length === 2 &&
+        value.split("\n").filter((line) => line.includes("Exploring files...")).length === 2 &&
         value.includes("Assistant answer remains visible.") &&
         value.includes("Another ordinary assistant output.") &&
         value.includes("Thought: Planning"),

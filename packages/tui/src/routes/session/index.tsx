@@ -90,8 +90,10 @@ import { getScrollAcceleration } from "../../util/scroll"
 import { collapseToolOutput } from "../../util/collapse-tool-output"
 import { capOutputLines } from "../../util/cap-lines"
 import {
-  activityHeader,
   computeActivityGroups,
+  computeActivitySubGroups,
+  countActivityTargets,
+  typedActivityHeader,
   resolveActivityExpanded,
   summarizeActivity,
   toggleActivityOverride,
@@ -2012,15 +2014,50 @@ function TextPart(props: { last: boolean; part: TextPart; message: AssistantMess
 // Exported so tests can mount the activity block outside the full Session route.
 export function ActivityGroup(props: { groupID: string }) {
   const ctx = use()
+  const group = createMemo(() => ctx.activity().byID.get(props.groupID))
+  // Keyed by block id (strings) so streamed updates never remount a block:
+  // remounting would reset local row state (hover, nested reasoning toggles).
+  const subIDs = createMemo(() => {
+    const g = group()
+    return g ? computeActivitySubGroups(g).map((sub) => sub.id) : []
+  })
+  return (
+    <box
+      ref={(el: BoxRenderable) => {
+        alwaysSeparate.add(el)
+        setPreLayoutSiblingMargin(el, (previous) => {
+          return previous instanceof BoxRenderable && (previous.height > 1 || alwaysSeparate.has(previous)) ? 1 : 0
+        })
+      }}
+      paddingLeft={3}
+      flexShrink={0}
+    >
+      <For each={subIDs()}>{(id) => <ActivitySubGroupBlock groupID={props.groupID} subID={id} />}</For>
+    </box>
+  )
+}
+
+// One typed working block ("Explored N files", "Ran N commands", "Edited N
+// files", or the unchanged misc "Working..." block) inside an activity group.
+// The header is clickable: collapsed shows the summary, expanded renders each
+// call with its native full row.
+function ActivitySubGroupBlock(props: { groupID: string; subID: string }) {
+  const ctx = use()
   const renderer = useRenderer()
   const { theme } = useTheme()
   const [hover, setHover] = createSignal(false)
 
-  const group = createMemo(() => ctx.activity().byID.get(props.groupID))
-  const items = createMemo(() => group()?.items ?? [])
-  const parts = createMemo(() => group()?.parts ?? [])
+  const sub = createMemo(() => {
+    const g = ctx.activity().byID.get(props.groupID)
+    if (!g) return undefined
+    return computeActivitySubGroups(g).find((s) => s.id === props.subID)
+  })
+  const kind = createMemo(() => sub()?.kind ?? "misc")
+  const items = createMemo(() => sub()?.items ?? [])
+  const parts = createMemo(() => sub()?.parts ?? [])
   const summary = createMemo(() => summarizeActivity(items().map((item) => item.part)))
-  const expanded = createMemo(() => ctx.activityExpanded(props.groupID))
+  const targets = createMemo(() => countActivityTargets(items()))
+  const expanded = createMemo(() => ctx.activityExpanded(props.subID))
   // A running block counts up once a second, from its first started tool call.
   const startedAt = createMemo(() => {
     let start: number | undefined
@@ -2033,7 +2070,7 @@ export function ActivityGroup(props: { groupID: string }) {
   })
   const clock = useClock(() => summary().working && startedAt() !== undefined)
   const header = createMemo(() =>
-    activityHeader(summary(), {
+    typedActivityHeader(kind(), summary(), targets(), {
       expanded: expanded(),
       duration: summary().working
         ? startedAt() === undefined
@@ -2052,20 +2089,11 @@ export function ActivityGroup(props: { groupID: string }) {
 
   const toggle = () => {
     if (renderer.getSelection()?.getSelectedText()) return
-    ctx.toggleActivity(props.groupID)
+    ctx.toggleActivity(props.subID)
   }
 
   return (
-    <box
-      ref={(el: BoxRenderable) => {
-        alwaysSeparate.add(el)
-        setPreLayoutSiblingMargin(el, (previous) => {
-          return previous instanceof BoxRenderable && (previous.height > 1 || alwaysSeparate.has(previous)) ? 1 : 0
-        })
-      }}
-      paddingLeft={3}
-      flexShrink={0}
-    >
+    <box>
       <box onMouseOver={() => setHover(true)} onMouseOut={() => setHover(false)} onMouseUp={toggle}>
         <Switch>
           <Match when={summary().working}>

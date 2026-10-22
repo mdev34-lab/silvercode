@@ -378,8 +378,8 @@ describe("computeActivityGroups", () => {
     const group = computeActivityGroups(rows).byID.get("act-t1")
     expect(group).toBeDefined()
     const summary = summarizeActivity((group?.items ?? []).map((item) => item.part))
-    expect(activityHeader(summary, { expanded: false, duration: undefined }).marker).toBe("▸")
-    expect(activityHeader(summary, { expanded: true, duration: undefined }).marker).toBe("▾")
+    expect(activityHeader(summary, { expanded: false, duration: undefined }).marker).toBe("+")
+    expect(activityHeader(summary, { expanded: true, duration: undefined }).marker).toBe("−")
   })
 
   test("keeps the group id stable while the run grows at its tail", () => {
@@ -770,7 +770,7 @@ describe("activityHeader", () => {
       { count: 3, working: true, failed: 0, denied: false, interrupted: false, durationMs: undefined },
       { expanded: false, duration: undefined },
     )
-    expect(header).toEqual({ marker: "▸", main: "Working... 3 tool calls", failed: undefined, note: undefined })
+    expect(header).toEqual({ marker: "+", main: "Working... 3 tool calls", failed: undefined, note: undefined })
   })
 
   test("surfaces failures while working", () => {
@@ -787,7 +787,7 @@ describe("activityHeader", () => {
       { count: 9, working: false, failed: 0, denied: false, interrupted: false, durationMs: 4200 },
       { expanded: false, duration: "4.2s" },
     )
-    expect(header).toEqual({ marker: "▸", main: "Worked for 4.2s · 9 tool calls", failed: undefined, note: undefined })
+    expect(header).toEqual({ marker: "+", main: "Worked for 4.2s · 9 tool calls", failed: undefined, note: undefined })
   })
 
   test("pluralizes a single tool call", () => {
@@ -820,12 +820,12 @@ describe("activityHeader", () => {
       { count: 2, working: false, failed: 0, denied: false, interrupted: true, durationMs: 1000 },
       { expanded: true, duration: "1.0s" },
     )
-    expect(interrupted).toMatchObject({ marker: "▾", note: "interrupted" })
+    expect(interrupted).toMatchObject({ marker: "−", note: "interrupted" })
     const denied = activityHeader(
       { count: 2, working: false, failed: 0, denied: true, interrupted: false, durationMs: 1000 },
       { expanded: false, duration: "1.0s" },
     )
-    expect(denied).toMatchObject({ marker: "▸", note: "denied" })
+    expect(denied).toMatchObject({ marker: "+", note: "denied" })
   })
 })
 

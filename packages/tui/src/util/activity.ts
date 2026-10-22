@@ -188,6 +188,145 @@ export function summarizeActivity(parts: readonly ToolPart[]): ActivitySummary {
   return { count: parts.length, working, failed, denied, interrupted, durationMs }
 }
 
+
+export type ActivityKind = "explore" | "bash" | "edit" | "misc"
+
+// Working-block kinds, keyed by tool id. Everything not listed here (web
+// tools, LSP, skills, MCP, invalid, ...) stays in the unchanged "Working..."
+// misc block. Membership here is presentation only: it never changes whether
+// a call belongs to the activity run (that is NON_WORK_TOOLS above).
+const TOOL_KIND: Record<string, ActivityKind> = {
+  read: "explore",
+  glob: "explore",
+  grep: "explore",
+  list: "explore",
+  bash: "bash",
+  write: "edit",
+  edit: "edit",
+  apply_patch: "edit",
+}
+
+export function activityKindOf(tool: string): ActivityKind {
+  return TOOL_KIND[tool] ?? "misc"
+}
+
+export type ActivitySubGroup = {
+  id: string
+  kind: ActivityKind
+  items: ActivityItem[]
+  parts: ActivityGroupPart[]
+}
+
+// Splits one activity group into per-kind blocks in first-appearance order,
+// merging same-kind calls even when other kinds interleave (read, bash, read
+// -> one Explored block + one Ran block). Reasoning attaches to the block of
+// the tool call that follows it, since that is the action it plans; trailing
+// reasoning lands in the last block. Block ids derive from the group id and
+// the kind, so they stay stable while the run grows during streaming.
+export function computeActivitySubGroups(group: ActivityGroup): ActivitySubGroup[] {
+  const toolKinds = group.parts.map((item) =>
+    item.part.type === "tool" ? activityKindOf(item.part.tool) : undefined,
+  )
+  // Resolve reasoning to the kind of the tool call that follows it (that is
+  // the action it plans); trailing reasoning joins the previous tool's block.
+  const nextTool: (ActivityKind | undefined)[] = new Array(group.parts.length)
+  let next: ActivityKind | undefined
+  for (let i = group.parts.length - 1; i >= 0; i--) {
+    if (toolKinds[i] !== undefined) next = toolKinds[i]
+    nextTool[i] = next
+  }
+  const kinds: ActivityKind[] = new Array(group.parts.length)
+  let prev: ActivityKind | undefined
+  for (let i = 0; i < group.parts.length; i++) {
+    if (toolKinds[i] !== undefined) {
+      kinds[i] = toolKinds[i]!
+      prev = toolKinds[i]
+      continue
+    }
+    kinds[i] = nextTool[i] ?? prev ?? "misc"
+  }
+  const order: ActivityKind[] = []
+  const byKind = new Map<ActivityKind, ActivitySubGroup>()
+  for (let i = 0; i < group.parts.length; i++) {
+    const kind = kinds[i]!
+    let sub = byKind.get(kind)
+    if (!sub) {
+      sub = { id: `${group.id}:${kind}`, kind, items: [], parts: [] }
+      byKind.set(kind, sub)
+      order.push(kind)
+    }
+    sub.parts.push(group.parts[i]!)
+    if (group.parts[i]!.part.type === "tool") sub.items.push(group.parts[i] as ActivityItem)
+  }
+  return order.map((kind) => byKind.get(kind)!)
+}
+
+// The target a call counts towards in an Explored/Edited header. Distinct
+// targets keep repeated reads of one file from inflating the count. Calls
+// without a recognizable target still count once (fallback key per call).
+function activityTarget(part: ToolPart): string {
+  const input = "input" in part.state && part.state.input ? (part.state.input as Record<string, unknown>) : {}
+  const filePath = typeof input.filePath === "string" ? input.filePath : undefined
+  switch (part.tool) {
+    case "read":
+    case "write":
+    case "edit":
+      return filePath ?? part.id
+    case "apply_patch":
+      return filePath ?? part.id
+    case "glob":
+    case "grep":
+      return `${typeof input.pattern === "string" ? input.pattern : part.id} in ${typeof input.path === "string" ? input.path : ""}`
+    case "list":
+      return typeof input.path === "string" ? input.path : part.id
+    default:
+      return part.id
+  }
+}
+
+// Distinct-target count for file-oriented blocks (Explored/Edited). Bash and
+// misc blocks count calls instead, so they pass targetCount = summary.count.
+export function countActivityTargets(items: readonly ActivityItem[]): number {
+  const seen = new Set<string>()
+  for (const item of items) seen.add(activityTarget(item.part))
+  return seen.size
+}
+
+// Per-kind header text. The misc block keeps the original "Working... N tool
+// calls" / "Worked for X · N calls" wording; the typed blocks name the work.
+// Duration renders as "· X" for typed blocks (mockup format) and stays
+// "Worked for X · N calls" for misc.
+export function typedActivityHeader(
+  kind: ActivityKind,
+  summary: ActivitySummary,
+  targetCount: number,
+  options: { expanded: boolean; duration: string | undefined },
+): ActivityHeader {
+  const marker = options.expanded ? "−" : "+"
+  const failed = summary.failed > 0 ? `${summary.failed} failed` : undefined
+  const suffix = options.duration ? ` · ${options.duration}` : ""
+  if (kind === "misc") return activityHeader(summary, options)
+  if (kind === "explore") {
+    const main = summary.working
+      ? `Exploring files...${suffix}`
+      : `Explored ${targetCount} file${targetCount === 1 ? "" : "s"}${suffix}`
+    const note = summary.working ? undefined : summary.interrupted ? "interrupted" : summary.denied ? "denied" : undefined
+    return { marker, main, failed, note }
+  }
+  if (kind === "bash") {
+    const main = summary.working
+      ? `Running command...${suffix}`
+      : `Ran ${summary.count} command${summary.count === 1 ? "" : "s"}${suffix}`
+    const note = summary.working ? undefined : summary.interrupted ? "interrupted" : summary.denied ? "denied" : undefined
+    return { marker, main, failed, note }
+  }
+  const main = summary.working
+    ? `Editing files...${suffix}`
+    : `Edited ${targetCount} file${targetCount === 1 ? "" : "s"}${suffix}`
+  const note = summary.working ? undefined : summary.interrupted ? "interrupted" : summary.denied ? "denied" : undefined
+  return { marker, main, failed, note }
+}
+
 export type ActivityExpandedOverride = boolean | undefined
 
 // A group's expanded state is its explicit per-group override when the user
@@ -210,7 +349,7 @@ export function toggleActivityOverride(
 }
 
 export type ActivityHeader = {
-  marker: "▸" | "▾"
+  marker: "+" | "−"
   main: string
   failed: string | undefined
   note: string | undefined
@@ -220,7 +359,7 @@ export function activityHeader(
   summary: ActivitySummary,
   options: { expanded: boolean; duration: string | undefined },
 ): ActivityHeader {
-  const marker = options.expanded ? "▾" : "▸"
+  const marker = options.expanded ? "−" : "+"
   const calls = `${summary.count} tool call${summary.count === 1 ? "" : "s"}`
   const failed = summary.failed > 0 ? `${summary.failed} failed` : undefined
   if (summary.working) {

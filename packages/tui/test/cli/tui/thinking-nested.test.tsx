@@ -260,7 +260,7 @@ function deltaEvent(partID: string, delta: string, id: number): GlobalEvent {
 // Two completed tool calls put the reasoning inside a Working block; expand it
 // through the real header click so nested rows are on screen.
 async function expandWorkingBlock(app: Setup, keymap: () => OpenTuiKeymap) {
-  await waitFor(app, () => (app.captureCharFrame().includes("tool call") ? app.captureCharFrame() : undefined))
+  await waitFor(app, () => (app.captureCharFrame().includes("Ran 2 commands") ? app.captureCharFrame() : undefined))
   keymap().dispatchCommand("session.toggle.activity")
   await settle(app)
 }
