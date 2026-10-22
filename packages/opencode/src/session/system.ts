@@ -18,7 +18,7 @@ import PROMPT_CODEX from "./prompt/codex.txt"
 import PROMPT_TRINITY from "./prompt/trinity.txt"
 import PROMPT_STE_LITE from "./prompt/ste-lite.txt"
 import type { Provider } from "@/provider/provider"
-import type { Agent } from "@/agent/agent"
+import { Agent } from "@/agent/agent"
 import { Permission } from "@/permission"
 import { Skill } from "@/skill"
 import { AbsolutePath } from "@opencode-ai/core/schema"
@@ -72,6 +72,7 @@ export interface Interface {
   readonly environment: (model: Provider.Model) => Effect.Effect<string[]>
   readonly skills: (agent: Agent.Info) => Effect.Effect<string | undefined>
   readonly mcp: (agent: Agent.Info, permission?: PermissionV1.Ruleset) => Effect.Effect<string | undefined>
+  readonly delegation: (agent: Agent.Info, permission?: PermissionV1.Ruleset) => Effect.Effect<string | undefined>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/SystemPrompt") {}
@@ -80,6 +81,7 @@ const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const skill = yield* Skill.Service
+    const agents = yield* Agent.Service
     const mcp = yield* MCP.Service
     const locations = yield* LocationServiceMap.Service
     const config = yield* Config.Service
@@ -140,6 +142,31 @@ const layer = Layer.effect(
         ].join("\n")
       }),
 
+      delegation: Effect.fn("SystemPrompt.delegation")(function* (agent: Agent.Info, permission?: PermissionV1.Ruleset) {
+        // Only primary-style callers drive delegation; subagents execute.
+        if (agent.mode === "subagent") return
+
+        // Built from the live registry: any delegable agent that plans,
+        // excluding the caller itself, hidden agents, and agents the merged
+        // agent + session permission ruleset may not delegate to.
+        const ruleset = Permission.merge(agent.permission, permission ?? [])
+        const planners = (yield* agents.list()).filter(
+          (item) =>
+            item.name !== agent.name &&
+            item.mode !== "primary" &&
+            item.hidden !== true &&
+            Permission.evaluate("task", item.name, ruleset).action !== "deny" &&
+            (/\bplan/i.test(item.name) || /\bplan/i.test(item.description ?? "")),
+        )
+        if (planners.length === 0) return
+
+        const names = planners.map((item) => `\`${item.name}\``).join(" or ")
+        return [
+          `When a request needs non-trivial implementation planning, delegate that planning to ${names} once, at the start, with the task tool.`,
+          "Then work the plan step by step, carrying it forward instead of re-deriving or re-planning it at every tool call.",
+        ].join("\n")
+      }),
+
       mcp: Effect.fn("SystemPrompt.mcp")(function* (agent: Agent.Info, permission?: PermissionV1.Ruleset) {
         const ruleset = Permission.merge(agent.permission, permission ?? [])
         const instructions = (yield* mcp.instructions()).filter(
@@ -170,7 +197,7 @@ const locationServiceMapNode = LayerNode.make({
 export const node = LayerNode.make({
   service: Service,
   layer: layer,
-  deps: [Skill.node, MCP.node, Config.node, Global.node, locationServiceMapNode],
+  deps: [Skill.node, MCP.node, Config.node, Global.node, Agent.node, locationServiceMapNode],
 })
 
 export * as SystemPrompt from "./system"

@@ -3,7 +3,7 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Effect, Layer } from "effect"
 import os from "os"
 import { Global } from "@opencode-ai/core/global"
-import type { Agent } from "../../src/agent/agent"
+import { Agent } from "../../src/agent/agent"
 import { NamedError } from "@opencode-ai/core/util/error"
 import { Skill } from "../../src/skill"
 import { Permission } from "../../src/permission"
@@ -51,6 +51,26 @@ const build: Agent.Info = {
   options: {},
 }
 
+const plan: Agent.Info = {
+  name: "plan",
+  mode: "all",
+  native: true,
+  description:
+    "Planning specialist. Researches the codebase and the web, then drafts an implementation plan. Disallows all edit tools.",
+  permission: Permission.fromConfig({ "*": "allow" }),
+  options: {},
+}
+
+// A hidden planner must never be advertised in prompts.
+const hiddenPlanner: Agent.Info = {
+  name: "architect-planner",
+  mode: "all",
+  hidden: true,
+  description: "Planning helper for internal use.",
+  permission: Permission.fromConfig({ "*": "allow" }),
+  options: {},
+}
+
 const it = testEffect(
   LayerNode.compile(SystemPrompt.node, [
     [Global.node, Global.layerWith({ desktop: desktopDirectory })],
@@ -70,6 +90,12 @@ const it = testEffect(
               tools: ["tool-server_search", "tool-server_update"],
             },
           ]),
+      }),
+    ],
+    [
+      Agent.node,
+      Layer.mock(Agent.Service, {
+        list: () => Effect.succeed([build, plan, hiddenPlanner]),
       }),
     ],
     [
@@ -208,4 +234,62 @@ describe("session.system", () => {
       )
     }),
   )
+
+  it.effect("delegation nudge names the registry planning agent for primary callers", () =>
+    Effect.gen(function* () {
+      const prompt = yield* SystemPrompt.Service
+      const output = (yield* prompt.delegation(build)) ?? (yield* Effect.fail(new NamedError.Unknown({ message: "missing delegation output" })))
+
+      expect(output).toContain("`plan`")
+      expect(output).toContain("once, at the start")
+      expect(output).toContain("carrying it forward instead of re-deriving or re-planning it at every tool call")
+      expect(output).not.toContain("architect-planner")
+    }),
+  )
+
+  it.effect("delegation nudge is omitted for subagent callers", () =>
+    Effect.gen(function* () {
+      const prompt = yield* SystemPrompt.Service
+      const output = yield* prompt.delegation({ ...build, name: "general", mode: "subagent" })
+
+      expect(output).toBeUndefined()
+    }),
+  )
+
+  it.effect("delegation nudge is omitted for the planning agent itself", () =>
+    Effect.gen(function* () {
+      const prompt = yield* SystemPrompt.Service
+      const output = yield* prompt.delegation(plan)
+
+      expect(output).toBeUndefined()
+    }),
+  )
+
+  it.effect("delegation nudge is omitted when delegation to the planner is denied", () =>
+    Effect.gen(function* () {
+      const prompt = yield* SystemPrompt.Service
+      const output = yield* prompt.delegation({ ...build, permission: Permission.fromConfig({ task: { plan: "deny" } }) })
+
+      expect(output).toBeUndefined()
+    }),
+  )
+
+  it.effect("delegation nudge is omitted when the session ruleset denies delegation to the planner", () =>
+    Effect.gen(function* () {
+      const prompt = yield* SystemPrompt.Service
+      const output = yield* prompt.delegation(build, Permission.fromConfig({ task: { plan: "deny" } }) )
+
+      expect(output).toBeUndefined()
+    }),
+  )
+
+  test("plan prompt keeps the up-front plan output contract", async () => {
+    const text = await Bun.file(
+      new URL("../../src/agent/prompt/plan.txt", import.meta.url),
+    ).text()
+    expect(text).toContain("overview")
+    expect(text).toContain("numbered steps")
+    expect(text).toContain("independently verifiable")
+    expect(text).toContain("acceptance criteria")
+  })
 })

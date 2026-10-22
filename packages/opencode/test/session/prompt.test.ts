@@ -841,6 +841,31 @@ withMcpInstructions.instance(
   15_000,
 )
 
+it.instance(
+  "assembled primary system prompt carries the delegation nudge",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({
+        title: "Pinned",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      yield* llm.hang
+      yield* user(chat.id, "hello")
+
+      const fiber = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+      yield* awaitWithTimeout(llm.wait(1), "timed out waiting for the model request", "10 seconds")
+
+      const hits = yield* llm.hits
+      const body = JSON.stringify(hits[0]?.body)
+      expect(body).toContain("delegate that planning to `plan` once, at the start")
+      yield* Fiber.interrupt(fiber)
+    }),
+  15_000,
+)
+
 it.instance("legacy prompt emits message events without session.next events", () =>
   Effect.gen(function* () {
     const events = yield* EventV2Bridge.Service

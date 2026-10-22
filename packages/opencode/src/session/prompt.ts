@@ -1683,12 +1683,13 @@ const layer = Layer.effect(
 
             yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
 
-            const [skills, env, instructions, mcpInstructions, toolOverview] = yield* Effect.all([
+            const [skills, env, instructions, mcpInstructions, toolOverview, delegation] = yield* Effect.all([
               sys.skills(agent),
               sys.environment(model),
               instruction.system().pipe(Effect.orDie),
               sys.mcp(agent, session.permission),
               catalog.overview(session.id),
+              sys.delegation(agent, session.permission),
             ])
             const isDefaultPrimary = yield* agents
               .defaultInfo()
@@ -1714,6 +1715,7 @@ const layer = Layer.effect(
               ...(mcpInstructions ? [mcpInstructions] : []),
               ...(toolOverview ? [toolOverview] : []),
               ...(skills ? [skills] : []),
+              ...(delegation ? [delegation] : []),
               ...(isDefaultPrimary ? [PROMPT_SCOPE_CONTRACT] : []),
               ...(isDefaultPrimary && sessionWroteFiles ? [PROMPT_REVIEW_POLICY] : []),
               // Reviewer sessions keep their own structured-report contract and
