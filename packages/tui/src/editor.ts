@@ -47,9 +47,23 @@ export async function openEditor(input: { value: string; renderer: CliRenderer; 
     return (await readFile(file, "utf8")) || undefined
   } finally {
     await rm(file, { force: true }).catch(() => {})
-    input.renderer.currentRenderBuffer.clear()
-    await input.renderer.resume()
-    input.renderer.requestRender()
+    // The renderer can be destroyed while the external editor owns the
+    // terminal (SIGHUP/SIGTERM teardown between suspend and resume, #377).
+    // Resuming a destroyed renderer throws on the native guard; skip it and
+    // let the teardown path own the terminal instead.
+    if (!input.renderer.isDestroyed) {
+      input.renderer.currentRenderBuffer.clear()
+      try {
+        await input.renderer.resume()
+        // resume() is async: teardown can land while it is in flight, so
+        // recheck before touching the native scene again.
+        if (!input.renderer.isDestroyed) input.renderer.requestRender()
+      } catch (error) {
+        // Suppress only the teardown race; a resume() failure on a live
+        // renderer is a real defect and must propagate.
+        if (!input.renderer.isDestroyed) throw error
+      }
+    }
   }
 }
 
