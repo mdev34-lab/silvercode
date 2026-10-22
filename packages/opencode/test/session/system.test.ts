@@ -273,4 +273,23 @@ describe("session.system", () => {
       expect(output).toBeUndefined()
     }),
   )
+
+  it.effect("delegation nudge is omitted when the session ruleset denies delegation to the planner", () =>
+    Effect.gen(function* () {
+      const prompt = yield* SystemPrompt.Service
+      const output = yield* prompt.delegation(build, Permission.fromConfig({ task: { plan: "deny" } }) )
+
+      expect(output).toBeUndefined()
+    }),
+  )
+
+  test("plan prompt keeps the up-front plan output contract", async () => {
+    const text = await Bun.file(
+      new URL("../../src/agent/prompt/plan.txt", import.meta.url),
+    ).text()
+    expect(text).toContain("overview")
+    expect(text).toContain("numbered steps")
+    expect(text).toContain("independently verifiable")
+    expect(text).toContain("acceptance criteria")
+  })
 })

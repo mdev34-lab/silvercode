@@ -1689,7 +1689,7 @@ const layer = Layer.effect(
               instruction.system().pipe(Effect.orDie),
               sys.mcp(agent, session.permission),
               catalog.overview(session.id),
-              sys.delegation(agent),
+              sys.delegation(agent, session.permission),
             ])
             const isDefaultPrimary = yield* agents
               .defaultInfo()

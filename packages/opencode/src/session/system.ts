@@ -72,7 +72,7 @@ export interface Interface {
   readonly environment: (model: Provider.Model) => Effect.Effect<string[]>
   readonly skills: (agent: Agent.Info) => Effect.Effect<string | undefined>
   readonly mcp: (agent: Agent.Info, permission?: PermissionV1.Ruleset) => Effect.Effect<string | undefined>
-  readonly delegation: (agent: Agent.Info) => Effect.Effect<string | undefined>
+  readonly delegation: (agent: Agent.Info, permission?: PermissionV1.Ruleset) => Effect.Effect<string | undefined>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/SystemPrompt") {}
@@ -142,19 +142,20 @@ const layer = Layer.effect(
         ].join("\n")
       }),
 
-      delegation: Effect.fn("SystemPrompt.delegation")(function* (agent: Agent.Info) {
+      delegation: Effect.fn("SystemPrompt.delegation")(function* (agent: Agent.Info, permission?: PermissionV1.Ruleset) {
         // Only primary-style callers drive delegation; subagents execute.
         if (agent.mode === "subagent") return
 
         // Built from the live registry: any delegable agent that plans,
-        // excluding the caller itself, hidden agents, and agents the
-        // caller's permission may not delegate to.
+        // excluding the caller itself, hidden agents, and agents the merged
+        // agent + session permission ruleset may not delegate to.
+        const ruleset = Permission.merge(agent.permission, permission ?? [])
         const planners = (yield* agents.list()).filter(
           (item) =>
             item.name !== agent.name &&
             item.mode !== "primary" &&
             item.hidden !== true &&
-            Permission.evaluate("task", item.name, agent.permission).action !== "deny" &&
+            Permission.evaluate("task", item.name, ruleset).action !== "deny" &&
             (/\bplan/i.test(item.name) || /\bplan/i.test(item.description ?? "")),
         )
         if (planners.length === 0) return
