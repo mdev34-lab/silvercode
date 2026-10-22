@@ -13,6 +13,9 @@ import PROMPT_PLAN from "./prompt/plan.txt"
 import WORK_SWITCH from "./prompt/work-switch.txt"
 import PLAN_MODE from "./prompt/plan-mode.txt"
 
+const scratchpad = (plan: string) =>
+  `A plan file exists at ${plan}. Execute on the plan defined within it, and keep the file current as your scratchpad: check off steps as you finish them and revise the remaining steps when reality diverges from the plan.`
+
 export const apply = Effect.fn("SessionReminders.apply")(function* (input: {
   messages: SessionV1.WithParts[]
   agent: Agent.Info
@@ -37,12 +40,15 @@ export const apply = Effect.fn("SessionReminders.apply")(function* (input: {
     }
     const wasPlan = input.messages.some((msg) => msg.info.role === "assistant" && AgentSchema.canonicalID(msg.info.agent ?? "") === "think")
     if (wasPlan && input.agent.name === "work") {
+      const ctx = yield* InstanceState.context
+      const plan = Session.plan(input.session, ctx)
+      const exists = yield* fsys.existsSafe(plan)
       userMessage.parts.push({
         id: PartID.ascending(),
         messageID: userMessage.info.id,
         sessionID: userMessage.info.sessionID,
         type: "text",
-        text: WORK_SWITCH,
+        text: exists ? `${WORK_SWITCH}\n\n${scratchpad(plan)}` : WORK_SWITCH,
         synthetic: true,
       })
     }
@@ -59,9 +65,7 @@ export const apply = Effect.fn("SessionReminders.apply")(function* (input: {
       messageID: userMessage.info.id,
       sessionID: userMessage.info.sessionID,
       type: "text",
-      text: exists
-        ? `${WORK_SWITCH}\n\nA plan file exists at ${plan}. Execute on the plan defined within it, and keep the file current as your scratchpad: check off steps as you finish them and revise the remaining steps when reality diverges from the plan.`
-        : WORK_SWITCH,
+      text: exists ? `${WORK_SWITCH}\n\n${scratchpad(plan)}` : WORK_SWITCH,
       synthetic: true,
     })
     userMessage.parts.push(part)
