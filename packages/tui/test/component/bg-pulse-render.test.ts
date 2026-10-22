@@ -59,3 +59,19 @@ describe("GoUpsellArtPainter bounds (#378)", () => {
     expect(buffer.buffers.bg.some((value) => value !== 0)).toBe(true)
   })
 })
+
+describe("GoUpsellArtPainter skipped frames (#378 review)", () => {
+  it("advances the pulse clock even when the frame is skipped", () => {
+    const skipped = makePainter()
+    skipped.render(makeBuffer(0, 0), { deltaTime: 400 })
+    skipped.render(makeBuffer(80, 24, 100), { deltaTime: 400 })
+    const afterSkips = makeBuffer(80, 24)
+    skipped.render(afterSkips, { deltaTime: 0 })
+
+    const direct = makePainter()
+    const reference = makeBuffer(80, 24)
+    direct.render(reference, { deltaTime: 800 })
+
+    expect(Array.from(afterSkips.buffers.bg)).toEqual(Array.from(reference.buffers.bg))
+  })
+})

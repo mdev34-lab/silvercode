@@ -168,6 +168,10 @@ export class GoUpsellArtPainter {
   }
 
   render(frameBuffer: OptimizedBuffer, options: GoUpsellArtRenderOptions = {}) {
+    // Advance the pulse clock even when the frame below is skipped: a skipped
+    // frame must not freeze the animation (#378 review).
+    const rgb = options.rgb === true
+    this.elapsed = (this.elapsed + (options.deltaTime ?? 0)) % PERIOD
     // A zero/negative layout transition or a stale native buffer view would
     // index past the typed arrays below (#378); skip the frame instead.
     const buffers = frameBuffer.buffers
@@ -175,8 +179,6 @@ export class GoUpsellArtPainter {
     if (cells <= 0) return
     if (buffers.char.length < cells || buffers.attributes.length < cells) return
     if (buffers.fg.length < cells * 4 || buffers.bg.length < cells * 4) return
-    const rgb = options.rgb === true
-    this.elapsed = (this.elapsed + (options.deltaTime ?? 0)) % PERIOD
     this.rebuildGeometry(frameBuffer, rgb)
     if (options.cache !== false) {
       this.drawCached(frameBuffer, rgb)
