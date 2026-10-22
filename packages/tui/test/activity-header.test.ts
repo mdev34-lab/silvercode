@@ -127,3 +127,61 @@ describe("computeActivitySubGroups", () => {
     expect(subs[0]!.parts.map((item) => item.part.id)).toEqual(["a", "r1"])
   })
 })
+
+describe("activity kind lookup", () => {
+  test("inherited object property names are misc, not a bogus kind", () => {
+    expect(activityKindOf("constructor")).toBe("misc")
+    expect(activityKindOf("toString")).toBe("misc")
+    expect(activityKindOf("hasOwnProperty")).toBe("misc")
+    expect(activityKindOf("read")).toBe("explore")
+  })
+
+  test("a tool named constructor groups under misc", () => {
+    const group = groupOf([tool("t1", "constructor", {})])
+    const subs = computeActivitySubGroups(group)
+    expect(subs).toHaveLength(1)
+    expect(subs[0]?.kind).toBe("misc")
+  })
+})
+
+describe("activity target counting", () => {
+  test("path spellings normalize to one target", () => {
+    const group = groupOf([
+      tool("t1", "read", { filePath: "src/a.ts" }),
+      tool("t2", "read", { filePath: "./src/a.ts" }),
+    ])
+    const subs = computeActivitySubGroups(group)
+    expect(subs).toHaveLength(1)
+    expect(countActivityTargets(subs[0]!.items)).toBe(1)
+  })
+
+  test("repeated patches to the same file count once, parsed from patchText", () => {
+    const patch = "*** Begin Patch\n*** Update File: src/a.ts\n@@\n-old\n+new\n*** End Patch\n"
+    const group = groupOf([
+      tool("t1", "apply_patch", { patchText: patch }),
+      tool("t2", "apply_patch", { patchText: patch }),
+    ])
+    const subs = computeActivitySubGroups(group)
+    expect(subs).toHaveLength(1)
+    expect(subs[0]?.kind).toBe("edit")
+    expect(countActivityTargets(subs[0]!.items)).toBe(1)
+  })
+
+  test("one multi-file patch counts each affected file", () => {
+    const patch =
+      "*** Begin Patch\n*** Update File: src/a.ts\n@@\n-old\n+new\n*** Add File: src/b.ts\n+created\n*** Delete File: ./src/c.ts\n*** End Patch\n"
+    const group = groupOf([tool("t1", "apply_patch", { patchText: patch })])
+    const subs = computeActivitySubGroups(group)
+    expect(subs).toHaveLength(1)
+    expect(countActivityTargets(subs[0]!.items)).toBe(3)
+    const summary = summarizeActivity(group.items.map((item) => item.part as ToolPart))
+    const header = typedActivityHeader("edit", summary, 3, { expanded: false, duration: undefined })
+    expect(header.main).toBe("Edited 3 files")
+  })
+
+  test("a patch with unparseable text falls back to one target per call", () => {
+    const group = groupOf([tool("t1", "apply_patch", { patchText: "not a patch" })])
+    const subs = computeActivitySubGroups(group)
+    expect(countActivityTargets(subs[0]!.items)).toBe(1)
+  })
+})

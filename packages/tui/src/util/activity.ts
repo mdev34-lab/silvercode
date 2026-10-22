@@ -207,7 +207,9 @@ const TOOL_KIND: Record<string, ActivityKind> = {
 }
 
 export function activityKindOf(tool: string): ActivityKind {
-  return TOOL_KIND[tool] ?? "misc"
+  // Own-property lookup: indexing a plain object would resolve inherited
+  // names ("constructor", "toString") to a bogus kind for unknown tools.
+  return Object.prototype.hasOwnProperty.call(TOOL_KIND, tool) ? TOOL_KIND[tool]! : "misc"
 }
 
 export type ActivitySubGroup = {
@@ -264,21 +266,41 @@ export function computeActivitySubGroups(group: ActivityGroup): ActivitySubGroup
 // The target a call counts towards in an Explored/Edited header. Distinct
 // targets keep repeated reads of one file from inflating the count. Calls
 // without a recognizable target still count once (fallback key per call).
+// Path spellings differ per call ("src/a.ts" vs "./src/a.ts"); normalize
+// before counting so one file is one target.
+function normalizeTargetPath(value: string): string {
+  let out = value.trim().replaceAll("\\", "/")
+  while (out.startsWith("./")) out = out.slice(2)
+  return out.replace(/\/+/g, "/")
+}
+
+// apply_patch inputs carry the whole patch text, not a filePath. Parse the
+// affected files out of the patch headers so repeated patches to the same
+// file count once and one multi-file patch counts each file.
+const PATCH_FILE_RE = /^\*\*\* (?:Add|Update|Delete) File: (.+)$/gm
+
 function activityTarget(part: ToolPart): string {
   const input = "input" in part.state && part.state.input ? (part.state.input as Record<string, unknown>) : {}
-  const filePath = typeof input.filePath === "string" ? input.filePath : undefined
+  const filePath = typeof input.filePath === "string" ? normalizeTargetPath(input.filePath) : undefined
   switch (part.tool) {
     case "read":
     case "write":
     case "edit":
       return filePath ?? part.id
-    case "apply_patch":
+    case "apply_patch": {
+      if (typeof input.patchText === "string") {
+        const files = [...input.patchText.matchAll(PATCH_FILE_RE)]
+          .map((match) => normalizeTargetPath(match[1] ?? ""))
+          .filter((file) => file.length > 0)
+        if (files.length > 0) return [...new Set(files)].sort().join("\n")
+      }
       return filePath ?? part.id
+    }
     case "glob":
     case "grep":
-      return `${typeof input.pattern === "string" ? input.pattern : part.id} in ${typeof input.path === "string" ? input.path : ""}`
+      return `${typeof input.pattern === "string" ? input.pattern : part.id} in ${typeof input.path === "string" ? normalizeTargetPath(input.path) : ""}`
     case "list":
-      return typeof input.path === "string" ? input.path : part.id
+      return typeof input.path === "string" ? normalizeTargetPath(input.path) : part.id
     default:
       return part.id
   }
@@ -288,7 +310,11 @@ function activityTarget(part: ToolPart): string {
 // misc blocks count calls instead, so they pass targetCount = summary.count.
 export function countActivityTargets(items: readonly ActivityItem[]): number {
   const seen = new Set<string>()
-  for (const item of items) seen.add(activityTarget(item.part))
+  for (const item of items) {
+    // A multi-file apply_patch yields one composite key (newline-joined, and
+    // real paths never contain newlines); count each affected file.
+    for (const target of activityTarget(item.part).split("\n")) seen.add(target)
+  }
   return seen.size
 }
 
