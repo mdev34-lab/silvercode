@@ -11,7 +11,8 @@ import { EditTool } from "./edit"
 import { GlobTool } from "./glob"
 import { GrepTool } from "./grep"
 import { ReadTool } from "./read"
-import { TaskTool } from "./task"
+import { makeParameters, subagentTypeDescription, TaskTool } from "./task"
+import { ToolJsonSchema } from "./json-schema"
 import { Database } from "@opencode-ai/core/database/database"
 import { TodoWriteTool } from "./todo"
 import { WebFetchTool } from "./webfetch"
@@ -280,12 +281,16 @@ const layer = Layer.effect(
       return (yield* all()).map((tool) => tool.id)
     })
 
-    const describeTask = Effect.fn("ToolRegistry.describeTask")(function* (agent: Agent.Info) {
+    const delegatable = Effect.fn("ToolRegistry.delegatable")(function* (agent: Agent.Info) {
       const items = (yield* agents.list()).filter((item) => item.mode !== "primary")
       const filtered = items.filter(
         (item) => Permission.evaluate("task", item.name, agent.permission).action !== "deny",
       )
-      const list = filtered.toSorted((a, b) => a.name.localeCompare(b.name))
+      return filtered.toSorted((a, b) => a.name.localeCompare(b.name))
+    })
+
+    const describeTask = Effect.fn("ToolRegistry.describeTask")(function* (agent: Agent.Info) {
+      const list = yield* delegatable(agent)
       const description = list
         .map(
           (item) =>
@@ -355,6 +360,14 @@ const layer = Layer.effect(
             output.parameters === tool.parameters || output.jsonSchema !== tool.jsonSchema
               ? output.jsonSchema
               : undefined
+          // The task tool's `subagent_type` parameter enumerates the same
+          // per-caller, permission-filtered agents its description lists, so
+          // the choices are visible where the model fills in the value. A
+          // plugin-replaced parameter schema wins over this enrichment.
+          const taskParameters =
+            tool.id === TaskTool.id && output.parameters === tool.parameters
+              ? makeParameters(subagentTypeDescription(yield* delegatable(input.agent)))
+              : undefined
           return {
             id: tool.id,
             description: [
@@ -364,8 +377,8 @@ const layer = Layer.effect(
             ]
               .filter(Boolean)
               .join("\n"),
-            parameters: output.parameters,
-            jsonSchema,
+            parameters: taskParameters ?? output.parameters,
+            jsonSchema: taskParameters ? ToolJsonSchema.fromSchema(taskParameters) : jsonSchema,
             metadata: tool.metadata,
             execute: tool.execute,
             formatValidationError: tool.formatValidationError,

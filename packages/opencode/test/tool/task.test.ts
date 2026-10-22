@@ -21,6 +21,7 @@ import { Permission } from "@/permission"
 
 import { FinishTool, type Reason } from "../../src/tool/finish"
 import { TaskTool, type TaskPromptOps } from "../../src/tool/task"
+import { ToolJsonSchema } from "../../src/tool/json-schema"
 
 type LooseTaskPromptOps = Omit<TaskPromptOps, "prompt"> & {
   prompt(input: Parameters<TaskPromptOps["prompt"]>[0]): Effect.Effect<any, any, any>
@@ -386,6 +387,74 @@ describe("tool.task", () => {
 
         expect(description).toContain("- alpha: Alpha agent")
         expect(description).not.toContain("- zebra: Zebra agent")
+      }),
+    {
+      config: {
+        permission: {
+          task: {
+            "*": "allow",
+            zebra: "deny",
+          },
+        },
+        agent: {
+          zebra: {
+            description: "Zebra agent",
+            mode: "subagent",
+          },
+          alpha: {
+            description: "Alpha agent",
+            mode: "subagent",
+          },
+        },
+      },
+    },
+  )
+
+  it.instance(
+    "subagent_type parameter enumerates the caller's delegatable agents",
+    () =>
+      Effect.gen(function* () {
+        const agent = yield* Agent.Service
+        const build = yield* agent.get("work")
+        const registry = yield* ToolRegistry.Service
+        const task = (yield* registry.tools({ ...ref, agent: build })).find((tool) => tool.id === TaskTool.id)
+        expect(task).toBeDefined()
+        const schema = ToolJsonSchema.fromTool(task!) as {
+          properties: { subagent_type: { description: string } }
+        }
+        const description = schema.properties.subagent_type.description
+        // Generated from the agent registry, same permission-filtered list the
+        // tool description appends: no primary agents, no denied names.
+        expect(description).toContain("plan - Planning specialist.")
+        expect(description).toContain("zebra - Zebra agent")
+        expect(description).not.toContain("work - General-purpose workhorse")
+      }),
+    {
+      config: {
+        agent: {
+          zebra: {
+            description: "Zebra agent",
+            mode: "subagent",
+          },
+        },
+      },
+    },
+  )
+
+  it.instance(
+    "subagent_type parameter hides denied subagents for the caller",
+    () =>
+      Effect.gen(function* () {
+        const agent = yield* Agent.Service
+        const build = yield* agent.get("work")
+        const registry = yield* ToolRegistry.Service
+        const task = (yield* registry.tools({ ...ref, agent: build })).find((tool) => tool.id === TaskTool.id)
+        const schema = ToolJsonSchema.fromTool(task!) as {
+          properties: { subagent_type: { description: string } }
+        }
+        const description = schema.properties.subagent_type.description
+        expect(description).toContain("alpha - Alpha agent")
+        expect(description).not.toContain("zebra - Zebra agent")
       }),
     {
       config: {

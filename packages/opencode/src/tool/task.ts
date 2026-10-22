@@ -65,26 +65,49 @@ const BACKGROUND_UPDATED = [
   'If it is not finished and you have no independent work left, the main session can call finish with reason "waiting_for_subagent" to yield — this task\'s notification wakes it. A subagent may yield the same way only for background subagents it launched itself: its job stays running until they report. With nothing of its own in flight it must deliver with "success" or "failure" instead.',
 ].join("\n")
 
+const SUBAGENT_TYPE_FALLBACK = "The type of specialized agent to use for this task"
+
+/**
+ * Render the delegation-eligible agents into the `subagent_type` parameter
+ * description, so specialists are visible at the point the model picks a value
+ * instead of only in the tool description prose. The registry supplies the
+ * per-caller, permission-filtered list; a nudge, not a restriction - any
+ * resolvable name stays valid.
+ */
+export function subagentTypeDescription(agents: Agent.Info[]): string {
+  const available = agents
+    .filter((agent) => agent.mode !== "primary" && !agent.hidden && agent.description)
+    .map((agent) => `${agent.name} - ${agent.description}`)
+  return available.length ? `${SUBAGENT_TYPE_FALLBACK}. Available: ${available.join("; ")}` : SUBAGENT_TYPE_FALLBACK
+}
+
 const BaseParameterFields = {
   description: Schema.String.annotate({ description: "A short (3-5 words) description of the task" }),
   prompt: Schema.String.annotate({ description: "The task for the agent to perform" }),
-  subagent_type: Schema.String.annotate({ description: "The type of specialized agent to use for this task" }),
+  subagent_type: Schema.String.annotate({ description: SUBAGENT_TYPE_FALLBACK }),
   task_id: Schema.optional(Schema.String).annotate({
     description: "Resume a previous subagent session by its task_id",
   }),
   command: Schema.optional(Schema.String).annotate({ description: "Triggering command" }),
 }
 
-export const Parameters = Schema.Struct({
-  ...BaseParameterFields,
-  effort: Schema.optional(AgentEffort.Level).annotate({
-    description: "Override the child's effort policy; omit to inherit.",
-  }),
-  background: Schema.optional(Schema.Boolean).annotate({
-    description:
-      "Run asynchronously and get notified on completion (default). Agents configured with `background: false` in opencode.json run in the foreground and wait for the result; true forces a background launch; false on any other agent still launches it in the background.",
-  }),
-})
+export const makeParameters = (subagentType: string) =>
+  Schema.Struct({
+    ...BaseParameterFields,
+    subagent_type: Schema.String.annotate({ description: subagentType }),
+    effort: Schema.optional(AgentEffort.Level).annotate({
+      description: "Override the child's effort policy; omit to inherit.",
+    }),
+    background: Schema.optional(Schema.Boolean).annotate({
+      description:
+        "Run asynchronously and get notified on completion (default). Agents configured with `background: false` in opencode.json run in the foreground and wait for the result; true forces a background launch; false on any other agent still launches it in the background.",
+    }),
+  })
+
+// Module-scope fallback so imports that cannot run the tool's Effect init (the
+// JSON-Schema snapshot test) still see a stable wire shape; the constructed
+// tool replaces this with the enumerated description.
+export const Parameters = makeParameters(SUBAGENT_TYPE_FALLBACK)
 
 /**
  * Wording for the termination element the parent reads out of the envelope.
