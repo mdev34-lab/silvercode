@@ -3,7 +3,7 @@ import type { ColorInput, RGBA, ScrollBoxRenderable } from "@opentui/core"
 import { useRenderer } from "@opentui/solid"
 import { Locale } from "../../util/locale"
 import { tint } from "../../context/theme"
-import { createEffect, createMemo, For, Match, Switch } from "solid-js"
+import { createEffect, createMemo, For, Match, onCleanup, Switch } from "solid-js"
 import { buildFileTree, flattenFileTree, type FileTreeItem, type FileTreeRow } from "./diff-viewer-file-tree-utils"
 import { Panel } from "./diff-viewer-ui"
 
