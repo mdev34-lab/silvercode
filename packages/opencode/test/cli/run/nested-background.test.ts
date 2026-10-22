@@ -231,10 +231,17 @@ describe("opencode run with a report deferred during a successful child turn", (
         )
         // This refusal is evidence that the last grandchild has actually
         // settled. No fabricated finish and no assumed event interleaving.
+        // On slow runners the child can absorb the deferred report before its
+        // wait-guard turn runs, ending with "late report received" instead -
+        // then this matcher is legitimately never pulled (#511).
+        let guardRefused = false
         yield* llm.pushMatch(
-          (hit) =>
-            last(hit.body as Body)?.role === "tool" &&
-            lastText(hit.body as Body).includes("has no background subagents of its own"),
+          (hit) => {
+            if (last(hit.body as Body)?.role !== "tool") return false
+            if (!lastText(hit.body as Body).includes("has no background subagents of its own")) return false
+            guardRefused = true
+            return true
+          },
           reply().tool("finish", { reason: "success", result: "CHILD_EARLY_DONE" }),
         )
         yield* llm.pushMatch(
@@ -303,7 +310,9 @@ describe("opencode run with a report deferred during a successful child turn", (
         }
         opencode.expectExit(result, 0)
         expect(result.stdout).toContain("ROOT_RECOVERED_DEFERRED_REPORT")
-        expect(yield* llm.pending).toBe(0)
+        // Every scripted reply but the optional guard-refusal one was pulled:
+        // when the child absorbs the report first, exactly that one remains.
+        expect(yield* llm.pending).toBe(guardRefused ? 0 : 1)
       }),
     30_000,
   )
