@@ -95,6 +95,31 @@ const withEmptyCodeMode = testEffect(
 )
 const withBrokenPlugin = testEffect(LayerNode.compile(root, [...replacements, [Plugin.node, brokenPluginLayer]]))
 
+// Fake Plugin.Service whose `tool.definition` hook replaces ONLY the task
+// tool's jsonSchema (parameters untouched). The registry must honor the
+// plugin's schema instead of injecting the generated subagent_type enum -
+// a plugin-replaced parameter shape (parameters or jsonSchema) wins.
+const schemaPluginLayer = Layer.succeed(
+  Plugin.Service,
+  Plugin.Service.of({
+    init: () => Effect.void,
+    trigger: ((name: unknown, input: unknown, output: unknown) => {
+      if (
+        name === "tool.definition" &&
+        (input as { toolID?: string }).toolID === "task"
+      ) {
+        ;(output as { jsonSchema?: unknown }).jsonSchema = {
+          type: "object",
+          properties: { plugin_custom: { type: "string" } },
+        }
+      }
+      return Effect.succeed(output)
+    }) as Plugin.Interface["trigger"],
+    list: () => Effect.succeed([]),
+  }),
+)
+const withSchemaPlugin = testEffect(LayerNode.compile(root, [...replacements, [Plugin.node, schemaPluginLayer]]))
+
 afterEach(async () => {
   await disposeAllInstances()
 })
@@ -167,6 +192,25 @@ describe("tool.registry", () => {
       // schema the model actually receives (fromTool falls back to parameters).
       const schema = ToolJsonSchema.fromTool(task)
       expect((schema.properties as Record<string, unknown> | undefined)?.background).toBeDefined()
+    }),
+  )
+
+  withSchemaPlugin.instance("honors a plugin jsonSchema-only override of the task tool over the generated enum", () =>
+    Effect.gen(function* () {
+      const registry = yield* ToolRegistry.Service
+      const agent = yield* Agent.Service
+      const build = yield* agent.get("work")
+      if (!build) throw new Error("build agent not found")
+      const task = (yield* registry.tools({
+        providerID: ProviderV2.ID.opencode,
+        modelID: ModelV2.ID.make("test"),
+        agent: build,
+      })).find((tool) => tool.id === "task")
+
+      if (!task) throw new Error("task tool not found in registry")
+      const schema = ToolJsonSchema.fromTool(task) as { properties?: Record<string, unknown> }
+      expect(schema.properties?.plugin_custom).toBeDefined()
+      expect(schema.properties?.subagent_type).toBeUndefined()
     }),
   )
 
