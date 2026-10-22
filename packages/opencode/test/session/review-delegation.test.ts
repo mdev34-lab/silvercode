@@ -382,9 +382,9 @@ const scriptPolicyFollowingModel = Effect.gen(function* () {
   // required envelope through the real finish call, so the review can complete.
   yield* llm.pushMatch(reviewerMatch, reply().tool("finish", { reason: "success", result: REPORT }))
   // Policy present, verdict received: consume it and fix the finding.
-  yield* llm.pushMatch(policyMatch, reply().text("Fixed the off-by-one in src/cache.ts."))
+  yield* llm.pushMatch(policyMatch, reply().text("Fixed the off-by-one in src/cache.ts.").stop())
   // Policy absent (control arm): self-review, the old behavior.
-  yield* llm.pushMatch(noPolicyMatch, reply().text("I re-read the diff and the tests pass — the fix looks correct."))
+  yield* llm.pushMatch(noPolicyMatch, reply().text("I re-read the diff and the tests pass — the fix looks correct.").stop())
 })
 
 type CompletedToolPart = SessionV1.ToolPart & { state: SessionV1.ToolStateCompleted }
