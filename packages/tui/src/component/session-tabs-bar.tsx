@@ -1,6 +1,6 @@
 /** @jsxImportSource @opentui/solid */
 import { createMemo, For, Show } from "solid-js"
-import { useTerminalDimensions } from "@opentui/solid"
+import { useTerminalDimensions } from "../util/terminal-dimensions"
 import { useTheme } from "../context/theme"
 import { useSync } from "../context/sync"
 import { useRoute } from "../context/route"

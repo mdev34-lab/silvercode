@@ -1,6 +1,6 @@
 /** @jsxImportSource @opentui/solid */
 import { RGBA, TextAttributes, type KeyEvent, type Renderable } from "@opentui/core"
-import { useTerminalDimensions } from "@opentui/solid"
+import { useTerminalDimensions } from "../../util/terminal-dimensions"
 import { createEffect, createMemo, createSignal, For, Show } from "solid-js"
 import { useBindings, useKeymapSelector } from "../../keymap"
 import type { ActiveKey } from "@opentui/keymap"
