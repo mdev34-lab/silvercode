@@ -56,15 +56,21 @@ const squote = (text: string) => `'${text}'`
 const projectRoot = path.join(__dirname, "../..")
 const bin = quote(process.execPath.replaceAll("\\", "/"))
 const evalarg = (text: string) => (Shell.name(Shell.acceptable()) === "cmd" ? quote(text) : squote(text))
+// PowerShell needs the call operator to invoke a quoted executable path,
+// same as the fill() helper in shell.test.ts.
+const command = (text: string) => {
+  const line = `${bin} -e ${evalarg(text)}`
+  return ["pwsh", "powershell"].includes(Shell.name(Shell.acceptable())) ? `& ${line}` : line
+}
 
 describe("tool.shell output spill failure", () => {
   it.live("survives a failing spill stream and warns instead of crashing", () =>
     Effect.gen(function* () {
-      const command = `${bin} -e ${evalarg('for(let i=0;i<200;i++)console.log("x".repeat(64))')}`
+      const commandline = command('for(let i=0;i<200;i++)console.log("x".repeat(64))')
       const info = yield* ShellTool
       const bash = yield* info.init()
       const result = yield* bash.execute(
-        { command } as Tool.InferParameters<typeof ShellTool>,
+        { command: commandline } as Tool.InferParameters<typeof ShellTool>,
         ctx,
       )
 
