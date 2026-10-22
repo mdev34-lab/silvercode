@@ -230,14 +230,32 @@ export function Prompt(props: PromptProps) {
   let promptPartTypeId = 0
   const event = useEvent()
 
+  // Every deferred callback below captures the renderer, the input or the
+  // router; an untracked setTimeout can still fire after the Prompt is
+  // destroyed (tab closed) and navigate or paint into a dead tree (#418).
+  // Track each handle and cancel the survivors on unmount.
+  const timers = new Set<ReturnType<typeof setTimeout>>()
+  function defer(callback: () => void, ms: number) {
+    const handle = setTimeout(() => {
+      timers.delete(handle)
+      callback()
+    }, ms)
+    timers.add(handle)
+    return handle
+  }
+  onCleanup(() => {
+    for (const handle of timers) clearTimeout(handle)
+    timers.clear()
+  })
+
   // Prompt mounts per session/home and on every tab switch; without the
   // unsubscribe each stale mount inserts the appended text again (#417).
   const offPromptAppend = event.on("tui.prompt.append", (evt, { workspace }) => {
     if (workspace !== project.workspace.current()) return
     if (!input || input.isDestroyed) return
     input.insertText(evt.properties.text)
-    setTimeout(() => {
-      // setTimeout is a workaround and needs to be addressed properly
+    defer(() => {
+      // defer is a workaround and needs to be addressed properly
       if (!input || input.isDestroyed) return
       input.invalidateIntrinsicSize()
       input.gotoBufferEnd()
@@ -434,7 +452,7 @@ export function Prompt(props: PromptProps) {
 
           setStore("interrupt", store.interrupt + 1)
 
-          setTimeout(() => {
+          defer(() => {
             setStore("interrupt", 0)
           }, DOUBLE_PRESS_WINDOW_MS)
 
@@ -1174,7 +1192,7 @@ export function Prompt(props: PromptProps) {
     // temporary hack to make sure the message is sent
     if (!props.sessionID) {
       if (editorParts.length > 0) editor.preserveSelectionFromNewSession()
-      setTimeout(() => {
+      defer(() => {
         route.navigate({
           type: "session",
           sessionID,
@@ -1265,7 +1283,7 @@ export function Prompt(props: PromptProps) {
       insertText: (value) => input.insertText(value),
     })
 
-    setTimeout(() => {
+    defer(() => {
       if (!input || input.isDestroyed) return
       input.invalidateIntrinsicSize()
       renderer.requestRender()
@@ -1476,7 +1494,7 @@ export function Prompt(props: PromptProps) {
               onSubmit={() => {
                 // IME: double-defer so the last composed character (e.g. Korean
                 // hangul) is flushed to plainText before we read it for submission.
-                setTimeout(() => setTimeout(() => submit(), 0), 0)
+                defer(() => defer(() => submit(), 0), 0)
               }}
               onPaste={async (event: PasteEvent) => {
                 if (props.disabled) {
@@ -1513,8 +1531,8 @@ export function Prompt(props: PromptProps) {
                   promptPartTypeId = input.extmarks.registerType("prompt-part")
                 }
                 props.ref?.(ref)
-                setTimeout(() => {
-                  // setTimeout is a workaround and needs to be addressed properly
+                defer(() => {
+                  // defer is a workaround and needs to be addressed properly
                   if (!input || input.isDestroyed) return
                   input.cursorColor = theme.text
                   if (tuiConfig.cursor) input.cursorStyle = tuiConfig.cursor
