@@ -11,7 +11,8 @@ import { EditTool } from "./edit"
 import { GlobTool } from "./glob"
 import { GrepTool } from "./grep"
 import { ReadTool } from "./read"
-import { TaskTool } from "./task"
+import { delegatableAgents, describeAgents, makeParameters, subagentTypeDescription, TaskTool } from "./task"
+import { ToolJsonSchema } from "./json-schema"
 import { Database } from "@opencode-ai/core/database/database"
 import { TodoWriteTool } from "./todo"
 import { WebFetchTool } from "./webfetch"
@@ -280,19 +281,13 @@ const layer = Layer.effect(
       return (yield* all()).map((tool) => tool.id)
     })
 
-    const describeTask = Effect.fn("ToolRegistry.describeTask")(function* (agent: Agent.Info) {
-      const items = (yield* agents.list()).filter((item) => item.mode !== "primary")
-      const filtered = items.filter(
-        (item) => Permission.evaluate("task", item.name, agent.permission).action !== "deny",
-      )
-      const list = filtered.toSorted((a, b) => a.name.localeCompare(b.name))
-      const description = list
-        .map(
-          (item) =>
-            `- ${item.name}: ${item.description ?? "This subagent should only be called manually by the user."}`,
-        )
-        .join("\n")
-      return ["Available agent types and the tools they have access to:", description].join("\n")
+    const delegatable = Effect.fn("ToolRegistry.delegatable")(function* (
+      agent: Agent.Info,
+      permission?: PermissionV1.Ruleset,
+    ) {
+      // Per-call rulesets (session-level task denies) stack on the agent's own.
+      const ruleset = Permission.merge(agent.permission, permission ?? [])
+      return delegatableAgents(yield* agents.list(), ruleset)
     })
 
     const describeCodeMode = Effect.fn("ToolRegistry.describeCodeMode")(function* (input: {
@@ -342,6 +337,8 @@ const layer = Layer.effect(
         : undefined
       const visible = permissionFiltered.filter((tool) => tool.id !== "execute" || codeModeDescription)
 
+      const taskAgents = yield* delegatable(input.agent, input.permission)
+
       return yield* Effect.forEach(
         visible,
         Effect.fnUntraced(function* (tool: Tool.Def) {
@@ -355,17 +352,26 @@ const layer = Layer.effect(
             output.parameters === tool.parameters || output.jsonSchema !== tool.jsonSchema
               ? output.jsonSchema
               : undefined
+          // The task tool's `subagent_type` parameter enumerates the same
+          // per-caller, permission-filtered agents its description lists, so
+          // the choices are visible where the model fills in the value. A
+          // plugin-replaced parameter shape (parameters or jsonSchema) wins
+          // over this enrichment.
+          const taskParameters =
+            tool.id === TaskTool.id && output.parameters === tool.parameters && output.jsonSchema === tool.jsonSchema
+              ? makeParameters(subagentTypeDescription(taskAgents))
+              : undefined
           return {
             id: tool.id,
             description: [
               output.description,
-              tool.id === TaskTool.id ? yield* describeTask(input.agent) : undefined,
+              tool.id === TaskTool.id ? describeAgents(taskAgents) : undefined,
               tool.id === "execute" ? codeModeDescription : undefined,
             ]
               .filter(Boolean)
               .join("\n"),
-            parameters: output.parameters,
-            jsonSchema,
+            parameters: taskParameters ?? output.parameters,
+            jsonSchema: taskParameters ? ToolJsonSchema.fromSchema(taskParameters) : jsonSchema,
             metadata: tool.metadata,
             execute: tool.execute,
             formatValidationError: tool.formatValidationError,

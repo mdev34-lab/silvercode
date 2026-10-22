@@ -1,4 +1,4 @@
-import { afterEach, describe, expect } from "bun:test"
+import { afterEach, describe, expect, test } from "bun:test"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Database } from "@opencode-ai/core/database/database"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
@@ -20,7 +20,15 @@ import { Todo } from "@/session/todo"
 import { Permission } from "@/permission"
 
 import { FinishTool, type Reason } from "../../src/tool/finish"
-import { TaskTool, type TaskPromptOps } from "../../src/tool/task"
+import {
+  delegatableAgents,
+  describeAgents,
+  makeParameters,
+  subagentTypeDescription,
+  TaskTool,
+  type TaskPromptOps,
+} from "../../src/tool/task"
+import { ToolJsonSchema } from "../../src/tool/json-schema"
 
 type LooseTaskPromptOps = Omit<TaskPromptOps, "prompt"> & {
   prompt(input: Parameters<TaskPromptOps["prompt"]>[0]): Effect.Effect<any, any, any>
@@ -395,6 +403,111 @@ describe("tool.task", () => {
             zebra: "deny",
           },
         },
+        agent: {
+          zebra: {
+            description: "Zebra agent",
+            mode: "subagent",
+          },
+          alpha: {
+            description: "Alpha agent",
+            mode: "subagent",
+          },
+        },
+      },
+    },
+  )
+
+  it.instance(
+    "subagent_type parameter enumerates the caller's delegatable agents",
+    () =>
+      Effect.gen(function* () {
+        const agent = yield* Agent.Service
+        const build = yield* agent.get("work")
+        const registry = yield* ToolRegistry.Service
+        const task = (yield* registry.tools({ ...ref, agent: build })).find((tool) => tool.id === TaskTool.id)
+        expect(task).toBeDefined()
+        const schema = ToolJsonSchema.fromTool(task!) as {
+          properties: { subagent_type: { description: string } }
+        }
+        const description = schema.properties.subagent_type.description
+        // Generated from the agent registry, same permission-filtered list the
+        // tool description appends: no primary agents, no denied names.
+        expect(description).toContain("plan - Planning specialist.")
+        expect(description).toContain("zebra - Zebra agent")
+        expect(description).not.toContain("work - General-purpose workhorse")
+      }),
+    {
+      config: {
+        agent: {
+          zebra: {
+            description: "Zebra agent",
+            mode: "subagent",
+          },
+        },
+      },
+    },
+  )
+
+  it.instance(
+    "subagent_type parameter hides denied subagents for the caller",
+    () =>
+      Effect.gen(function* () {
+        const agent = yield* Agent.Service
+        const build = yield* agent.get("work")
+        const registry = yield* ToolRegistry.Service
+        const task = (yield* registry.tools({ ...ref, agent: build })).find((tool) => tool.id === TaskTool.id)
+        const schema = ToolJsonSchema.fromTool(task!) as {
+          properties: { subagent_type: { description: string } }
+        }
+        const description = schema.properties.subagent_type.description
+        expect(description).toContain("alpha - Alpha agent")
+        expect(description).not.toContain("zebra - Zebra agent")
+      }),
+    {
+      config: {
+        permission: {
+          task: {
+            "*": "allow",
+            zebra: "deny",
+          },
+        },
+        agent: {
+          zebra: {
+            description: "Zebra agent",
+            mode: "subagent",
+          },
+          alpha: {
+            description: "Alpha agent",
+            mode: "subagent",
+          },
+        },
+      },
+    },
+  )
+
+  it.instance(
+    "subagent_type parameter honors a per-call ruleset deny",
+    () =>
+      Effect.gen(function* () {
+        const agent = yield* Agent.Service
+        const build = yield* agent.get("work")
+        const registry = yield* ToolRegistry.Service
+        const task = (
+          yield* registry.tools({
+            ...ref,
+            agent: build,
+            permission: Permission.fromConfig({ task: { zebra: "deny" } }),
+          })
+        ).find((tool) => tool.id === TaskTool.id)
+        const schema = ToolJsonSchema.fromTool(task!) as {
+          properties: { subagent_type: { description: string } }
+        }
+        const description = schema.properties.subagent_type.description
+        expect(description).toContain("alpha - Alpha agent")
+        expect(description).not.toContain("zebra - Zebra agent")
+      }),
+    {
+      config: {
         agent: {
           zebra: {
             description: "Zebra agent",
@@ -3606,3 +3719,51 @@ for (const teardown of [false, true]) {
     { config: { subagent_depth: 2 } },
   )
 }
+
+describe("tool.task delegation enumeration", () => {
+  const agentInfo = (over: Partial<Agent.Info>): Agent.Info => ({
+    name: "agent-x",
+    mode: "subagent",
+    permission: Permission.fromConfig({ "*": "allow" }),
+    options: {},
+    ...over,
+  })
+  const allow = Permission.fromConfig({ "*": "allow" })
+
+  test("subagent_type falls back to the bare description when nobody is delegatable", () => {
+    expect(subagentTypeDescription([])).toBe("The type of specialized agent to use for this task")
+    expect(describeAgents([])).toContain("Available agent types and the tools they have access to:")
+  })
+
+  test("hidden agents are never advertised", () => {
+    const list = delegatableAgents([agentInfo({ name: "ghost", hidden: true })], allow)
+    expect(list).toEqual([])
+  })
+
+  test("prose and parameter descriptions enumerate the same names, including description-less agents", () => {
+    const list = delegatableAgents(
+      [agentInfo({ name: "silent" }), agentInfo({ name: "plan", description: "Plans things." })],
+      allow,
+    )
+    const prose = describeAgents(list)
+    const param = subagentTypeDescription(list)
+    for (const name of ["plan", "silent"]) {
+      expect(prose).toContain(name)
+      expect(param).toContain(name)
+    }
+    expect(param).toContain("plan - Plans things.")
+    expect(prose).toContain("- silent: This subagent should only be called manually by the user.")
+  })
+
+  test("task-denied agents are excluded from the enumeration", () => {
+    const list = delegatableAgents(
+      [agentInfo({ name: "zebra" }), agentInfo({ name: "alpha" })],
+      Permission.fromConfig({ task: { "*": "allow", zebra: "deny" } }),
+    )
+    expect(list.map((item) => item.name)).toEqual(["alpha"])
+  })
+
+  test("makeParameters memoizes on the rendered description", () => {
+    expect(makeParameters("same input")).toBe(makeParameters("same input"))
+  })
+})
