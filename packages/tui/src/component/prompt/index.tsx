@@ -493,6 +493,10 @@ export function Prompt(props: PromptProps) {
               paths.cwd,
           })
           if (!content) return
+          // The renderer may have been destroyed while the editor owned the
+          // terminal (#377); touching the input or extmarks would hit native
+          // guards, so drop the edited content instead of crashing teardown.
+          if (renderer.isDestroyed) return
           const normalized = normalizePromptContent(content)
 
           input.setText(normalized)
