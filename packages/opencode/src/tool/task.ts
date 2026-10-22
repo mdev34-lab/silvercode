@@ -21,6 +21,8 @@ import { EffectBridge } from "@/effect/bridge"
 import { Database } from "@opencode-ai/core/database/database"
 import { AgentEffort } from "@opencode-ai/schema/agent-effort"
 import { NotFoundError } from "@/storage/storage"
+import { Permission } from "@/permission"
+import type { PermissionV1 } from "@opencode-ai/core/v1/permission"
 
 export interface TaskPromptOps {
   cancel(sessionID: SessionID): Effect.Effect<void>
@@ -68,16 +70,38 @@ const BACKGROUND_UPDATED = [
 const SUBAGENT_TYPE_FALLBACK = "The type of specialized agent to use for this task"
 
 /**
+ * The single source for who a caller may delegate to: non-primary, non-hidden
+ * agents the caller's (merged) ruleset does not deny the task tool for. Both
+ * the tool description prose and the `subagent_type` parameter description
+ * render from this list, so they can never diverge.
+ */
+export function delegatableAgents(agents: Agent.Info[], permission: PermissionV1.Ruleset): Agent.Info[] {
+  return agents
+    .filter(
+      (item) =>
+        item.mode !== "primary" &&
+        item.hidden !== true &&
+        Permission.evaluate("task", item.name, permission).action !== "deny",
+    )
+    .toSorted((a, b) => a.name.localeCompare(b.name, "en"))
+}
+
+/** The tool-description prose listing the delegatable agents. */
+export function describeAgents(agents: Agent.Info[]): string {
+  const description = agents
+    .map((item) => `- ${item.name}: ${item.description ?? "This subagent should only be called manually by the user."}`)
+    .join("\n")
+  return ["Available agent types and the tools they have access to:", description].join("\n")
+}
+
+/**
  * Render the delegation-eligible agents into the `subagent_type` parameter
  * description, so specialists are visible at the point the model picks a value
- * instead of only in the tool description prose. The registry supplies the
- * per-caller, permission-filtered list; a nudge, not a restriction - any
- * resolvable name stays valid.
+ * instead of only in the tool description prose. A nudge, not a restriction -
+ * any resolvable name stays valid.
  */
 export function subagentTypeDescription(agents: Agent.Info[]): string {
-  const available = agents
-    .filter((agent) => agent.mode !== "primary" && !agent.hidden && agent.description)
-    .map((agent) => `${agent.name} - ${agent.description}`)
+  const available = agents.map((agent) => (agent.description ? `${agent.name} - ${agent.description}` : agent.name))
   return available.length ? `${SUBAGENT_TYPE_FALLBACK}. Available: ${available.join("; ")}` : SUBAGENT_TYPE_FALLBACK
 }
 
@@ -91,7 +115,11 @@ const BaseParameterFields = {
   command: Schema.optional(Schema.String).annotate({ description: "Triggering command" }),
 }
 
-export const makeParameters = (subagentType: string) =>
+// Memoized: tools() runs per request and schema identity feeds downstream
+// caches, so the same enumeration must return the same Schema instance.
+const parametersCache = new Map<string, ReturnType<typeof makeParametersUncached>>()
+
+const makeParametersUncached = (subagentType: string) =>
   Schema.Struct({
     ...BaseParameterFields,
     subagent_type: Schema.String.annotate({ description: subagentType }),
@@ -103,6 +131,14 @@ export const makeParameters = (subagentType: string) =>
         "Run asynchronously and get notified on completion (default). Agents configured with `background: false` in opencode.json run in the foreground and wait for the result; true forces a background launch; false on any other agent still launches it in the background.",
     }),
   })
+
+export const makeParameters = (subagentType: string) => {
+  const cached = parametersCache.get(subagentType)
+  if (cached) return cached
+  const parameters = makeParametersUncached(subagentType)
+  parametersCache.set(subagentType, parameters)
+  return parameters
+}
 
 // Module-scope fallback so imports that cannot run the tool's Effect init (the
 // JSON-Schema snapshot test) still see a stable wire shape; the constructed
