@@ -690,6 +690,9 @@ export class TestLLMServer extends Context.Service<TestLLMServer, TestLLMServer.
         const next = pull(current)
         if (!next) {
           hits = [...hits, current]
+          // Record the unmatched request: on a miss the auto-reply below has
+          // no finish tool, which surfaces far away as a 3-nudge turn stop.
+          misses = [...misses, current]
           yield* notify()
           const auto: Sse = { type: "sse", head: [role()], tail: [textLine("ok"), finishLine("stop")] }
           if (mode === "responses") return send(responses(auto, modelFrom(body)))
