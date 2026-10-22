@@ -28,7 +28,7 @@ import { useEvent } from "../../context/event"
 import { editorSelectionKey, useEditorContext, type EditorSelection } from "../../context/editor"
 import { normalizePromptContent, openEditor } from "../../editor"
 import { useExit } from "../../context/exit"
-import { promptOffsetWidth } from "../../prompt/display"
+import { displayIndexOf, promptOffsetWidth } from "../../prompt/display"
 import { createStore, produce, unwrap } from "solid-js/store"
 import { usePromptHistory, type PromptInfo } from "../../prompt/history"
 import { computePromptTraits } from "../../prompt/traits"
@@ -516,11 +516,11 @@ export function Prompt(props: PromptProps) {
 
               if (!virtualText) return part
 
-              const newStart = normalized.indexOf(virtualText)
+              const newStart = displayIndexOf(normalized, virtualText)
               // if the virtual text is deleted, remove the part
               if (newStart === -1) return null
 
-              const newEnd = newStart + virtualText.length
+              const newEnd = newStart + promptOffsetWidth(virtualText)
 
               if (part.type === "file" && part.source?.text) {
                 return {
@@ -558,7 +558,7 @@ export function Prompt(props: PromptProps) {
             parts: updatedNonTextParts,
           })
           restoreExtmarksFromParts(updatedNonTextParts)
-          input.cursorOffset = Bun.stringWidth(normalized)
+          input.cursorOffset = promptOffsetWidth(normalized)
         },
       },
       {
@@ -960,12 +960,13 @@ export function Prompt(props: PromptProps) {
           title: "Next prompt history",
           category: "Prompt",
           run() {
-            if (input.cursorOffset !== input.plainText.length) {
+            const endOffset = promptOffsetWidth(input.plainText)
+            if (input.cursorOffset !== endOffset) {
               if (
                 input.scrollY + input.visualCursor.visualRow ===
                 Math.max(0, input.editorView.getTotalVirtualLineCount() - 1)
               )
-                input.cursorOffset = input.plainText.length
+                input.cursorOffset = endOffset
               return false
             }
 
@@ -975,7 +976,7 @@ export function Prompt(props: PromptProps) {
             setStore("prompt", item)
             setStore("mode", item.mode ?? "normal")
             restoreExtmarksFromParts(item.parts)
-            input.cursorOffset = input.plainText.length
+            input.cursorOffset = promptOffsetWidth(item.input)
           },
         },
       ],
@@ -1303,7 +1304,7 @@ export function Prompt(props: PromptProps) {
       return x.mime.startsWith("image/")
     }).length
     const virtualText = pdf ? `[PDF ${count + 1}]` : `[Image ${count + 1}]`
-    const extmarkEnd = extmarkStart + virtualText.length
+    const extmarkEnd = extmarkStart + promptOffsetWidth(virtualText)
     const textToInsert = virtualText + " "
 
     input.insertText(textToInsert)
