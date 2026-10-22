@@ -11,9 +11,53 @@ import { AppRuntime } from "@/effect/app-runtime"
 import { Effect } from "effect"
 import { disposeAllInstancesAndEmitGlobalDisposed } from "@/server/global-lifecycle"
 
-const onUnhandledRejection = (_error: unknown) => {}
+// Surface worker defects instead of swallowing them (#396): every
+// unhandledRejection/uncaughtException is logged and emitted to the main
+// thread, which shows it as a TUI toast instead of letting an RPC hang look
+// like a freeze. An uncaughtException in the subprocess also exits abnormally
+// so the supervisor's crash-restart engages (see createDefectHandlers).
+export type WorkerErrorReport = { message: string; stack?: string; fatal: boolean }
 
-const onUncaughtException = (_error: Error) => {}
+function toWorkerErrorReport(error: unknown, fatal: boolean): WorkerErrorReport {
+  const err = error instanceof Error ? error : new Error(String(error))
+  return { message: err.message || "unknown error", stack: err.stack, fatal }
+}
+
+export function createDefectHandlers(deps: {
+  processWorker: boolean
+  report: (report: WorkerErrorReport, done: () => void) => void
+  exit: (code: number) => void
+}) {
+  let exited = false
+  const exitOnce = (code: number) => {
+    if (exited) return
+    exited = true
+    deps.exit(code)
+  }
+  return {
+    onUnhandledRejection(error: unknown) {
+      deps.report(toWorkerErrorReport(error, false), () => {})
+    },
+    onUncaughtException(error: Error) {
+      const report = toWorkerErrorReport(error, true)
+      // Only a subprocess can crash-restart; a thread worker shares the UI
+      // process and must not exit it. 134 is the exit-code counterpart of
+      // SIGABRT and classifies as a crash on every platform (isCrash in
+      // worker-process.ts). Exit only after the report's flush ack so the
+      // parent reliably receives the final worker.error before we die; the
+      // fallback timer covers a dead IPC channel, where the ack never comes.
+      if (!deps.processWorker) {
+        deps.report(report, () => {})
+        return
+      }
+      const fallback = setTimeout(() => exitOnce(134), 5000)
+      deps.report(report, () => {
+        clearTimeout(fallback)
+        exitOnce(134)
+      })
+    },
+  }
+}
 
 // Subscribe to global events and forward them via RPC
 const onGlobalEvent = (event: Parameters<typeof GlobalBus.emitEvent>[0]) => {
@@ -36,6 +80,43 @@ const processWorker = typeof process.send === "function"
 // reliable signal: a compiled Bun binary runs every secondary entrypoint
 // (the thread worker) with `import.meta.main === false`.
 const isTuiWorker = resolveIsTuiWorker(process.env, processWorker)
+
+// Report a defect over the worker's RPC channel. `done` fires only when the
+// report was actually flushed to the parent: on a failed process.send ack the
+// callback carries an error and done stays uncalled, so a caller waiting on
+// the ack (the crash-exit path) falls through to its fallback timer instead
+// of exiting early as if the report had been delivered. Exported for tests.
+export function createRpcReporter(deps: {
+  processWorker: boolean
+  emitProcess: (event: string, data: unknown, cb?: (error: Error | null) => void) => void
+  emit: (event: string, data: unknown) => void
+}) {
+  return (report: WorkerErrorReport, done: () => void) => {
+    console.error(
+      `[silvercode-worker] ${report.fatal ? "uncaughtException" : "unhandledRejection"}: ${report.message}\n${report.stack ?? ""}`,
+    )
+    if (deps.processWorker) {
+      deps.emitProcess("worker.error", report, (err) => {
+        if (!err) done()
+      })
+    } else {
+      deps.emit("worker.error", report)
+      done()
+    }
+  }
+}
+
+const defectHandlers = createDefectHandlers({
+  processWorker,
+  report: createRpcReporter({
+    processWorker,
+    emitProcess: Rpc.emitProcess,
+    emit: Rpc.emit,
+  }),
+  exit: (code) => process.exit(code),
+})
+const onUnhandledRejection = defectHandlers.onUnhandledRejection
+const onUncaughtException = defectHandlers.onUncaughtException
 
 // Worker identity and transport selection are independent concerns (see
 // `processWorker` above). Exporting the identity decision keeps the gating

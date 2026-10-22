@@ -11,6 +11,8 @@ import { withNetworkOptions, resolveNetworkOptionsNoConfig, hasArg } from "@/cli
 import { Filesystem } from "@/util/filesystem"
 import type { GlobalEvent } from "@opencode-ai/sdk/v2"
 import type { EventSource } from "@opencode-ai/tui/context/sdk"
+import { workerErrorToastEvent } from "@/cli/tui/worker-error-toast"
+import type { WorkerErrorReport } from "@/cli/tui/worker"
 import { writeHeapSnapshot } from "v8"
 import { ServerAuth } from "@/server/auth"
 import { validateSession } from "../tui/validate-session"
@@ -43,9 +45,18 @@ function createWorkerFetch(client: RpcClient): typeof fetch {
 function createEventSource(client: RpcClient): EventSource {
   return {
     subscribe: async (handler) => {
-      return client.on<GlobalEvent>("global.event", (e) => {
+      const offGlobal = client.on<GlobalEvent>("global.event", (e) => {
         handler(e)
       })
+      // Surface worker-internal defects (unhandled rejections, uncaught
+      // exceptions) as TUI toasts instead of a frozen footer (#396).
+      const offWorkerError = client.on<WorkerErrorReport>("worker.error", (e) => {
+        handler(workerErrorToastEvent(e))
+      })
+      return () => {
+        offGlobal()
+        offWorkerError()
+      }
     },
   }
 }
