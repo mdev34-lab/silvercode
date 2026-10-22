@@ -134,6 +134,14 @@ describe("opencode run with a subagent that yields for its own subagent", () => 
           },
         })
 
+        // Same miss diagnostics as the deferred-report variant below (#511).
+        if (result.exitCode !== 0) {
+          const misses = yield* llm.misses
+          console.error(
+            `[llm-mock] ${misses.length} unmatched request(s):`,
+            misses.map((miss) => miss.body).join("\n---\n"),
+          )
+        }
         opencode.expectExit(result, 0)
         expect(result.stdout).toContain(ROOT_ANSWER)
         // Every scripted reply was pulled: no request fell through to the
