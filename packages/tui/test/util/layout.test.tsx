@@ -53,3 +53,33 @@ test("chains an existing onLifecyclePass handler instead of clobbering it (#379)
     app.renderer.destroy()
   }
 })
+
+test("a repeated setup replaces the first wrapper instead of stacking callbacks (#379)", async () => {
+  let second!: BoxRenderable
+  let existingRan = 0
+  const app = await testRender(
+    () => (
+      <box flexDirection="column">
+        <box height={2} />
+        <box ref={(el: BoxRenderable) => (second = el)} height={2} />
+      </box>
+    ),
+    { width: 40, height: 10 },
+  )
+  try {
+    await app.renderOnce()
+    second.onLifecyclePass = () => {
+      existingRan++
+    }
+    setPreLayoutSiblingMargin(second, () => 1)
+    setPreLayoutSiblingMargin(second, () => 2)
+    const before = existingRan
+    await app.renderOnce()
+    // The latest margin wins, and the chained original runs once per pass,
+    // not once per stacked wrapper.
+    expect(second.marginTop).toBe(2)
+    expect(existingRan - before).toBe(1)
+  } finally {
+    app.renderer.destroy()
+  }
+})
