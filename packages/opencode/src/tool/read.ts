@@ -231,50 +231,57 @@ export const ReadTool = Tool.define<
       ctx: Tool.Context<Metadata>,
     ) {
       const instance = yield* InstanceState.context
-      let filepath = params.filePath
-      // Models sometimes hand a shell pipeline over as the path
-      // (`file | head -200`, `file | Select-Object -First 200`). When the
-      // text before the first pipe names a real file, read that file;
-      // otherwise fall through to the normal not-found error.
-      let recovered = false
-      const pipeAt = filepath.indexOf("|")
-      if (pipeAt > 0) {
-        const candidate = filepath
-          .slice(0, pipeAt)
-          .trim()
-          .replace(/^["']+|["']+$/g, "")
-        if (candidate) {
-          const resolved = path.isAbsolute(candidate) ? candidate : path.resolve(instance.directory, candidate)
-          const normalized = process.platform === "win32" ? FSUtil.normalizePath(resolved) : resolved
-          const piped = yield* fs.stat(normalized).pipe(
-            Effect.catchIf(
-              (err) => "reason" in err && err.reason._tag === "NotFound",
-              () => Effect.succeed(undefined),
-            ),
-          )
-          if (piped) {
-            filepath = normalized
-            recovered = true
-          }
+      // Strip only a properly paired outer quote; an unmatched quote is a
+      // literal character in a legal file name and must stay.
+      const unquote = (value: string) => {
+        if (value.length >= 2) {
+          const first = value[0]
+          if ((first === '"' || first === "'") && value[value.length - 1] === first) return value.slice(1, -1)
         }
+        return value
       }
+      const statOrUndefined = (target: string) =>
+        fs.stat(target).pipe(
+          Effect.catchIf(
+            (err) => "reason" in err && err.reason._tag === "NotFound",
+            () => Effect.succeed(undefined),
+          ),
+        )
+      let filepath = params.filePath
       if (!path.isAbsolute(filepath)) {
         filepath = path.resolve(instance.directory, filepath)
       }
       if (process.platform === "win32") {
         filepath = FSUtil.normalizePath(filepath)
       }
+      let stat = yield* statOrUndefined(filepath)
+      // Models sometimes hand a shell pipeline over as the path
+      // (`file | head -200`, `file | Select-Object -First 200`). The original
+      // text wins when it names a real file (`a|b.txt` is a legal POSIX
+      // name); only when it does not exist, and the text before the first
+      // pipe names a real file, read that file. Otherwise fall through to
+      // the normal not-found error for the original path.
+      let recovered = false
+      if (!stat) {
+        const pipeAt = params.filePath.indexOf("|")
+        if (pipeAt > 0) {
+          const candidate = unquote(params.filePath.slice(0, pipeAt).trim())
+          if (candidate) {
+            const resolved = path.isAbsolute(candidate) ? candidate : path.resolve(instance.directory, candidate)
+            const normalized = process.platform === "win32" ? FSUtil.normalizePath(resolved) : resolved
+            const piped = yield* statOrUndefined(normalized)
+            if (piped) {
+              filepath = normalized
+              stat = piped
+              recovered = true
+            }
+          }
+        }
+      }
       const title = path.relative(instance.worktree, filepath)
       const notice = recovered
         ? "(filePath contained a shell pipeline; read the file before the first \"|\". Pass a plain path and use offset/limit to page through large files.)\n"
         : ""
-
-      const stat = yield* fs.stat(filepath).pipe(
-        Effect.catchIf(
-          (err) => "reason" in err && err.reason._tag === "NotFound",
-          () => Effect.succeed(undefined),
-        ),
-      )
 
       yield* assertExternalDirectoryEffect(ctx, filepath, {
         bypass: Boolean(ctx.extra?.["bypassCwdCheck"]),

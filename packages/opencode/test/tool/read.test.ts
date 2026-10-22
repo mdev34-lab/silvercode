@@ -667,4 +667,41 @@ describe("tool.read piped filePath recovery", () => {
       expect(err.message).toContain("File not found")
     }),
   )
+
+  it.live("reads the literal piped name when it exists (pipe recovery only fires on a miss)", () =>
+    Effect.gen(function* () {
+      // `|` is not a legal file-name character on win32.
+      if (process.platform === "win32") return
+      const dir = yield* tmpdirScoped()
+      yield* put(path.join(dir, "a|b.txt"), "literal pipe name")
+      yield* put(path.join(dir, "a"), "before pipe")
+
+      const result = yield* exec(dir, { filePath: path.join(dir, "a|b.txt") })
+      expect(result.output).toContain("1: literal pipe name")
+      expect(result.output).not.toContain("before pipe")
+      expect(result.output).not.toContain("shell pipeline")
+    }),
+  )
+
+  it.live("strips a paired outer quote but keeps an unmatched quote literal", () =>
+    Effect.gen(function* () {
+      // A leading quote is not a legal file-name character on win32.
+      if (process.platform === "win32") return
+      const dir = yield* tmpdirScoped()
+      yield* put(path.join(dir, "real.txt"), "plain body")
+      yield* put(path.join(dir, '"real.txt'), "literal quote body")
+
+      // Unmatched leading quote stays: the literally-named file wins over
+      // the unquoted candidate. (Relative input: a leading quote makes the
+      // path non-absolute.)
+      const unmatched = yield* exec(dir, { filePath: `"real.txt | head -1` })
+      expect(unmatched.output).toContain("1: literal quote body")
+      expect(unmatched.output).not.toContain("plain body")
+
+      // A properly paired outer quote is stripped and recovers the file.
+      const paired = yield* exec(dir, { filePath: `"${path.join(dir, "real.txt")}" | head -1` })
+      expect(paired.output).toContain("1: plain body")
+      expect(paired.output).toContain("shell pipeline")
+    }),
+  )
 })
