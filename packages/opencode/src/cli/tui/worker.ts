@@ -81,19 +81,38 @@ const processWorker = typeof process.send === "function"
 // (the thread worker) with `import.meta.main === false`.
 const isTuiWorker = resolveIsTuiWorker(process.env, processWorker)
 
-const defectHandlers = createDefectHandlers({
-  processWorker,
-  report: (report, done) => {
+// Report a defect over the worker's RPC channel. `done` fires only when the
+// report was actually flushed to the parent: on a failed process.send ack the
+// callback carries an error and done stays uncalled, so a caller waiting on
+// the ack (the crash-exit path) falls through to its fallback timer instead
+// of exiting early as if the report had been delivered. Exported for tests.
+export function createRpcReporter(deps: {
+  processWorker: boolean
+  emitProcess: (event: string, data: unknown, cb?: (error: Error | null) => void) => void
+  emit: (event: string, data: unknown) => void
+}) {
+  return (report: WorkerErrorReport, done: () => void) => {
     console.error(
       `[silvercode-worker] ${report.fatal ? "uncaughtException" : "unhandledRejection"}: ${report.message}\n${report.stack ?? ""}`,
     )
-    if (processWorker) {
-      Rpc.emitProcess("worker.error", report, done)
+    if (deps.processWorker) {
+      deps.emitProcess("worker.error", report, (err) => {
+        if (!err) done()
+      })
     } else {
-      Rpc.emit("worker.error", report)
+      deps.emit("worker.error", report)
       done()
     }
-  },
+  }
+}
+
+const defectHandlers = createDefectHandlers({
+  processWorker,
+  report: createRpcReporter({
+    processWorker,
+    emitProcess: Rpc.emitProcess,
+    emit: Rpc.emit,
+  }),
   exit: (code) => process.exit(code),
 })
 const onUnhandledRejection = defectHandlers.onUnhandledRejection

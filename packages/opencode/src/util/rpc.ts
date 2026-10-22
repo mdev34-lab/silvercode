@@ -62,12 +62,13 @@ export function emit(event: string, data: unknown) {
   postMessage(JSON.stringify({ type: "rpc.event", event, data }))
 }
 
-export function emitProcess(event: string, data: unknown, cb?: () => void) {
+export function emitProcess(event: string, data: unknown, cb?: (error: Error | null) => void) {
   if (typeof process.send !== "function") return
   // The send callback fires when the message has been flushed to the parent,
   // so callers that exit right after a final emit can wait for the ack
-  // instead of guessing a flush delay.
-  process.send(JSON.stringify({ type: "rpc.event", event, data }), () => cb?.())
+  // instead of guessing a flush delay. The error is forwarded: a failed send
+  // is NOT an ack and callers must not treat it as delivered.
+  process.send(JSON.stringify({ type: "rpc.event", event, data }), (err) => cb?.(err ?? null))
 }
 
 export function client<T extends Definition>(target: {

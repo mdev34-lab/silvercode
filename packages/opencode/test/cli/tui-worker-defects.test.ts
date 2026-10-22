@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { createDefectHandlers, type WorkerErrorReport } from "../../src/cli/tui/worker"
+import { createDefectHandlers, createRpcReporter, type WorkerErrorReport } from "../../src/cli/tui/worker"
 import { workerErrorToastEvent } from "../../src/cli/tui/worker-error-toast"
 
 function setup(processWorker: boolean) {
@@ -68,6 +68,53 @@ describe("worker defect handlers (#396)", () => {
     await new Promise((resolve) => setTimeout(resolve, 80))
     expect(reports).toEqual([{ message: "thread defect", stack: expect.any(String), fatal: true }])
     expect(exits).toEqual([])
+  })
+
+  test("a successful process.send ack delivers the report", () => {
+    const sent: string[] = []
+    const dones: string[] = []
+    const report = createRpcReporter({
+      processWorker: true,
+      emitProcess: (_event, data, cb) => {
+        sent.push((data as WorkerErrorReport).message)
+        cb?.(null)
+      },
+      emit: () => {},
+    })
+    report({ message: "flushed fine", fatal: true }, () => dones.push("done"))
+    expect(sent).toEqual(["flushed fine"])
+    expect(dones).toEqual(["done"])
+  })
+
+  test("a failed process.send ack is not treated as delivered", () => {
+    const sent: string[] = []
+    const dones: string[] = []
+    const report = createRpcReporter({
+      processWorker: true,
+      emitProcess: (_event, data, cb) => {
+        sent.push((data as WorkerErrorReport).message)
+        cb?.(new Error("EPIPE"))
+      },
+      emit: () => {},
+    })
+    report({ message: "lost on the wire", fatal: true }, () => dones.push("done"))
+    expect(sent).toEqual(["lost on the wire"])
+    // done stays uncalled: the crash-exit path keeps its fallback timer and
+    // never claims the final report reached the parent
+    expect(dones).toEqual([])
+  })
+
+  test("a thread worker reports through postMessage and completes immediately", () => {
+    const emitted: string[] = []
+    const dones: string[] = []
+    const report = createRpcReporter({
+      processWorker: false,
+      emitProcess: () => {},
+      emit: (_event, data) => emitted.push((data as WorkerErrorReport).message),
+    })
+    report({ message: "thread ok", fatal: false }, () => dones.push("done"))
+    expect(emitted).toEqual(["thread ok"])
+    expect(dones).toEqual(["done"])
   })
 
   test("the synthesized toast event satisfies the GlobalEvent shape", () => {
