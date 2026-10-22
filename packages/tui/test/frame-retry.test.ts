@@ -26,3 +26,16 @@ test("captureFrame rethrows non-busy errors without retrying", async () => {
   ).rejects.toThrow("boom")
   expect(calls).toBe(1)
 })
+
+test("captureFrame gives up after the retry budget when the buffer stays busy", async () => {
+  let calls = 0
+  await expect(
+    captureFrame({
+      captureCharFrame() {
+        calls++
+        throw new Error("OutputBusy: buffer leased")
+      },
+    }),
+  ).rejects.toThrow("OutputBusy")
+  expect(calls).toBe(41)
+})
