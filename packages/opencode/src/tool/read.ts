@@ -232,6 +232,32 @@ export const ReadTool = Tool.define<
     ) {
       const instance = yield* InstanceState.context
       let filepath = params.filePath
+      // Models sometimes hand a shell pipeline over as the path
+      // (`file | head -200`, `file | Select-Object -First 200`). When the
+      // text before the first pipe names a real file, read that file;
+      // otherwise fall through to the normal not-found error.
+      let recovered = false
+      const pipeAt = filepath.indexOf("|")
+      if (pipeAt > 0) {
+        const candidate = filepath
+          .slice(0, pipeAt)
+          .trim()
+          .replace(/^["']+|["']+$/g, "")
+        if (candidate) {
+          const resolved = path.isAbsolute(candidate) ? candidate : path.resolve(instance.directory, candidate)
+          const normalized = process.platform === "win32" ? FSUtil.normalizePath(resolved) : resolved
+          const piped = yield* fs.stat(normalized).pipe(
+            Effect.catchIf(
+              (err) => "reason" in err && err.reason._tag === "NotFound",
+              () => Effect.succeed(undefined),
+            ),
+          )
+          if (piped) {
+            filepath = normalized
+            recovered = true
+          }
+        }
+      }
       if (!path.isAbsolute(filepath)) {
         filepath = path.resolve(instance.directory, filepath)
       }
@@ -239,6 +265,9 @@ export const ReadTool = Tool.define<
         filepath = FSUtil.normalizePath(filepath)
       }
       const title = path.relative(instance.worktree, filepath)
+      const notice = recovered
+        ? "(filePath contained a shell pipeline; read the file before the first \"|\". Pass a plain path and use offset/limit to page through large files.)\n"
+        : ""
 
       const stat = yield* fs.stat(filepath).pipe(
         Effect.catchIf(
@@ -272,7 +301,7 @@ export const ReadTool = Tool.define<
         return {
           title,
           output: [
-            `<path>${filepath}</path>`,
+            notice + `<path>${filepath}</path>`,
             `<type>directory</type>`,
             `<entries>`,
             sliced.join("\n"),
@@ -335,7 +364,7 @@ export const ReadTool = Tool.define<
         )
       }
 
-      let output = [`<path>${filepath}</path>`, `<type>file</type>`, "<content>\n"].join("\n")
+      let output = [notice + `<path>${filepath}</path>`, `<type>file</type>`, "<content>\n"].join("\n")
       output += file.raw.map((line, i) => `${i + file.offset}: ${line}`).join("\n")
 
       const last = file.offset + file.raw.length - 1

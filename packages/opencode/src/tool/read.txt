@@ -1,5 +1,6 @@
 Read a file or directory from the local filesystem; errors if the path does not exist.
 
 - `filePath` should be absolute. Returns up to 2000 lines from the start by default; use `offset` (1-indexed) to read later sections, with larger windows rather than tiny repeated slices. Lines over 2000 characters are truncated.
+- `filePath` is a plain file path, never a shell command: do not append pipes such as `| head -200` or `| Select-Object -First 200`. To read part of a file, use `offset` and `limit`.
 - Lines are prefixed `<line>: <content>`. Directories list one entry per line, with a trailing `/` for subdirectories.
 - Reads images and PDFs as attachments. Read several files in parallel when you know them. Use grep for content in large files and glob to find paths.
