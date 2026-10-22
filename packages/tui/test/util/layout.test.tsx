@@ -71,13 +71,20 @@ test("a repeated setup replaces the first wrapper instead of stacking callbacks 
     second.onLifecyclePass = () => {
       existingRan++
     }
-    setPreLayoutSiblingMargin(second, () => 1)
+    // The superseded wrapper must never run: count the FIRST margin
+    // callback, which the old stacking code still invoked on every pass.
+    let firstMarginRan = 0
+    setPreLayoutSiblingMargin(second, () => {
+      firstMarginRan++
+      return 1
+    })
     setPreLayoutSiblingMargin(second, () => 2)
     const before = existingRan
     await app.renderOnce()
     // The latest margin wins, and the chained original runs once per pass,
     // not once per stacked wrapper.
     expect(second.marginTop).toBe(2)
+    expect(firstMarginRan).toBe(0)
     expect(existingRan - before).toBe(1)
   } finally {
     app.renderer.destroy()
