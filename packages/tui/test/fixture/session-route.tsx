@@ -1,6 +1,6 @@
 /** @jsxImportSource @opentui/solid */
 import { createDefaultOpenTuiKeymap } from "@opentui/keymap/opentui"
-import { captureFrame } from "./frame"
+import { captureFrame, captureSpans } from "./frame"
 import { testRender, useRenderer } from "@opentui/solid"
 import { onCleanup } from "solid-js"
 import { mkdir } from "node:fs/promises"
@@ -366,16 +366,13 @@ export async function snapshot(app: Setup, name: string) {
 
 // Joined span text per row; the streaming markdown/code blocks only show up in
 // span captures once the frame settles.
-export function spansOf(app: Setup) {
-  return app
-    .captureSpans()
-    .lines.map((line) => line.spans.map((span) => span.text).join(""))
-    .join("\n")
+export async function spansOf(app: Setup) {
+  return (await captureSpans(app)).lines.map((line) => line.spans.map((span) => span.text).join("")).join("\n")
 }
 
 // Every span whose text includes `needle`, with its colour and attribute bits.
-export function spansMatching(app: Setup, needle: string) {
-  return app.captureSpans().lines.flatMap((line) => line.spans.filter((span) => span.text.includes(needle)))
+export async function spansMatching(app: Setup, needle: string) {
+  return (await captureSpans(app)).lines.flatMap((line) => line.spans.filter((span) => span.text.includes(needle)))
 }
 
 // Overlap detection on the character grid: a frame row never contains two

@@ -5,7 +5,7 @@ import { testRender, useRenderer } from "@opentui/solid"
 import { onCleanup } from "solid-js"
 import type { AssistantMessage, GlobalEvent, Message, Part, ReasoningPart, ToolPart } from "@opencode-ai/sdk/v2"
 import { tmpdir } from "../../fixture/fixture"
-import { captureFrame, waitFor } from "../../fixture/frame"
+import { captureFrame, captureSpans, waitFor } from "../../fixture/frame"
 import { createTuiResolvedConfig } from "../../fixture/tui-runtime"
 import { createEventSource, createFetch, directory, json } from "../../fixture/tui-sdk"
 import { TestTuiContexts } from "../../fixture/tui-environment"
@@ -227,8 +227,8 @@ async function frameOf(app: Setup) {
 
 // The reasoning body renders through the streaming markdown/code block, which
 // settles a frame or two after the store change, so read spans for it.
-function spansOf(app: Setup) {
-  const spans = app.captureSpans()
+async function spansOf(app: Setup) {
+  const spans = await captureSpans(app)
   return spans.lines.map((line) => line.spans.map((span) => span.text).join("")).join("\n")
 }
 
@@ -271,21 +271,21 @@ describe("thinking toggle on CoT nested inside a Working block", () => {
     await expandWorkingBlock(app, keymap)
 
     // Hide mode keeps the nested block collapsed to its header.
-    const collapsed = spansOf(app)
+    const collapsed = await spansOf(app)
     expect(collapsed).toContain("+ Thought")
     expect(collapsed).not.toContain(COT_BODY)
 
     // /thinking expand must reveal the CoT of the already-rendered block.
     keymap().dispatchCommand("session.toggle.thinking")
     await settle(app)
-    const expanded = spansOf(app)
+    const expanded = await spansOf(app)
     expect(expanded).toContain(COT_BODY)
     expect(expanded).not.toContain("+ Thought")
 
     // And /thinking again restores the collapsed header.
     keymap().dispatchCommand("session.toggle.thinking")
     await settle(app)
-    const restored = spansOf(app)
+    const restored = await spansOf(app)
     expect(restored).toContain("+ Thought")
     expect(restored).not.toContain(COT_BODY)
   })
@@ -312,7 +312,7 @@ describe("thinking toggle on CoT nested inside a Working block", () => {
     events.emit(deltaEvent("prt_late", STREAMED_BODY, 1))
     await settle(app)
     // The stream is still open, so the body is readable regardless of mode.
-    expect(spansOf(app)).toContain(STREAMED_BODY)
+    expect(await spansOf(app)).toContain(STREAMED_BODY)
 
     // The reasoning stream ends; hide mode collapses the completed block.
     events.emit(
@@ -329,12 +329,12 @@ describe("thinking toggle on CoT nested inside a Working block", () => {
       ),
     )
     await settle(app)
-    expect(spansOf(app)).not.toContain(STREAMED_BODY)
+    expect(await spansOf(app)).not.toContain(STREAMED_BODY)
 
     // The command's expanded state reaches the subsequently-rendered block.
     keymap().dispatchCommand("session.toggle.thinking")
     await settle(app)
-    expect(spansOf(app)).toContain(STREAMED_BODY)
+    expect(await spansOf(app)).toContain(STREAMED_BODY)
   })
 
   test("a manually expanded nested thought stays open across streaming updates", async () => {
@@ -348,13 +348,13 @@ describe("thinking toggle on CoT nested inside a Working block", () => {
     expect(row).toBeGreaterThan(-1)
     await app.mockMouse.click(8, row)
     await settle(app)
-    expect(spansOf(app)).toContain(COT_BODY)
+    expect(await spansOf(app)).toContain(COT_BODY)
 
     // The next part of the run arrives: the activity groups recompute. The
     // expansion must survive it (top-level blocks already behave this way).
     events.emit(updatedEvent(toolPart("prt_tool_c", BASE + 300), 3))
     await settle(app)
-    expect(spansOf(app)).toContain(COT_BODY)
+    expect(await spansOf(app)).toContain(COT_BODY)
     expect(await frameOf(app)).toContain("- Thought")
   })
 })
