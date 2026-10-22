@@ -75,6 +75,8 @@ export interface WorkerProcessOptions {
   spawn?: Spawn
   /** Thread-mode worker factory (tests). Defaults to the global Worker. */
   spawnWorker?: (target: string, init: { env?: Record<string, string> }) => ThreadWorkerLike
+  /** Thread-mode bootstrap watchdog timeout in ms (tests). Default 10_000. */
+  bootstrapTimeoutMs?: number
 }
 
 /**
@@ -320,15 +322,40 @@ export function createThreadWorker(target: string, options: WorkerProcessOptions
   transport.terminate = async () => {
     // Bun's Worker.terminate resolves after the thread finishes flushing;
     // awaiting it keeps in-flight RPC emits from being cut off (#401).
+    clearTimeout(bootTimer)
     await worker.terminate()
     finish({ code: 0, signal: null })
   }
   transport.waitForRestart = () => Promise.resolve()
 
+  // Bootstrap watchdog (#398): the thread worker's identity depends on
+  // SILVERCODE_TUI_WORKER surviving into the thread's env, which Bun's
+  // Worker env option does not guarantee. If the thread never registers its
+  // RPC listener it also never emits a message, and the parent's first RPC
+  // call would hang forever. Any first message (the worker.ready beacon or
+  // a global event) proves bootstrap; otherwise fail fast with a clear
+  // error instead of a silent hang.
+  let booted = false
+  const bootTimer = setTimeout(() => {
+    if (booted) return
+    transport.onclose?.(
+      new Error(
+        "Bun worker bootstrap timed out: the thread never registered its RPC listener (worker identity env did not propagate)",
+      ),
+    )
+    void worker.terminate()
+    finish({ code: 1, signal: null })
+  }, options.bootstrapTimeoutMs ?? 10_000)
+
   worker.onmessage = (evt) => {
+    if (!booted) {
+      booted = true
+      clearTimeout(bootTimer)
+    }
     transport.onmessage?.({ data: evt.data as string } as MessageEvent<string>)
   }
   worker.onerror = (event) => {
+    clearTimeout(bootTimer)
     const message = event instanceof MessageEvent ? String(event.data ?? "unknown worker error") : "unknown worker error"
     transport.onclose?.(new Error(`Bun worker exited with error: ${message}`))
     finish({ code: 1, signal: null })

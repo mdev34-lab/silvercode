@@ -322,4 +322,69 @@ describe("TUI thread worker", () => {
     await Bun.sleep(0)
     expect(exits).toHaveLength(1)
   })
+
+  test("fails fast when the thread never bootstraps its RPC listener (#398)", async () => {
+    const fake = {
+      onmessage: null as null | ((event: { data: unknown }) => void),
+      onerror: null as null | ((event: unknown) => void),
+      terminated: false,
+      postMessage() {},
+      terminate() {
+        this.terminated = true
+      },
+    }
+    const closes: Error[] = []
+    const exits: WorkerExit[] = []
+    const worker = createThreadWorker("worker.ts", {
+      spawnWorker: () => fake as never,
+      log: () => {},
+      bootstrapTimeoutMs: 30,
+      onExit: (exit) => {
+        exits.push(exit)
+      },
+    })
+    worker.onclose = (error) => {
+      closes.push(error)
+    }
+
+    await expect(worker.closed).resolves.toEqual({ code: 1, signal: null })
+    expect(closes).toHaveLength(1)
+    expect(closes[0]!.message).toContain("bootstrap timed out")
+    expect(fake.terminated).toBe(true)
+    await Bun.sleep(0)
+    expect(exits).toEqual([{ code: 1, signal: null }])
+  })
+
+  test("a first message marks the thread booted and silences the watchdog (#398)", async () => {
+    const fake = {
+      onmessage: null as null | ((event: { data: unknown }) => void),
+      onerror: null as null | ((event: unknown) => void),
+      terminated: false,
+      postMessage() {},
+      terminate() {
+        this.terminated = true
+      },
+    }
+    const closes: Error[] = []
+    const messages: string[] = []
+    const worker = createThreadWorker("worker.ts", {
+      spawnWorker: () => fake as never,
+      log: () => {},
+      bootstrapTimeoutMs: 30,
+    })
+    worker.onclose = (error) => {
+      closes.push(error)
+    }
+    worker.onmessage = (evt) => {
+      messages.push(String(evt.data))
+    }
+
+    fake.onmessage?.({ data: "{\"type\":\"rpc.event\",\"event\":\"worker.ready\",\"data\":{}}" })
+    await Bun.sleep(80)
+    expect(messages).toHaveLength(1)
+    expect(closes).toHaveLength(0)
+    expect(fake.terminated).toBe(false)
+    await worker.terminate()
+    await expect(worker.closed).resolves.toEqual({ code: 0, signal: null })
+  })
 })

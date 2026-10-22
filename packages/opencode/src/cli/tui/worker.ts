@@ -228,5 +228,12 @@ if (isTuiWorker) {
     }
   } else {
     stopRpcListener = Rpc.listen(rpc)
+    // Bootstrap beacon (#398): a thread worker's identity rests entirely on
+    // SILVERCODE_TUI_WORKER surviving into the thread's env, which Bun's
+    // Worker env option does not guarantee. Emitting ready proves to the
+    // parent that the RPC listener registered; the parent fails fast with a
+    // clear error when no message ever arrives instead of hanging on the
+    // first RPC call.
+    Rpc.emit("worker.ready", {})
   }
 }
