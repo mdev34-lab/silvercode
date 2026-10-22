@@ -243,6 +243,8 @@ describe("session.system", () => {
       expect(output).toContain("`think`")
       expect(output).toContain("once, at the start")
       expect(output).toContain("carrying it forward instead of re-deriving or re-planning it at every tool call")
+      expect(output).toContain("living scratchpad")
+      expect(output).toContain("at milestones")
       expect(output).not.toContain("architect-planner")
     }),
   )
