@@ -45,3 +45,16 @@ it.instance(
     },
   },
 )
+
+it.instance(
+  "think agent default color is lilac #A78BFA",
+  () =>
+    Effect.gen(function* () {
+      const think = yield* AgentSvc.use.get("think")
+      expect(think?.color).toBe("#A78BFA")
+      // The legacy plan id resolves to the same default.
+      const plan = yield* AgentSvc.use.get("plan")
+      expect(plan?.color).toBe("#A78BFA")
+    }),
+  { git: true },
+)
