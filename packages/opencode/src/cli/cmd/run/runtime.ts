@@ -30,7 +30,7 @@ export { runPromptQueue } from "./runtime.queue"
 
 type BootContext = Pick<
   RunInput,
-  "sdk" | "directory" | "sessionID" | "sessionTitle" | "resume" | "agent" | "model" | "variant"
+  "sdk" | "directory" | "workspace" | "sessionID" | "sessionTitle" | "resume" | "agent" | "model" | "variant"
 >
 
 type CreateSessionInput = {
@@ -489,6 +489,7 @@ async function runInteractiveRuntime(input: RunRuntimeInput, deps: RunRuntimeDep
       const handle = await mod.createSessionTransport({
         sdk: ctx.sdk,
         directory: ctx.directory,
+        workspace: ctx.workspace,
         sessionID: state.sessionID,
         thinking: input.thinking,
         replay: input.replay,

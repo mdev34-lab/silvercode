@@ -69,6 +69,10 @@ const StreamClosed = undefined as never
 type StreamInput = {
   sdk: OpencodeClient
   directory?: string
+  // Control-plane workspace the session lives in; undefined is the default
+  // workspace. Dispose events from other workspaces must not kill this
+  // transport (#419).
+  workspace?: string
   sessionID: string
   thinking: boolean
   replay?: boolean
@@ -200,12 +204,26 @@ function globalPayloadEvent(value: unknown): Event | undefined {
   return isEvent(payload) ? payload : undefined
 }
 
-function isMatchingDisposeEvent(value: unknown, directory: string | undefined): boolean {
+function isMatchingDisposeEvent(
+  value: unknown,
+  directory: string | undefined,
+  workspace: string | undefined,
+): boolean {
   if (!directory || !isGlobalEvent(value)) {
     return false
   }
 
   if (value.directory !== directory) {
+    return false
+  }
+
+  // Multi-workspace instances share a directory and a global bus, so a
+  // dispose emitted by one workspace reaches every transport subscribed to
+  // that directory. The envelope carries the emitting workspace; both sides
+  // are undefined for the default workspace, so exact equality is the match
+  // (#419).
+  const eventWorkspace = Reflect.get(value, "workspace")
+  if (eventWorkspace !== workspace) {
     return false
   }
 
@@ -1177,7 +1195,7 @@ function createLayer(input: StreamInput) {
                   return
                 }
 
-                if (isMatchingDisposeEvent(item, input.directory)) {
+                if (isMatchingDisposeEvent(item, input.directory, input.workspace)) {
                   yield* fail(new Error("instance disposed"))
                   yield* closeScope()
                   return
