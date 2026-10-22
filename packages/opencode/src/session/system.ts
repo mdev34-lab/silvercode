@@ -146,24 +146,53 @@ const layer = Layer.effect(
         // Only primary-style callers drive delegation; subagents execute.
         if (agent.mode === "subagent") return
 
-        // Built from the live registry: any delegable agent that plans,
-        // excluding the caller itself, hidden agents, and agents the merged
-        // agent + session permission ruleset may not delegate to.
+        // Built from the live registry: any delegable agent, excluding the
+        // caller itself, hidden agents, and agents the merged agent + session
+        // permission ruleset may not delegate to.
         const ruleset = Permission.merge(agent.permission, permission ?? [])
-        const planners = (yield* agents.list()).filter(
+        const delegatable = (yield* agents.list()).filter(
           (item) =>
             item.name !== agent.name &&
             item.mode !== "primary" &&
             item.hidden !== true &&
-            Permission.evaluate("task", item.name, ruleset).action !== "deny" &&
-            (/\bplan/i.test(item.name) || /\bplan/i.test(item.description ?? "")),
+            Permission.evaluate("task", item.name, ruleset).action !== "deny",
         )
-        if (planners.length === 0) return
+        // A planner plans; an implementer writes software for a living. Both
+        // are identified from registry names and descriptions, never from
+        // hardcoded agent names, so renames and custom agents keep working.
+        // Read-only explorers and reviewers match neither pattern.
+        const planners = delegatable.filter(
+          (item) => /\bplan/i.test(item.name) || /\bplan/i.test(item.description ?? ""),
+        )
+        const implementers = delegatable.filter(
+          (item) =>
+            !planners.includes(item) &&
+            (/\bcode\b/i.test(item.name) || /\bengineer/i.test(item.description ?? "")),
+        )
+        // The planning agent itself plans; its own prompt governs it.
+        if (/\bplan/i.test(agent.name) || /\bplan/i.test(agent.description ?? "")) return
+        if (planners.length === 0 && implementers.length === 0) return
 
-        const names = planners.map((item) => `\`${item.name}\``).join(" or ")
+        const names = (list: Agent.Info[]) => list.map((item) => `\`${item.name}\``).join(" or ")
+        if (implementers.length === 0) {
+          return [
+            `When a request needs non-trivial implementation planning, delegate that planning to ${names(planners)} once, at the start, with the task tool.`,
+            "Then work the plan step by step, carrying it forward instead of re-deriving or re-planning it at every tool call.",
+          ].join("\n")
+        }
+        if (planners.length === 0) {
+          return [
+            `Delegate by default: you coordinate and ${names(implementers)} implements.`,
+            `For anything beyond a small task, delegate each implementation step to ${names(implementers)} with the task tool.`,
+            "Direct work is the exception, reserved for small tasks - a quick lookup, a tiny edit, a short answer.",
+            "You stay responsible for the outcome: give each subagent complete context, then verify and integrate what it returns.",
+          ].join("\n")
+        }
         return [
-          `When a request needs non-trivial implementation planning, delegate that planning to ${names} once, at the start, with the task tool.`,
-          "Then work the plan step by step, carrying it forward instead of re-deriving or re-planning it at every tool call.",
+          `Delegate by default: you coordinate, ${names(planners)} plans, and ${names(implementers)} implements.`,
+          `For anything beyond a small task, delegate planning to ${names(planners)} once, at the start, with the task tool, then delegate each implementation step to ${names(implementers)}.`,
+          "Direct work is the exception, reserved for small tasks - a quick lookup, a tiny edit, a short answer.",
+          "You stay responsible for the outcome: give each subagent complete context, then verify and integrate what it returns instead of re-deriving or re-planning it at every tool call.",
         ].join("\n")
       }),
 

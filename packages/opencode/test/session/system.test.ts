@@ -61,6 +61,27 @@ const think: Agent.Info = {
   options: {},
 }
 
+const code: Agent.Info = {
+  name: "code",
+  mode: "all",
+  native: true,
+  description:
+    "Software-engineering specialist. Runs in Git/project folders with LSP and repo-aware context.",
+  permission: Permission.fromConfig({ "*": "allow" }),
+  options: {},
+}
+
+// A read-only explorer mentions code in its description but must never be
+// advertised as an implementer.
+const scout: Agent.Info = {
+  name: "scout",
+  mode: "all",
+  native: true,
+  description: "Fast, read-only agent for finding files, searching code and answering codebase questions.",
+  permission: Permission.fromConfig({ "*": "allow" }),
+  options: {},
+}
+
 // A hidden planner must never be advertised in prompts.
 const hiddenPlanner: Agent.Info = {
   name: "architect-planner",
@@ -95,7 +116,7 @@ const it = testEffect(
     [
       Agent.node,
       Layer.mock(Agent.Service, {
-        list: () => Effect.succeed([build, think, hiddenPlanner]),
+        list: () => Effect.succeed([build, think, code, scout, hiddenPlanner]),
       }),
     ],
     [
@@ -235,19 +256,24 @@ describe("session.system", () => {
     }),
   )
 
-  it.effect("delegation nudge names the registry planning agent for primary callers", () =>
+  it.effect("delegation guidance pushes planner and implementer delegation for primary callers", () =>
     Effect.gen(function* () {
       const prompt = yield* SystemPrompt.Service
       const output = (yield* prompt.delegation(build)) ?? (yield* Effect.fail(new NamedError.Unknown({ message: "missing delegation output" })))
 
       expect(output).toContain("`think`")
+      expect(output).toContain("`code`")
+      expect(output).toContain("Delegate by default")
       expect(output).toContain("once, at the start")
-      expect(output).toContain("carrying it forward instead of re-deriving or re-planning it at every tool call")
+      expect(output).toContain("delegate each implementation step to `code`")
+      expect(output).toContain("Direct work is the exception")
+      expect(output).toContain("re-deriving or re-planning it at every tool call")
       expect(output).not.toContain("architect-planner")
+      expect(output).not.toContain("`scout`")
     }),
   )
 
-  it.effect("delegation nudge is omitted for subagent callers", () =>
+  it.effect("delegation guidance is omitted for subagent callers", () =>
     Effect.gen(function* () {
       const prompt = yield* SystemPrompt.Service
       const output = yield* prompt.delegation({ ...build, name: "general", mode: "subagent" })
@@ -256,7 +282,7 @@ describe("session.system", () => {
     }),
   )
 
-  it.effect("delegation nudge is omitted for the planning agent itself", () =>
+  it.effect("delegation guidance is omitted for the planning agent itself", () =>
     Effect.gen(function* () {
       const prompt = yield* SystemPrompt.Service
       const output = yield* prompt.delegation(think)
@@ -265,19 +291,46 @@ describe("session.system", () => {
     }),
   )
 
-  it.effect("delegation nudge is omitted when delegation to the planner is denied", () =>
+  it.effect("delegation guidance still pushes implementer delegation when the planner is denied", () =>
     Effect.gen(function* () {
       const prompt = yield* SystemPrompt.Service
-      const output = yield* prompt.delegation({ ...build, permission: Permission.fromConfig({ task: { think: "deny" } }) })
+      const output = (yield* prompt.delegation({ ...build, permission: Permission.fromConfig({ task: { think: "deny" } }) })) ?? (yield* Effect.fail(new NamedError.Unknown({ message: "missing delegation output" })))
 
-      expect(output).toBeUndefined()
+      expect(output).toContain("`code`")
+      expect(output).toContain("Delegate by default")
+      expect(output).not.toContain("`plan`")
     }),
   )
 
-  it.effect("delegation nudge is omitted when the session ruleset denies delegation to the planner", () =>
+  it.effect("delegation guidance still pushes implementer delegation when the session ruleset denies the planner", () =>
     Effect.gen(function* () {
       const prompt = yield* SystemPrompt.Service
-      const output = yield* prompt.delegation(build, Permission.fromConfig({ task: { think: "deny" } }) )
+      const output = (yield* prompt.delegation(build, Permission.fromConfig({ task: { think: "deny" } }) )) ?? (yield* Effect.fail(new NamedError.Unknown({ message: "missing delegation output" })))
+
+      expect(output).toContain("`code`")
+      expect(output).toContain("Delegate by default")
+      expect(output).not.toContain("`think`")
+    }),
+  )
+
+  it.effect("delegation guidance falls back to the planning nudge when the implementer is denied", () =>
+    Effect.gen(function* () {
+      const prompt = yield* SystemPrompt.Service
+      const output = (yield* prompt.delegation({ ...build, permission: Permission.fromConfig({ task: { code: "deny" } }) })) ?? (yield* Effect.fail(new NamedError.Unknown({ message: "missing delegation output" })))
+
+      expect(output).toContain("`think`")
+      expect(output).toContain("non-trivial implementation planning")
+      expect(output).not.toContain("`code`")
+    }),
+  )
+
+  it.effect("delegation guidance is omitted when both planner and implementer are denied", () =>
+    Effect.gen(function* () {
+      const prompt = yield* SystemPrompt.Service
+      const output = yield* prompt.delegation({
+        ...build,
+        permission: Permission.fromConfig({ task: { think: "deny", code: "deny" } }),
+      })
 
       expect(output).toBeUndefined()
     }),
