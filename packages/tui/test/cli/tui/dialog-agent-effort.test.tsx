@@ -338,7 +338,10 @@ async function frameWhere(app: Setup, predicate: (frame: string) => boolean, lab
       const frame = app.captureCharFrame()
       return predicate(frame) ? frame : undefined
     },
-    200,
+    // 200 passes ran dry in ~3.5s on the loaded windows runner before the
+    // failure toast painted; 600 keeps the same pump shape with headroom
+    // (#485).
+    600,
     `timed out waiting for frame: ${label}`,
   )
 }
