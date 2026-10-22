@@ -619,7 +619,17 @@ interface Miss {
 }
 
 function miss(hit: Hit): Miss {
-  return { url: hit.url, body: JSON.stringify(hit.body).slice(-800) }
+  // The decisive part of an unmatched request is its final messages, not the
+  // JSON tail: chat bodies end with the tools array, so a raw slice shows
+  // tool schemas instead of the message that failed to match. Excerpt the
+  // last two messages (chat mode) or input items (responses mode) instead.
+  const body = hit.body as { messages?: unknown; input?: unknown }
+  const items = Array.isArray(body.messages) ? body.messages : Array.isArray(body.input) ? body.input : []
+  const excerpt = items
+    .slice(-2)
+    .map((entry) => JSON.stringify(entry).slice(-500))
+    .join("\n---\n")
+  return { url: hit.url, body: excerpt || JSON.stringify(hit.body).slice(-800) }
 }
 
 function isTitleRequest(body: unknown): boolean {
