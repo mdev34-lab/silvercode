@@ -1,7 +1,20 @@
 import { describe, expect, test } from "bun:test"
-import { displayCharAt, displaySlice, mentionTriggerIndex } from "../../src/prompt/display"
+import { displayCharAt, displayIndexOf, displaySlice, mentionTriggerIndex, promptOffsetWidth } from "../../src/prompt/display"
 
 describe("prompt display", () => {
+  test("displayIndexOf converts UTF-16 indexOf results to display columns (#372)", () => {
+    expect(displayIndexOf("foo @bar", "@bar")).toBe(4)
+    expect(displayIndexOf("中文 @bar", "@bar")).toBe(5)
+    expect(displayIndexOf("🙂 @bar", "@bar")).toBe(3)
+    expect(displayIndexOf("👨‍👩‍👧‍👦 @bar", "@bar")).toBe(3)
+    expect(displayIndexOf("a\nb @bar", "@bar")).toBe(4)
+    expect(displayIndexOf("foo", "@bar")).toBe(-1)
+    // The display-column end of a token after wide chars must match the
+    // extmark range restoreExtmarksFromParts recreates.
+    const text = "中文 @file.md rest"
+    const start = displayIndexOf(text, "@file.md")
+    expect(start + promptOffsetWidth("@file.md")).toBe(13)
+  })
   test("uses display-width offsets for mentions", () => {
     expect(mentionTriggerIndex("@")).toBe(0)
     expect(mentionTriggerIndex("test @")).toBe(5)

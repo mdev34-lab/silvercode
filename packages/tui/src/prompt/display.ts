@@ -9,6 +9,15 @@ export function promptOffsetWidth(value: string) {
   return width
 }
 
+// indexOf returns a UTF-16 index, but prompt/extmark offsets are display
+// columns (Textarea measures with widthMethod "unicode"); convert so a token
+// sitting after wide chars lands on the right extmark range (#372).
+export function displayIndexOf(value: string, search: string) {
+  const index = value.indexOf(search)
+  if (index === -1) return -1
+  return promptOffsetWidth(value.slice(0, index))
+}
+
 function displayOffsetIndex(value: string, offset: number) {
   if (offset <= 0) return 0
 
