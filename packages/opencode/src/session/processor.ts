@@ -723,6 +723,9 @@ const layer = Layer.effect(
         // the processor returns "continue" (not "stop") so the outer
         // runLoop can pick up the new selection on the next iteration.
         const retryInvalidated = yield* Ref.make(false)
+        // Counts scheduled retries so a terminal error can say the turn did
+        // not die on the first failure.
+        const retryAttempts = yield* Ref.make(0)
 
         return yield* Effect.gen(function* () {
           yield* Effect.gen(function* () {
@@ -771,13 +774,15 @@ const layer = Layer.effect(
                 provider: input.model.providerID,
                 parse,
                 set: (info) => {
-                  return status.set(ctx.sessionID, {
-                    type: "retry",
-                    attempt: info.attempt,
-                    message: info.message,
-                    action: info.action,
-                    next: info.next,
-                  })
+                  return Effect.flatMap(Ref.update(retryAttempts, (n) => n + 1), () =>
+                    status.set(ctx.sessionID, {
+                      type: "retry",
+                      attempt: info.attempt,
+                      message: info.message,
+                      action: info.action,
+                      next: info.next,
+                    }),
+                  )
                 },
                 // Cancel stale retries when the user has switched to a
                 // different model/provider since this turn started. The
@@ -805,7 +810,20 @@ const layer = Layer.effect(
                   })
                 }),
             ),
-            Effect.catch(halt),
+            Effect.catch((e) =>
+              Effect.gen(function* () {
+                // After real retries, say so in the terminal error: a bare
+                // "stream timed out" reads as if the turn died on the first
+                // failure with no retry marker left behind.
+                const attempts = yield* Ref.get(retryAttempts)
+                if (attempts > 0 && e instanceof ProviderError.ResponseStreamError) {
+                  return yield* halt(
+                    new ProviderError.ResponseStreamError(`${e.message} (gave up after ${attempts} retries)`),
+                  )
+                }
+                return yield* halt(e)
+              }),
+            ),
             Effect.ensuring(cleanup()),
           )
 
