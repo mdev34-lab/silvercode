@@ -3081,7 +3081,9 @@ it.instance("concurrent loop callers all receive same error result", () =>
     const sessions = yield* Session.Service
     const chat = yield* sessions.create({ title: "Pinned" })
 
-    yield* llm.fail("boom")
+    // A non-retryable HTTP error: the loop surfaces it immediately instead of
+    // entering the retry backoff a mid-stream failure now takes.
+    yield* llm.error(400, { error: { message: "boom" } })
     yield* user(chat.id, "hello")
 
     const [a, b] = yield* Effect.all([prompt.loop({ sessionID: chat.id }), prompt.loop({ sessionID: chat.id })], {
@@ -5124,4 +5126,37 @@ it.instance("loop sends a reduced context projection and keeps canonical history
     // the request does not grow with the turn: the projection is re-derived, not accumulated
     expect(sizes[1]).toBeLessThan(sizes[0] + 2000)
   }),
+)
+
+it.instance(
+  "retries the turn when the response stream fails mid-generation",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({
+        title: "Pinned",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      // First attempt dies the way the reasoning watchdog kills a stalled
+      // stream; the retry must issue a fresh request and complete the turn.
+      yield* llm.fail("reasoning stream timed out after 1m without new tokens")
+      yield* llm.text("recovered after retry")
+      yield* user(chat.id, "hello")
+
+      const result = yield* prompt.loop({ sessionID: chat.id })
+      expect(yield* llm.calls).toBe(2)
+      expect(result.info.role).toBe("assistant")
+      if (result.info.role === "assistant") {
+        expect(result.info.error).toBeUndefined()
+      }
+      const messages = yield* sessions.messages({ sessionID: chat.id })
+      const texts = messages
+        .flatMap((message) => message.parts)
+        .filter((part) => part.type === "text")
+        .map((part) => part.text)
+      expect(texts.join("")).toContain("recovered after retry")
+    }),
+  { timeout: 30_000 },
 )

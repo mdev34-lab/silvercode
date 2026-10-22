@@ -20,6 +20,7 @@ import { SessionStatus } from "./status"
 import { SessionSummary } from "./summary"
 import type { Provider } from "@/provider/provider"
 import { Question } from "@/question"
+import { ProviderError } from "@/provider/error"
 import { errorMessage } from "@/util/error"
 import { isRecord } from "@/util/record"
 import { EventV2Bridge } from "@/event-v2-bridge"
@@ -119,6 +120,12 @@ const layer = Layer.effect(
         reasoningLast: {},
       }
       let aborted = false
+      // Set from every step-finish event. A stream that ends with no
+      // step-finish, or with a step-finish whose reason is "unknown" (the
+      // provider connection dropped mid-generation and the SDK synthesized a
+      // reason-less finish), died instead of completing - without this check
+      // the turn ends silently with no error and no retry.
+      let stepFinishReason: string | undefined = undefined
       const clock = createGenerationClock()
 
       const parse = (e: unknown) =>
@@ -507,6 +514,7 @@ const layer = Layer.effect(
             return
 
           case "step-finish": {
+            stepFinishReason = value.reason
             const completedSnapshot = yield* snapshot.track()
             yield* Effect.forEach(Object.keys(ctx.reasoningMap), finishReasoning)
             const usage = Session.getUsage({
@@ -719,6 +727,7 @@ const layer = Layer.effect(
         return yield* Effect.gen(function* () {
           yield* Effect.gen(function* () {
             ctx.currentText = undefined
+            stepFinishReason = undefined
             // A retry after a stalled or failed stream must not leave the previous attempt's thought open.
             yield* Effect.forEach(Object.keys(ctx.reasoningMap), finishReasoning)
             ctx.reasoningMap = {}
@@ -735,6 +744,15 @@ const layer = Layer.effect(
               Stream.takeUntil(() => ctx.needsCompaction),
               Stream.runDrain,
             )
+            // A stream that ended without a definitive finish reason died
+            // mid-generation. Route it into the retry pipeline as a stream
+            // error; aborts and compaction takeUntil are legitimate early
+            // ends and stay untouched.
+            if (!aborted && !ctx.needsCompaction && (stepFinishReason === undefined || stepFinishReason === "unknown")) {
+              return yield* Effect.fail(
+                new ProviderError.ResponseStreamError("response stream ended without a finish reason"),
+              )
+            }
           }).pipe(
             Effect.onInterrupt(() =>
               Effect.gen(function* () {
