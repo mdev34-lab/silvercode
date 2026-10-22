@@ -272,10 +272,19 @@ export function DialogSelect<T>(props: DialogSelectProps<T>) {
     visibilityGeneration++
   })
 
+  // The deferred filter reset kept no handle, so closing the dialog inside
+  // the tick still moved selection on a destroyed scrollbox (#422).
+  let filterTimer: ReturnType<typeof setTimeout> | undefined
+  onCleanup(() => {
+    if (filterTimer !== undefined) clearTimeout(filterTimer)
+  })
+
   createEffect(
     on([() => store.filter, () => props.current], ([filter, current]) => {
       if (filter.length > 0) resetSelection = true
-      setTimeout(() => {
+      if (filterTimer !== undefined) clearTimeout(filterTimer)
+      filterTimer = setTimeout(() => {
+        filterTimer = undefined
         if (filter.length > 0) {
           moveTo(0, true, false)
         } else if (current) {

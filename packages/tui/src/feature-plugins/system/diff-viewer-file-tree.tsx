@@ -41,14 +41,27 @@ export function DiffViewerFileTree(props: DiffViewerFileTreeProps) {
   const rows = createMemo(() => flattenFileTree(tree(), props.expandedNodes))
   let scroll: ScrollBoxRenderable | undefined
 
+  // Every selection move queues a frame; with no id or guard the queued
+  // frames pile up while holding j and still run after unmount (#422). The
+  // renderer has no cancelAnimationFrame, so stale frames check the
+  // generation and live ones replace it.
+  let scrollGeneration = 0
+  onCleanup(() => {
+    scrollGeneration++
+  })
+
   createEffect(() => {
     const node = props.highlightedNode
     if (node === undefined) return
     const selectedIndex = rows().findIndex((row) => row.id === node)
     if (selectedIndex === -1) return
+    const generation = ++scrollGeneration
     const scrollSelectedIntoView = () => scrollFileTreeRowIntoView(scroll, selectedIndex)
     scrollSelectedIntoView()
-    renderer.requestAnimationFrame(scrollSelectedIntoView)
+    renderer.requestAnimationFrame(() => {
+      if (generation !== scrollGeneration) return
+      scrollSelectedIntoView()
+    })
   })
 
   const fadedColor = () => tint(props.theme.text, props.theme.background, 0.75)
