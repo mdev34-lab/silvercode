@@ -1,4 +1,4 @@
-Use this tool when you have completed the planning phase and are ready to exit plan agent.
+Use this tool when you have completed the planning phase and are ready to exit the think agent.
 
 This tool will ask the user if they want to switch to work agent to start implementing the plan.
 

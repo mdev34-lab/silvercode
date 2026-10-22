@@ -94,13 +94,13 @@ describe("Work/Code agent split", () => {
     }),
   )
 
-  it.instance("work cannot delegate to itself, and plan is advertised for delegation", () =>
+  it.instance("work cannot delegate to itself, and think is advertised for delegation", () =>
     Effect.gen(function* () {
       const agent = yield* Agent.Service
       const work = yield* agent.get("work")
       expect(work).toBeDefined()
       expect(Permission.evaluate("task", "work", work!.permission).action).toBe("deny")
-      expect(Permission.evaluate("task", "plan", work!.permission).action).toBe("allow")
+      expect(Permission.evaluate("task", "think", work!.permission).action).toBe("allow")
       const registry = yield* ToolRegistry.Service
       const tools = yield* registry.tools({
         providerID: ProviderV2.ID.make("test"),
@@ -110,7 +110,7 @@ describe("Work/Code agent split", () => {
       const taskTool = tools.find((t) => t.id === "task")
       expect(taskTool).toBeDefined()
       expect(taskTool?.description).not.toContain("- work:")
-      expect(taskTool?.description).toContain("- plan:")
+      expect(taskTool?.description).toContain("- think:")
     }),
   )
 
@@ -131,7 +131,7 @@ describe("Work/Code agent split", () => {
       const taskTool = tools.find((t) => t.id === "task")
       expect(taskTool).toBeDefined()
       expect(taskTool?.description).not.toContain("- work:")
-      expect(taskTool?.description).toContain("- plan:")
+      expect(taskTool?.description).toContain("- think:")
     }),
   )
 
@@ -222,7 +222,7 @@ describe("Work/Code agent split", () => {
   it.instance("existing agents and delegation behavior unchanged", () =>
     Effect.gen(function* () {
       const agent = yield* Agent.Service
-      const plan = yield* agent.get("plan")
+      const plan = yield* agent.get("think")
       const explore = yield* agent.get("explore")
       const general = yield* agent.get("general")
       const review = yield* agent.get("review")

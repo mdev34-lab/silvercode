@@ -28,7 +28,7 @@ function testAgent(input: {
 
 it.instance("subagent permissions take precedence over parent agent restrictions", () =>
   Effect.gen(function* () {
-    const planAgent = yield* Agent.use.get("plan")
+    const planAgent = yield* Agent.use.get("think")
     const generalAgent = yield* Agent.use.get("general")
 
     expect(planAgent).toBeDefined()
@@ -74,7 +74,7 @@ it.instance(
   "custom subagent can explicitly enable edits denied to its parent agent",
   () =>
     Effect.gen(function* () {
-      const planAgent = yield* Agent.use.get("plan")
+      const planAgent = yield* Agent.use.get("think")
       const my = yield* Agent.use.get("my_subagent")
       expect(planAgent).toBeDefined()
       expect(my).toBeDefined()

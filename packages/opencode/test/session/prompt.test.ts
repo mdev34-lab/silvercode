@@ -860,7 +860,7 @@ it.instance(
 
       const hits = yield* llm.hits
       const body = JSON.stringify(hits[0]?.body)
-      expect(body).toContain("delegate that planning to `plan` once, at the start")
+      expect(body).toContain("delegate that planning to `think` once, at the start")
       yield* Fiber.interrupt(fiber)
     }),
   15_000,

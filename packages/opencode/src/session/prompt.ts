@@ -1721,10 +1721,10 @@ const layer = Layer.effect(
               // Reviewer sessions keep their own structured-report contract and
               // must not recursively review themselves.
               ...(isReviewAgent(agent.name) || !sessionWroteFiles ? [] : [EFFORT_PROCESS[effort]]),
-              // Plan scales research depth and candidate count by effort, but it does
+              // Think scales research depth and candidate count by effort, but it does
               // not write code, so the write-gated process line above rarely reaches
               // it. Surface the bare level whenever the process line did not fire.
-              ...(agent.name === "plan" && (isReviewAgent(agent.name) || !sessionWroteFiles)
+              ...(agent.name === "think" && (isReviewAgent(agent.name) || !sessionWroteFiles)
                 ? [`## Agent effort: ${effort}`]
                 : []),
             ]

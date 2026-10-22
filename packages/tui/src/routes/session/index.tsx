@@ -393,7 +393,7 @@ export function Session() {
       local.agent.set("work")
       lastSwitch = part.id
     } else if (part.tool === "plan_enter") {
-      local.agent.set("plan")
+      local.agent.set("think")
       lastSwitch = part.id
     }
   })
@@ -3341,7 +3341,7 @@ function PlanExit(props: ToolProps) {
   const declined = createMemo(() => props.part.state.status === "error")
   return (
     <InlineTool icon="✓" pending="Requesting plan approval..." complete={true} part={props.part}>
-      {declined() ? "Plan approval declined — staying in plan mode" : "Plan complete — switching to Work agent"}
+      {declined() ? "Plan approval declined — staying with the Think agent" : "Plan complete — switching to Work agent"}
     </InlineTool>
   )
 }
