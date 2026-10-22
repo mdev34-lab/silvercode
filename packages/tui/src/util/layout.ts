@@ -7,7 +7,12 @@ const previousByParent = new WeakMap<
 
 export function setPreLayoutSiblingMargin(el: BoxRenderable, margin: (previous?: BaseRenderable) => number) {
   // Run before Yoga layout so scroll geometry matches the rendered frame.
+  // Chain any handler the renderable (or a Renderable subclass) already has
+  // instead of clobbering it (#379); since 0.6.x the onLifecyclePass setter
+  // registers the pass even when this ref runs after insertion.
+  const existing = el.onLifecyclePass?.bind(el)
   el.onLifecyclePass = () => {
+    existing?.()
     const parent = el.parent
     if (!parent) return
     const cached = previousByParent.get(parent)
