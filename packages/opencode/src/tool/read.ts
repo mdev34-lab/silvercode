@@ -231,6 +231,22 @@ export const ReadTool = Tool.define<
       ctx: Tool.Context<Metadata>,
     ) {
       const instance = yield* InstanceState.context
+      // Strip only a properly paired outer quote; an unmatched quote is a
+      // literal character in a legal file name and must stay.
+      const unquote = (value: string) => {
+        if (value.length >= 2) {
+          const first = value[0]
+          if ((first === '"' || first === "'") && value[value.length - 1] === first) return value.slice(1, -1)
+        }
+        return value
+      }
+      const statOrUndefined = (target: string) =>
+        fs.stat(target).pipe(
+          Effect.catchIf(
+            (err) => "reason" in err && err.reason._tag === "NotFound",
+            () => Effect.succeed(undefined),
+          ),
+        )
       let filepath = params.filePath
       if (!path.isAbsolute(filepath)) {
         filepath = path.resolve(instance.directory, filepath)
@@ -238,14 +254,34 @@ export const ReadTool = Tool.define<
       if (process.platform === "win32") {
         filepath = FSUtil.normalizePath(filepath)
       }
+      let stat = yield* statOrUndefined(filepath)
+      // Models sometimes hand a shell pipeline over as the path
+      // (`file | head -200`, `file | Select-Object -First 200`). The original
+      // text wins when it names a real file (`a|b.txt` is a legal POSIX
+      // name); only when it does not exist, and the text before the first
+      // pipe names a real file, read that file. Otherwise fall through to
+      // the normal not-found error for the original path.
+      let recovered = false
+      if (!stat) {
+        const pipeAt = params.filePath.indexOf("|")
+        if (pipeAt > 0) {
+          const candidate = unquote(params.filePath.slice(0, pipeAt).trim())
+          if (candidate) {
+            const resolved = path.isAbsolute(candidate) ? candidate : path.resolve(instance.directory, candidate)
+            const normalized = process.platform === "win32" ? FSUtil.normalizePath(resolved) : resolved
+            const piped = yield* statOrUndefined(normalized)
+            if (piped) {
+              filepath = normalized
+              stat = piped
+              recovered = true
+            }
+          }
+        }
+      }
       const title = path.relative(instance.worktree, filepath)
-
-      const stat = yield* fs.stat(filepath).pipe(
-        Effect.catchIf(
-          (err) => "reason" in err && err.reason._tag === "NotFound",
-          () => Effect.succeed(undefined),
-        ),
-      )
+      const notice = recovered
+        ? "(filePath contained a shell pipeline; read the file before the first \"|\". Pass a plain path and use offset/limit to page through large files.)\n"
+        : ""
 
       yield* assertExternalDirectoryEffect(ctx, filepath, {
         bypass: Boolean(ctx.extra?.["bypassCwdCheck"]),
@@ -272,7 +308,7 @@ export const ReadTool = Tool.define<
         return {
           title,
           output: [
-            `<path>${filepath}</path>`,
+            notice + `<path>${filepath}</path>`,
             `<type>directory</type>`,
             `<entries>`,
             sliced.join("\n"),
@@ -335,7 +371,7 @@ export const ReadTool = Tool.define<
         )
       }
 
-      let output = [`<path>${filepath}</path>`, `<type>file</type>`, "<content>\n"].join("\n")
+      let output = [notice + `<path>${filepath}</path>`, `<type>file</type>`, "<content>\n"].join("\n")
       output += file.raw.map((line, i) => `${i + file.offset}: ${line}`).join("\n")
 
       const last = file.offset + file.raw.length - 1

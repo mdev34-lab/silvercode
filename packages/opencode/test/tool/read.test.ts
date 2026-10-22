@@ -614,3 +614,94 @@ describe("tool.read binary detection", () => {
     }),
   )
 })
+
+describe("tool.read piped filePath recovery", () => {
+  it.live("recovers the real file when filePath contains a shell pipe", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped()
+      yield* put(path.join(dir, "SKILL.md"), "first line\nsecond line")
+
+      const result = yield* exec(dir, { filePath: `${path.join(dir, "SKILL.md")} | head -200` })
+      expect(result.output).toContain("first line")
+      expect(result.output).toContain("shell pipeline")
+    }),
+  )
+
+  it.live("recovers a quoted path with spaces piped to Select-Object", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped()
+      const spaced = path.join(dir, "area de trabalho")
+      yield* put(path.join(spaced, "SKILL.md"), "skill body")
+
+      const result = yield* exec(dir, { filePath: `"${path.join(spaced, "SKILL.md")}" | Select-Object -First 200` })
+      expect(result.output).toContain("skill body")
+      expect(result.output).toContain("shell pipeline")
+    }),
+  )
+
+  it.live("reads the file before the pipe when the pipeline target is relative", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped()
+      yield* put(path.join(dir, "note.txt"), "relative body")
+
+      const result = yield* exec(dir, { filePath: "note.txt | tail -1" })
+      expect(result.output).toContain("relative body")
+    }),
+  )
+
+  it.live("keeps the normal not-found error when the path before the pipe does not exist", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped()
+
+      const err = yield* fail(dir, { filePath: `${path.join(dir, "missing.txt")} | head -200` })
+      expect(err.message).toContain("File not found")
+      expect(err.message).toContain("| head -200")
+    }),
+  )
+
+  it.live("does not recover when no pipe is present", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped()
+
+      const err = yield* fail(dir, { filePath: path.join(dir, "missing.txt") })
+      expect(err.message).toContain("File not found")
+    }),
+  )
+
+  it.live("reads the literal piped name when it exists (pipe recovery only fires on a miss)", () =>
+    Effect.gen(function* () {
+      // `|` is not a legal file-name character on win32.
+      if (process.platform === "win32") return
+      const dir = yield* tmpdirScoped()
+      yield* put(path.join(dir, "a|b.txt"), "literal pipe name")
+      yield* put(path.join(dir, "a"), "before pipe")
+
+      const result = yield* exec(dir, { filePath: path.join(dir, "a|b.txt") })
+      expect(result.output).toContain("1: literal pipe name")
+      expect(result.output).not.toContain("before pipe")
+      expect(result.output).not.toContain("shell pipeline")
+    }),
+  )
+
+  it.live("strips a paired outer quote but keeps an unmatched quote literal", () =>
+    Effect.gen(function* () {
+      // A leading quote is not a legal file-name character on win32.
+      if (process.platform === "win32") return
+      const dir = yield* tmpdirScoped()
+      yield* put(path.join(dir, "real.txt"), "plain body")
+      yield* put(path.join(dir, '"real.txt'), "literal quote body")
+
+      // Unmatched leading quote stays: the literally-named file wins over
+      // the unquoted candidate. (Relative input: a leading quote makes the
+      // path non-absolute.)
+      const unmatched = yield* exec(dir, { filePath: `"real.txt | head -1` })
+      expect(unmatched.output).toContain("1: literal quote body")
+      expect(unmatched.output).not.toContain("plain body")
+
+      // A properly paired outer quote is stripped and recovers the file.
+      const paired = yield* exec(dir, { filePath: `"${path.join(dir, "real.txt")}" | head -1` })
+      expect(paired.output).toContain("1: plain body")
+      expect(paired.output).toContain("shell pipeline")
+    }),
+  )
+})
