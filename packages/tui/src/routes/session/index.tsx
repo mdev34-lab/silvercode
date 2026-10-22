@@ -379,7 +379,9 @@ export function Session() {
   })
 
   let lastSwitch: string | undefined = undefined
-  event.on("message.part.updated", (evt) => {
+  // Session mounts on every sessionID switch; without the unsubscribe the
+  // handlers pile up on the global emitter (#416).
+  const offPartUpdated = event.on("message.part.updated", (evt) => {
     const part = evt.properties.part
     if (part.type !== "tool") return
     if (part.sessionID !== route.sessionID) return
@@ -394,6 +396,7 @@ export function Session() {
       lastSwitch = part.id
     }
   })
+  onCleanup(offPartUpdated)
 
   let seeded = false
   let scroll: ScrollBoxRenderable
@@ -427,7 +430,7 @@ export function Session() {
   const dialog = useDialog()
   const renderer = useRenderer()
 
-  event.on("session.status", (evt) => {
+  const offSessionStatus = event.on("session.status", (evt) => {
     if (evt.properties.sessionID !== route.sessionID) return
     if (evt.properties.status.type !== "retry") return
     if (!evt.properties.status.action) return
@@ -446,6 +449,7 @@ export function Session() {
       kv.set(keys.lastSeenAt, Date.now())
     })
   })
+  onCleanup(offSessionStatus)
 
   // Helper: Find next visible message boundary in direction
   const findNextVisibleMessage = (direction: "next" | "prev"): string | null => {
