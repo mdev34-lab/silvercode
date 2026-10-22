@@ -265,6 +265,16 @@ describe("opencode run with a report deferred during a successful child turn", (
             }),
           },
         })
+        // On a matcher miss the mock auto-replies without a finish tool and
+        // the subprocess dies on the 3-nudge stop far from the cause; dump
+        // the unmatched requests so the failing CI log names the miss (#511).
+        if (result.exitCode !== 0) {
+          const misses = yield* llm.misses
+          console.error(
+            `[llm-mock] ${misses.length} unmatched request(s):`,
+            misses.map((miss) => miss.body).join("\n---\n"),
+          )
+        }
         opencode.expectExit(result, 0)
         expect(result.stdout).toContain("ROOT_RECOVERED_DEFERRED_REPORT")
         expect(yield* llm.pending).toBe(0)
