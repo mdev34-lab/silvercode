@@ -54,7 +54,9 @@ describe("Git fixture", () => {
     } finally {
       await processes.settle()
     }
-  })
+    // 40 sequential git spawns; windows CreateProcess + AV cost blows past
+    // bun's 5s default (#487).
+  }, 30_000)
 
   test("cancels its own setup when the budget expires", async () => {
     await using root = await tmpdir()

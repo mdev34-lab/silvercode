@@ -405,6 +405,9 @@ describe("WebFetchTool registration", () => {
         value: `Unable to fetch ${url}`,
       })
     }),
+    // Converting 10k nested divs is CPU-bound; a loaded windows runner crosses
+    // bun's 5s default (#487).
+    30_000,
   )
 
   it.effect("rejects declared and streamed oversized bodies", () =>
