@@ -11,7 +11,7 @@ export function workerErrorToastEvent(report: WorkerErrorReport) {
     directory: "global",
     payload: {
       id: EventV2.ID.create(),
-      type: "tui.toast.show",
+      type: "tui.toast.show" as const,
       properties: {
         title: report.fatal ? "Backend worker crashed" : "Backend worker error",
         message: report.message,
