@@ -25,20 +25,36 @@ function toWorkerErrorReport(error: unknown, fatal: boolean): WorkerErrorReport 
 
 export function createDefectHandlers(deps: {
   processWorker: boolean
-  report: (report: WorkerErrorReport) => void
+  report: (report: WorkerErrorReport, done: () => void) => void
   exit: (code: number) => void
 }) {
+  let exited = false
+  const exitOnce = (code: number) => {
+    if (exited) return
+    exited = true
+    deps.exit(code)
+  }
   return {
     onUnhandledRejection(error: unknown) {
-      deps.report(toWorkerErrorReport(error, false))
+      deps.report(toWorkerErrorReport(error, false), () => {})
     },
     onUncaughtException(error: Error) {
-      deps.report(toWorkerErrorReport(error, true))
+      const report = toWorkerErrorReport(error, true)
       // Only a subprocess can crash-restart; a thread worker shares the UI
       // process and must not exit it. 134 is the exit-code counterpart of
       // SIGABRT and classifies as a crash on every platform (isCrash in
-      // worker-process.ts). The short delay lets the IPC emit flush first.
-      if (deps.processWorker) setTimeout(() => deps.exit(134), 50)
+      // worker-process.ts). Exit only after the report's flush ack so the
+      // parent reliably receives the final worker.error before we die; the
+      // fallback timer covers a dead IPC channel, where the ack never comes.
+      if (!deps.processWorker) {
+        deps.report(report, () => {})
+        return
+      }
+      const fallback = setTimeout(() => exitOnce(134), 5000)
+      deps.report(report, () => {
+        clearTimeout(fallback)
+        exitOnce(134)
+      })
     },
   }
 }
@@ -67,14 +83,15 @@ const isTuiWorker = resolveIsTuiWorker(process.env, processWorker)
 
 const defectHandlers = createDefectHandlers({
   processWorker,
-  report: (report) => {
+  report: (report, done) => {
     console.error(
       `[silvercode-worker] ${report.fatal ? "uncaughtException" : "unhandledRejection"}: ${report.message}\n${report.stack ?? ""}`,
     )
     if (processWorker) {
-      Rpc.emitProcess("worker.error", report)
+      Rpc.emitProcess("worker.error", report, done)
     } else {
       Rpc.emit("worker.error", report)
+      done()
     }
   },
   exit: (code) => process.exit(code),
