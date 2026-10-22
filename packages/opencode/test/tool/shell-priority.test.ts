@@ -49,14 +49,20 @@ const squote = (text: string) => `'${text}'`
 const projectRoot = path.join(__dirname, "../..")
 const bin = quote(process.execPath.replaceAll("\\", "/"))
 const evalarg = (text: string) => (Shell.name(Shell.acceptable()) === "cmd" ? quote(text) : squote(text))
+// PowerShell needs the call operator to invoke a quoted executable path,
+// same as the fill() helper in shell.test.ts.
+const command = (text: string) => {
+  const line = `${bin} -e ${evalarg(text)}`
+  return ["pwsh", "powershell"].includes(Shell.name(Shell.acceptable())) ? `& ${line}` : line
+}
 
 describe("tool.shell child priority", () => {
   it.live("runs commands below normal OS priority so heavy children cannot starve the TUI", () =>
     Effect.gen(function* () {
-      const command = `${bin} -e ${evalarg('console.log(require("os").getPriority(process.pid))')}`
+      const commandline = command('console.log(require("os").getPriority(process.pid))')
       const info = yield* ShellTool
       const bash = yield* info.init()
-      const result = yield* bash.execute({ command } as Tool.InferParameters<typeof ShellTool>, ctx)
+      const result = yield* bash.execute({ command: commandline } as Tool.InferParameters<typeof ShellTool>, ctx)
 
       expect(result.metadata.exit).toBe(0)
       // os.constants.priority.PRIORITY_BELOW_NORMAL === 10 on every platform
