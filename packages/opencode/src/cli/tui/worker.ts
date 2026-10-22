@@ -11,9 +11,37 @@ import { AppRuntime } from "@/effect/app-runtime"
 import { Effect } from "effect"
 import { disposeAllInstancesAndEmitGlobalDisposed } from "@/server/global-lifecycle"
 
-const onUnhandledRejection = (_error: unknown) => {}
+// Surface worker defects instead of swallowing them (#396): every
+// unhandledRejection/uncaughtException is logged and emitted to the main
+// thread, which shows it as a TUI toast instead of letting an RPC hang look
+// like a freeze. An uncaughtException in the subprocess also exits abnormally
+// so the supervisor's crash-restart engages (see createDefectHandlers).
+export type WorkerErrorReport = { message: string; stack?: string; fatal: boolean }
 
-const onUncaughtException = (_error: Error) => {}
+function toWorkerErrorReport(error: unknown, fatal: boolean): WorkerErrorReport {
+  const err = error instanceof Error ? error : new Error(String(error))
+  return { message: err.message || "unknown error", stack: err.stack, fatal }
+}
+
+export function createDefectHandlers(deps: {
+  processWorker: boolean
+  report: (report: WorkerErrorReport) => void
+  exit: (code: number) => void
+}) {
+  return {
+    onUnhandledRejection(error: unknown) {
+      deps.report(toWorkerErrorReport(error, false))
+    },
+    onUncaughtException(error: Error) {
+      deps.report(toWorkerErrorReport(error, true))
+      // Only a subprocess can crash-restart; a thread worker shares the UI
+      // process and must not exit it. 134 is the exit-code counterpart of
+      // SIGABRT and classifies as a crash on every platform (isCrash in
+      // worker-process.ts). The short delay lets the IPC emit flush first.
+      if (deps.processWorker) setTimeout(() => deps.exit(134), 50)
+    },
+  }
+}
 
 // Subscribe to global events and forward them via RPC
 const onGlobalEvent = (event: Parameters<typeof GlobalBus.emitEvent>[0]) => {
@@ -36,6 +64,23 @@ const processWorker = typeof process.send === "function"
 // reliable signal: a compiled Bun binary runs every secondary entrypoint
 // (the thread worker) with `import.meta.main === false`.
 const isTuiWorker = resolveIsTuiWorker(process.env, processWorker)
+
+const defectHandlers = createDefectHandlers({
+  processWorker,
+  report: (report) => {
+    console.error(
+      `[silvercode-worker] ${report.fatal ? "uncaughtException" : "unhandledRejection"}: ${report.message}\n${report.stack ?? ""}`,
+    )
+    if (processWorker) {
+      Rpc.emitProcess("worker.error", report)
+    } else {
+      Rpc.emit("worker.error", report)
+    }
+  },
+  exit: (code) => process.exit(code),
+})
+const onUnhandledRejection = defectHandlers.onUnhandledRejection
+const onUncaughtException = defectHandlers.onUncaughtException
 
 // Worker identity and transport selection are independent concerns (see
 // `processWorker` above). Exporting the identity decision keeps the gating

@@ -43,9 +43,28 @@ function createWorkerFetch(client: RpcClient): typeof fetch {
 function createEventSource(client: RpcClient): EventSource {
   return {
     subscribe: async (handler) => {
-      return client.on<GlobalEvent>("global.event", (e) => {
+      const offGlobal = client.on<GlobalEvent>("global.event", (e) => {
         handler(e)
       })
+      // Surface worker-internal defects (unhandled rejections, uncaught
+      // exceptions) as TUI toasts instead of a frozen footer (#396).
+      const offWorkerError = client.on<{ message: string; stack?: string; fatal: boolean }>("worker.error", (e) => {
+        handler({
+          payload: {
+            type: "tui.toast.show",
+            properties: {
+              title: e.fatal ? "Backend worker crashed" : "Backend worker error",
+              message: e.message,
+              variant: "error",
+              duration: 8000,
+            },
+          },
+        } as GlobalEvent)
+      })
+      return () => {
+        offGlobal()
+        offWorkerError()
+      }
     },
   }
 }
