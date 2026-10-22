@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test"
+import { describe, expect, setDefaultTimeout, test } from "bun:test"
 import { $ } from "bun"
 import fs from "fs/promises"
 import path from "path"
@@ -8,6 +8,10 @@ import { gitProcesses, gitRemote, type Remote, withRemote } from "./git"
 import { tmpdir } from "./tmpdir"
 
 const it = testEffect(Layer.empty)
+
+// These tests each stand up a full git remote fixture; a loaded Windows runner
+// can spend 9s+ on that setup alone, so the suite budget matches test/git.test.ts.
+setDefaultTimeout(45_000)
 
 // A git process that stays alive until something cancels it. It stands in for
 // the `git push -u origin main` that was still running when the Windows test

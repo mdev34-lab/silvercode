@@ -12,8 +12,8 @@ import { testEffect } from "./lib/effect"
 
 const it = testEffect(LayerNode.compile(Git.node))
 
-// Real Git clone/push against a local origin; Windows runners intermittently exceed the 5s default (#278).
-setDefaultTimeout(30_000)
+// Real Git clone/push against a local origin; Windows runners intermittently exceed the 5s default (#278), and a loaded runner can spend 9s+ on fixture setup alone with single git spawns at 2-9s, so the suite gets 45s.
+setDefaultTimeout(45_000)
 
 describe("Git", () => {
   it.live(
@@ -35,11 +35,6 @@ describe("Git", () => {
           expect(yield* read(path.join(target, "README.md"))).toBe("one\n")
         }),
       ),
-    // Windows CI spends seconds spawning git for the fixture, remote, and
-    // clone; this test had no explicit budget, so it inherited Bun's 5s
-    // default and failed there. Same assertion, more generous budget — the
-    // sibling test below already does this.
-    15_000,
   )
 
   it.live(
@@ -64,10 +59,6 @@ describe("Git", () => {
           expect(yield* read(path.join(target, "README.md"))).toBe("feature\n")
         }),
       ),
-    // A fresh clone plus remote fetch/reset can exceed Bun's 5s default on
-    // Windows CI. Give the test a more generous budget without changing what
-    // it asserts.
-    15_000,
   )
 })
 
