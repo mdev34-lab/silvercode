@@ -193,6 +193,9 @@ describe("ProjectV2.resolve", () => {
 
       expect(result.directory).toBe(yield* real(tmp.path))
     }),
+    // ~9 sequential git spawns between the fixture and resolve; windows
+    // CreateProcess + AV cost blows past bun's 5s default (#485).
+    30_000,
   )
 
   it.live("linked worktree returns opened worktree directory and previous from common dir", () =>
@@ -217,5 +220,8 @@ describe("ProjectV2.resolve", () => {
       expect(result.id).toBe(remoteID("github.com/owner/repo"))
       expect(result.vcs?.type).toBe("git")
     }),
+    // `git worktree add` on top of the initRepo spawn chain is the slowest
+    // case in this file on the windows runner (#485).
+    30_000,
   )
 })
