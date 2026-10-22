@@ -190,17 +190,25 @@ describe("tool.read external_directory permission", () => {
         const dir = yield* tmpdirScoped({ git: true })
         yield* put(path.join(dir, "test.txt"), "hello world")
 
-        const { items, next } = asks()
         const target = path.join(dir, "test.txt")
-        const alt = target
-          .replace(/^[A-Za-z]:/, "")
-          .replaceAll("\\", "/")
-          .toLowerCase()
 
-        yield* exec(dir, { filePath: alt }, next)
-        const read = items.find((item) => item.permission === "read")
-        expect(read).toBeDefined()
-        expect(read!.patterns).toEqual([path.relative(dir, full(target))])
+        // Case and separator variants always name the same file. A
+        // drive-relative variant only does when the process cwd sits on the
+        // same drive as the temp dir - on the GitHub windows runner the repo
+        // lives on D: while TEMP is on C: (#505).
+        const variants = [target.replaceAll("\\", "/").toLowerCase()]
+        const sameDrive =
+          path.parse(process.cwd()).root.slice(0, 1).toLowerCase() ===
+          path.parse(target).root.slice(0, 1).toLowerCase()
+        if (sameDrive) variants.push(target.replace(/^[A-Za-z]:/, "").replaceAll("\\", "/").toLowerCase())
+
+        for (const variant of variants) {
+          const { items, next } = asks()
+          yield* exec(dir, { filePath: variant }, next)
+          const read = items.find((item) => item.permission === "read")
+          expect(read).toBeDefined()
+          expect(read!.patterns).toEqual([path.relative(dir, full(target))])
+        }
       }),
     )
   }
