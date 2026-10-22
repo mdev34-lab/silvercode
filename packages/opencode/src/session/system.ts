@@ -146,13 +146,13 @@ const layer = Layer.effect(
         // Only primary-style callers drive delegation; subagents execute.
         if (agent.mode === "subagent") return
 
-        // Built from the live registry: any delegable agent, excluding the
-        // caller itself, hidden agents, and agents the merged agent + session
-        // permission ruleset may not delegate to.
+        // Built from the live registry: any non-primary, non-hidden agent the
+        // merged agent + session permission ruleset may delegate to. The
+        // caller is filtered out only where the guidance is advertised, so
+        // planner identity below can be resolved against the real registry.
         const ruleset = Permission.merge(agent.permission, permission ?? [])
-        const delegatable = (yield* agents.list()).filter(
+        const eligible = (yield* agents.list()).filter(
           (item) =>
-            item.name !== agent.name &&
             item.mode !== "primary" &&
             item.hidden !== true &&
             Permission.evaluate("task", item.name, ruleset).action !== "deny",
@@ -161,36 +161,44 @@ const layer = Layer.effect(
         // are identified from registry names and descriptions, never from
         // hardcoded agent names, so renames and custom agents keep working.
         // Read-only explorers and reviewers match neither pattern.
-        const planners = delegatable.filter(
-          (item) => /\bplan/i.test(item.name) || /\bplan/i.test(item.description ?? ""),
-        )
-        const implementers = delegatable.filter(
+        const planners = eligible.filter((item) => /\bplan/i.test(item.name) || /\bplan/i.test(item.description ?? ""))
+        const implementers = eligible.filter(
           (item) =>
             !planners.includes(item) &&
-            (/\bcode\b/i.test(item.name) || /\bengineer/i.test(item.description ?? "")),
+            (/\bcode\b/i.test(item.name) || /\bengineer/i.test(item.description ?? "")) &&
+            // Capability check, not just a name match: a read-only candidate
+            // (reviewer, auditor) that the registry forbids to edit can never
+            // implement, whatever its description claims.
+            Permission.evaluate("edit", "*", item.permission).action !== "deny",
         )
-        // The planning agent itself plans; its own prompt governs it.
-        if (/\bplan/i.test(agent.name) || /\bplan/i.test(agent.description ?? "")) return
-        if (planners.length === 0 && implementers.length === 0) return
+        // The planning agent itself plans; its own prompt governs it. This is
+        // an identity check against the discovered planners - only non-primary
+        // agents are eligible above, so a primary agent that merely mentions
+        // planning in its description can never lose the guidance here.
+        if (planners.some((item) => item.name === agent.name)) return
+        const delegatable = (list: Agent.Info[]) => list.filter((item) => item.name !== agent.name)
+        const plannersToAdvertise = delegatable(planners)
+        const implementersToAdvertise = delegatable(implementers)
+        if (plannersToAdvertise.length === 0 && implementersToAdvertise.length === 0) return
 
         const names = (list: Agent.Info[]) => list.map((item) => `\`${item.name}\``).join(" or ")
-        if (implementers.length === 0) {
+        if (implementersToAdvertise.length === 0) {
           return [
-            `When a request needs non-trivial implementation planning, delegate that planning to ${names(planners)} once, at the start, with the task tool.`,
+            `When a request needs non-trivial implementation planning, delegate that planning to ${names(plannersToAdvertise)} once, at the start, with the task tool.`,
             "Then work the plan step by step, carrying it forward instead of re-deriving or re-planning it at every tool call.",
           ].join("\n")
         }
-        if (planners.length === 0) {
+        if (plannersToAdvertise.length === 0) {
           return [
-            `Delegate by default: you coordinate and ${names(implementers)} implements.`,
-            `For anything beyond a small task, delegate each implementation step to ${names(implementers)} with the task tool.`,
+            `Delegate by default: you coordinate and ${names(implementersToAdvertise)} implements.`,
+            `For anything beyond a small task, delegate each implementation step to ${names(implementersToAdvertise)} with the task tool.`,
             "Direct work is the exception, reserved for small tasks - a quick lookup, a tiny edit, a short answer.",
             "You stay responsible for the outcome: give each subagent complete context, then verify and integrate what it returns.",
           ].join("\n")
         }
         return [
-          `Delegate by default: you coordinate, ${names(planners)} plans, and ${names(implementers)} implements.`,
-          `For anything beyond a small task, delegate planning to ${names(planners)} once, at the start, with the task tool, then delegate each implementation step to ${names(implementers)}.`,
+          `Delegate by default: you coordinate, ${names(plannersToAdvertise)} plans, and ${names(implementersToAdvertise)} implements.`,
+          `For anything beyond a small task, delegate planning to ${names(plannersToAdvertise)} once, at the start, with the task tool, then delegate each implementation step to ${names(implementersToAdvertise)}.`,
           "Direct work is the exception, reserved for small tasks - a quick lookup, a tiny edit, a short answer.",
           "You stay responsible for the outcome: give each subagent complete context, then verify and integrate what it returns instead of re-deriving or re-planning it at every tool call.",
         ].join("\n")

@@ -71,6 +71,18 @@ const code: Agent.Info = {
   options: {},
 }
 
+// A read-only reviewer whose name and description match the implementer
+// heuristic but whose registry permission forbids edits must never be
+// advertised as an implementer either: eligibility is capability-checked.
+const engineerReviewer: Agent.Info = {
+  name: "engineer-review",
+  mode: "all",
+  native: true,
+  description: "Software engineer reviewer. Reads diffs and returns verdicts.",
+  permission: Permission.fromConfig({ edit: { "*": "deny" } }),
+  options: {},
+}
+
 // A read-only explorer mentions code in its description but must never be
 // advertised as an implementer.
 const scout: Agent.Info = {
@@ -116,7 +128,7 @@ const it = testEffect(
     [
       Agent.node,
       Layer.mock(Agent.Service, {
-        list: () => Effect.succeed([build, think, code, scout, hiddenPlanner]),
+        list: () => Effect.succeed([build, think, code, scout, engineerReviewer, hiddenPlanner]),
       }),
     ],
     [
@@ -270,6 +282,7 @@ describe("session.system", () => {
       expect(output).toContain("re-deriving or re-planning it at every tool call")
       expect(output).not.toContain("architect-planner")
       expect(output).not.toContain("`scout`")
+      expect(output).not.toContain("engineer-review")
     }),
   )
 
@@ -279,6 +292,23 @@ describe("session.system", () => {
       const output = yield* prompt.delegation({ ...build, name: "general", mode: "subagent" })
 
       expect(output).toBeUndefined()
+    }),
+  )
+
+  it.effect("delegation guidance is kept for a primary caller that merely mentions planning", () =>
+    Effect.gen(function* () {
+      const prompt = yield* SystemPrompt.Service
+      const orchestrator: Agent.Info = {
+        name: "orchestrator",
+        mode: "primary",
+        description: "Coordinates planning and delivery across the team.",
+        permission: Permission.fromConfig({ "*": "allow" }),
+        options: {},
+      }
+      const output = (yield* prompt.delegation(orchestrator)) ?? (yield* Effect.fail(new NamedError.Unknown({ message: "missing delegation output" })))
+
+      expect(output).toContain("`plan`")
+      expect(output).toContain("`code`")
     }),
   )
 
