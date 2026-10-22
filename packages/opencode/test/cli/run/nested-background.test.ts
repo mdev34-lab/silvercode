@@ -231,10 +231,17 @@ describe("opencode run with a report deferred during a successful child turn", (
         )
         // This refusal is evidence that the last grandchild has actually
         // settled. No fabricated finish and no assumed event interleaving.
+        // On slow runners the child can absorb the deferred report before its
+        // wait-guard turn runs, ending with "late report received" instead -
+        // then this matcher is legitimately never pulled (#511).
+        let guardRefused = false
         yield* llm.pushMatch(
-          (hit) =>
-            last(hit.body as Body)?.role === "tool" &&
-            lastText(hit.body as Body).includes("has no background subagents of its own"),
+          (hit) => {
+            if (last(hit.body as Body)?.role !== "tool") return false
+            if (!lastText(hit.body as Body).includes("has no background subagents of its own")) return false
+            guardRefused = true
+            return true
+          },
           reply().tool("finish", { reason: "success", result: "CHILD_EARLY_DONE" }),
         )
         yield* llm.pushMatch(
@@ -247,8 +254,26 @@ describe("opencode run with a report deferred during a successful child turn", (
           },
           reply().tool("finish", { reason: "success", result: "late report received" }),
         )
+        // The root's resume must not assume WHICH result the child ended with:
+        // on slow runners the child absorbs the deferred report itself (its own
+        // "grandchild dispatch" call satisfies the report matcher above) and
+        // completes with "late report received", so a CHILD_EARLY_DONE-keyed
+        // matcher never fires and the root nudge-stops (#511). Accept the
+        // child's completion notification in either result shape; the
+        // deliveredGate still orders the recovery after the report.
         yield* llm.pushMatch(
-          (hit) => lastText(hit.body as Body).includes("CHILD_EARLY_DONE"),
+          (hit) => {
+            const text = lastText(hit.body as Body)
+            if (text.includes("CHILD_EARLY_DONE")) return true
+            // The child's completion notification specifically: task identity
+            // and completed state inside the notification itself, so stale
+            // conversation history cannot satisfy it.
+            return (
+              text.includes("<task id=") &&
+              text.includes('state="completed"') &&
+              text.includes("Background task completed: child dispatch")
+            )
+          },
           reply()
             .wait(deliveredGate)
             .text("ROOT_RECOVERED_DEFERRED_REPORT")
@@ -285,7 +310,9 @@ describe("opencode run with a report deferred during a successful child turn", (
         }
         opencode.expectExit(result, 0)
         expect(result.stdout).toContain("ROOT_RECOVERED_DEFERRED_REPORT")
-        expect(yield* llm.pending).toBe(0)
+        // Every scripted reply but the optional guard-refusal one was pulled:
+        // when the child absorbs the report first, exactly that one remains.
+        expect(yield* llm.pending).toBe(guardRefused ? 0 : 1)
       }),
     30_000,
   )
