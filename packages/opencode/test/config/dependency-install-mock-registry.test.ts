@@ -140,6 +140,9 @@ describe("Config Dependency Install Integration with MockRegistry", () => {
     expect(urls.some((u) => u.includes("@opencode-ai") || u.includes("plugin"))).toBe(true)
   }, budget)
 
+  // Same windows spawn-cost class as the background-install test above: the
+  // recover path crossed the suite's 30s flag on a loaded runner (#485).
+  const budget500 = process.platform === "win32" ? 90_000 : 30_000
   test("config loads successfully and waitForDependencies recovers when mock registry returns HTTP 500", async () => {
     await using tmp = await tmpdir()
     await using registry = await MockRegistry.start([
@@ -174,7 +177,7 @@ describe("Config Dependency Install Integration with MockRegistry", () => {
     if (result._tag === "Success") {
       expect(result.value).toBeDefined()
     }
-  })
+  }, budget500)
 
   test("config loads successfully when mock registry connection is abruptly closed", async () => {
     await using tmp = await tmpdir()
@@ -330,7 +333,9 @@ describe("Config Dependency Install Integration with MockRegistry", () => {
       // The 250ms bound expired before the join returned...
       expect(elapsed).toBeGreaterThanOrEqual(200)
       // ...and the join returned instead of hanging on the stalled registry.
-      expect(elapsed).toBeLessThan(10_000)
+      // The 10s wall bound needs headroom on the loaded windows runner, where
+      // the same join crossed it under load (#485).
+      expect(elapsed).toBeLessThan(process.platform === "win32" ? 30_000 : 10_000)
       // The install really started against the mock registry before stalling.
       expect(registry.requests.length).toBeGreaterThan(0)
       // The bound expiry is reported as a timeout, not as an install failure.
