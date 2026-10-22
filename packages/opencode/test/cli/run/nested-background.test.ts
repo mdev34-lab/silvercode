@@ -272,9 +272,7 @@ describe("opencode run with a report deferred during a successful child turn", (
           const misses = yield* llm.misses
           console.error(
             `[llm-mock] ${misses.length} unmatched request(s):`,
-            misses
-              .map((miss) => JSON.stringify(miss.body).slice(-600))
-              .join("\n---\n"),
+            misses.map((miss) => miss.body).join("\n---\n"),
           )
         }
         opencode.expectExit(result, 0)

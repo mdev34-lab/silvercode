@@ -611,6 +611,17 @@ function hit(url: string, body: unknown) {
   } satisfies Hit
 }
 
+const MAX_MISSES = 20
+
+interface Miss {
+  url: URL
+  body: string
+}
+
+function miss(hit: Hit): Miss {
+  return { url: hit.url, body: JSON.stringify(hit.body).slice(-800) }
+}
+
 function isTitleRequest(body: unknown): boolean {
   if (!body || typeof body !== "object") return false
   return JSON.stringify(body).includes("Generate a title for this conversation")
@@ -637,7 +648,7 @@ namespace TestLLMServer {
     readonly wait: (count: number) => Effect.Effect<void>
     readonly inputs: Effect.Effect<Record<string, unknown>[]>
     readonly pending: Effect.Effect<number>
-    readonly misses: Effect.Effect<Hit[]>
+    readonly misses: Effect.Effect<Miss[]>
   }
 }
 
@@ -651,7 +662,7 @@ export class TestLLMServer extends Context.Service<TestLLMServer, TestLLMServer.
       let hits: Hit[] = []
       let list: Queue[] = []
       let waits: Wait[] = []
-      let misses: Hit[] = []
+      let misses: Miss[] = []
 
       const queue = (...input: (Item | Reply)[]) => {
         list = [...list, ...input.map((value) => ({ item: item(value) }))]
@@ -692,7 +703,9 @@ export class TestLLMServer extends Context.Service<TestLLMServer, TestLLMServer.
           hits = [...hits, current]
           // Record the unmatched request: on a miss the auto-reply below has
           // no finish tool, which surfaces far away as a 3-nudge turn stop.
-          misses = [...misses, current]
+          // Keep only a truncated copy of the body and cap the array so a
+          // runaway request loop cannot grow memory without bound.
+          misses = [...misses, miss(current)].slice(-MAX_MISSES)
           yield* notify()
           const auto: Sse = { type: "sse", head: [role()], tail: [textLine("ok"), finishLine("stop")] }
           if (mode === "responses") return send(responses(auto, modelFrom(body)))
