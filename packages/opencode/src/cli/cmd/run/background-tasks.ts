@@ -35,11 +35,13 @@ export const make = (rootSessionID: string) => {
       if (input.sessionID === rootSessionID) return false
       parents.set(input.sessionID, input.parentSessionID)
       const key = input.run ?? input.sessionID
-      // A launch re-emitted for a run still pending is the same run. One whose
-      // delivery already arrived was resumed (task_id): a new run, so it is
-      // pending again.
+      // Explicit execution keys stay idempotent after delivery. Legacy keys
+      // cannot distinguish a completed-launch replay from task_id resume.
       if (launched.has(key)) {
-        if (!resolved.has(key)) return false
+        // An explicit run identifies one execution forever. Replaying its
+        // launch after delivery cannot resurrect completed work. Only legacy
+        // session-only launches lack enough identity to distinguish resume.
+        if (input.run !== undefined || !resolved.has(key)) return false
         resolved.delete(key)
       }
       launched.set(key, { sessionID: input.sessionID, parentSessionID: input.parentSessionID })

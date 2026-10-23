@@ -135,3 +135,17 @@ test("a resolved session resumed through task_id is pending again until its new 
   tasks.resolve(child)
   expect(tasks.settled()).toBe(true)
 })
+
+test("a completed explicit run launch replay stays settled while a new run remains pending", () => {
+  const tasks = BackgroundTasks.make(root)
+  tasks.launch({ ...launch(root, child), run: `${child}@1` })
+  tasks.resolve(`${child}@1`)
+  expect(tasks.settled()).toBe(true)
+  expect(tasks.launch({ ...launch(root, child), run: `${child}@1` })).toBe(false)
+  expect(tasks.settled()).toBe(true)
+  tasks.launch({ ...launch(root, child), run: `${child}@2` })
+  expect(tasks.launch({ ...launch(root, child), run: `${child}@1` })).toBe(false)
+  expect(tasks.pending()).toEqual([child])
+  tasks.resolve(`${child}@2`)
+  expect(tasks.settled()).toBe(true)
+})

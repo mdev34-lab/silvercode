@@ -264,7 +264,9 @@ export const make = Effect.gen(function* () {
                 type: input.type,
                 title: input.title,
                 status: "running" as const,
-                started_at,
+                // started_at also identifies a run on the wire. A completed
+                // session can restart before the millisecond clock advances.
+                started_at: Math.max(started_at, (existing?.info.started_at ?? -Infinity) + 1),
                 metadata: input.metadata,
               },
               done,
