@@ -6,6 +6,7 @@ import path from "node:path"
 import { spawn } from "node:child_process"
 import type { Stream } from "node:stream"
 import { resolveZedDbPath, resolveZedSelection } from "./editor-zed"
+import { win32DisableProcessedInput } from "./terminal-win32"
 
 type EditorStdio = "inherit" | "pipe" | "ignore" | number | Stream
 
@@ -31,6 +32,13 @@ export async function openEditor(input: { value: string; renderer: CliRenderer; 
   await input.renderer.suspend()
   input.renderer.currentRenderBuffer.clear()
   try {
+    // suspend() restores the console mode it found, which re-enables processed
+    // input. On Windows that turns Ctrl+C into a console event for every process
+    // attached to the console (the editor, this process, and any npm launcher)
+    // instead of input the editor can handle. The Ctrl+C guard re-asserts this
+    // after raw-mode toggles, but it only wraps the stream it was installed on,
+    // so re-assert at the handoff as well (#441).
+    win32DisableProcessedInput()
     await new Promise<void>((resolve, reject) => {
       const parts = editor.split(" ")
       const child = spawn(parts[0]!, [...parts.slice(1), file], {
