@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test"
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync } from "fs"
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync, utimesSync } from "fs"
 import { tmpdir } from "os"
 import path from "path"
 import { randomUUID } from "crypto"
@@ -875,44 +875,48 @@ describe("daemon teardown: verified-exit protocol (integration)", () => {
 describe("daemon teardown: ownership and wait-path regressions (integration)", () => {
   // POSIX-only: the SIGTERM-ignoring child uses sh trap semantics; no Windows
   // fixture or cross-platform coverage is claimed for the wait-path regression.
-  ;(process.platform === "win32" ? test.skip : test)("EPERM injected on the WAIT path (probe and signals allowed): stop refuses, registration kept, nothing spawned", async () => {
-    // A child that ignores SIGTERM, so the wait path is what decides.
-    const child = Bun.spawn(["sh", "-c", "trap '' TERM; exec sleep 30"], { stdio: ["ignore", "ignore", "ignore"] })
-    const server = fakeServer({ active: { kind: "ok", runs: 0 }, stop: { kind: "grant" } })
-    writeRegistration({ version: installationVersion, url: server.url.origin, pid: child.pid })
-    const originalRegistration = readFileSync(serverFile, "utf8")
-    const originalKill = process.kill
-    let signaled = false
-    process.kill = ((pid: number, sig?: NodeJS.Signals | 0) => {
-      if (sig === 0 || sig === undefined) {
-        if (signaled) throw Object.assign(new Error("operation not permitted"), { code: "EPERM" })
-        return originalKill(pid, 0)
+  ;(process.platform === "win32" ? test.skip : test)(
+    "EPERM injected on the WAIT path (probe and signals allowed): stop refuses, registration kept, nothing spawned",
+    async () => {
+      // A child that ignores SIGTERM, so the wait path is what decides.
+      const child = Bun.spawn(["sh", "-c", "trap '' TERM; exec sleep 30"], { stdio: ["ignore", "ignore", "ignore"] })
+      const server = fakeServer({ active: { kind: "ok", runs: 0 }, stop: { kind: "grant" } })
+      writeRegistration({ version: installationVersion, url: server.url.origin, pid: child.pid })
+      const originalRegistration = readFileSync(serverFile, "utf8")
+      const originalKill = process.kill
+      let signaled = false
+      process.kill = ((pid: number, sig?: NodeJS.Signals | 0) => {
+        if (sig === 0 || sig === undefined) {
+          if (signaled) throw Object.assign(new Error("operation not permitted"), { code: "EPERM" })
+          return originalKill(pid, 0)
+        }
+        signaled = true
+        return originalKill(pid, sig)
+      }) as typeof process.kill
+      let stopped: Outcome
+      try {
+        stopped = await runDaemon((daemon) => daemon.stop())
+      } finally {
+        process.kill = originalKill
       }
-      signaled = true
-      return originalKill(pid, sig)
-    }) as typeof process.kill
-    let stopped: Outcome
-    try {
-      stopped = await runDaemon((daemon) => daemon.stop())
-    } finally {
-      process.kill = originalKill
-    }
-    try {
-      // The wait never saw a verified exit (EPERM after SIGTERM and after
-      // SIGKILL), so teardown must refuse even though the signals landed.
-      expect(stopped!.ok).toBe(false)
-      if (!stopped!.ok) {
-        expect(stopped!.message).toContain("could not be verified")
-        expect(stopped!.message).toContain("after SIGKILL")
+      try {
+        // The wait never saw a verified exit (EPERM after SIGTERM and after
+        // SIGKILL), so teardown must refuse even though the signals landed.
+        expect(stopped!.ok).toBe(false)
+        if (!stopped!.ok) {
+          expect(stopped!.message).toContain("could not be verified")
+          expect(stopped!.message).toContain("after SIGKILL")
+        }
+        expect(readFileSync(serverFile, "utf8")).toBe(originalRegistration)
+        expect(existsSync(markerOut)).toBe(false)
+      } finally {
+        child.kill("SIGKILL")
+        server.stop(true)
+        rmSync(serverFile, { force: true })
       }
-      expect(readFileSync(serverFile, "utf8")).toBe(originalRegistration)
-      expect(existsSync(markerOut)).toBe(false)
-    } finally {
-      child.kill("SIGKILL")
-      server.stop(true)
-      rmSync(serverFile, { force: true })
-    }
-  }, 60_000)
+    },
+    60_000,
+  )
 
   test("registration changed before the teardown re-check: stop refuses without signaling, the new registration is preserved (regression: ownership race)", async () => {
     const childA = Bun.spawn(["sleep", "30"], { stdio: ["ignore", "ignore", "ignore"] })
@@ -1023,6 +1027,21 @@ describe("daemon teardown: ownership and wait-path regressions (integration)", (
 })
 
 describe("daemon teardown: registration lock coordination (integration)", () => {
+  test("first register creates the state directory before acquiring its lock and finalizes its own registration", async () => {
+    rmSync(path.dirname(serverFile), { recursive: true, force: true })
+    const layer = mod.layer.pipe(Layer.provide(NodeFileSystem.layer))
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const daemon = yield* mod.Service
+        yield* daemon.register({ _tag: "TcpAddress", hostname: "127.0.0.1", port: 12345 })
+        expect(existsSync(serverFile)).toBe(true)
+        expect(existsSync(serverFile + ".lock")).toBe(false)
+      }).pipe(Effect.scoped, Effect.provide(layer)),
+    )
+    expect(existsSync(serverFile)).toBe(false)
+    expect(existsSync(serverFile + ".lock")).toBe(false)
+  })
+
   test("a held registration lock makes stop fail WITHOUT deleting the file; releasing the lock lets the next stop remove it", async () => {
     const child = Bun.spawn(["sleep", "30"], { stdio: ["ignore", "ignore", "ignore"] })
     const server = fakeServer({ active: { kind: "ok", runs: 0 }, stop: { kind: "grant" } })
@@ -1030,6 +1049,9 @@ describe("daemon teardown: registration lock coordination (integration)", () => 
     const originalRegistration = readFileSync(serverFile, "utf8")
     // A concurrent publisher holds the lock: the removal must not happen.
     mkdirSync(serverFile + ".lock")
+    // Age is not proof the holder died: never steal a paused holder's lock.
+    const old = new Date(Date.now() - 60_000)
+    utimesSync(serverFile + ".lock", old, old)
     try {
       const stopped = await runDaemon((daemon) => daemon.stop())
       expect(stopped.ok).toBe(false)
@@ -1081,8 +1103,7 @@ describe("daemon teardown: registration lock coordination (integration)", () => 
         // compare refuses to delete a registration it does not own. Both
         // leave B's file untouched and spawn nothing - the invariants below
         // (file kept, B alive, nothing spawned) are what this regression pins.
-        if (!restarted.ok)
-          expect(restarted.message).toMatch(/could not be verified|different service registered/)
+        if (!restarted.ok) expect(restarted.message).toMatch(/could not be verified|different service registered/)
         expect(alive(childA.pid)).toBe(false)
         expect(alive(childB.pid)).toBe(true)
         expect(existsSync(markerOut)).toBe(false)

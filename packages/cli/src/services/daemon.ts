@@ -81,9 +81,7 @@ export function decideRestart(input: {
 // an unrelated process also reads as alive, so reuse can cause a false
 // refusal but never a false "exited".
 export function kill0MeansExited(cause: unknown): boolean {
-  return (
-    cause !== null && typeof cause === "object" && (cause as { code?: unknown }).code === "ESRCH"
-  )
+  return cause !== null && typeof cause === "object" && (cause as { code?: unknown }).code === "ESRCH"
 }
 
 const ACTIVE_PROBE_TIMEOUT = "2 seconds"
@@ -199,7 +197,9 @@ export const layer = Layer.effect(
           return "delivered" as const
         },
         catch: (cause) => cause,
-      }).pipe(Effect.catch((cause) => Effect.succeed(kill0MeansExited(cause) ? ("exited" as const) : ("error" as const))))
+      }).pipe(
+        Effect.catch((cause) => Effect.succeed(kill0MeansExited(cause) ? ("exited" as const) : ("error" as const))),
+      )
     })
 
     // Teardown ends in exactly one of two outcomes. "stopped" means the
@@ -235,8 +235,7 @@ export const layer = Layer.effect(
 
       const term = yield* signalChecked(info.pid, "SIGTERM")
       if (term === "exited") return { status: "stopped" }
-      if (term === "error")
-        return { status: "unverified", reason: `SIGTERM could not be delivered to PID ${info.pid}` }
+      if (term === "error") return { status: "unverified", reason: `SIGTERM could not be delivered to PID ${info.pid}` }
       const stopped = yield* awaitStopped(info.pid).pipe(
         Effect.retry(Schedule.spaced("50 millis").pipe(Schedule.both(Schedule.recurs(100)))),
         Effect.option,
@@ -252,8 +251,7 @@ export const layer = Layer.effect(
         }
       const kill = yield* signalChecked(info.pid, "SIGKILL")
       if (kill === "exited") return { status: "stopped" }
-      if (kill === "error")
-        return { status: "unverified", reason: `SIGKILL could not be delivered to PID ${info.pid}` }
+      if (kill === "error") return { status: "unverified", reason: `SIGKILL could not be delivered to PID ${info.pid}` }
       const final = yield* awaitStopped(info.pid).pipe(
         Effect.retry(Schedule.spaced("50 millis").pipe(Schedule.both(Schedule.recurs(100)))),
         Effect.option,
@@ -267,10 +265,15 @@ export const layer = Layer.effect(
     // build can rewrite the registration between the compare and the remove.
     // (Servers on older builds do not take the lock; against those the
     // compare still narrows the window but cannot close it - no claim
-    // otherwise.) A lock abandoned by a crashed process is reclaimed after
-    // 30s; a live contender makes the caller fail fast instead of waiting.
+    // otherwise.) A lock is never stolen based on age: a paused live
+    // holder is indistinguishable from a crashed one. Contention refuses
+    // safely; abandoned locks require operator recovery after all service
+    // and client processes using this state directory have been stopped.
     const lockDir = file + ".lock"
     const acquireLock = Effect.gen(function* () {
+      yield* fs
+        .makeDirectory(directory, { recursive: true })
+        .pipe(Effect.mapError(() => new Error("Could not create the service state directory; nothing was removed.")))
       const deadline = Date.now() + 2_000
       for (;;) {
         const acquired = yield* fs.makeDirectory(lockDir).pipe(
@@ -278,22 +281,22 @@ export const layer = Layer.effect(
           Effect.orElseSucceed(() => false),
         )
         if (acquired) return
-        const stat = yield* fs.stat(lockDir).pipe(Effect.option)
-        const mtime = Option.getOrUndefined(Option.flatMap(stat, (s) => s.mtime))
-        if (mtime !== undefined && Date.now() - mtime.getTime() > 30_000) {
-          yield* fs.remove(lockDir, { recursive: true }).pipe(Effect.ignore)
-          continue
-        }
         if (Date.now() > deadline) {
           return yield* Effect.fail(
-            new Error("The service registration is being updated concurrently; nothing was removed. Retry."),
+            new Error(
+              "The service registration is being updated concurrently; nothing was removed. Retry. If the lock is abandoned, stop all service and client processes using this state directory before removing server.json.lock.",
+            ),
           )
         }
         yield* Effect.sleep("50 millis")
       }
     })
     const withRegistrationLock = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
-      Effect.acquireUseRelease(acquireLock, () => effect, () => fs.remove(lockDir, { recursive: true }).pipe(Effect.ignore))
+      Effect.acquireUseRelease(
+        acquireLock,
+        () => effect,
+        () => fs.remove(lockDir, { recursive: true }).pipe(Effect.ignore),
+      )
 
     // Ownership-conditioned removal under the lock: the registration is
     // deleted only when the file still describes the exact record this caller
@@ -737,10 +740,9 @@ export const layer = Layer.effect(
         Effect.forkScoped,
       )
       yield* Effect.addFinalizer(() =>
-        registration().pipe(
-          Effect.flatMap((info) => (info.id === id ? fs.remove(file) : Effect.void)),
-          Effect.ignore,
-        ),
+        withRegistrationLock(
+          registration().pipe(Effect.flatMap((info) => (info.id === id ? fs.remove(file) : Effect.void))),
+        ).pipe(Effect.ignore),
       )
     })
 
