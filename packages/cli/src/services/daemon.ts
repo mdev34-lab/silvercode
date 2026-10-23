@@ -256,7 +256,7 @@ export const layer = Layer.effect(
       return false
     }
 
-    const probeLiveness = Effect.fn("cli.daemon.probeLiveness")(function* (info: Registration)
+    const probeLiveness = Effect.fn("cli.daemon.probeLiveness")(function* (info: Registration) {
       const headers = ServerAuth.headers({ password: yield* password() })
       const response = yield* Effect.tryPromise({
         try: () =>
