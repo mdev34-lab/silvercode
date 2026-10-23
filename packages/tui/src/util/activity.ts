@@ -267,9 +267,15 @@ export function computeActivitySubGroups(group: ActivityGroup): ActivitySubGroup
 // targets keep repeated reads of one file from inflating the count. Calls
 // without a recognizable target still count once (fallback key per call).
 // Path spellings differ per call ("src/a.ts" vs "./src/a.ts"); normalize
-// before counting so one file is one target.
-function normalizeTargetPath(value: string): string {
-  let out = value.trim().replaceAll("\\", "/")
+// before counting so one file is one target. The policy follows the
+// platform's own naming rules: on Windows a backslash is a path separator
+// and names are case-insensitive, so both are folded; on POSIX a backslash
+// is a legal literal filename character and names are case-sensitive, so
+// both are preserved. This key is only ever counted, never rendered, so
+// display text is unaffected either way.
+function normalizeTargetPath(value: string, platform: NodeJS.Platform = process.platform): string {
+  let out = value.trim()
+  if (platform === "win32") out = out.replaceAll("\\", "/").toLowerCase()
   while (out.startsWith("./")) out = out.slice(2)
   return out.replace(/\/+/g, "/")
 }
@@ -279,9 +285,9 @@ function normalizeTargetPath(value: string): string {
 // file count once and one multi-file patch counts each file.
 const PATCH_FILE_RE = /^\*\*\* (?:Add|Update|Delete) File: (.+)$/gm
 
-function activityTarget(part: ToolPart): string {
+function activityTarget(part: ToolPart, platform: NodeJS.Platform): string {
   const input = "input" in part.state && part.state.input ? (part.state.input as Record<string, unknown>) : {}
-  const filePath = typeof input.filePath === "string" ? normalizeTargetPath(input.filePath) : undefined
+  const filePath = typeof input.filePath === "string" ? normalizeTargetPath(input.filePath, platform) : undefined
   switch (part.tool) {
     case "read":
     case "write":
@@ -290,7 +296,7 @@ function activityTarget(part: ToolPart): string {
     case "apply_patch": {
       if (typeof input.patchText === "string") {
         const files = [...input.patchText.matchAll(PATCH_FILE_RE)]
-          .map((match) => normalizeTargetPath(match[1] ?? ""))
+          .map((match) => normalizeTargetPath(match[1] ?? "", platform))
           .filter((file) => file.length > 0)
         if (files.length > 0) return [...new Set(files)].sort().join("\n")
       }
@@ -298,9 +304,9 @@ function activityTarget(part: ToolPart): string {
     }
     case "glob":
     case "grep":
-      return `${typeof input.pattern === "string" ? input.pattern : part.id} in ${typeof input.path === "string" ? normalizeTargetPath(input.path) : ""}`
+      return `${typeof input.pattern === "string" ? input.pattern : part.id} in ${typeof input.path === "string" ? normalizeTargetPath(input.path, platform) : ""}`
     case "list":
-      return typeof input.path === "string" ? normalizeTargetPath(input.path) : part.id
+      return typeof input.path === "string" ? normalizeTargetPath(input.path, platform) : part.id
     default:
       return part.id
   }
@@ -308,12 +314,15 @@ function activityTarget(part: ToolPart): string {
 
 // Distinct-target count for file-oriented blocks (Explored/Edited). Bash and
 // misc blocks count calls instead, so they pass targetCount = summary.count.
-export function countActivityTargets(items: readonly ActivityItem[]): number {
+export function countActivityTargets(
+  items: readonly ActivityItem[],
+  platform: NodeJS.Platform = process.platform,
+): number {
   const seen = new Set<string>()
   for (const item of items) {
     // A multi-file apply_patch yields one composite key (newline-joined, and
     // real paths never contain newlines); count each affected file.
-    for (const target of activityTarget(item.part).split("\n")) seen.add(target)
+    for (const target of activityTarget(item.part, platform).split("\n")) seen.add(target)
   }
   return seen.size
 }

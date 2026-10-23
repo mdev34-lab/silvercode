@@ -179,6 +179,38 @@ describe("activity target counting", () => {
     expect(header.main).toBe("Edited 3 files")
   })
 
+  test("windows counting folds separator and case aliases into one target", () => {
+    const group = groupOf([
+      tool("t1", "read", { filePath: "src\\App.ts" }),
+      tool("t2", "read", { filePath: "src/app.ts" }),
+      tool("t3", "read", { filePath: "./SRC/APP.TS" }),
+    ])
+    const subs = computeActivitySubGroups(group)
+    expect(countActivityTargets(subs[0]!.items, "win32")).toBe(1)
+  })
+
+  test("posix counting keeps backslash and case literal, so aliases stay distinct", () => {
+    const group = groupOf([
+      tool("t1", "read", { filePath: "src\\app.ts" }),
+      tool("t2", "read", { filePath: "src/app.ts" }),
+      tool("t3", "read", { filePath: "src/App.ts" }),
+    ])
+    const subs = computeActivitySubGroups(group)
+    expect(countActivityTargets(subs[0]!.items, "linux")).toBe(3)
+  })
+
+  test("windows counting folds case aliases parsed from patch headers", () => {
+    const upper = "*** Begin Patch\n*** Update File: SRC/APP.TS\n@@\n-old\n+new\n*** End Patch\n"
+    const lower = "*** Begin Patch\n*** Update File: src\\app.ts\n@@\n-old\n+new\n*** End Patch\n"
+    const group = groupOf([
+      tool("t1", "apply_patch", { patchText: upper }),
+      tool("t2", "apply_patch", { patchText: lower }),
+    ])
+    const subs = computeActivitySubGroups(group)
+    expect(countActivityTargets(subs[0]!.items, "win32")).toBe(1)
+    expect(countActivityTargets(subs[0]!.items, "linux")).toBe(2)
+  })
+
   test("a patch with unparseable text falls back to one target per call", () => {
     const group = groupOf([tool("t1", "apply_patch", { patchText: "not a patch" })])
     const subs = computeActivitySubGroups(group)
