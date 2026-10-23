@@ -43,6 +43,7 @@ const execution = Layer.succeed(
       Effect.sync(() => {
         wakeCalls.push(sessionID)
       }),
+    stopIfIdle: Effect.succeed({ status: "stopping" }),
   }),
 )
 const it = testEffect(

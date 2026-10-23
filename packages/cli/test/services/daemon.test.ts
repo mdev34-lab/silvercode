@@ -70,17 +70,29 @@ describe("decideStart", () => {
 })
 
 describe("decideRestart", () => {
-  test("proceeds when nothing is registered", () => {
-    expect(mod.decideRestart({ registered: false, activeRuns: undefined })).toBe("proceed")
+  test("proceeds when nothing is registered, whatever the answer would be", () => {
+    for (const stop of [
+      { status: "stopping" } as const,
+      { status: "busy", activeRuns: 2 } as const,
+      { status: "unknown" } as const,
+    ]) {
+      expect(mod.decideRestart({ registered: false, stop })).toBe("proceed")
+    }
   })
 
-  test("unknown probe result refuses", () => {
-    expect(mod.decideRestart({ registered: true, activeRuns: undefined })).toBe("refuse-unknown")
+  test("proceeds only when the service itself accepted the stop", () => {
+    expect(mod.decideRestart({ registered: true, stop: { status: "stopping" } })).toBe("proceed")
   })
 
-  test("proceeds only when verified idle; refuses with active runs", () => {
-    expect(mod.decideRestart({ registered: true, activeRuns: 0 })).toBe("proceed")
-    expect(mod.decideRestart({ registered: true, activeRuns: 1 })).toBe("refuse-active")
+  test("refuses while runs are active, with or without a count", () => {
+    expect(mod.decideRestart({ registered: true, stop: { status: "busy", activeRuns: 1 } })).toBe("refuse-active")
+    expect(mod.decideRestart({ registered: true, stop: { status: "busy", activeRuns: undefined } })).toBe(
+      "refuse-active",
+    )
+  })
+
+  test("refuses when the active-run state is unknown", () => {
+    expect(mod.decideRestart({ registered: true, stop: { status: "unknown" } })).toBe("refuse-unknown")
   })
 })
 
@@ -100,31 +112,88 @@ type ActiveMode =
   | { kind: "hang" }
   | { kind: "drop" }
 
-// Fake registered server. /api/health is always healthy so the probe is the only
-// variable; /api/session/active behaves according to `active`.
-function fakeServer(active: ActiveMode) {
+// How the fake service answers `POST /api/daemon/stop-if-idle`. `grant` also
+// ends the stand-in process, the way a real service terminates itself.
+type StopMode =
+  | { kind: "grant" }
+  | { kind: "grant-drop" }
+  | { kind: "busy"; runs: number }
+  | { kind: "busy"; body: string }
+  | { kind: "ok-body"; text: string }
+  | { kind: "unavailable" }
+  | { kind: "missing" }
+  | { kind: "status"; status: number }
+  | { kind: "hang" }
+  | { kind: "drop" }
+
+// Fake registered server. /api/health is always healthy, /api/session/active
+// behaves according to `active` (only `start` uses it), and
+// /api/daemon/stop-if-idle behaves according to `stop` (only `restart` uses it).
+// `then` answers the first health request with ok (the registration pre-check
+// must pass) and every later request with the given mode, so recheck probes see
+// it. `hang` never responds; `{ status }` answers with that status.
+type HealthMode = "ok" | { then: "hang" | { status: number } }
+
+function fakeServer(input: { active: ActiveMode; stop: StopMode; health?: HealthMode; onGrant?: () => void }) {
   const requests: Array<{ path: string; authorization: string | null }> = []
+  let healthRequests = 0
   const server = Bun.serve({
     hostname: "127.0.0.1",
     port: 0,
     fetch(req) {
       const url = new URL(req.url)
       requests.push({ path: url.pathname, authorization: req.headers.get("Authorization") })
-      if (url.pathname === "/api/health") return Response.json({ healthy: true })
-      if (url.pathname !== "/api/session/active") return new Response("not found", { status: 404 })
-      if (active.kind === "ok") {
-        const sessions = Object.fromEntries(
-          Array.from({ length: active.runs }, (_, i) => [`ses_test_${i}`, { type: "running" }]),
-        )
-        return Response.json({ data: sessions })
+      if (url.pathname === "/api/health") {
+        healthRequests++
+        const health = input.health ?? "ok"
+        if (health === "ok" || healthRequests === 1) return Response.json({ healthy: true })
+        if (health.then === "hang") return new Promise<Response>(() => {})
+        return new Response("nope", { status: health.then.status })
       }
-      if (active.kind === "status") return new Response("nope", { status: active.status })
-      if (active.kind === "body") return new Response(active.text, { status: 200 })
-      if (active.kind === "drop") return Response.error() // connection-level failure; listener stays up
-      return new Promise<Response>(() => {}) // hang: the client's 2 s timeout must fire
+      if (url.pathname === "/api/session/active") return activeResponse(input.active)
+      if (url.pathname !== "/api/daemon/stop-if-idle") return new Response("not found", { status: 404 })
+      return stopResponse(input.stop, input.onGrant)
     },
   })
   return Object.assign(server, { requests })
+}
+
+function activeResponse(active: ActiveMode) {
+  if (active.kind === "ok") {
+    const sessions = Object.fromEntries(
+      Array.from({ length: active.runs }, (_, i) => [`ses_test_${i}`, { type: "running" }]),
+    )
+    return Response.json({ data: sessions })
+  }
+  if (active.kind === "status") return new Response("nope", { status: active.status })
+  if (active.kind === "body") return new Response(active.text, { status: 200 })
+  if (active.kind === "drop") return Response.error() // connection-level failure; listener stays up
+  return new Promise<Response>(() => {}) // hang: the client's 2 s timeout must fire
+}
+
+function stopResponse(stop: StopMode, onGrant?: () => void): Response | Promise<Response> {
+  if (stop.kind === "grant") {
+    onGrant?.()
+    return Response.json({ data: { status: "stopping" } })
+  }
+  if (stop.kind === "grant-drop") {
+    // The service grants and terminates, but the answer never reaches the
+    // client (the way a lost response plays out against the 250ms teardown).
+    onGrant?.()
+    return new Promise<Response>(() => {})
+  }
+  if (stop.kind === "ok-body") return new Response(stop.text, { status: 200 })
+  if (stop.kind === "busy") {
+    const body =
+      "body" in stop ? stop.body : JSON.stringify({ _tag: "ActiveRunsError", message: "busy", activeRuns: stop.runs })
+    return new Response(body, { status: 409 })
+  }
+  if (stop.kind === "unavailable")
+    return Response.json({ _tag: "ActiveRunsUnknownError", message: "unknown" }, { status: 503 })
+  if (stop.kind === "missing") return new Response("not found", { status: 404 })
+  if (stop.kind === "status") return new Response("nope", { status: stop.status })
+  if (stop.kind === "drop") return Response.error()
+  return new Promise<Response>(() => {})
 }
 
 function writeRegistration(input: { version: string; url: string; pid: number }) {
@@ -153,53 +222,68 @@ function errorText(error: unknown) {
   return error instanceof Error ? error.message : String(error)
 }
 
+// Restores argv/marker env around a body, and starts from no registration.
+async function withMarker(body: () => Promise<void>) {
+  const originalArgv1 = process.argv[1]
+  const originalMark = process.env.SILVERCODE_TEST_MARK
+  process.argv[1] = markerScript
+  process.env.SILVERCODE_TEST_MARK = markerOut
+  rmSync(markerOut, { force: true })
+  try {
+    await body()
+  } finally {
+    process.argv[1] = originalArgv1
+    if (originalMark === undefined) delete process.env.SILVERCODE_TEST_MARK
+    else process.env.SILVERCODE_TEST_MARK = originalMark
+    rmSync(serverFile, { force: true })
+  }
+}
+
+// Registers a healthy service whose active-run probe and stop-if-idle answers
+// are controlled by the caller. A real process stands in for the service so a
+// stop is observable. Refusals must leave the process alive, the marker
+// unwritten, and the registration untouched.
 async function withRegisteredService(
-  active: ActiveMode,
-  version: string,
+  input: { active: ActiveMode; stop: StopMode; health?: HealthMode; version: string },
   body: (ctx: {
     child: ReturnType<typeof Bun.spawn>
     url: string
     requests: ReturnType<typeof fakeServer>["requests"]
   }) => Promise<void>,
 ) {
-  const server = fakeServer(active)
-  const url = server.url.origin
-  // A real process stands in for the registered server so a stop is observable.
   const child = Bun.spawn(["sleep", "30"], { stdio: ["ignore", "ignore", "ignore"] })
-  writeRegistration({ version, url, pid: child.pid })
-  const originalArgv1 = process.argv[1]
-  const originalMark = process.env.SILVERCODE_TEST_MARK
-  process.argv[1] = markerScript
-  process.env.SILVERCODE_TEST_MARK = markerOut
-  rmSync(markerOut, { force: true })
+  const server = fakeServer({
+    active: input.active,
+    stop: input.stop,
+    health: input.health,
+    onGrant: () => child.kill("SIGTERM"),
+  })
+  writeRegistration({ version: input.version, url: server.url.origin, pid: child.pid })
   const originalRegistration = readFileSync(serverFile, "utf8")
   try {
-    await body({ child, url, requests: server.requests })
-    // Neither reuse nor refusal may signal, spawn, or change registration.
-    expect(alive(child.pid)).toBe(true)
-    expect(existsSync(markerOut)).toBe(false)
-    expect(readFileSync(serverFile, "utf8")).toBe(originalRegistration)
+    await withMarker(async () => {
+      await body({ child, url: server.url.origin, requests: server.requests })
+      expect(alive(child.pid)).toBe(true)
+      expect(existsSync(markerOut)).toBe(false)
+      expect(readFileSync(serverFile, "utf8")).toBe(originalRegistration)
+    })
   } finally {
-    process.argv[1] = originalArgv1
-    if (originalMark === undefined) delete process.env.SILVERCODE_TEST_MARK
-    else process.env.SILVERCODE_TEST_MARK = originalMark
     child.kill()
     server.stop(true)
     rmSync(serverFile, { force: true })
   }
 }
 
-describe("daemon start/restart: verified active-run boundary (integration)", () => {
-  test("active run on a same-version service: start reuses, restart refuses, process stays alive", async () => {
-    await withRegisteredService({ kind: "ok", runs: 1 }, installationVersion, async ({ url }) => {
-      const started = await runDaemon((daemon) => daemon.start())
-      expect(started.ok).toBe(true)
-      if (started.ok) expect(started.value).toBe(url)
-
-      const restarted = await runDaemon((daemon) => daemon.restart())
-      expect(restarted.ok).toBe(false)
-      if (!restarted.ok) expect(restarted.message).toContain("1 active run(s)")
-    })
+describe("daemon start: verified active-run boundary (integration)", () => {
+  test("active run on a same-version service: start reuses, process stays alive", async () => {
+    await withRegisteredService(
+      { active: { kind: "ok", runs: 1 }, stop: { kind: "missing" }, version: installationVersion },
+      async ({ url }) => {
+        const started = await runDaemon((daemon) => daemon.start())
+        expect(started.ok).toBe(true)
+        if (started.ok) expect(started.value).toBe(url)
+      },
+    )
   }, 60_000)
 
   const unknownCases: Array<{ name: string; active: ActiveMode }> = [
@@ -216,98 +300,70 @@ describe("daemon start/restart: verified active-run boundary (integration)", () 
   ]
 
   for (const item of unknownCases) {
-    test(`unknown probe (${item.name}): same-version start/transport reuse, restart refuses`, async () => {
-      await withRegisteredService(item.active, installationVersion, async ({ url, requests }) => {
-        const started = await runDaemon((daemon) => daemon.start())
-        expect(started).toEqual({ ok: true, value: url })
-        expect(requests.filter((req) => req.path === "/api/session/active")).toHaveLength(1)
+    test(`unknown probe (${item.name}): same-version start/transport reuse`, async () => {
+      await withRegisteredService(
+        { active: item.active, stop: { kind: "missing" }, version: installationVersion },
+        async ({ url, requests }) => {
+          const started = await runDaemon((daemon) => daemon.start())
+          expect(started).toEqual({ ok: true, value: url })
+          expect(requests.filter((req) => req.path === "/api/session/active")).toHaveLength(1)
 
-        const transported = await runDaemon((daemon) => daemon.transport())
-        const headers = { Authorization: `Basic ${Buffer.from("opencode:test-password").toString("base64")}` }
-        expect(transported).toEqual({ ok: true, value: { url, headers } })
-        expect(requests.filter((req) => req.path === "/api/session/active")).toHaveLength(2)
-        expect(requests.every((req) => req.authorization === headers.Authorization)).toBe(true)
-
-        const restarted = await runDaemon((daemon) => daemon.restart())
-        expect(restarted.ok).toBe(false)
-        if (!restarted.ok) expect(restarted.message).toContain("Could not confirm")
-        expect(requests.filter((req) => req.path === "/api/session/active")).toHaveLength(3)
-      })
+          const transported = await runDaemon((daemon) => daemon.transport())
+          const headers = { Authorization: `Basic ${Buffer.from("opencode:test-password").toString("base64")}` }
+          expect(transported).toEqual({ ok: true, value: { url, headers } })
+          expect(requests.filter((req) => req.path === "/api/session/active")).toHaveLength(2)
+          expect(requests.every((req) => req.authorization === headers.Authorization)).toBe(true)
+        },
+      )
     }, 60_000)
 
-    test(`unknown probe (${item.name}): version mismatch start/transport/restart refuse`, async () => {
-      await withRegisteredService(item.active, "0.0.0-old", async ({ requests }) => {
-        for (const operation of ["start", "transport", "restart"] as const) {
-          const result = await runDaemon<unknown, unknown>((daemon) => daemon[operation]())
-          expect(result.ok).toBe(false)
-          if (!result.ok) expect(result.message).toContain("Could not confirm")
-        }
-        expect(requests.filter((req) => req.path === "/api/session/active")).toHaveLength(3)
-      })
+    test(`unknown probe (${item.name}): version mismatch start/transport refuse`, async () => {
+      await withRegisteredService(
+        { active: item.active, stop: { kind: "missing" }, version: "0.0.0-old" },
+        async ({ requests }) => {
+          for (const operation of ["start", "transport"] as const) {
+            const result = await runDaemon<unknown, unknown>((daemon) => daemon[operation]())
+            expect(result.ok).toBe(false)
+            if (!result.ok) expect(result.message).toContain("Could not confirm")
+          }
+          expect(requests.filter((req) => req.path === "/api/session/active")).toHaveLength(2)
+        },
+      )
     }, 60_000)
   }
 
   test("verified active run on a mismatched service: start refuses without replacement", async () => {
-    await withRegisteredService({ kind: "ok", runs: 1 }, "0.0.0-old", async () => {
-      const started = await runDaemon((daemon) => daemon.start())
-      expect(started.ok).toBe(false)
-      if (!started.ok) expect(started.message).toContain("1 active run(s)")
-    })
+    await withRegisteredService(
+      { active: { kind: "ok", runs: 1 }, stop: { kind: "missing" }, version: "0.0.0-old" },
+      async () => {
+        const started = await runDaemon((daemon) => daemon.start())
+        expect(started.ok).toBe(false)
+        if (!started.ok) expect(started.message).toContain("1 active run(s)")
+      },
+    )
   })
 
   test("verified idle zero, version mismatch: start replaces (old process killed, new spawn attempted)", async () => {
-    const originalArgv1 = process.argv[1]
-    const originalMark = process.env.SILVERCODE_TEST_MARK
-    process.env.SILVERCODE_TEST_MARK = markerOut
-    process.argv[1] = markerScript
-    rmSync(markerOut, { force: true })
-    const server = fakeServer({ kind: "ok", runs: 0 })
-    const child = Bun.spawn(["sleep", "30"], { stdio: ["ignore", "ignore", "ignore"] })
-    writeRegistration({ version: "0.0.0-old", url: server.url.origin, pid: child.pid })
-    try {
-      const started = await runDaemon((daemon) => daemon.start())
-      expect(started.ok).toBe(false)
-      if (!started.ok) expect(started.message).toContain("Failed to start server")
-      expect(await child.exited).not.toBe(null)
-      expect(alive(child.pid)).toBe(false)
-      expect(readFileSync(markerOut, "utf8")).toBe("serve --register")
-    } finally {
-      child.kill()
-      server.stop(true)
-      rmSync(serverFile, { force: true })
-      process.argv[1] = originalArgv1
-      if (originalMark === undefined) delete process.env.SILVERCODE_TEST_MARK
-      else process.env.SILVERCODE_TEST_MARK = originalMark
-    }
-  }, 60_000)
-
-  test("verified idle zero, version mismatch: restart stops the old process and spawns a new one", async () => {
-    const originalArgv1 = process.argv[1]
-    const originalMark = process.env.SILVERCODE_TEST_MARK
-    process.env.SILVERCODE_TEST_MARK = markerOut
-    process.argv[1] = markerScript
-    rmSync(markerOut, { force: true })
-    const server = fakeServer({ kind: "ok", runs: 0 })
-    const child = Bun.spawn(["sleep", "30"], { stdio: ["ignore", "ignore", "ignore"] })
-    writeRegistration({ version: "0.0.0-old", url: server.url.origin, pid: child.pid })
-    try {
-      const restarted = await runDaemon((daemon) => daemon.restart())
-      expect(restarted.ok).toBe(false)
-      if (!restarted.ok) expect(restarted.message).toContain("Failed to start server")
-      expect(await child.exited).not.toBe(null)
-      expect(readFileSync(markerOut, "utf8")).toBe("serve --register")
-    } finally {
-      child.kill()
-      server.stop(true)
-      rmSync(serverFile, { force: true })
-      process.argv[1] = originalArgv1
-      if (originalMark === undefined) delete process.env.SILVERCODE_TEST_MARK
-      else process.env.SILVERCODE_TEST_MARK = originalMark
-    }
+    await withMarker(async () => {
+      const server = fakeServer({ active: { kind: "ok", runs: 0 }, stop: { kind: "missing" } })
+      const child = Bun.spawn(["sleep", "30"], { stdio: ["ignore", "ignore", "ignore"] })
+      writeRegistration({ version: "0.0.0-old", url: server.url.origin, pid: child.pid })
+      try {
+        const started = await runDaemon((daemon) => daemon.start())
+        expect(started.ok).toBe(false)
+        if (!started.ok) expect(started.message).toContain("Failed to start server")
+        expect(await child.exited).not.toBe(null)
+        expect(alive(child.pid)).toBe(false)
+        expect(readFileSync(markerOut, "utf8")).toBe("serve --register")
+      } finally {
+        child.kill()
+        server.stop(true)
+      }
+    })
   }, 60_000)
 
   test("explicit service stop is unchanged: ends the process even with an active run", async () => {
-    const server = fakeServer({ kind: "ok", runs: 1 })
+    const server = fakeServer({ active: { kind: "ok", runs: 1 }, stop: { kind: "missing" } })
     const child = Bun.spawn(["sleep", "30"], { stdio: ["ignore", "ignore", "ignore"] })
     writeRegistration({ version: installationVersion, url: server.url.origin, pid: child.pid })
     try {
@@ -320,5 +376,188 @@ describe("daemon start/restart: verified active-run boundary (integration)", () 
       server.stop(true)
       rmSync(serverFile, { force: true })
     }
+  }, 60_000)
+})
+
+describe("daemon restart: server-side stop-if-idle (integration)", () => {
+  test("idle: the service accepts the stop, so restart ends it and starts a new one", async () => {
+    await withMarker(async () => {
+      const child = Bun.spawn(["sleep", "30"], { stdio: ["ignore", "ignore", "ignore"] })
+      const server = fakeServer({
+        active: { kind: "ok", runs: 0 },
+        stop: { kind: "grant" },
+        onGrant: () => child.kill("SIGTERM"),
+      })
+      writeRegistration({ version: installationVersion, url: server.url.origin, pid: child.pid })
+      try {
+        const restarted = await runDaemon((daemon) => daemon.restart())
+        // The marker writes no registration, so the new service never reports
+        // healthy; the spawn itself is what this test asserts.
+        expect(restarted.ok).toBe(false)
+        if (!restarted.ok) expect(restarted.message).toContain("Failed to start server")
+        expect(await child.exited).not.toBe(null)
+        expect(alive(child.pid)).toBe(false)
+        expect(existsSync(serverFile)).toBe(false)
+        expect(readFileSync(markerOut, "utf8")).toBe("serve --register")
+      } finally {
+        child.kill()
+        server.stop(true)
+      }
+    })
+  }, 60_000)
+
+  test("busy: the service refuses, so restart reports the count and leaves it running", async () => {
+    await withRegisteredService(
+      { active: { kind: "ok", runs: 1 }, stop: { kind: "busy", runs: 1 }, version: installationVersion },
+      async ({ requests }) => {
+        const restarted = await runDaemon((daemon) => daemon.restart())
+        expect(restarted.ok).toBe(false)
+        if (!restarted.ok) expect(restarted.message).toContain("1 active run(s)")
+        // Refusal is decided by the service, not by a client-side probe.
+        expect(requests.filter((req) => req.path === "/api/session/active")).toHaveLength(0)
+        expect(requests.filter((req) => req.path === "/api/daemon/stop-if-idle")).toHaveLength(1)
+      },
+    )
+  }, 60_000)
+
+  test("busy: an unreadable refusal body still refuses", async () => {
+    await withRegisteredService(
+      { active: { kind: "ok", runs: 1 }, stop: { kind: "busy", body: "not-json" }, version: installationVersion },
+      async () => {
+        const restarted = await runDaemon((daemon) => daemon.restart())
+        expect(restarted.ok).toBe(false)
+        if (!restarted.ok) expect(restarted.message).toContain("active runs")
+      },
+    )
+  }, 60_000)
+
+  const unknownCases: Array<{ name: string; stop: StopMode }> = [
+    { name: "HTTP 503 (active-run state unavailable)", stop: { kind: "unavailable" } },
+    { name: "HTTP 404 (older service without the endpoint)", stop: { kind: "missing" } },
+    { name: "HTTP 401 (auth mismatch)", stop: { kind: "status", status: 401 } },
+    { name: "HTTP 500", stop: { kind: "status", status: 500 } },
+    { name: "timeout (no response)", stop: { kind: "hang" } },
+    { name: "network error (connection dropped)", stop: { kind: "drop" } },
+  ]
+
+  for (const item of unknownCases) {
+    test(`unknown (${item.name}): restart refuses and leaves the service running`, async () => {
+      await withRegisteredService(
+        { active: { kind: "ok", runs: 0 }, stop: item.stop, version: installationVersion },
+        async ({ requests }) => {
+          const restarted = await runDaemon((daemon) => daemon.restart())
+          expect(restarted.ok).toBe(false)
+          if (!restarted.ok) expect(restarted.message).toContain("Could not confirm")
+          expect(requests.filter((req) => req.path === "/api/daemon/stop-if-idle")).toHaveLength(1)
+        },
+      )
+    }, 60_000)
+  }
+
+  const unconfirmedBodies: Array<{ name: string; text: string }> = [
+    { name: "200 with a non-contract status", text: '{"data":{"status":"ok"}}' },
+    { name: "200 with an unrelated body", text: "<html>ok</html>" },
+    { name: "200 with no body", text: "" },
+  ]
+
+  for (const item of unconfirmedBodies) {
+    test(`unconfirmed grant (${item.name}): restart refuses and leaves the service running`, async () => {
+      await withRegisteredService(
+        { active: { kind: "ok", runs: 0 }, stop: { kind: "ok-body", text: item.text }, version: installationVersion },
+        async ({ requests }) => {
+          const restarted = await runDaemon((daemon) => daemon.restart())
+          expect(restarted.ok).toBe(false)
+          if (!restarted.ok) expect(restarted.message).toContain("Could not confirm")
+          expect(requests.filter((req) => req.path === "/api/daemon/stop-if-idle")).toHaveLength(1)
+        },
+      )
+    }, 60_000)
+  }
+
+  test("granted stop whose response is lost: restart re-verifies and proceeds instead of claiming the service runs", async () => {
+    await withMarker(async () => {
+      const child = Bun.spawn(["sleep", "30"], { stdio: ["ignore", "ignore", "ignore"] })
+      const server = fakeServer({
+        active: { kind: "ok", runs: 0 },
+        stop: { kind: "grant-drop" },
+        onGrant: () => {
+          child.kill("SIGTERM")
+          setTimeout(() => server.stop(true), 25)
+        },
+      })
+      writeRegistration({ version: installationVersion, url: server.url.origin, pid: child.pid })
+      try {
+        const restarted = await runDaemon((daemon) => daemon.restart())
+        // The marker writes no registration, so the new service never reports
+        // healthy; the spawn itself is what this test asserts.
+        expect(restarted.ok).toBe(false)
+        if (!restarted.ok) {
+          expect(restarted.message).toContain("Failed to start server")
+          expect(restarted.message).not.toContain("left running")
+        }
+        expect(await child.exited).not.toBe(null)
+        expect(alive(child.pid)).toBe(false)
+        expect(readFileSync(markerOut, "utf8")).toBe("serve --register")
+      } finally {
+        child.kill()
+        server.stop(true)
+      }
+    })
+  }, 60_000)
+
+  test("granted stop whose response is lost but the service survived: restart still refuses", async () => {
+    // The answer is lost for a transport reason while the service stays up
+    // (it never granted): the liveness recheck finds it alive and refuses.
+    await withRegisteredService(
+      { active: { kind: "ok", runs: 0 }, stop: { kind: "hang" }, version: installationVersion },
+      async ({ requests }) => {
+        const restarted = await runDaemon((daemon) => daemon.restart())
+        expect(restarted.ok).toBe(false)
+        if (!restarted.ok) expect(restarted.message).toContain("Could not confirm")
+        expect(requests.filter((req) => req.path === "/api/daemon/stop-if-idle")).toHaveLength(1)
+        expect(requests.filter((req) => req.path === "/api/health").length).toBeGreaterThan(0)
+      },
+    )
+  }, 60_000)
+
+  test("lost stop answer with the service answering 401 on health: restart refuses (a live listener is not a dead one)", async () => {
+    await withRegisteredService(
+      {
+        active: { kind: "ok", runs: 0 },
+        stop: { kind: "hang" },
+        health: { then: { status: 401 } },
+        version: installationVersion,
+      },
+      async () => {
+        const restarted = await runDaemon((daemon) => daemon.restart())
+        expect(restarted.ok).toBe(false)
+        if (!restarted.ok) expect(restarted.message).toContain("Could not confirm")
+      },
+    )
+  }, 60_000)
+
+  test("lost stop answer with the service hung on health: restart refuses (a timeout proves nothing)", async () => {
+    await withRegisteredService(
+      {
+        active: { kind: "ok", runs: 0 },
+        stop: { kind: "hang" },
+        health: { then: "hang" },
+        version: installationVersion,
+      },
+      async () => {
+        const restarted = await runDaemon((daemon) => daemon.restart())
+        expect(restarted.ok).toBe(false)
+        if (!restarted.ok) expect(restarted.message).toContain("Could not confirm")
+      },
+    )
+  }, 60_000)
+
+  test("nothing registered: restart starts a service without asking one to stop", async () => {
+    await withMarker(async () => {
+      const restarted = await runDaemon((daemon) => daemon.restart())
+      expect(restarted.ok).toBe(false)
+      if (!restarted.ok) expect(restarted.message).toContain("Failed to start server")
+      expect(readFileSync(markerOut, "utf8")).toBe("serve --register")
+    })
   }, 60_000)
 })

@@ -4,7 +4,7 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { filesystem } from "@opencode-ai/core/effect/app-node-platform"
 import { createOpencodeClient } from "@opencode-ai/sdk/v2/client"
 import { ServerAuth } from "@opencode-ai/server/auth"
-import { Context, Effect, FileSystem, Layer, Option, Schedule, Schema, Scope } from "effect"
+import { Cause, Context, Effect, Exit, FileSystem, Layer, Option, Schedule, Schema, Scope } from "effect"
 import { HttpServer } from "effect/unstable/http"
 import { randomBytes, randomUUID } from "crypto"
 import { spawn } from "node:child_process"
@@ -43,23 +43,42 @@ export function decideStart(input: {
   return "replace"
 }
 
-// Restart is stop-then-start, so it is refused unless the registered service is
-// verified idle. This client-side probe is not atomic with the later signal: a
-// run may begin between them. A server-side stop-if-idle/drain contract is needed
-// to close that gap. If spawning fails after stopping, the service stays stopped.
-// Explicit `service stop` remains the way to end a service on purpose.
+// Result of the server-side stop-if-idle contract. `busy` is a refusal, not a
+// failure to stop: the service answered and stays up. `stopping` is only
+// returned for a 200 whose body confirms `{ data: { status: "stopping" } }`;
+// any other 200 is unconfirmed. Any transport-level surprise (non-2xx other
+// than 409, timeout, network error, unconfirmed 200) is `unknown`. An
+// unconfirmed stop is not proof the service stayed up: a granted stop ends the
+// service even if the answer is lost, so `restart` re-verifies liveness before
+// refusing (see recheckAfterUnknown) and never treats unknown as idle.
+export type StopIdleResult =
+  | { readonly status: "stopping" }
+  | { readonly status: "busy"; readonly activeRuns: number | undefined }
+  | { readonly status: "unknown" }
+
+// Restart is stop-then-start, so it is refused unless the registered service
+// itself accepted a stop-if-idle request. The server performs the idle check and
+// closes its run gate in one atomic step, so unlike a client-side probe there is
+// no window where a run can begin after the service was verified idle. If
+// spawning fails after the stop, the service stays stopped. Explicit
+// `service stop` remains the way to end a service on purpose.
 export function decideRestart(input: {
   registered: boolean
-  activeRuns: number | undefined
+  stop: StopIdleResult
 }): "proceed" | "refuse-active" | "refuse-unknown" {
   if (!input.registered) return "proceed"
-  if (input.activeRuns === undefined) return "refuse-unknown"
-  if (input.activeRuns > 0) return "refuse-active"
+  if (input.stop.status === "busy") return "refuse-active"
+  if (input.stop.status === "unknown") return "refuse-unknown"
   return "proceed"
 }
 
 const ACTIVE_PROBE_TIMEOUT = "2 seconds"
+const ACTIVE_PROBE_TIMEOUT_MS = 2_000
+const STOP_IDLE_PATH = "/api/daemon/stop-if-idle"
+const STOP_IDLE_TIMEOUT = 2_000
 const ActiveBody = Schema.Struct({ data: Schema.Record(Schema.String, Schema.Unknown) })
+const ActiveRunsBody = Schema.Struct({ activeRuns: Schema.Number })
+const StoppingBody = Schema.Struct({ data: Schema.Struct({ status: Schema.Literal("stopping") }) })
 
 const Registration = Schema.Struct({
   id: Schema.optional(Schema.String),
@@ -166,6 +185,102 @@ export const layer = Layer.effect(
             return Object.keys(body.data).length
           }).pipe(Effect.catch(() => Effect.succeed(undefined)))
 
+    // Asks the registered service to stop itself, atomically, only while idle.
+    // The status code is the contract: 200 granted (the service is terminating),
+    // 409 refused with runs active, 503 refused because its active-run state is
+    // unknown. Anything else — network error, timeout, other status — is unknown.
+    const stopIfIdle = Effect.fn("cli.daemon.stopIfIdle")(function* (info: Registration) {
+      const headers = ServerAuth.headers({ password: yield* password() })
+      const response = yield* Effect.tryPromise({
+        try: () =>
+          fetch(new URL(STOP_IDLE_PATH, info.url), {
+            method: "POST",
+            headers,
+            signal: AbortSignal.timeout(STOP_IDLE_TIMEOUT),
+          }),
+        catch: (cause) => cause,
+      }).pipe(Effect.catch(() => Effect.succeed(undefined)))
+      if (response === undefined) return { status: "unknown" as const }
+      if (response.status === 200) {
+        // The status code alone is not the grant: an unrelated 200 (a server
+        // that does not mount the daemon route behind a fallback, a proxy, an
+        // older build) must not be read as acceptance. Only the contract body
+        // confirms the service is terminating.
+        return yield* Effect.tryPromise(() => response.json()).pipe(
+          Effect.flatMap(Schema.decodeUnknownEffect(StoppingBody)),
+          Effect.map(() => ({ status: "stopping" }) as const),
+          Effect.catch(() => Effect.succeed({ status: "unknown" } as const)),
+        )
+      }
+      if (response.status === 503) return { status: "unknown" as const }
+      if (response.status !== 409) return { status: "unknown" as const }
+      // A busy refusal is already safe to act on; the count only improves the
+      // message, so an unreadable body still refuses.
+      const activeRuns = yield* Effect.tryPromise(() => response.json()).pipe(
+        Effect.flatMap(Schema.decodeUnknownEffect(ActiveRunsBody)),
+        Effect.map((body) => body.activeRuns),
+        Effect.catch(() => Effect.succeed(undefined)),
+      )
+      return { status: "busy" as const, activeRuns }
+    })
+
+    // Re-verifies liveness after an unconfirmed stop request. A granted stop
+    // terminates the service ~250ms after the response is written, whether or
+    // not the answer arrived, so a lost answer must not be reported as "left
+    // running". The recheck waits out the self-terminate delay with margin,
+    // then classifies the probe precisely, because only one outcome proves
+    // termination:
+    //
+    // - any HTTP response at all (200, 401, 404, 500, ...) proves a process is
+    //   listening and answering: the service is ALIVE. A 401/404 is an auth or
+    //   version mismatch, not a dead process.
+    // - a refused connection proves the local port is closed: the listener is
+    //   gone. Both endpoints are local, so a refused connection is a dead
+    //   (or dying) process, not a network partition.
+    // - anything else (timeout, reset, DNS, TLS) proves nothing and stays
+    //   unknown, which refuses.
+    //
+    // Death is accepted only after two consecutive refused connections, so a
+    // transient refusal while the socket tears down cannot reopen the stop.
+    type Liveness = "alive" | "dead" | "unknown"
+
+    const isConnectionRefused = (error: unknown): boolean => {
+      let current: unknown = error
+      while (current !== null && typeof current === "object") {
+        const code = (current as { code?: unknown }).code
+        if (code === "ECONNREFUSED" || code === "ConnectionRefused") return true
+        const message = (current as { message?: unknown }).message
+        if (typeof message === "string" && message.includes("Connection refused")) return true
+        current = (current as { cause?: unknown }).cause
+      }
+      return false
+    }
+
+    const probeLiveness = Effect.fn("cli.daemon.probeLiveness")(function* (info: Registration)
+      const headers = ServerAuth.headers({ password: yield* password() })
+      const response = yield* Effect.tryPromise({
+        try: () =>
+          fetch(new URL("/api/health", info.url), {
+            headers,
+            signal: AbortSignal.timeout(ACTIVE_PROBE_TIMEOUT_MS),
+          }),
+        catch: (cause) => cause,
+      }).pipe(Effect.exit)
+      if (Exit.isSuccess(response)) return "alive" as const
+      // Unwrap the Effect Cause to the original fetch error before inspecting
+      // codes; the Cause wrapper itself carries no connection information.
+      return isConnectionRefused(Cause.squash(response.cause)) ? ("dead" as const) : ("unknown" as const)
+    })
+
+    const recheckAfterUnknown = Effect.fn("cli.daemon.recheckAfterUnknown")(function* (info: Registration) {
+      yield* Effect.sleep("500 millis")
+      const first = yield* probeLiveness(info)
+      if (first !== "dead") return { status: "unknown" } as const
+      yield* Effect.sleep("250 millis")
+      const second = yield* probeLiveness(info)
+      return second === "dead" ? ({ status: "stopping" } as const) : ({ status: "unknown" } as const)
+    })
+
     const start = Effect.fn("cli.daemon.start")(function* () {
       const existing = yield* healthy().pipe(Effect.option)
       const found = Option.getOrUndefined(existing)
@@ -224,23 +339,33 @@ export const layer = Layer.effect(
     const restart = Effect.fn("cli.daemon.restart")(function* () {
       const existing = yield* healthy().pipe(Effect.option)
       const found = Option.getOrUndefined(existing)
-      const activeCount = yield* probeActiveRuns(found)
-      const restartDecision = decideRestart({ registered: found !== undefined, activeRuns: activeCount })
+      let stopIdle: StopIdleResult = found === undefined ? { status: "stopping" } : yield* stopIfIdle(found)
+      if (found !== undefined && stopIdle.status === "unknown") stopIdle = yield* recheckAfterUnknown(found)
+      const restartDecision = decideRestart({ registered: found !== undefined, stop: stopIdle })
       if (restartDecision === "refuse-active") {
+        const runs = stopIdle.status === "busy" ? stopIdle.activeRuns : undefined
+        const active = runs === undefined ? "has active runs" : `has ${runs} active run(s)`
         return yield* Effect.fail(
           new Error(
-            `Background service has ${activeCount} active run(s); restart refused so they are not interrupted. Wait for them to finish, or run "service stop" to end them explicitly.`,
+            `Background service ${active}; restart refused so they are not interrupted. Wait for them to finish, or run "service stop" to end them explicitly.`,
           ),
         )
       }
       if (restartDecision === "refuse-unknown") {
         return yield* Effect.fail(
           new Error(
-            'Could not confirm the background service is idle (active-run probe failed); restart refused and the service was left running. Retry, or run "service stop" to end it explicitly.',
+            'Could not confirm the background service is idle (stop-if-idle refused or unconfirmed); the service was verified still running and left up. Retry, or run "service stop" to end it explicitly.',
           ),
         )
       }
-      yield* stop()
+      // The service closed its run gate when it granted the stop, so the usual
+      // teardown (SIGTERM, escalating to SIGKILL) cannot interrupt a run.
+      // Waiting for it to go away also keeps the replacement from racing the
+      // registration of the service that is still shutting down.
+      if (found) {
+        yield* stopProcess(found)
+        yield* fs.remove(file).pipe(Effect.ignore)
+      }
       return yield* start()
     })
 

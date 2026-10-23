@@ -2,6 +2,13 @@ export * as SessionRunCoordinator from "./run-coordinator"
 
 import { Deferred, Effect, Exit, Fiber, FiberSet, Scope } from "effect"
 
+/** Outcome of an atomic idle-stop claim. */
+export type IdleStop =
+  /** Nothing is active; new runs are refused from now on. */
+  | { readonly status: "stopping" }
+  /** Something is active, so the claim is refused. */
+  | { readonly status: "busy"; readonly activeRuns: number }
+
 /** Serializes execution for each key while allowing different keys to run concurrently. */
 export interface Coordinator<Key, E> {
   /** Snapshots keys with an execution owned by this coordinator. */
@@ -12,6 +19,13 @@ export interface Coordinator<Key, E> {
   readonly wake: (key: Key) => Effect.Effect<void>
   /** Stops active execution and waits for its cleanup. */
   readonly interrupt: (key: Key) => Effect.Effect<void>
+  /**
+   * Claims a stop while nothing is active. The check and the refusal of new
+   * runs happen in one synchronous step, so no execution can begin between
+   * them. Once claimed, `run` and `wake` are inert: recorded work stays
+   * durable and is picked up by whoever owns execution next.
+   */
+  readonly stopIfIdle: Effect.Effect<IdleStop>
 }
 
 type Entry<E> = {
@@ -27,6 +41,7 @@ export const make = <Key, E>(options: {
   Effect.gen(function* () {
     const active = new Map<Key, Entry<E>>()
     const fork = yield* FiberSet.makeRuntime<never, void, never>()
+    let stopping = false
 
     const makeEntry = (): Entry<E> => ({
       done: Deferred.makeUnsafe<void, E>(),
@@ -66,6 +81,10 @@ export const make = <Key, E>(options: {
 
     const run = (key: Key): Effect.Effect<void, E> =>
       Effect.uninterruptibleMask((restore) => {
+        // A claimed idle stop owns the rest of this process' lifetime, so a
+        // resume arriving after it is dropped instead of starting work that
+        // the stop would interrupt.
+        if (stopping) return Effect.void
         const entry = active.get(key)
         if (entry !== undefined) {
           if (entry.stopping) return restore(Deferred.await(entry.done).pipe(Effect.andThen(run(key))))
@@ -80,6 +99,7 @@ export const make = <Key, E>(options: {
 
     const wake = (key: Key) =>
       Effect.sync(() => {
+        if (stopping) return
         const entry = active.get(key)
         if (entry !== undefined) {
           entry.pendingWake = true
@@ -100,5 +120,11 @@ export const make = <Key, E>(options: {
         return Fiber.interrupt(entry.owner)
       })
 
-    return { active: Effect.sync(() => new Set(active.keys())), run, wake, interrupt }
+    const stopIfIdle: Effect.Effect<IdleStop> = Effect.sync(() => {
+      if (active.size > 0) return { status: "busy", activeRuns: active.size }
+      stopping = true
+      return { status: "stopping" }
+    })
+
+    return { active: Effect.sync(() => new Set(active.keys())), run, wake, interrupt, stopIfIdle }
   })
