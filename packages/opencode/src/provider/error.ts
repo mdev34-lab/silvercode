@@ -20,6 +20,20 @@ export class ResponseStreamError extends Error {
   }
 }
 
+/**
+ * A response stream that died after the provider issued tool calls. Retrying
+ * would re-issue the same request and replay those calls' side effects, so
+ * this is always classified non-retryable; the user continues the turn
+ * manually instead.
+ */
+export class StreamInterruptedAfterToolCallError extends Error {
+  public override readonly name = "ProviderStreamInterruptedAfterToolCallError"
+
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options)
+  }
+}
+
 function isOpenAiErrorRetryable(e: APICallError) {
   const status = e.statusCode
   if (!status) return e.isRetryable

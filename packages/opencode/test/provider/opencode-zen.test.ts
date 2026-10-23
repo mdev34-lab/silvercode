@@ -741,6 +741,126 @@ describe("OpenCodeZen", () => {
       expect(await response.text()).toBe(ssePayload)
     })
 
+    test("converts a stream cut before completion into an in-band provider error frame", async () => {
+      // No finish-reason chunk and no [DONE]: the upstream connection ended
+      // mid-completion. Ending the guarded stream cleanly here would let the
+      // SDK synthesize a reason-less "unknown" finish and hide the cut.
+      const { upstream } = recorder(() =>
+        stream('data: {"choices":[{"index":0,"delta":{"content":"partial"},"finish_reason":null}]}', ""),
+      )
+      const zen = createFetch({ upstream })
+      const body = JSON.stringify({ model: "big-pickle", messages: [], stream: true })
+
+      const response = await zen(zenURL, { method: "POST", body })
+      const text = await response.text()
+      expect(text).toContain('"content":"partial"')
+      expect(text).not.toContain("[DONE]")
+      expect(text).toContain('"error"')
+      expect(text).toContain("Zen stream ended before the completion finished")
+    })
+
+    test("passes a [DONE]-terminated stream through without a truncation frame", async () => {
+      const { upstream } = recorder(() => sse())
+      const zen = createFetch({ upstream })
+      const body = JSON.stringify({ model: "big-pickle", messages: [], stream: true })
+
+      const response = await zen(zenURL, { method: "POST", body })
+      const text = await response.text()
+      expect(text).toContain("[DONE]")
+      expect(text).not.toContain('"error"')
+    })
+
+    test("tolerates a finish-reason completion that omits the [DONE] frame", async () => {
+      const { upstream } = recorder(() =>
+        stream('data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}', ""),
+      )
+      const zen = createFetch({ upstream })
+      const body = JSON.stringify({ model: "big-pickle", messages: [], stream: true })
+
+      const response = await zen(zenURL, { method: "POST", body })
+      const text = await response.text()
+      expect(text).not.toContain('"error"')
+    })
+
+    test("converts a mid-stream transport failure into an in-band provider error frame", async () => {
+      const failing = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(
+            encoder.encode('data: {"choices":[{"index":0,"delta":{"content":"partial"},"finish_reason":null}]}\n\n'),
+          )
+          controller.error(new Error("connection reset"))
+        },
+      })
+      const { upstream } = recorder(() => new Response(failing, { headers: { "content-type": "text/event-stream" } }))
+      const zen = createFetch({ upstream })
+      const body = JSON.stringify({ model: "big-pickle", messages: [], stream: true })
+
+      const response = await zen(zenURL, { method: "POST", body })
+      const text = await response.text()
+            // Bytes buffered behind the failed read may or may not survive the
+      // transport error; the truncation frame is the contract.
+      expect(text).toContain("Zen stream ended before the completion finished")
+    })
+
+    test("applies the truncation contract when the caller catalog already carries the fingerprint tools", async () => {
+      // injectedOnly is empty here (caller already lists bash/glob/grep/read,
+      // the production shape): the guard must still wrap the stream, or a cut
+      // like this one would sail through as a clean end.
+      const { upstream } = recorder(() =>
+        stream('data: {"choices":[{"index":0,"delta":{"content":"partial"},"finish_reason":null}]}', ""),
+      )
+      const zen = createFetch({ upstream })
+      const body = JSON.stringify({
+        model: "big-pickle",
+        messages: [],
+        stream: true,
+        tools: ["bash", "glob", "grep", "read"].map((name) => ({
+          type: "function",
+          function: { name, parameters: { type: "object", properties: {} } },
+        })),
+      })
+
+      const response = await zen(zenURL, { method: "POST", body })
+      const text = await response.text()
+      expect(text).toContain("Zen stream ended before the completion finished")
+    })
+
+    test("treats a frame cut off inside the finish_reason value as truncation", async () => {
+      // The tail dies after the full `"finish_reason":"sto` prefix: a
+      // substring search would count this as a completed response even though
+      // the frame is not valid JSON and no finish was ever transmitted.
+      const { upstream } = recorder(() =>
+        stream(
+          'data: {"choices":[{"index":0,"delta":{"content":"partial"},"finish_reason":null}]}',
+          "",
+          'data: {"choices":[{"index":0,"delta":{},"finish_reason":"sto',
+        ),
+      )
+      const zen = createFetch({ upstream })
+      const body = JSON.stringify({ model: "big-pickle", messages: [], stream: true })
+
+      const response = await zen(zenURL, { method: "POST", body })
+      const text = await response.text()
+      expect(text).toContain("Zen stream ended before the completion finished")
+    })
+
+    test("does not mistake content quoting a finish_reason literal for completion", async () => {
+      // The model's own text can contain the substring `"finish_reason":"stop"`;
+      // only a parsed finish field proves completion.
+      const { upstream } = recorder(() =>
+        stream(
+          'data: {"choices":[{"index":0,"delta":{"content":"see {\\"finish_reason\\":\\"stop\\"} here"}}]}',
+          "",
+        ),
+      )
+      const zen = createFetch({ upstream })
+      const body = JSON.stringify({ model: "big-pickle", messages: [], stream: true })
+
+      const response = await zen(zenURL, { method: "POST", body })
+      const text = await response.text()
+      expect(text).toContain("Zen stream ended before the completion finished")
+    })
+
     test("forwards a non-JSON body untouched", async () => {
       const { calls, upstream } = recorder(() => Response.json({ ok: true }))
       const zen = createFetch({ upstream })

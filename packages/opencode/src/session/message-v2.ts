@@ -683,6 +683,17 @@ export function fromError(
         },
         { cause: e },
       ).toObject()
+    case e instanceof ProviderError.StreamInterruptedAfterToolCallError:
+      return new APIError(
+        {
+          message: e.message,
+          isRetryable: false,
+          metadata: {
+            code: e.name,
+          },
+        },
+        { cause: e },
+      ).toObject()
     case e instanceof ProviderError.ResponseStreamError:
       return new APIError(
         {

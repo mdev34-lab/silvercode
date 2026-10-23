@@ -3081,7 +3081,9 @@ it.instance("concurrent loop callers all receive same error result", () =>
     const sessions = yield* Session.Service
     const chat = yield* sessions.create({ title: "Pinned" })
 
-    yield* llm.fail("boom")
+    // A non-retryable HTTP error: the loop surfaces it immediately instead of
+    // entering the retry backoff a mid-stream failure now takes.
+    yield* llm.error(400, { error: { message: "boom" } })
     yield* user(chat.id, "hello")
 
     const [a, b] = yield* Effect.all([prompt.loop({ sessionID: chat.id }), prompt.loop({ sessionID: chat.id })], {
@@ -5124,4 +5126,178 @@ it.instance("loop sends a reduced context projection and keeps canonical history
     // the request does not grow with the turn: the projection is re-derived, not accumulated
     expect(sizes[1]).toBeLessThan(sizes[0] + 2000)
   }),
+)
+
+it.instance(
+  "retries a stream death after a completed tool step with the tool result riding the retry's history",
+  () =>
+    Effect.gen(function* () {
+      const { directory: dir } = yield* TestInstance
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({
+        title: "Pinned",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      const target = path.join(dir, "side-effect.txt")
+      // Step 1 completes normally with a tool call the SDK executes; the
+      // step-2 stream then dies. Retrying THAT step is safe only because its
+      // request carries the executed result - prove the result rides the
+      // retry's history and the command never runs twice.
+      yield* llm.tool("bash", { command: `printf 'once\\n' >> ${JSON.stringify(target)}` })
+      yield* llm.cut()
+      yield* llm.text("recovered after retry")
+      yield* user(chat.id, "hello")
+
+      const result = yield* prompt.loop({ sessionID: chat.id })
+      expect(yield* llm.calls).toBe(3)
+      expect(result.info.role).toBe("assistant")
+      if (result.info.role === "assistant") {
+        expect(result.info.error).toBeUndefined()
+      }
+      const hits = yield* llm.hits
+      expect(JSON.stringify(hits[2]?.body)).toContain("once")
+      const fs = yield* FSUtil.Service
+      expect((yield* fs.readFileStringSafe(target))?.trim()).toBe("once")
+    }),
+  { timeout: 30_000 },
+)
+
+it.instance(
+  "does not retry a stream that dies with tool calls still pending",
+  () =>
+    Effect.gen(function* () {
+      const { directory: dir } = yield* TestInstance
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({
+        title: "Pinned",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      const target = path.join(dir, "no-replay.txt")
+      // The stream announces a tool call and then dies before the step
+      // resolves. Whether or not the SDK already executed the call, a retry
+      // would issue it again: the turn must end as a terminal interruption
+      // instead, and the command must never run twice.
+      yield* llm.push(reply().tool("bash", { command: `printf 'replay\\n' >> ${JSON.stringify(target)}` }).cut().item())
+      yield* user(chat.id, "hello")
+
+      const result = yield* prompt.loop({ sessionID: chat.id })
+      expect(yield* llm.calls).toBe(1)
+      expect(result.info.role).toBe("assistant")
+      if (result.info.role === "assistant") {
+        expect(result.info.error).toBeDefined()
+        expect(JSON.stringify(result.info.error)).toContain("not retried so tool side effects are not repeated")
+      }
+      const fs = yield* FSUtil.Service
+      const content = (yield* fs.readFileStringSafe(target)) ?? ""
+      expect(content.split("\n").filter((line) => line.trim() === "replay").length).toBeLessThanOrEqual(1)
+    }),
+  { timeout: 30_000 },
+)
+
+it.instance(
+  "retries the turn when the response stream fails mid-generation",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({
+        title: "Pinned",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      // First attempt dies with the in-band error frame a gateway emits when
+      // its stream is cut; the retry must issue a fresh request and complete
+      // the turn. A raw transport drop on a provider without a transport
+      // guard ends as an unretried "unknown" finish instead (see the Zen
+      // adapter's truncation guard).
+      yield* llm.cut("reasoning stream timed out after 1m without new tokens")
+      yield* llm.text("recovered after retry")
+      yield* user(chat.id, "hello")
+
+      const result = yield* prompt.loop({ sessionID: chat.id })
+      expect(yield* llm.calls).toBe(2)
+      expect(result.info.role).toBe("assistant")
+      if (result.info.role === "assistant") {
+        expect(result.info.error).toBeUndefined()
+      }
+      const messages = yield* sessions.messages({ sessionID: chat.id })
+      const texts = messages
+        .flatMap((message) => message.parts)
+        .filter((part) => part.type === "text")
+        .map((part) => part.text)
+      expect(texts.join("")).toContain("recovered after retry")
+    }),
+  { timeout: 30_000 },
+)
+
+it.instance(
+  "does not retry a completed response whose provider omitted the finish reason",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({
+        title: "Pinned",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      // A provider may complete a response without transmitting a finish
+      // reason; the SDK surfaces that as an "unknown" finish. The usage
+      // accounting still arrives with the completed response, so the turn
+      // must end here - retrying would replay the completed work.
+      yield* llm.push(reply().text("completed without finish metadata").usage({ input: 10, output: 5 }))
+      yield* user(chat.id, "hello")
+
+      const result = yield* prompt.loop({ sessionID: chat.id })
+      expect(yield* llm.calls).toBe(1)
+      expect(result.info.role).toBe("assistant")
+      if (result.info.role === "assistant") {
+        expect(result.info.error).toBeUndefined()
+      }
+      const messages = yield* sessions.messages({ sessionID: chat.id })
+      const texts = messages
+        .flatMap((message) => message.parts)
+        .filter((part) => part.type === "text")
+        .map((part) => part.text)
+      expect(texts.join("")).toContain("completed without finish metadata")
+    }),
+  { timeout: 30_000 },
+)
+
+it.instance(
+  "does not retry a completed response that carried neither finish reason nor usage",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({
+        title: "Pinned",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      // The weakest legitimate completion a provider can send: content, then
+      // a clean stream end with no finish reason and no usage accounting.
+      // Nothing here proves interruption, so the turn must complete, not
+      // retry - a retry would replay the completed work.
+      yield* llm.push(reply().text("bare completion"))
+      yield* user(chat.id, "hello")
+
+      const result = yield* prompt.loop({ sessionID: chat.id })
+      expect(yield* llm.calls).toBe(1)
+      expect(result.info.role).toBe("assistant")
+      if (result.info.role === "assistant") {
+        expect(result.info.error).toBeUndefined()
+      }
+      const messages = yield* sessions.messages({ sessionID: chat.id })
+      const texts = messages
+        .flatMap((message) => message.parts)
+        .filter((part) => part.type === "text")
+        .map((part) => part.text)
+      expect(texts.join("")).toContain("bare completion")
+    }),
+  { timeout: 30_000 },
 )
