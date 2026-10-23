@@ -1067,6 +1067,97 @@ describe("daemon teardown: ownership and wait-path regressions (integration)", (
 })
 
 describe("daemon teardown: registration lock coordination (integration)", () => {
+  test("real register replacement survives the old worker's scoped finalizer", async () => {
+    rmSync(serverFile, { force: true })
+    rmSync(path.join(stateHome, "close-12345"), { force: true })
+    rmSync(path.join(stateHome, "close-12346"), { force: true })
+    const worker = path.join(import.meta.dir, "fixtures", "registration-worker.ts")
+    const launch = (port: number) =>
+      Bun.spawn([process.execPath, worker, String(port), path.join(stateHome, `close-${port}`)], {
+        env: { ...process.env, XDG_STATE_HOME: stateHome },
+        stdin: "pipe",
+        stdout: "pipe",
+        stderr: "pipe",
+      })
+    const first = launch(12345)
+    let second: ReturnType<typeof launch> | undefined
+    const ready = async (child: ReturnType<typeof launch>) => {
+      const reader = child.stdout.getReader()
+      try {
+        const result = await Promise.race([
+          reader.read(),
+          Bun.sleep(10_000).then(() => {
+            throw new Error("registration worker readiness timeout")
+          }),
+        ])
+        expect(new TextDecoder().decode(result.value)).toContain("ready")
+      } finally {
+        reader.releaseLock()
+      }
+    }
+    try {
+      await ready(first)
+      second = launch(12346)
+      await ready(second)
+      const replacement = readFileSync(serverFile, "utf8")
+      expect(JSON.parse(replacement).pid).toBe(second.pid)
+      writeFileSync(path.join(stateHome, "close-12345"), "close")
+      const firstExit = await first.exited
+      if (firstExit !== 0) console.error(await new Response(first.stderr).text())
+      expect(firstExit).toBe(0)
+      expect(readFileSync(serverFile, "utf8")).toBe(replacement)
+      expect(alive(second.pid)).toBe(true)
+      expect(existsSync(serverFile + ".lock")).toBe(false)
+      writeFileSync(path.join(stateHome, "close-12346"), "close")
+      expect(await second.exited).toBe(0)
+      expect(existsSync(serverFile)).toBe(false)
+    } finally {
+      first.kill()
+      second?.kill()
+      rmSync(serverFile, { force: true })
+    }
+  }, 30_000)
+
+  for (const coordination of [true, null]) {
+    test(`malformed protocol ${coordination} refuses start and publication without changing bytes`, async () => {
+      writeRegistration({ version: installationVersion, url: "http://127.0.0.1:1", pid: process.pid })
+      const invalid = { ...JSON.parse(readFileSync(serverFile, "utf8")), coordination }
+      writeFileSync(serverFile, JSON.stringify(invalid))
+      const original = readFileSync(serverFile, "utf8")
+      try {
+        const started = await runDaemon((daemon) => daemon.start())
+        expect(started.ok).toBe(false)
+        if (!started.ok) expect(started.message).toContain("registration is invalid")
+        const layer = mod.layer.pipe(Layer.provide(NodeFileSystem.layer))
+        const published = await Effect.runPromise(
+          Effect.gen(function* () {
+            const daemon = yield* mod.Service
+            return yield* daemon.register({ _tag: "TcpAddress", hostname: "127.0.0.1", port: 12345 })
+          }).pipe(Effect.scoped, Effect.result, Effect.provide(layer)),
+        )
+        expect(published._tag).toBe("Failure")
+        expect(readFileSync(serverFile, "utf8")).toBe(original)
+      } finally {
+        rmSync(serverFile, { force: true })
+      }
+    })
+  }
+
+  test("non-ENOENT registration read error refuses without removing the entry", async () => {
+    mkdirSync(path.dirname(serverFile), { recursive: true })
+    rmSync(serverFile, { force: true })
+    // Reading a directory as a file returns EISDIR, never genuine absence.
+    mkdirSync(serverFile)
+    try {
+      const started = await runDaemon((daemon) => daemon.start())
+      expect(started.ok).toBe(false)
+      if (!started.ok) expect(started.message).toContain("registration is unreadable")
+      expect(existsSync(serverFile)).toBe(true)
+    } finally {
+      rmSync(serverFile, { recursive: true })
+    }
+  })
+
   test("publisher attempting B exactly between compare and unlink is excluded until removal releases the lock", async () => {
     const child = Bun.spawn(["sleep", "30"], { stdio: ["ignore", "ignore", "ignore"] })
     child.kill()
@@ -1123,7 +1214,10 @@ describe("daemon teardown: registration lock coordination (integration)", () => 
     writeFileSync(serverFile, JSON.stringify(legacy))
     const original = readFileSync(serverFile, "utf8")
     try {
-      for (const operation of ["stop", "restart"] as const) {
+      const status = await runDaemon((daemon) => daemon.status())
+      expect(status.ok).toBe(true)
+      if (status.ok) expect(status.value).toBeUndefined()
+      for (const operation of ["start", "stop", "restart"] as const) {
         const result = await runDaemon((daemon) => daemon[operation]())
         expect(result.ok).toBe(false)
         if (!result.ok) expect(result.message).toContain("service registration protocol")
@@ -1145,7 +1239,10 @@ describe("daemon teardown: registration lock coordination (integration)", () => 
     writeFileSync(serverFile, JSON.stringify(legacy))
     const original = readFileSync(serverFile, "utf8")
     try {
-      for (const operation of ["stop", "restart"] as const) {
+      const status = await runDaemon((daemon) => daemon.status())
+      expect(status.ok).toBe(true)
+      if (status.ok) expect(status.value).toBeUndefined()
+      for (const operation of ["start", "stop", "restart"] as const) {
         const result = await runDaemon((daemon) => daemon[operation]())
         expect(result.ok).toBe(false)
         if (!result.ok) expect(result.message).toContain("service registration protocol")
@@ -1192,6 +1289,7 @@ describe("daemon teardown: registration lock coordination (integration)", () => 
       // contested file survived - no delete under someone else's lock.
       expect(alive(child.pid)).toBe(false)
       expect(readFileSync(serverFile, "utf8")).toBe(originalRegistration)
+      expect(existsSync(serverFile + ".lock")).toBe(true)
     } finally {
       rmSync(serverFile + ".lock", { recursive: true, force: true })
     }
@@ -1236,6 +1334,9 @@ describe("daemon teardown: registration lock coordination (integration)", () => 
         // leave B's file untouched and spawn nothing - the invariants below
         // (file kept, B alive, nothing spawned) are what this regression pins.
         if (!restarted.ok) expect(restarted.message).toMatch(/could not be verified|different service registered/)
+        // onGrant sent SIGTERM; wait for the actual child exit, not a
+        // scheduler-dependent immediate kill(0) observation.
+        await childA.exited
         expect(alive(childA.pid)).toBe(false)
         expect(alive(childB.pid)).toBe(true)
         expect(existsSync(markerOut)).toBe(false)

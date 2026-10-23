@@ -162,6 +162,31 @@ export const layer = Layer.effect(
       return yield* fs.readFileString(file).pipe(Effect.flatMap(decodeRegistration))
     })
 
+    // Only ENOENT is absence. Decode, permission, and I/O failures preserve
+    // the entry and refuse instead of silently opening the spawn path.
+    const optionalRegistration = Effect.fnUntraced(function* () {
+      const text = yield* fs.readFileString(file).pipe(
+        Effect.map((value) => Option.some(value)),
+        Effect.catchReason("PlatformError", "NotFound", () => Effect.succeed(Option.none<string>())),
+        Effect.mapError(
+          () =>
+            new Error(
+              "Service registration is unreadable. Stop all service and client processes using this state directory and inspect the registration before retrying. Nothing was removed or spawned.",
+            ),
+        ),
+      )
+      if (Option.isNone(text)) return Option.none<Registration>()
+      const info = yield* decodeRegistration(text.value).pipe(
+        Effect.mapError(
+          () =>
+            new Error(
+              "Service registration is invalid. Stop all service and client processes using this state directory and inspect the registration before retrying. Nothing was removed or spawned.",
+            ),
+        ),
+      )
+      return Option.some(info)
+    })
+
     const createClient = Effect.fnUntraced(function* (url: string) {
       return createOpencodeClient({ baseUrl: url, headers: ServerAuth.headers({ password: yield* password() }) })
     })
@@ -324,7 +349,7 @@ export const layer = Layer.effect(
       yield* requireCoordinated(expected)
       return yield* withRegistrationLock(
         Effect.gen(function* () {
-          const current = yield* registration().pipe(Effect.option)
+          const current = yield* optionalRegistration()
           if (Option.isNone(current)) return "absent" as const
           if (!sameRegistration(current.value, expected)) return "changed" as const
           yield* fs.remove(file).pipe(Effect.ignore)
@@ -478,8 +503,9 @@ export const layer = Layer.effect(
         // Same entry rule as restart: a failed health check is not absence.
         // Classify the registration before spawning anything; a wedged or
         // unconfirmable registered process refuses instead of being orphaned.
-        const raw = yield* registration().pipe(Effect.option)
+        const raw = yield* optionalRegistration()
         if (Option.isSome(raw)) {
+          yield* requireCoordinated(raw.value)
           const entry = yield* classifyUnhealthyEntry(raw.value)
           if (entry.status === "orphaned") {
             return yield* Effect.fail(
@@ -520,6 +546,7 @@ export const layer = Layer.effect(
         // Keep probing even for compatible servers: verified idle retains the
         // development/factory replacement behavior. Unknown permits only reuse,
         // not replacement, and is never converted to a zero active-run count.
+        if (found) yield* requireCoordinated(found)
         const activeCount = yield* probeActiveRuns(found)
 
         const decision = decideStart({
@@ -562,7 +589,7 @@ export const layer = Layer.effect(
                 ),
               )
             }
-            found = Option.getOrUndefined(yield* registration().pipe(Effect.option))
+            found = Option.getOrUndefined(yield* optionalRegistration())
             continue
           }
         }
@@ -600,11 +627,12 @@ export const layer = Layer.effect(
         // A failed health check does not prove nothing is registered: re-read
         // the registration and classify it before the service is treated as
         // absent. Spawning here with a live registered PID would orphan it.
-        const raw = yield* registration().pipe(Effect.option)
+        const raw = yield* optionalRegistration()
         if (Option.isNone(raw)) {
           stopIdle = { status: "stopping" }
         } else {
           found = raw.value
+          yield* requireCoordinated(found)
           stopIdle = yield* classifyUnhealthyEntry(found)
         }
       }
@@ -671,12 +699,28 @@ export const layer = Layer.effect(
     const status = Effect.fn("cli.daemon.status")(function* () {
       const existing = yield* healthy().pipe(Effect.option)
       const found = Option.getOrUndefined(existing)
+      if (found) {
+        const coordinated = yield* requireCoordinated(found).pipe(
+          Effect.as(true),
+          Effect.catch((error) => Effect.logWarning(error.message).pipe(Effect.as(false))),
+        )
+        if (!coordinated) return undefined
+      }
       if (found?.version === InstallationVersion) return found.url
       if (found) return undefined
       // A failed health check is not absence: only a verified dead PID
       // (ESRCH) makes the registration stale enough to remove. While any
       // process holds the PID the registration is the operator's only record.
-      const raw = yield* registration().pipe(Effect.option)
+      const raw = yield* optionalRegistration().pipe(
+        Effect.catch((error) => Effect.logWarning(error.message).pipe(Effect.as(Option.none<Registration>()))),
+      )
+      if (Option.isSome(raw)) {
+        const valid = yield* requireCoordinated(raw.value).pipe(
+          Effect.as(true),
+          Effect.catch((error) => Effect.logWarning(error.message).pipe(Effect.as(false))),
+        )
+        if (!valid) return undefined
+      }
       if (Option.isSome(raw) && (yield* processExited(raw.value.pid))) {
         // Same ownership rule as the other callers: remove only if the file
         // still describes the record we just proved stale. Best-effort: a
@@ -716,8 +760,9 @@ export const layer = Layer.effect(
       // registration stale, so it is removed; a live PID keeps it, because
       // the registration is the only record the operator has for the manual
       // route, and removing it before a verified kill would lose that.
-      const raw = yield* registration().pipe(Effect.option)
+      const raw = yield* optionalRegistration()
       if (Option.isNone(raw)) return
+      yield* requireCoordinated(raw.value)
       const pid = raw.value.pid
       const gone = yield* processExited(pid)
       if (gone) {
@@ -737,7 +782,7 @@ export const layer = Layer.effect(
       // its remove (same build on both sides).
       yield* withRegistrationLock(
         Effect.gen(function* () {
-          const current = yield* registration().pipe(Effect.option)
+          const current = yield* optionalRegistration()
           if (Option.isSome(current)) yield* requireCoordinated(current.value)
           yield* fs.makeDirectory(directory, { recursive: true })
           yield* fs.writeFileString(
