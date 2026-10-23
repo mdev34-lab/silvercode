@@ -173,11 +173,13 @@ export function patternMayReachWorktree(pattern: string, worktree: string): bool
  * Only shapes that plainly do under the matcher's real semantics, where `*`
  * crosses `/` and `?` consumes exactly one character, also crossing `/`:
  * star-only patterns match everything, and an absolute pattern ending in a
- * single trailing `*` covers the tree when its head (before that star, with
- * no other `*`) matches every possible descendant prefix. Literal heads use
- * the plain boundary-prefix test ("/repo/*" and "/repo/**" are equivalent
- * here, and "/repo*" even covers sibling roots sharing the prefix - still
- * correct, because such a pattern genuinely matches those paths too). A
+ * trailing star RUN (`*` or `**` or more - the matcher treats a run of
+ * stars as one dotAll wildcard) covers the tree when its head (before the
+ * run, with no other `*`) matches every possible descendant prefix. Literal
+ * heads use the plain boundary-prefix test ("/repo/*" and "/repo/**" are
+ * equivalent here, and "/repo*" even covers sibling roots sharing the
+ * prefix - still correct, because such a pattern genuinely matches those
+ * paths too). A
  * head containing `?` is aligned against the root character by character:
  * literal positions must equal the root, `?` matches any single character,
  * and the head may reach at most two characters past it - the separating
@@ -193,7 +195,11 @@ export function patternCoversWorktree(pattern: string, worktree: string): boolea
   if (/^\*+$/.test(normalized)) return true
   if (!isAbsolutePattern(normalized)) return false
   if (!normalized.endsWith("*")) return false
-  const head = normalized.slice(0, -1)
+  // The matcher compiles every `*` to a dotAll run crossing `/`, so a trailing
+  // star RUN (`*` or `**` or more) is one wildcard: strip it whole. Leaving a
+  // single star in the head would wrongly reject shapes like "/repo/**" or
+  // "/**", which deny the same paths as "/repo/*" and "/*".
+  const head = normalized.replace(/\*+$/, "")
   if (head.includes("*")) return false
   if (head === "") return true
   const root = worktreeRoot(worktree)

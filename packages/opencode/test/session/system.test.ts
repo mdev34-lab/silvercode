@@ -682,6 +682,58 @@ describe("session.system", () => {
     ).toBe("partial")
   })
 
+  test("worktree edit capability is denied when a worktree-wide deny uses a trailing star run", () => {
+    // The matcher compiles every `*` to a dotAll wildcard crossing `/`, so a
+    // trailing run of stars is one wildcard: "/repo/**" denies every path the
+    // single-star "/repo/*" denies. Stripping only the final star leaves a
+    // star in the head and used to degrade these to "partial".
+    for (const pattern of ["/repo/*", "/repo/**", "/repo/***"]) {
+      const scoped: Agent.Info = {
+        ...code,
+        permission: Permission.fromConfig({ edit: { [pattern]: "deny" } }),
+      }
+      expect(
+        subagentWorktreeEditCapability({
+          worktree: "/repo",
+          subagent: scoped,
+          parentSessionPermission: Permission.fromConfig({ "*": "allow" }),
+        }),
+      ).toBe("denied")
+    }
+  })
+
+  test("worktree edit capability is denied for a root-spanning star run", () => {
+    for (const pattern of ["/*", "/**"]) {
+      const scoped: Agent.Info = {
+        ...code,
+        permission: Permission.fromConfig({ edit: { [pattern]: "deny" } }),
+      }
+      expect(
+        subagentWorktreeEditCapability({
+          worktree: "/repo",
+          subagent: scoped,
+          parentSessionPermission: Permission.fromConfig({ "*": "allow" }),
+        }),
+      ).toBe("denied")
+    }
+  })
+
+  test("worktree edit capability stays partial when a star remains inside the head", () => {
+    // "/repo/*/x**" denies only descendants of first-level children: nothing
+    // directly under the root matches, so the tree is not covered.
+    const scoped: Agent.Info = {
+      ...code,
+      permission: Permission.fromConfig({ edit: { "/repo/*/x**": "deny" } }),
+    }
+    expect(
+      subagentWorktreeEditCapability({
+        worktree: "/repo",
+        subagent: scoped,
+        parentSessionPermission: Permission.fromConfig({ "*": "allow" }),
+      }),
+    ).toBe("partial")
+  })
+
   test("worktree edit capability stays partial when a literal follows the slash before the star", () => {
     // `/repo/a*` denies only children starting with `a`; every other name is
     // still editable.
