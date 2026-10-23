@@ -227,7 +227,19 @@ async function frameOf(app: Setup) {
 
 // The reasoning body renders through the streaming markdown/code block, which
 // settles a frame or two after the store change, so read spans for it.
-async function spansOf(app: Setup) {
+async function spansOf(app: Setup, visible?: string) {
+  if (visible !== undefined) {
+    return waitFor(
+      app,
+      () => {
+        const spans = app.captureSpans()
+        const text = spans.lines.map((line) => line.spans.map((span) => span.text).join("")).join("\n")
+        return text.includes(visible) ? text : undefined
+      },
+      400,
+      `reasoning body did not paint: ${visible}`,
+    )
+  }
   const spans = await captureSpans(app)
   return spans.lines.map((line) => line.spans.map((span) => span.text).join("")).join("\n")
 }
@@ -278,7 +290,7 @@ describe("thinking toggle on CoT nested inside a Working block", () => {
     // /thinking expand must reveal the CoT of the already-rendered block.
     keymap().dispatchCommand("session.toggle.thinking")
     await settle(app)
-    const expanded = await spansOf(app)
+    const expanded = await spansOf(app, COT_BODY)
     expect(expanded).toContain(COT_BODY)
     expect(expanded).not.toContain("+ Thought")
 
@@ -312,7 +324,7 @@ describe("thinking toggle on CoT nested inside a Working block", () => {
     events.emit(deltaEvent("prt_late", STREAMED_BODY, 1))
     await settle(app)
     // The stream is still open, so the body is readable regardless of mode.
-    expect(await spansOf(app)).toContain(STREAMED_BODY)
+    expect(await spansOf(app, STREAMED_BODY)).toContain(STREAMED_BODY)
 
     // The reasoning stream ends; hide mode collapses the completed block.
     events.emit(
@@ -334,11 +346,15 @@ describe("thinking toggle on CoT nested inside a Working block", () => {
     // The command's expanded state reaches the subsequently-rendered block.
     keymap().dispatchCommand("session.toggle.thinking")
     await settle(app)
-    expect(await spansOf(app)).toContain(STREAMED_BODY)
+    expect(await spansOf(app, STREAMED_BODY)).toContain(STREAMED_BODY)
   })
 
   test("a manually expanded nested thought stays open across streaming updates", async () => {
-    const { app, events, keymap } = await mountSession([reasoningPart(), toolPart("prt_tool_a"), toolPart("prt_tool_b")])
+    const { app, events, keymap } = await mountSession([
+      reasoningPart(),
+      toolPart("prt_tool_a"),
+      toolPart("prt_tool_b"),
+    ])
     await expandWorkingBlock(app, keymap)
 
     // Click-open the collapsed nested thought, like a user reading the CoT
@@ -348,13 +364,13 @@ describe("thinking toggle on CoT nested inside a Working block", () => {
     expect(row).toBeGreaterThan(-1)
     await app.mockMouse.click(8, row)
     await settle(app)
-    expect(await spansOf(app)).toContain(COT_BODY)
+    expect(await spansOf(app, COT_BODY)).toContain(COT_BODY)
 
     // The next part of the run arrives: the activity groups recompute. The
     // expansion must survive it (top-level blocks already behave this way).
     events.emit(updatedEvent(toolPart("prt_tool_c", BASE + 300), 3))
     await settle(app)
-    expect(await spansOf(app)).toContain(COT_BODY)
+    expect(await spansOf(app, COT_BODY)).toContain(COT_BODY)
     expect(await frameOf(app)).toContain("- Thought")
   })
 })
