@@ -657,8 +657,10 @@ export const layer = Layer.effect(
       const raw = yield* registration().pipe(Effect.option)
       if (Option.isSome(raw) && (yield* processExited(raw.value.pid))) {
         // Same ownership rule as the other callers: remove only if the file
-        // still describes the record we just proved stale.
-        yield* removeIfSame(raw.value)
+        // still describes the record we just proved stale. Best-effort: a
+        // contested lock leaves the stale entry for the next caller rather
+        // than failing a read-only status query.
+        yield* removeIfSame(raw.value).pipe(Effect.ignore)
       }
       return undefined
     })
