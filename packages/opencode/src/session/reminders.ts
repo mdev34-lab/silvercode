@@ -15,7 +15,7 @@ import PLAN_MODE from "./prompt/plan-mode.txt"
 import { NotFoundError } from "@/storage/storage"
 
 const scratchpad = (plan: string) =>
-  `A plan file exists at ${plan}. Execute on the plan defined within it, and keep the file current as your scratchpad: check off steps as you finish them and revise the remaining steps when reality diverges from the plan.`
+  `A plan file exists at ${plan}. Execute on the plan defined within it, and keep the file current as your scratchpad: check off each step when its verification passes, not in a batch later, and revise the remaining steps when reality diverges from the plan.`
 
 // Plan files belong to the root session: a Think running as a delegated
 // subagent writes the same plan file its caller's session later reads.
