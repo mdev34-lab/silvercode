@@ -164,6 +164,7 @@ const layer = Layer.effect(
         return [
           `When a request needs non-trivial implementation planning, delegate that planning to ${names} once, at the start, with the task tool.`,
           "Then work the plan step by step, carrying it forward instead of re-deriving or re-planning it at every tool call.",
+          "If the planner's reply names a plan file, that file is your living scratchpad: update it at milestones (completed steps, discoveries, revised remaining steps), never after every tool call, and never let maintaining it block the work itself.",
         ].join("\n")
       }),
 
