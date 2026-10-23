@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test"
 import { mkdtemp, rm } from "fs/promises"
 import { tmpdir } from "os"
 import { join } from "path"
+import { fileURLToPath } from "url"
 import { createTuiWorker, createWorkerProcess } from "../../src/cli/tui/worker-process"
 import { Rpc } from "../../src/util/rpc"
 
@@ -377,6 +378,58 @@ setInterval(() => {}, 1000)
       await rm(dir, { recursive: true, force: true })
     }
   })
+
+  // #442: Windows has no detached process groups, and the worker's own owner
+  // watchdog never observes a hard-killed owner there (#480). The owner-side
+  // guarantee is the OS: the worker is assigned to a kill-on-close job object,
+  // so the owner's death takes it down. The worker script installs no
+  // watchdog, so nothing except the job can end it.
+  test("a Windows job object kills the worker when its owner is hard-killed (#442)", async () => {
+    if (process.platform !== "win32") return
+    const dir = await mkdtemp(join(tmpdir(), "silvercode-worker-job-"))
+    const target = join(dir, "worker.ts")
+    await Bun.write(target, `process.send?.("pid=" + process.pid)\nsetInterval(() => {}, 1000)\n`)
+
+    const owner = join(dir, "owner.ts")
+    await Bun.write(
+      owner,
+      `import { createTuiWorker } from ${JSON.stringify(fileURLToPath(new URL("../../src/cli/tui/worker-process.ts", import.meta.url)))}
+const worker = createTuiWorker(${JSON.stringify(target)}, { log: () => {} })
+worker.onmessage = (event) => {
+  if (typeof event.data === "string" && event.data.startsWith("pid=")) process.send?.(event.data)
+}
+setInterval(() => {}, 1000)
+`,
+    )
+
+    let reportPid!: (pid: number) => void
+    const reported = new Promise<number>((resolve) => {
+      reportPid = resolve
+    })
+    const ownerProcess = Bun.spawn([process.execPath, owner], {
+      ipc: (message) => {
+        const text = String(message)
+        if (text.startsWith("pid=")) reportPid(Number(text.slice("pid=".length)))
+      },
+      stderr: "inherit",
+    })
+    const pid = await bounded(reported, "worker never reported its PID", 20000)
+    try {
+      expect(pid).toBeGreaterThan(0)
+      expect(windowsPidAlive(pid)).toBe(true)
+      // Kill the owner the way TerminateProcess or the OOM killer does: no
+      // shutdown RPC, no signal handling, no cooperation.
+      ownerProcess.kill("SIGKILL")
+      await ownerProcess.exited
+      await waitForWindowsPidGone(pid, 15000)
+    } finally {
+      ownerProcess.kill("SIGKILL")
+      // On the pass path the worker is already gone; on the failure path this
+      // keeps a broken build from leaking a process on CI.
+      Bun.spawnSync(["taskkill", "/PID", String(pid), "/T", "/F"])
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
 })
 
 function countLines(text: string) {
@@ -390,5 +443,20 @@ async function waitForFileText(path: string, needle: string, timeout: number) {
     if (text.includes(needle)) return text
     if (Date.now() > deadline) throw new Error(`${needle} never appeared in ${path} (saw ${text.length} bytes)`)
     await Bun.sleep(25)
+  }
+}
+
+function windowsPidAlive(pid: number) {
+  // tasklist is the authority here: the signal-0 probe is exactly what #480
+  // showed is unreliable for a hard-killed owner on Windows.
+  const listing = Bun.spawnSync(["tasklist", "/FI", `PID eq ${pid}`, "/NH", "/FO", "CSV"]).stdout.toString()
+  return listing.includes(`"${pid}"`)
+}
+
+async function waitForWindowsPidGone(pid: number, timeout: number) {
+  const deadline = Date.now() + timeout
+  while (windowsPidAlive(pid)) {
+    if (Date.now() > deadline) throw new Error(`worker ${pid} survived its hard-killed owner (#442)`)
+    await Bun.sleep(100)
   }
 }

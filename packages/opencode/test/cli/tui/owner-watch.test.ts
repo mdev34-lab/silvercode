@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test"
-import { watchOwnerProcess } from "../../../src/cli/tui/owner-watch"
+import { probeOwnerAlive, watchOwnerProcess } from "../../../src/cli/tui/owner-watch"
 
 const tick = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 
@@ -80,4 +80,18 @@ test("a subscriber that fires synchronously during subscribe does not trip the T
   expect(orphaned).toBe(1)
   unwatch()
   expect(orphaned).toBe(1)
+})
+
+test("reads only ESRCH as owner death", () => {
+  const survives = (code: string) =>
+    probeOwnerAlive(1, () => {
+      throw Object.assign(new Error(code), { code })
+    })
+  // EPERM means the owner exists but we may not signal it; any other probe
+  // error is not evidence of death either. Killing the worker on those would
+  // orphan in-flight work of a live owner (#442).
+  expect(survives("EPERM")).toBe(true)
+  expect(survives("EINVAL")).toBe(true)
+  expect(survives("ESRCH")).toBe(false)
+  expect(probeOwnerAlive(1, () => {})).toBe(true)
 })
