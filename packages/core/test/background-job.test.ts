@@ -61,6 +61,20 @@ describe("BackgroundJob", () => {
     }).pipe(Effect.provide(jobsLayer)),
   )
 
+  it.effect("keeps same-session run keys distinct when the clock has not advanced", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const starts: number[] = []
+      for (let index = 0; index < 3; index++) {
+        const job = yield* jobs.start({ id: "ses_same_millisecond", type: "task", run: Effect.succeed("done") })
+        starts.push(job.started_at)
+        yield* jobs.wait({ id: job.id })
+      }
+      expect(new Set(starts).size).toBe(3)
+      expect(starts).toEqual([0, 1, 2])
+    }).pipe(Effect.provide(jobsLayer)),
+  )
+
   it.live("increments pending work before starting immediately settling extensions", () =>
     Effect.gen(function* () {
       const jobs = yield* BackgroundJob.Service
