@@ -94,6 +94,14 @@ describe("decideRestart", () => {
   test("refuses when the active-run state is unknown", () => {
     expect(mod.decideRestart({ registered: true, stop: { status: "unknown" } })).toBe("refuse-unknown")
   })
+
+  test("refuses when the listener is gone but the process is alive (orphaned)", () => {
+    expect(mod.decideRestart({ registered: true, stop: { status: "orphaned" } })).toBe("refuse-orphaned")
+  })
+
+  test("proceeds when nothing is registered even with an orphaned answer", () => {
+    expect(mod.decideRestart({ registered: false, stop: { status: "orphaned" } })).toBe("proceed")
+  })
 })
 
 function alive(pid: number) {
@@ -518,6 +526,53 @@ describe("daemon restart: server-side stop-if-idle (integration)", () => {
         expect(requests.filter((req) => req.path === "/api/health").length).toBeGreaterThan(0)
       },
     )
+  }, 60_000)
+
+  test("listener gone but the process alive: restart refuses as orphaned and leaves the process (regression: a closed port is not a dead process)", async () => {
+    await withMarker(async () => {
+      const child = Bun.spawn(["sleep", "30"], { stdio: ["ignore", "ignore", "ignore"] })
+      const server = fakeServer({ active: { kind: "ok", runs: 0 }, stop: { kind: "hang" } })
+      writeRegistration({ version: installationVersion, url: server.url.origin, pid: child.pid })
+      const originalRegistration = readFileSync(serverFile, "utf8")
+      try {
+        // The listener dies while the stop answer hangs: the recheck probes get
+        // ECONNREFUSED twice, but the registered process never exited. Without
+        // the PID check this played out as remove-registration + spawn, leaving
+        // the wedged process alive and unmanaged.
+        setTimeout(() => server.stop(true), 100)
+        const restarted = await runDaemon((daemon) => daemon.restart())
+        expect(restarted.ok).toBe(false)
+        if (!restarted.ok) expect(restarted.message).toContain("still running")
+        expect(alive(child.pid)).toBe(true)
+        expect(existsSync(markerOut)).toBe(false)
+        expect(readFileSync(serverFile, "utf8")).toBe(originalRegistration)
+      } finally {
+        child.kill()
+        server.stop(true)
+      }
+    })
+  }, 60_000)
+
+  test("listener gone and the process exited: restart proceeds (the granted-stop teardown path)", async () => {
+    await withMarker(async () => {
+      const child = Bun.spawn(["sleep", "30"], { stdio: ["ignore", "ignore", "ignore"] })
+      const server = fakeServer({ active: { kind: "ok", runs: 0 }, stop: { kind: "hang" } })
+      writeRegistration({ version: installationVersion, url: server.url.origin, pid: child.pid })
+      try {
+        setTimeout(() => {
+          child.kill("SIGTERM")
+          server.stop(true)
+        }, 100)
+        const restarted = await runDaemon((daemon) => daemon.restart())
+        expect(restarted.ok).toBe(false)
+        if (!restarted.ok) expect(restarted.message).toContain("Failed to start server")
+        expect(alive(child.pid)).toBe(false)
+        expect(readFileSync(markerOut, "utf8")).toBe("serve --register")
+      } finally {
+        child.kill()
+        server.stop(true)
+      }
+    })
   }, 60_000)
 
   test("lost stop answer with the service answering 401 on health: restart refuses (a live listener is not a dead one)", async () => {

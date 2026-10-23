@@ -55,6 +55,9 @@ export type StopIdleResult =
   | { readonly status: "stopping" }
   | { readonly status: "busy"; readonly activeRuns: number | undefined }
   | { readonly status: "unknown" }
+  // The listener is confirmed gone but the registered process is still alive:
+  // the service is wedged, not stopped. Spawning a replacement would orphan it.
+  | { readonly status: "orphaned" }
 
 // Restart is stop-then-start, so it is refused unless the registered service
 // itself accepted a stop-if-idle request. The server performs the idle check and
@@ -65,10 +68,11 @@ export type StopIdleResult =
 export function decideRestart(input: {
   registered: boolean
   stop: StopIdleResult
-}): "proceed" | "refuse-active" | "refuse-unknown" {
+}): "proceed" | "refuse-active" | "refuse-unknown" | "refuse-orphaned" {
   if (!input.registered) return "proceed"
   if (input.stop.status === "busy") return "refuse-active"
   if (input.stop.status === "unknown") return "refuse-unknown"
+  if (input.stop.status === "orphaned") return "refuse-orphaned"
   return "proceed"
 }
 
@@ -80,6 +84,11 @@ const ActiveBody = Schema.Struct({ data: Schema.Record(Schema.String, Schema.Unk
 const ActiveRunsBody = Schema.Struct({ activeRuns: Schema.Number })
 const StoppingBody = Schema.Struct({ data: Schema.Struct({ status: Schema.Literal("stopping") }) })
 
+// The PID <-> listener association is by construction, not inferred: the
+// serving process writes this file itself in `register` with its own
+// `process.pid` and the address it actually bound. A registration can still
+// go STALE (the process dies and the OS recycles its PID), so a PID read from
+// this file is an identity hint that must be re-checked, never proof.
 const Registration = Schema.Struct({
   id: Schema.optional(Schema.String),
   version: Schema.optional(Schema.String),
@@ -228,29 +237,31 @@ export const layer = Layer.effect(
     // terminates the service ~250ms after the response is written, whether or
     // not the answer arrived, so a lost answer must not be reported as "left
     // running". The recheck waits out the self-terminate delay with margin,
-    // then classifies the probe precisely, because only one outcome proves
-    // termination:
+    // then classifies the probe precisely:
     //
     // - any HTTP response at all (200, 401, 404, 500, ...) proves a process is
     //   listening and answering: the service is ALIVE. A 401/404 is an auth or
     //   version mismatch, not a dead process.
-    // - a refused connection proves the local port is closed: the listener is
-    //   gone. Both endpoints are local, so a refused connection is a dead
-    //   (or dying) process, not a network partition.
+    // - a refused connection proves ONLY that nothing is listening on the
+    //   registered address: the LISTENER is gone. It says nothing about the
+    //   process - a wedged service can outlive its own listener, and treating
+    //   a closed port as a dead process would let a replacement orphan it.
+    //   Process exit is verified separately, by PID (see recheckAfterUnknown).
     // - anything else (timeout, reset, DNS, TLS) proves nothing and stays
     //   unknown, which refuses.
-    //
-    // Death is accepted only after two consecutive refused connections, so a
-    // transient refusal while the socket tears down cannot reopen the stop.
-    type Liveness = "alive" | "dead" | "unknown"
+    type Liveness = "alive" | "listener-gone" | "unknown"
 
+    // Structured codes only, walking the cause chain. A message-substring
+    // match is not accepted: an interposed proxy or tunnel can produce errors
+    // whose text mentions a refused connection for an address that is not the
+    // registered one, and only the kernel-generated refusal code on the actual
+    // dial proves nothing is listening there. A proxy that answers HTTP at all
+    // already reads as `alive` upstream, so it never reaches this check.
     const isConnectionRefused = (error: unknown): boolean => {
       let current: unknown = error
       while (current !== null && typeof current === "object") {
         const code = (current as { code?: unknown }).code
         if (code === "ECONNREFUSED" || code === "ConnectionRefused") return true
-        const message = (current as { message?: unknown }).message
-        if (typeof message === "string" && message.includes("Connection refused")) return true
         current = (current as { cause?: unknown }).cause
       }
       return false
@@ -269,16 +280,36 @@ export const layer = Layer.effect(
       if (Exit.isSuccess(response)) return "alive" as const
       // Unwrap the Effect Cause to the original fetch error before inspecting
       // codes; the Cause wrapper itself carries no connection information.
-      return isConnectionRefused(Cause.squash(response.cause)) ? ("dead" as const) : ("unknown" as const)
+      return isConnectionRefused(Cause.squash(response.cause)) ? ("listener-gone" as const) : ("unknown" as const)
+    })
+
+    // True only when no process owns the PID (ESRCH). EPERM and any probe
+    // error read as alive: they refuse, which is the safe side. A PID recycled
+    // by an unrelated process also reads as alive, so reuse can cause a false
+    // refusal but never a false "exited".
+    const processExited = Effect.fnUntraced(function* (pid: number) {
+      return yield* Effect.try({
+        try: () => {
+          process.kill(pid, 0)
+          return false
+        },
+        catch: (cause) => cause,
+      }).pipe(Effect.catch((cause) => Effect.succeed((cause as { code?: unknown }).code === "ESRCH")))
     })
 
     const recheckAfterUnknown = Effect.fn("cli.daemon.recheckAfterUnknown")(function* (info: Registration) {
       yield* Effect.sleep("500 millis")
       const first = yield* probeLiveness(info)
-      if (first !== "dead") return { status: "unknown" } as const
+      if (first !== "listener-gone") return { status: "unknown" } as const
+      // Two consecutive refusals prove the listener is gone for good, not that
+      // the process exited. A granted stop ends both together, but only the
+      // PID check separates "service stopped" from "service wedged without a
+      // listener"; a transient refusal while the socket tears down also cannot
+      // reopen the stop.
       yield* Effect.sleep("250 millis")
       const second = yield* probeLiveness(info)
-      return second === "dead" ? ({ status: "stopping" } as const) : ({ status: "unknown" } as const)
+      if (second !== "listener-gone") return { status: "unknown" } as const
+      return (yield* processExited(info.pid)) ? ({ status: "stopping" } as const) : ({ status: "orphaned" } as const)
     })
 
     const start = Effect.fn("cli.daemon.start")(function* () {
@@ -354,7 +385,14 @@ export const layer = Layer.effect(
       if (restartDecision === "refuse-unknown") {
         return yield* Effect.fail(
           new Error(
-            'Could not confirm the background service is idle (stop-if-idle refused or unconfirmed); the service was verified still running and left up. Retry, or run "service stop" to end it explicitly.',
+            'Could not confirm the background service is idle (stop-if-idle refused or unconfirmed); the service was left up, and its state could not be verified. Retry, or run "service stop" to end it explicitly.',
+          ),
+        )
+      }
+      if (restartDecision === "refuse-orphaned") {
+        return yield* Effect.fail(
+          new Error(
+            `Background service (PID ${found?.pid}) stopped answering its listener but the process is still running; it may be hung. Restart refused so a replacement does not orphan it. Run "service stop" to clear the registration, then verify the process is the opencode server (ps -p ${found?.pid} -o args=) and end it manually (kill ${found?.pid}).`,
           ),
         )
       }
@@ -391,9 +429,23 @@ export const layer = Layer.effect(
       const existing = yield* healthy().pipe(Effect.option)
       // A stale registration may point at a PID that has since been reused by
       // another process. Only signal the PID after authenticating the server.
-      if (Option.isNone(existing)) return yield* fs.remove(file).pipe(Effect.ignore)
-      yield* stopProcess(existing.value)
+      if (Option.isSome(existing)) {
+        yield* stopProcess(existing.value)
+        return yield* fs.remove(file).pipe(Effect.ignore)
+      }
+      // The registered server did not authenticate (wedged, hung, or stale).
+      // Its PID is NOT safe to signal unauthenticated, but leaving a hung
+      // process unmentioned would orphan it silently: report the precise
+      // manual route before clearing the registration.
+      const raw = yield* registration().pipe(Effect.option)
       yield* fs.remove(file).pipe(Effect.ignore)
+      if (Option.isNone(raw)) return
+      const pid = raw.value.pid
+      const gone = yield* processExited(pid)
+      if (gone) return
+      yield* Effect.logWarning(
+        `The registered service (PID ${pid}) did not answer its health endpoint, so it was not signaled; only its registration was removed. If it is hung, verify it is the opencode server (ps -p ${pid} -o args=) and end it manually (kill ${pid}).`,
+      )
     })
 
     const register = Effect.fn("cli.daemon.register")(function* (address: HttpServer.Address) {
