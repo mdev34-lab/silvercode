@@ -10,9 +10,34 @@ import { cliIt } from "../../lib/cli-process"
 
 describe("opencode run (non-interactive subprocess)", () => {
   cliIt.live(
-    "Zen quota SSE rejection before any stream part exits nonzero",
+    "Zen quota SSE rejection on a continued session exits nonzero",
     ({ llm, opencode }) =>
       Effect.gen(function* () {
+        yield* llm.text("initial session response")
+        const first = yield* opencode.run("initial request", {
+          timeoutMs: 20_000,
+          model: "opencode/local-quota-test",
+          env: {
+            OPENCODE_CONFIG_CONTENT: JSON.stringify({
+              agent: { work: { finishTool: false } },
+              provider: {
+                opencode: {
+                  npm: "@ai-sdk/openai-compatible",
+                  options: { baseURL: llm.url, apiKey: "public" },
+                  models: {
+                    "local-quota-test": {
+                      name: "local quota test",
+                      limit: { context: 128000, output: 4096 },
+                      cost: { input: 0, output: 0 },
+                    },
+                  },
+                },
+              },
+              permission: { "*": "allow" },
+            }),
+          },
+        })
+        expect(first.exitCode).toBe(0)
         yield* llm.push(
           raw({
             chunks: [
@@ -22,9 +47,11 @@ describe("opencode run (non-interactive subprocess)", () => {
         )
         const result = yield* opencode.run("quota rejection", {
           timeoutMs: 20_000,
+          extraArgs: ["--continue"],
           model: "opencode/local-quota-test",
           env: {
             OPENCODE_CONFIG_CONTENT: JSON.stringify({
+              agent: { work: { finishTool: false } },
               provider: {
                 opencode: {
                   npm: "@ai-sdk/openai-compatible",
