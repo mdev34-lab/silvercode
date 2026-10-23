@@ -36,7 +36,7 @@ export const PlanExitTool = Tool.define(
                 custom: false,
                 options: [
                   { label: "Yes", description: "Switch to work agent and start implementing the plan" },
-                  { label: "No", description: "Stay with plan agent to continue refining the plan" },
+                  { label: "No", description: "Stay with the think agent to continue refining the plan" },
                 ],
               },
             ],

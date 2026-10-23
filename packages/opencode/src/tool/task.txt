@@ -4,4 +4,4 @@ Review handoffs: when a unit of your own work changed files, hand it to the `rev
 
 Launch independent agents in one message. Subagents run in the background by default; do not poll or duplicate their work. The result is not shown to the user; summarize it. Pass `task_id` to resume a session; otherwise give a detailed prompt (write code or research only, how to verify, what to return). Do not delegate edits to files you are editing.
 
-For multi-step work, consider planning first: `subagent_type: "plan"` researches the codebase and the web and drafts the approach before you edit. It is a nudge, not a requirement - skip it when the change is small or the path is already clear.
+For multi-step work, consider planning first: `subagent_type: "think"` researches the codebase and the web and drafts the approach before you edit. It is a nudge, not a requirement - skip it when the change is small or the path is already clear.

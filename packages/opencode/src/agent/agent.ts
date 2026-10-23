@@ -14,7 +14,7 @@ import PROMPT_CODE from "./prompt/code.txt"
 import PROMPT_COMPACTION from "./prompt/compaction.txt"
 import PROMPT_EXPLORE from "./prompt/explore.txt"
 import PROMPT_REVIEW from "./prompt/review.txt"
-import PROMPT_PLAN from "./prompt/plan.txt"
+import PROMPT_THINK from "./prompt/think.txt"
 import PROMPT_SUMMARY from "./prompt/summary.txt"
 import PROMPT_TITLE from "./prompt/title.txt"
 import { Permission } from "@/permission"
@@ -231,15 +231,16 @@ const layer = Layer.effect(
             native: true,
             color: "#00A6FF",
           },
-          plan: {
-            name: "plan",
+          think: {
+            name: "think",
             description:
               "Planning specialist. Researches the codebase and the web, then drafts an implementation plan. Disallows all edit tools.",
-            prompt: PROMPT_PLAN,
+            prompt: PROMPT_THINK,
             options: {},
             permission: Permission.merge(defaults, planPermissions, user),
             mode: "all",
             native: true,
+            color: "#A78BFA",
           },
           general: {
             name: "general",
@@ -430,7 +431,7 @@ const layer = Layer.effect(
           const visible = Object.values(agents).filter((a) => a.mode !== "subagent" && a.hidden !== true)
           const work = visible.find((a) => a.name === "work")
           if (work) return work
-          const plan = visible.find((a) => a.name === "plan")
+          const plan = visible.find((a) => a.name === "think")
           if (plan) return plan
           const fallback = visible[0]
           if (!fallback) throw new Error("no primary visible agent found")

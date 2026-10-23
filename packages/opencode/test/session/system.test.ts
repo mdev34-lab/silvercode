@@ -51,8 +51,8 @@ const build: Agent.Info = {
   options: {},
 }
 
-const plan: Agent.Info = {
-  name: "plan",
+const think: Agent.Info = {
+  name: "think",
   mode: "all",
   native: true,
   description:
@@ -95,7 +95,7 @@ const it = testEffect(
     [
       Agent.node,
       Layer.mock(Agent.Service, {
-        list: () => Effect.succeed([build, plan, hiddenPlanner]),
+        list: () => Effect.succeed([build, think, hiddenPlanner]),
       }),
     ],
     [
@@ -240,7 +240,7 @@ describe("session.system", () => {
       const prompt = yield* SystemPrompt.Service
       const output = (yield* prompt.delegation(build)) ?? (yield* Effect.fail(new NamedError.Unknown({ message: "missing delegation output" })))
 
-      expect(output).toContain("`plan`")
+      expect(output).toContain("`think`")
       expect(output).toContain("once, at the start")
       expect(output).toContain("carrying it forward instead of re-deriving or re-planning it at every tool call")
       expect(output).not.toContain("architect-planner")
@@ -259,7 +259,7 @@ describe("session.system", () => {
   it.effect("delegation nudge is omitted for the planning agent itself", () =>
     Effect.gen(function* () {
       const prompt = yield* SystemPrompt.Service
-      const output = yield* prompt.delegation(plan)
+      const output = yield* prompt.delegation(think)
 
       expect(output).toBeUndefined()
     }),
@@ -268,7 +268,7 @@ describe("session.system", () => {
   it.effect("delegation nudge is omitted when delegation to the planner is denied", () =>
     Effect.gen(function* () {
       const prompt = yield* SystemPrompt.Service
-      const output = yield* prompt.delegation({ ...build, permission: Permission.fromConfig({ task: { plan: "deny" } }) })
+      const output = yield* prompt.delegation({ ...build, permission: Permission.fromConfig({ task: { think: "deny" } }) })
 
       expect(output).toBeUndefined()
     }),
@@ -277,15 +277,15 @@ describe("session.system", () => {
   it.effect("delegation nudge is omitted when the session ruleset denies delegation to the planner", () =>
     Effect.gen(function* () {
       const prompt = yield* SystemPrompt.Service
-      const output = yield* prompt.delegation(build, Permission.fromConfig({ task: { plan: "deny" } }) )
+      const output = yield* prompt.delegation(build, Permission.fromConfig({ task: { think: "deny" } }) )
 
       expect(output).toBeUndefined()
     }),
   )
 
-  test("plan prompt keeps the up-front plan output contract", async () => {
+  test("think prompt keeps the up-front plan output contract", async () => {
     const text = await Bun.file(
-      new URL("../../src/agent/prompt/plan.txt", import.meta.url),
+      new URL("../../src/agent/prompt/think.txt", import.meta.url),
     ).text()
     expect(text).toContain("overview")
     expect(text).toContain("numbered steps")
