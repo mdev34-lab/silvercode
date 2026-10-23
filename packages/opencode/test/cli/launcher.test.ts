@@ -38,8 +38,11 @@ async function launch(entry: string): Promise<Result> {
   let stdout = ""
   let signalled = false
   const pump = (async () => {
-    for await (const chunk of proc.stdout) {
-      stdout += decoder.decode(chunk)
+    const reader = proc.stdout.getReader()
+    for (;;) {
+      const chunk = await reader.read()
+      if (chunk.done) return
+      stdout += decoder.decode(chunk.value)
       // Signal once the child exists so a slow launcher start cannot turn this
       // into "no child to signal yet".
       if (!signalled && stdout.includes("child:ready")) {
