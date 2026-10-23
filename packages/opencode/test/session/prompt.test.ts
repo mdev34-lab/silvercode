@@ -5160,3 +5160,37 @@ it.instance(
     }),
   { timeout: 30_000 },
 )
+
+it.instance(
+  "does not retry a completed response whose provider omitted the finish reason",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({
+        title: "Pinned",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      // A provider may complete a response without transmitting a finish
+      // reason; the SDK surfaces that as an "unknown" finish. The usage
+      // accounting still arrives with the completed response, so the turn
+      // must end here - retrying would replay the completed work.
+      yield* llm.push(reply().text("completed without finish metadata").usage({ input: 10, output: 5 }))
+      yield* user(chat.id, "hello")
+
+      const result = yield* prompt.loop({ sessionID: chat.id })
+      expect(yield* llm.calls).toBe(1)
+      expect(result.info.role).toBe("assistant")
+      if (result.info.role === "assistant") {
+        expect(result.info.error).toBeUndefined()
+      }
+      const messages = yield* sessions.messages({ sessionID: chat.id })
+      const texts = messages
+        .flatMap((message) => message.parts)
+        .filter((part) => part.type === "text")
+        .map((part) => part.text)
+      expect(texts.join("")).toContain("completed without finish metadata")
+    }),
+  { timeout: 30_000 },
+)

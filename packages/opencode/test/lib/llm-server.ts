@@ -554,7 +554,14 @@ export class Reply {
     return {
       type: "sse",
       head: this.#head,
-      tail: this.#finish ? [...this.#tail, finishLine(this.#finish, this.#usage)] : this.#tail,
+      // Without a finish reason the usage still rides its own final chunk:
+    // some providers complete a response, send the usage accounting, and
+    // omit finish metadata - a completed response, not a dropped stream.
+    tail: this.#finish
+      ? [...this.#tail, finishLine(this.#finish, this.#usage)]
+      : this.#usage
+        ? [...this.#tail, chunk({ usage: this.#usage })]
+        : this.#tail,
       wait: this.#wait,
       hang: this.#hang,
       error: this.#error,

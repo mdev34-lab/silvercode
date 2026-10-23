@@ -121,11 +121,17 @@ const layer = Layer.effect(
       }
       let aborted = false
       // Set from every step-finish event. A stream that ends with no
-      // step-finish, or with a step-finish whose reason is "unknown" (the
-      // provider connection dropped mid-generation and the SDK synthesized a
-      // reason-less finish), died instead of completing - without this check
-      // the turn ends silently with no error and no retry.
+      // step-finish died instead of completing - without this check the turn
+      // ends silently with no error and no retry. An "unknown" reason alone
+      // is not proof of a drop: it means the provider transmitted no finish
+      // reason (per the provider-spec contract), which a completed response
+      // may also do, so the usage accounting below disambiguates.
       let stepFinishReason: string | undefined = undefined
+      // Set from every step-finish event. A completed response carries the
+      // provider's usage accounting (opencode requests includeUsage for
+      // openai-compatible models) even when the provider omitted the finish
+      // reason itself; a dropped stream never receives the usage chunk.
+      let stepFinishUsage: Usage | undefined = undefined
       const clock = createGenerationClock()
 
       const parse = (e: unknown) =>
@@ -515,6 +521,7 @@ const layer = Layer.effect(
 
           case "step-finish": {
             stepFinishReason = value.reason
+            stepFinishUsage = value.usage
             const completedSnapshot = yield* snapshot.track()
             yield* Effect.forEach(Object.keys(ctx.reasoningMap), finishReasoning)
             const usage = Session.getUsage({
@@ -731,6 +738,7 @@ const layer = Layer.effect(
           yield* Effect.gen(function* () {
             ctx.currentText = undefined
             stepFinishReason = undefined
+            stepFinishUsage = undefined
             // A retry after a stalled or failed stream must not leave the previous attempt's thought open.
             yield* Effect.forEach(Object.keys(ctx.reasoningMap), finishReasoning)
             ctx.reasoningMap = {}
@@ -750,8 +758,22 @@ const layer = Layer.effect(
             // A stream that ended without a definitive finish reason died
             // mid-generation. Route it into the retry pipeline as a stream
             // error; aborts and compaction takeUntil are legitimate early
-            // ends and stay untouched.
-            if (!aborted && !ctx.needsCompaction && (stepFinishReason === undefined || stepFinishReason === "unknown")) {
+            // ends and stay untouched. "unknown" means the provider
+            // transmitted no finish reason - that happens on a dropped
+            // stream, but a provider may also complete a response without
+            // the metadata, and retrying a completed response would replay
+            // its work. The usage accounting is the lifecycle signal: it
+            // arrives only with a completed response, never with a drop.
+            const usageReported =
+              stepFinishUsage !== undefined &&
+              ((stepFinishUsage.totalTokens ?? 0) > 0 ||
+                (stepFinishUsage.inputTokens ?? 0) > 0 ||
+                (stepFinishUsage.outputTokens ?? 0) > 0)
+            if (
+              !aborted &&
+              !ctx.needsCompaction &&
+              (stepFinishReason === undefined || (stepFinishReason === "unknown" && !usageReported))
+            ) {
               return yield* Effect.fail(
                 new ProviderError.ResponseStreamError("response stream ended without a finish reason"),
               )
