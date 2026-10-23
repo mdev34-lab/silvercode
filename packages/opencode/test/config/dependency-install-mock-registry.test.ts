@@ -6,6 +6,7 @@ import { HttpClient } from "effect/unstable/http"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
+import { NpmConfig } from "@opencode-ai/core/npm-config"
 import { Npm } from "@opencode-ai/core/npm"
 import { Global } from "@opencode-ai/core/global"
 import { httpClient } from "@opencode-ai/core/effect/app-node-platform"
@@ -32,7 +33,14 @@ const makeIntegrationLayer = (cacheDir: string) =>
     [
       [Auth.node, AuthTest.empty],
       [Account.node, AccountTest.empty],
-      [Global.node, Global.layerWith({ cache: cacheDir, state: path.join(cacheDir, "state") })],
+      [
+        Global.node,
+        Global.layerWith({
+          cache: cacheDir,
+          state: path.join(cacheDir, "state"),
+          config: path.join(cacheDir, "config"),
+        }),
+      ],
       [httpClient, Layer.succeed(HttpClient.HttpClient, unexpectedHttp)],
     ],
   )
@@ -47,17 +55,18 @@ const createProjectFixture = async (
   const opencodeDir = path.join(projectDir, ".opencode")
   await fs.mkdir(opencodeDir, { recursive: true })
 
-  await fs.writeFile(
-    path.join(opencodeDir, ".npmrc"),
-    [
-      `registry=${registryUrl}/`,
-      `cache=${npmCacheDir}`,
-      "fetch-retries=0",
-      "fetch-retry-mintimeout=1",
-      "fetch-retry-maxtimeout=1",
-      "",
-    ].join("\n"),
-  )
+  const globalConfigDir = path.join(baseDir, "cache", "config")
+  await fs.mkdir(globalConfigDir, { recursive: true })
+  const npmrc = [
+    `registry=${registryUrl}/`,
+    `cache=${npmCacheDir}`,
+    "fetch-retries=0",
+    "fetch-retry-mintimeout=1",
+    "fetch-retry-maxtimeout=1",
+    "",
+  ].join("\n")
+  // Config starts installs for both directories. Neither may escape to the public registry.
+  await Promise.all([opencodeDir, globalConfigDir].map((dir) => fs.writeFile(path.join(dir, ".npmrc"), npmrc)))
 
   await fs.writeFile(path.join(opencodeDir, "opencode.json"), JSON.stringify(configContent))
 
@@ -67,7 +76,7 @@ const createProjectFixture = async (
     project: { id: ProjectV2.ID.make("test-project"), root: projectDir } as unknown as InstanceContext["project"],
   }
 
-  return { projectDir, opencodeDir, ctx }
+  return { projectDir, opencodeDir, globalConfigDir, ctx }
 }
 
 const originalFlag = process.env.OPENCODE_DISABLE_CONFIG_DEP_INSTALL
@@ -87,6 +96,25 @@ afterEach(async () => {
 })
 
 describe("Config Dependency Install Integration with MockRegistry", () => {
+  test("isolates both config install directories and routes both to the mock registry", async () => {
+    await using tmp = await tmpdir()
+    const registry = "http://127.0.0.1:1"
+    const { opencodeDir, globalConfigDir } = await createProjectFixture(
+      tmp.path,
+      registry,
+      path.join(tmp.path, "npm-cache"),
+    )
+    expect(globalConfigDir.startsWith(tmp.path + path.sep)).toBe(true)
+    const layer = makeIntegrationLayer(path.join(tmp.path, "cache"))
+    const actual = await Effect.runPromise(
+      Effect.map(Global.Service, (global) => global.config).pipe(Effect.provide(layer)),
+    )
+    expect(actual).toBe(globalConfigDir)
+    for (const dir of [opencodeDir, globalConfigDir]) {
+      expect(await Effect.runPromise(NpmConfig.registry(dir))).toBe(registry)
+    }
+  })
+
   // The windows CI runner pays a heavy per-process spawn cost (CreateProcess + AV
   // scan), and this test shells out to a real package install, so it gets double the
   // suite's 30s budget instead of flaking at the bound. A cold install no longer fits
