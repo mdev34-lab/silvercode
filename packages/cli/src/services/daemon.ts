@@ -262,21 +262,54 @@ export const layer = Layer.effect(
       return { status: "unverified", reason: `a process still holds PID ${info.pid} after SIGKILL` }
     })
 
-    // Ownership-conditioned removal: the registration is deleted only when
-    // the file still describes the exact record this caller tore down. If a
-    // different service registered meanwhile ("changed"), its file is
-    // preserved and the caller must rediscover or refuse - never delete or
-    // replace a registration it does not own. The compare-to-remove gap
-    // cannot be closed from userspace without file locks; the backstop is
-    // server-side: a serving process re-reads its registration every 10s and
-    // exits when it no longer finds itself, so a lost race fails visible
-    // instead of leaving a hidden orphan.
+    // Ownership coordination is a lock directory, not a field guard: mkdir is
+    // atomic, so while a remover holds the lock no publisher running THIS
+    // build can rewrite the registration between the compare and the remove.
+    // (Servers on older builds do not take the lock; against those the
+    // compare still narrows the window but cannot close it - no claim
+    // otherwise.) A lock abandoned by a crashed process is reclaimed after
+    // 30s; a live contender makes the caller fail fast instead of waiting.
+    const lockDir = file + ".lock"
+    const acquireLock = Effect.gen(function* () {
+      const deadline = Date.now() + 2_000
+      for (;;) {
+        const acquired = yield* fs.makeDirectory(lockDir).pipe(
+          Effect.as(true),
+          Effect.orElseSucceed(() => false),
+        )
+        if (acquired) return
+        const stat = yield* fs.stat(lockDir).pipe(Effect.option)
+        const mtime = Option.getOrUndefined(Option.flatMap(stat, (s) => s.mtime))
+        if (mtime !== undefined && Date.now() - mtime.getTime() > 30_000) {
+          yield* fs.remove(lockDir, { recursive: true }).pipe(Effect.ignore)
+          continue
+        }
+        if (Date.now() > deadline) {
+          return yield* Effect.fail(
+            new Error("The service registration is being updated concurrently; nothing was removed. Retry."),
+          )
+        }
+        yield* Effect.sleep("50 millis")
+      }
+    })
+    const withRegistrationLock = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+      Effect.acquireUseRelease(acquireLock, () => effect, () => fs.remove(lockDir, { recursive: true }).pipe(Effect.ignore))
+
+    // Ownership-conditioned removal under the lock: the registration is
+    // deleted only when the file still describes the exact record this caller
+    // tore down. If a different service registered meanwhile ("changed"), its
+    // file is preserved and the caller must rediscover or refuse - never
+    // delete or replace a registration it does not own.
     const removeIfSame = Effect.fnUntraced(function* (expected: Registration) {
-      const current = yield* registration().pipe(Effect.option)
-      if (Option.isNone(current)) return "absent" as const
-      if (!sameRegistration(current.value, expected)) return "changed" as const
-      yield* fs.remove(file).pipe(Effect.ignore)
-      return "removed" as const
+      return yield* withRegistrationLock(
+        Effect.gen(function* () {
+          const current = yield* registration().pipe(Effect.option)
+          if (Option.isNone(current)) return "absent" as const
+          if (!sameRegistration(current.value, expected)) return "changed" as const
+          yield* fs.remove(file).pipe(Effect.ignore)
+          return "removed" as const
+        }),
+      )
     })
 
     // Verified active-run count for the registered server. Only a 2xx response
@@ -441,8 +474,17 @@ export const layer = Layer.effect(
             )
           }
           // The registered process is gone (ESRCH): the registration is stale
-          // and removed so the spawn below starts clean.
-          yield* fs.remove(file).pipe(Effect.ignore)
+          // and removed so the spawn below starts clean. Ownership-checked:
+          // if a different service registered meanwhile, its file stays and
+          // start refuses instead of deleting it.
+          const removal = yield* removeIfSame(raw.value)
+          if (removal === "changed") {
+            return yield* Effect.fail(
+              new Error(
+                `Start refused: the stale registration was replaced by a different service while it was being cleared. Nothing was removed or spawned; the registration stays at ${file}. Retry to act on the current registration.`,
+              ),
+            )
+          }
         }
       }
       const compiled = path.basename(process.execPath).replace(/\.exe$/, "") !== "bun"
@@ -666,19 +708,26 @@ export const layer = Layer.effect(
     const register = Effect.fn("cli.daemon.register")(function* (address: HttpServer.Address) {
       const id = randomUUID()
       const temp = file + "." + id + ".tmp"
-      yield* fs.makeDirectory(directory, { recursive: true })
-      yield* fs.writeFileString(
-        temp,
-        JSON.stringify({
-          id,
-          version: InstallationVersion,
-          url: HttpServer.formatAddress(address),
-          pid: process.pid,
-          startedAt: new Date(Date.now() - process.uptime() * 1000).toISOString(),
+      // Published under the same lock the removers take, so a teardown can
+      // never delete a registration that appeared between its compare and
+      // its remove (same build on both sides).
+      yield* withRegistrationLock(
+        Effect.gen(function* () {
+          yield* fs.makeDirectory(directory, { recursive: true })
+          yield* fs.writeFileString(
+            temp,
+            JSON.stringify({
+              id,
+              version: InstallationVersion,
+              url: HttpServer.formatAddress(address),
+              pid: process.pid,
+              startedAt: new Date(Date.now() - process.uptime() * 1000).toISOString(),
+            }),
+            { mode: 0o600 },
+          )
+          yield* fs.rename(temp, file)
         }),
-        { mode: 0o600 },
       )
-      yield* fs.rename(temp, file)
       yield* registration().pipe(
         Effect.flatMap((info) => (info.id === id ? Effect.void : signal(process.pid, "SIGTERM"))),
         Effect.catch(() => signal(process.pid, "SIGTERM")),

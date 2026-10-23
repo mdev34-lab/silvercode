@@ -873,7 +873,9 @@ describe("daemon teardown: verified-exit protocol (integration)", () => {
 })
 
 describe("daemon teardown: ownership and wait-path regressions (integration)", () => {
-  test("EPERM injected on the WAIT path (probe and signals allowed): stop refuses, registration kept, nothing spawned", async () => {
+  // POSIX-only: the SIGTERM-ignoring child uses sh trap semantics; no Windows
+  // fixture or cross-platform coverage is claimed for the wait-path regression.
+  ;(process.platform === "win32" ? test.skip : test)("EPERM injected on the WAIT path (probe and signals allowed): stop refuses, registration kept, nothing spawned", async () => {
     // A child that ignores SIGTERM, so the wait path is what decides.
     const child = Bun.spawn(["sh", "-c", "trap '' TERM; exec sleep 30"], { stdio: ["ignore", "ignore", "ignore"] })
     const server = fakeServer({ active: { kind: "ok", runs: 0 }, stop: { kind: "grant" } })
@@ -985,29 +987,106 @@ describe("daemon teardown: ownership and wait-path regressions (integration)", (
       stop: { kind: "grant" },
       onHealth: (n) => {
         if (n === 2) {
-          writeRegistration({ version: installationVersion, url: server.url.origin, pid: childB.pid })
+          writeRegistration({ version: "0.0.2-other", url: server.url.origin, pid: childB.pid })
           bFile = readFileSync(serverFile, "utf8")
         }
       },
     })
-    // A is outdated and verified idle: start would replace it. B (current
-    // version) registers during A's teardown.
+    // A is outdated and verified idle: start would replace it. B (also a
+    // mismatch, so the decision is platform-independent) registers during
+    // A's teardown.
     writeRegistration({ version: "0.0.0-outdated", url: server.url.origin, pid: childA.pid })
     await withMarker(async () => {
       try {
         const started = await runDaemon((daemon) => daemon.start())
         // A is torn down, B is rediscovered and the decision re-runs against
-        // B: a dev build replaces a verified-idle same-version service, so B
-        // is torn down too - but ONLY after stopProcess authenticates B and
+        // B. B is a version mismatch, so replacement applies on every
+        // platform - but ONLY after stopProcess authenticates B and
         // removeIfSame confirms the file still belongs to B. The marker
         // records the resulting spawn; it cannot serve, so start reports the
-        // spawn failure.
+        // spawn failure. On the unguarded code, A's teardown deleted B's
+        // registration while B stayed ALIVE - the regression this pins.
         expect(started.ok).toBe(false)
         if (!started.ok) expect(started.message).toContain("Failed to start server")
         expect(alive(childA.pid)).toBe(false)
         expect(alive(childB.pid)).toBe(false)
         expect(readFileSync(markerOut, "utf8")).toBe("serve --register")
         expect(bFile).not.toBe("")
+      } finally {
+        childA.kill()
+        childB.kill()
+        server.stop(true)
+        rmSync(serverFile, { force: true })
+      }
+    })
+  }, 60_000)
+})
+
+describe("daemon teardown: registration lock coordination (integration)", () => {
+  test("a held registration lock makes stop fail WITHOUT deleting the file; releasing the lock lets the next stop remove it", async () => {
+    const child = Bun.spawn(["sleep", "30"], { stdio: ["ignore", "ignore", "ignore"] })
+    const server = fakeServer({ active: { kind: "ok", runs: 0 }, stop: { kind: "grant" } })
+    writeRegistration({ version: installationVersion, url: server.url.origin, pid: child.pid })
+    const originalRegistration = readFileSync(serverFile, "utf8")
+    // A concurrent publisher holds the lock: the removal must not happen.
+    mkdirSync(serverFile + ".lock")
+    try {
+      const stopped = await runDaemon((daemon) => daemon.stop())
+      expect(stopped.ok).toBe(false)
+      if (!stopped.ok) expect(stopped.message).toContain("concurrently")
+      // The teardown itself was verified (authenticated SIGTERM), but the
+      // contested file survived - no delete under someone else's lock.
+      expect(alive(child.pid)).toBe(false)
+      expect(readFileSync(serverFile, "utf8")).toBe(originalRegistration)
+    } finally {
+      rmSync(serverFile + ".lock", { recursive: true, force: true })
+    }
+    try {
+      const stopped = await runDaemon((daemon) => daemon.stop())
+      expect(stopped.ok).toBe(true)
+      expect(existsSync(serverFile)).toBe(false)
+    } finally {
+      child.kill()
+      server.stop(true)
+      rmSync(serverFile, { force: true })
+    }
+  }, 60_000)
+
+  test("restart refuses when a different service registers during the granted teardown: file kept, nothing spawned (ownership race)", async () => {
+    const childA = Bun.spawn(["sleep", "30"], { stdio: ["ignore", "ignore", "ignore"] })
+    const childB = Bun.spawn(["sleep", "30"], { stdio: ["ignore", "ignore", "ignore"] })
+    let bFile = ""
+    const server = fakeServer({
+      active: { kind: "ok", runs: 0 },
+      stop: { kind: "grant" },
+      onGrant: () => childA.kill("SIGTERM"),
+      onHealth: (n) => {
+        // B publishes during A's first probe; the entry health read already
+        // happened, so A's teardown proceeds and the ownership check at
+        // removal is what must protect B's file.
+        if (n === 1) {
+          writeRegistration({ version: installationVersion, url: server.url.origin, pid: childB.pid })
+          bFile = readFileSync(serverFile, "utf8")
+        }
+      },
+    })
+    writeRegistration({ version: installationVersion, url: server.url.origin, pid: childA.pid })
+    await withMarker(async () => {
+      try {
+        const restarted = await runDaemon((daemon) => daemon.restart())
+        expect(restarted.ok).toBe(false)
+        // Either ownership gate can catch the race first, depending on
+        // whether A's exit is observed before the re-check: the pre-signal
+        // re-check refuses an unauthenticated teardown, and the removal-time
+        // compare refuses to delete a registration it does not own. Both
+        // leave B's file untouched and spawn nothing - the invariants below
+        // (file kept, B alive, nothing spawned) are what this regression pins.
+        if (!restarted.ok)
+          expect(restarted.message).toMatch(/could not be verified|different service registered/)
+        expect(alive(childA.pid)).toBe(false)
+        expect(alive(childB.pid)).toBe(true)
+        expect(existsSync(markerOut)).toBe(false)
+        expect(readFileSync(serverFile, "utf8")).toBe(bFile)
       } finally {
         childA.kill()
         childB.kill()
