@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync
 import { tmpdir } from "os"
 import path from "path"
 import { randomUUID } from "crypto"
-import { Effect, Layer } from "effect"
+import { Effect, FileSystem, Layer } from "effect"
 import { NodeFileSystem } from "@effect/platform-node"
 
 // The daemon state directory is resolved from XDG_STATE_HOME when the module is
@@ -215,13 +215,16 @@ function stopResponse(stop: StopMode, onGrant?: () => void): Response | Promise<
 
 function writeRegistration(input: { version: string; url: string; pid: number }) {
   mkdirSync(path.dirname(serverFile), { recursive: true })
-  writeFileSync(serverFile, JSON.stringify({ id: randomUUID(), ...input }))
+  writeFileSync(serverFile, JSON.stringify({ id: randomUUID(), coordination: "registration-lock-v1", ...input }))
 }
 
 type Outcome = { ok: true; value: unknown } | { ok: false; message: string }
 
-function runDaemon<A, E>(program: (daemon: DaemonInterface) => Effect.Effect<A, E, never>): Promise<Outcome> {
-  const layer = mod.layer.pipe(Layer.provide(NodeFileSystem.layer))
+function runDaemon<A, E>(
+  program: (daemon: DaemonInterface) => Effect.Effect<A, E, never>,
+  fsLayer: Layer.Layer<FileSystem.FileSystem> = NodeFileSystem.layer,
+): Promise<Outcome> {
+  const layer = mod.layer.pipe(Layer.provide(fsLayer))
   const outcome = Effect.gen(function* () {
     const daemon = yield* mod.Service
     yield* daemon.password("test-password")
@@ -1024,9 +1027,138 @@ describe("daemon teardown: ownership and wait-path regressions (integration)", (
       }
     })
   }, 60_000)
+
+  test("start rediscovers and reuses a same-version active B without deleting or signaling it", async () => {
+    const childA = Bun.spawn(["sleep", "30"], { stdio: ["ignore", "ignore", "ignore"] })
+    const childB = Bun.spawn(["sleep", "30"], { stdio: ["ignore", "ignore", "ignore"] })
+    let bFile = ""
+    const active: ActiveMode = { kind: "ok", runs: 0 }
+    const server = fakeServer({
+      active,
+      stop: { kind: "grant" },
+      onHealth: (n) => {
+        if (n === 2) {
+          active.runs = 1
+          writeRegistration({ version: installationVersion, url: server.url.origin, pid: childB.pid })
+          bFile = readFileSync(serverFile, "utf8")
+        }
+      },
+    })
+    // A is idle and outdated. B becomes active before rediscovery.
+    writeRegistration({ version: "0.0.0-outdated", url: server.url.origin, pid: childA.pid })
+    await withMarker(async () => {
+      try {
+        const started = await runDaemon((daemon) => daemon.start())
+        expect(started.ok).toBe(true)
+        if (started.ok) expect(started.value).toBe(server.url.origin)
+        expect(alive(childA.pid)).toBe(false)
+        expect(alive(childB.pid)).toBe(true)
+        expect(existsSync(markerOut)).toBe(false)
+        expect(readFileSync(serverFile, "utf8")).toBe(bFile)
+        expect(bFile).not.toBe("")
+      } finally {
+        childA.kill()
+        childB.kill()
+        server.stop(true)
+        rmSync(serverFile, { force: true })
+      }
+    })
+  }, 60_000)
 })
 
 describe("daemon teardown: registration lock coordination (integration)", () => {
+  test("publisher attempting B exactly between compare and unlink is excluded until removal releases the lock", async () => {
+    const child = Bun.spawn(["sleep", "30"], { stdio: ["ignore", "ignore", "ignore"] })
+    child.kill()
+    await child.exited
+    writeRegistration({ version: installationVersion, url: "http://127.0.0.1:1", pid: child.pid })
+    let blocked = false
+    let replacement = ""
+    const instrumented = Layer.effect(
+      FileSystem.FileSystem,
+      Effect.map(FileSystem.FileSystem, (fs) => ({
+        ...fs,
+        remove: (target, options) =>
+          Effect.gen(function* () {
+            if (target === serverFile) {
+              // removeIfSame has read/compared A, but has not unlinked it.
+              // A cooperating B must acquire this same lock before publish.
+              try {
+                mkdirSync(serverFile + ".lock")
+              } catch (error) {
+                if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error
+                blocked = true
+              }
+              expect(blocked).toBe(true)
+            }
+            yield* fs.remove(target, options)
+            if (target === serverFile + ".lock" && blocked) {
+              // The blocked publisher resumes only after A releases the lock.
+              mkdirSync(serverFile + ".lock")
+              writeRegistration({ version: installationVersion, url: "http://127.0.0.1:2", pid: process.pid })
+              replacement = readFileSync(serverFile, "utf8")
+              rmSync(serverFile + ".lock", { recursive: true })
+            }
+          }),
+      })),
+    ).pipe(Layer.provide(NodeFileSystem.layer))
+    try {
+      const result = await runDaemon((daemon) => daemon.stop(), instrumented)
+      expect(result.ok).toBe(true)
+      expect(blocked).toBe(true)
+      expect(replacement).not.toBe("")
+      expect(readFileSync(serverFile, "utf8")).toBe(replacement)
+    } finally {
+      rmSync(serverFile, { force: true })
+      rmSync(serverFile + ".lock", { recursive: true, force: true })
+    }
+  })
+
+  test("legacy registration refuses stop and restart without signals, removal, or spawn", async () => {
+    const child = Bun.spawn(["sleep", "30"], { stdio: ["ignore", "ignore", "ignore"] })
+    const server = fakeServer({ active: { kind: "ok", runs: 0 }, stop: { kind: "grant" } })
+    writeRegistration({ version: installationVersion, url: server.url.origin, pid: child.pid })
+    const legacy = JSON.parse(readFileSync(serverFile, "utf8"))
+    delete legacy.coordination
+    writeFileSync(serverFile, JSON.stringify(legacy))
+    const original = readFileSync(serverFile, "utf8")
+    try {
+      for (const operation of ["stop", "restart"] as const) {
+        const result = await runDaemon((daemon) => daemon[operation]())
+        expect(result.ok).toBe(false)
+        if (!result.ok) expect(result.message).toContain("service registration protocol")
+        expect(alive(child.pid)).toBe(true)
+        expect(readFileSync(serverFile, "utf8")).toBe(original)
+      }
+    } finally {
+      child.kill()
+      server.stop(true)
+      rmSync(serverFile, { force: true })
+    }
+  })
+  test("unknown future protocol refuses stop and restart without signals or file changes", async () => {
+    const child = Bun.spawn(["sleep", "30"], { stdio: ["ignore", "ignore", "ignore"] })
+    const server = fakeServer({ active: { kind: "ok", runs: 0 }, stop: { kind: "grant" } })
+    writeRegistration({ version: installationVersion, url: server.url.origin, pid: child.pid })
+    const legacy = JSON.parse(readFileSync(serverFile, "utf8"))
+    legacy.coordination = "registration-lock-v999"
+    writeFileSync(serverFile, JSON.stringify(legacy))
+    const original = readFileSync(serverFile, "utf8")
+    try {
+      for (const operation of ["stop", "restart"] as const) {
+        const result = await runDaemon((daemon) => daemon[operation]())
+        expect(result.ok).toBe(false)
+        if (!result.ok) expect(result.message).toContain("service registration protocol")
+        expect(alive(child.pid)).toBe(true)
+        expect(readFileSync(serverFile, "utf8")).toBe(original)
+      }
+    } finally {
+      child.kill()
+      server.stop(true)
+      rmSync(serverFile, { force: true })
+    }
+  })
+
   test("first register creates the state directory before acquiring its lock and finalizes its own registration", async () => {
     rmSync(path.dirname(serverFile), { recursive: true, force: true })
     const layer = mod.layer.pipe(Layer.provide(NodeFileSystem.layer))

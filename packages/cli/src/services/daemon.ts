@@ -99,6 +99,7 @@ const StoppingBody = Schema.Struct({ data: Schema.Struct({ status: Schema.Litera
 // this file is an identity hint that must be re-checked, never proof.
 const Registration = Schema.Struct({
   id: Schema.optional(Schema.String),
+  coordination: Schema.optional(Schema.String),
   version: Schema.optional(Schema.String),
   url: Schema.String,
   pid: Schema.Int.check(Schema.isGreaterThan(0)),
@@ -116,7 +117,13 @@ type Registration = typeof Registration.Type
 // signal; it does NOT detect the OS recycling the PID while the file stays
 // unchanged. Treat it as a guard, never as proof of identity.
 function sameRegistration(left: Registration, right: Registration) {
-  return left.id === right.id && left.version === right.version && left.url === right.url && left.pid === right.pid
+  return (
+    left.id === right.id &&
+    left.coordination === right.coordination &&
+    left.version === right.version &&
+    left.url === right.url &&
+    left.pid === right.pid
+  )
 }
 
 export const layer = Layer.effect(
@@ -141,6 +148,15 @@ export const layer = Layer.effect(
       yield* fs.rename(temp, passwordFile)
       return generated
     })
+
+    const requireCoordinated = (info: Registration) =>
+      info.coordination === "registration-lock-v1"
+        ? Effect.void
+        : Effect.fail(
+            new Error(
+              "Legacy or unknown service registration protocol cannot be changed safely by this client. Stop all older service and client processes using this state directory, verify they have exited, then remove the legacy registration and start again. Nothing was signaled or removed by this operation.",
+            ),
+          )
 
     const registration = Effect.fnUntraced(function* () {
       return yield* fs.readFileString(file).pipe(Effect.flatMap(decodeRegistration))
@@ -218,6 +234,7 @@ export const layer = Layer.effect(
     // an unchanged file is not detected. No stronger userspace guarantee
     // exists without platform-specific PID handles.
     const stopProcess = Effect.fnUntraced(function* (info: Registration) {
+      yield* requireCoordinated(info)
       // Nothing to signal when nobody owns the PID: ESRCH is a verified exit.
       // This says only that the ORIGINAL process is gone; it says nothing
       // about who owns the registration file now. Callers must condition any
@@ -304,6 +321,7 @@ export const layer = Layer.effect(
     // file is preserved and the caller must rediscover or refuse - never
     // delete or replace a registration it does not own.
     const removeIfSame = Effect.fnUntraced(function* (expected: Registration) {
+      yield* requireCoordinated(expected)
       return yield* withRegistrationLock(
         Effect.gen(function* () {
           const current = yield* registration().pipe(Effect.option)
@@ -338,6 +356,7 @@ export const layer = Layer.effect(
     // 409 refused with runs active, 503 refused because its active-run state is
     // unknown. Anything else — network error, timeout, other status — is unknown.
     const stopIfIdle = Effect.fn("cli.daemon.stopIfIdle")(function* (info: Registration) {
+      yield* requireCoordinated(info)
       const headers = ServerAuth.headers({ password: yield* password() })
       const response = yield* Effect.tryPromise({
         try: () =>
@@ -663,7 +682,7 @@ export const layer = Layer.effect(
         // still describes the record we just proved stale. Best-effort: a
         // contested lock leaves the stale entry for the next caller rather
         // than failing a read-only status query.
-        yield* removeIfSame(raw.value).pipe(Effect.ignore)
+        yield* removeIfSame(raw.value).pipe(Effect.catch((error) => Effect.logWarning(error.message)))
       }
       return undefined
     })
@@ -718,11 +737,14 @@ export const layer = Layer.effect(
       // its remove (same build on both sides).
       yield* withRegistrationLock(
         Effect.gen(function* () {
+          const current = yield* registration().pipe(Effect.option)
+          if (Option.isSome(current)) yield* requireCoordinated(current.value)
           yield* fs.makeDirectory(directory, { recursive: true })
           yield* fs.writeFileString(
             temp,
             JSON.stringify({
               id,
+              coordination: "registration-lock-v1",
               version: InstallationVersion,
               url: HttpServer.formatAddress(address),
               pid: process.pid,
@@ -741,7 +763,11 @@ export const layer = Layer.effect(
       )
       yield* Effect.addFinalizer(() =>
         withRegistrationLock(
-          registration().pipe(Effect.flatMap((info) => (info.id === id ? fs.remove(file) : Effect.void))),
+          registration().pipe(
+            Effect.flatMap((info) =>
+              info.id === id ? requireCoordinated(info).pipe(Effect.andThen(fs.remove(file))) : Effect.void,
+            ),
+          ),
         ).pipe(Effect.ignore),
       )
     })
