@@ -357,7 +357,7 @@ const layer = Layer.effect(
       }
 
       const handleEvent = Effect.fnUntraced(function* (value: StreamEvent) {
-        switch (value.type) {
+                switch (value.type) {
           case "reasoning-start":
             if (value.id in ctx.reasoningMap) return
             ctx.reasoningMap[value.id] = {
@@ -519,6 +519,11 @@ const layer = Layer.effect(
             throw new SessionV1.APIError({ message: value.message, isRetryable: value.retryable ?? false })
 
           case "step-start":
+            // A new step resets the finish witness: without this, a prior
+            // step's finish reason survives into a step whose stream dies
+            // before its own step-finish, and the no-finish backstop below
+            // mistakes the dead step for a completed one.
+            stepFinishReason = undefined
             if (!ctx.snapshot) ctx.snapshot = yield* snapshot.track()
             yield* session.updatePart({
               id: PartID.ascending(),
