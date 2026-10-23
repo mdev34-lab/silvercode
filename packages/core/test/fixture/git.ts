@@ -30,6 +30,11 @@ const config = [
 // (recorded phases: init 1.2s, commit 1.8s per spawn, push starved at 4.8s).
 // On a healthy runner the whole setup lands in ~1s, so 30s only bites a
 // genuinely stuck spawn; assertions and failure classes are unchanged.
+// INVARIANT: this budget must stay BELOW the timeout of every test that can
+// run fixture setup (45s+ across the fixture suite, core git tests, and the
+// repository-cache suite). If a test timeout fires first, the runner SIGTERMs
+// the setup's children after the test is reported - the #278 failure mode
+// (unhandled rejection in the next test, tmp root removed under a live git).
 const setupBudget = 30_000
 
 // Scoped fixture remote for tests. The temporary root is acquired first so its

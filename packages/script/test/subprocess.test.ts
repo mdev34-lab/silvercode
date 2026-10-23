@@ -44,9 +44,11 @@ const signatureOf = (r: SubprocessRecord) =>
     .find((line) => line.startsWith("signature:")) ?? ""
 
 describe("subprocess diagnostics", () => {
-  // Real-spawn tests get an explicit 15s: a contended Windows runner logged
-  // 10.2s for a single `git` spawn (#537), well past the 5s default. The
-  // budget covers process startup only; assertions are unchanged.
+  // Real-spawn tests get an explicit budget: a contended Windows runner logged
+  // 10.2s for a single `git` spawn (#537), well past the 5s default. Single-spawn
+  // tests get 15s; tests with two real spawns get 30s (2x the observed worst
+  // spawn, plus headroom). The budget covers process startup only; assertions
+  // are unchanged.
 
   test("a clean exit is ok and reports exit code 0 with no signal or spawn error", () => {
     const result = runSync(["git", "--version"])
@@ -80,7 +82,7 @@ describe("subprocess diagnostics", () => {
   test("the git() helper returns trimmed stdout and throws diagnostics on failure", () => {
     expect(git(process.cwd(), "--version")).toStartWith("git version")
     expect(() => git(process.cwd(), "not-a-real-git-subcommand-xyz")).toThrow("subprocess did not exit cleanly")
-  }, 15_000)
+  }, 30_000) // two real spawns
 
   test("a signal kill reports the signal and explains the empty stderr", () => {
     const described = describeSubprocess(record({ exitCode: null, signalCode: "SIGKILL", ok: false }))
@@ -137,7 +139,7 @@ describe("subprocess diagnostics", () => {
     const missing = await runAsync(["silvercode-definitely-not-a-real-binary-xyz"])
     expect(missing.ok).toBe(false)
     expect(missing.spawnError).not.toBeNull()
-  }, 15_000)
+  }, 30_000) // two real spawns (the missing-binary spawn never starts a process)
 
   test("removeFixture deletes a fixture directory and tolerates one that is already gone", async () => {
     const dir = await mkdtemp(path.join(tmpdir(), "silvercode-subprocess-fixture-"))

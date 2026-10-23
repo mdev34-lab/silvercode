@@ -10,6 +10,9 @@ afterEach(() => assertNoCleanupFailures())
 describe("git release metadata", () => {
   // Real git subprocesses (init, commits, two merges): on a contended Windows
   // runner each spawn costs hundreds of ms, so the 5s default is marginal.
+  // The recorded worst case (#549 windows attempts) burned 30s and was SIGTERMed
+  // mid-merge at ~10x spawn latency; 90s covers ~3x that profile and stays below
+  // the 120s cap the release suites already use for real-git flows.
   test("selects stable version tags and reads only first-parent commits", async () => {
     const cwd = await mkdtemp(path.join(tmpdir(), "silvercode-git-test-"))
     try {
@@ -51,7 +54,7 @@ describe("git release metadata", () => {
     } finally {
       await removeFixture(cwd)
     }
-  }, 60_000)
+  }, 90_000)
 
   test("recognizes a release tag at HEAD and ignores unrelated tags", async () => {
     const cwd = await mkdtemp(path.join(tmpdir(), "silvercode-git-tag-"))
@@ -77,5 +80,5 @@ describe("git release metadata", () => {
     } finally {
       await removeFixture(cwd)
     }
-  }, 60_000)
+  }, 90_000)
 })

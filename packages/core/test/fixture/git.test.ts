@@ -22,23 +22,30 @@ describe("Git fixture", () => {
   test("awaits the pushed remote before setup resolves", async () => {
     await using root = await tmpdir()
     const processes = gitProcesses()
-    const fixture = await gitRemote(processes, root.path)
-    const origin = path.join(root.path, "origin.git")
+    // gitRemote stays inside the try: when setup itself fails (budget abort),
+    // the finally still settles any children it managed to start before the
+    // temporary root is disposed (#278).
+    try {
+      const fixture = await gitRemote(processes, root.path)
+      const origin = path.join(root.path, "origin.git")
 
-    // Nothing may still be running when setup hands the fixture to a test.
-    expect(processes.pending).toBe(0)
-    expect((await $`git --git-dir=${origin} rev-parse --verify main`.quiet()).exitCode).toBe(0)
-    expect(await fs.readFile(path.join(origin, "HEAD"), "utf8")).toBe("ref: refs/heads/main\n")
-    expect(await fs.readFile(path.join(fixture.source, "README.md"), "utf8")).toBe("one\n")
+      // Nothing may still be running when setup hands the fixture to a test.
+      expect(processes.pending).toBe(0)
+      expect((await $`git --git-dir=${origin} rev-parse --verify main`.quiet()).exitCode).toBe(0)
+      expect(await fs.readFile(path.join(origin, "HEAD"), "utf8")).toBe("ref: refs/heads/main\n")
+      expect(await fs.readFile(path.join(fixture.source, "README.md"), "utf8")).toBe("one\n")
+    } finally {
+      await processes.settle()
+    }
   })
 
   test("drops settled promises after repeated successful and failed processes", async () => {
     await using root = await tmpdir()
     const processes = gitProcesses()
-    const fixture = await gitRemote(processes, root.path)
-
     expect(processes.tracked).toBe(0)
     try {
+      const fixture = await gitRemote(processes, root.path)
+
       for (let index = 0; index < 20; index++) {
         await fixture.git(fixture.source, "rev-parse", "--verify", "HEAD")
         expect(processes.tracked).toBe(0)
@@ -55,61 +62,74 @@ describe("Git fixture", () => {
       await processes.settle()
     }
     // 40 sequential git spawns; windows CreateProcess + AV cost blows past
-    // bun's 5s default (#487).
-  }, 30_000)
+    // bun's 5s default (#487). The test must also outlive the fixture's 30s
+    // setup budget, or the runner cancels mid-setup and reopens #278.
+  }, 60_000)
 
   test("cancels its own setup when the budget expires", async () => {
     await using root = await tmpdir()
     const processes = gitProcesses()
-    const failure = await gitRemote(processes, root.path, { setupBudget: 1 }).then(
-      () => undefined,
-      (error: unknown) => (error instanceof Error ? error.message : String(error)),
-    )
+    try {
+      const failure = await gitRemote(processes, root.path, { setupBudget: 1 }).then(
+        () => undefined,
+        (error: unknown) => (error instanceof Error ? error.message : String(error)),
+      )
 
-    // The fixture ends the slow phase itself and names it, instead of leaving
-    // the test runner to SIGTERM that process once the test is already over.
-    expect(failure).toMatch(/^git fixture \w+ failed after \d+ms \(completed: .*\)$/)
-    expect(processes.pending).toBe(0)
+      // The fixture ends the slow phase itself and names it, instead of leaving
+      // the test runner to SIGTERM that process once the test is already over.
+      expect(failure).toMatch(/^git fixture \w+ failed after \d+ms \(completed: .*\)$/)
+      expect(processes.pending).toBe(0)
+    } finally {
+      await processes.settle()
+    }
   })
 
   test("ends an in-flight process when its deadline aborts", async () => {
     await using root = await tmpdir()
     const processes = gitProcesses()
-    const fixture = await gitRemote(processes, root.path)
     const deadline = new AbortController()
-    setTimeout(() => deadline.abort(), 100)
-    const canceled = processes.run(fixture.source, ["hash-object", "--stdin", "-w"], { signal: deadline.signal }).then(
-      () => false,
-      () => true,
-    )
-    expect(processes.pending).toBe(1)
+    try {
+      const fixture = await gitRemote(processes, root.path)
+      setTimeout(() => deadline.abort(), 100)
+      const canceled = processes.run(fixture.source, ["hash-object", "--stdin", "-w"], { signal: deadline.signal }).then(
+        () => false,
+        () => true,
+      )
+      expect(processes.pending).toBe(1)
 
-    // This is how the setup budget ends a phase that is still running, without
-    // waiting for the test runner to do it after the test has been reported.
-    expect(await canceled).toBe(true)
-    expect(processes.pending).toBe(0)
+      // This is how the setup budget ends a phase that is still running, without
+      // waiting for the test runner to do it after the test has been reported.
+      expect(await canceled).toBe(true)
+      expect(processes.pending).toBe(0)
+    } finally {
+      await processes.settle()
+    }
   })
 
   test("ends and awaits a process still running at teardown", async () => {
     await using root = await tmpdir()
     const processes = gitProcesses()
-    const fixture = await gitRemote(processes, root.path)
-    const canceled = blocked(fixture).then(
-      () => false,
-      () => true,
-    )
-    expect(processes.pending).toBe(1)
-    expect(processes.tracked).toBe(1)
+    try {
+      const fixture = await gitRemote(processes, root.path)
+      const canceled = blocked(fixture).then(
+        () => false,
+        () => true,
+      )
+      expect(processes.pending).toBe(1)
+      expect(processes.tracked).toBe(1)
 
-    await processes.settle()
+      await processes.settle()
 
-    expect(processes.pending).toBe(0)
-    expect(processes.tracked).toBe(0)
-    // Whoever started the process still sees the cancellation; teardown does not
-    // let it resurface as an unhandled rejection.
-    expect(await canceled).toBe(true)
-    await processes.settle()
-    expect(processes.pending).toBe(0)
+      expect(processes.pending).toBe(0)
+      expect(processes.tracked).toBe(0)
+      // Whoever started the process still sees the cancellation; teardown does not
+      // let it resurface as an unhandled rejection.
+      expect(await canceled).toBe(true)
+      await processes.settle()
+      expect(processes.pending).toBe(0)
+    } finally {
+      await processes.settle()
+    }
   })
 
   it.effect("settles fixture processes before removing the temporary root", () =>

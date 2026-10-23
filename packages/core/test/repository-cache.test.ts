@@ -1,7 +1,9 @@
 import { describe, expect, setDefaultTimeout } from "bun:test"
 
 // These fixtures run several real Git operations; Windows runners exceed Bun's 5s default.
-setDefaultTimeout(20_000)
+// Fixture setup carries a 30s budget (test/fixture/git.ts); every test
+// here must outlive it, or the runner cancels mid-setup and reopens #278.
+setDefaultTimeout(45_000)
 import fs from "fs/promises"
 import path from "path"
 import { pathToFileURL } from "url"
@@ -33,7 +35,7 @@ describe("RepositoryCache", () => {
         expect(yield* read(path.join(localPath, "README.md"))).toBe("one\n")
       }).pipe(Effect.provide(cacheLayer(fixture.root))),
     ),
-    { timeout: 20000 },
+    { timeout: 45_000 },
   )
 
   it.live("serializes concurrent materialization for the same checkout", () =>
@@ -49,7 +51,7 @@ describe("RepositoryCache", () => {
         expect(results[0].localPath).toBe(results[1].localPath)
       }).pipe(Effect.provide(cacheLayer(fixture.root))),
     ),
-    { timeout: 20000 },
+    { timeout: 45_000 },
   )
 
   it.live("replaces an existing checkout whose origin does not match", () =>
@@ -68,7 +70,7 @@ describe("RepositoryCache", () => {
         expect(yield* exists(path.join(replaced.localPath, "stale.txt"))).toBe(false)
       }).pipe(Effect.provide(cacheLayer(fixture.root))),
     ),
-    { timeout: 20000 },
+    { timeout: 45_000 },
   )
 
   it.live("keeps branch checkouts isolated from branchless refreshes", () =>
@@ -91,7 +93,7 @@ describe("RepositoryCache", () => {
         expect(yield* read(path.join(cached.localPath, "README.md"))).toBe("two\n")
       }).pipe(Effect.provide(cacheLayer(fixture.root))),
     ),
-    { timeout: 20000 },
+    { timeout: 45_000 },
   )
 
   it.live("does not mistake an enclosing repository for the cache checkout", () =>
@@ -107,7 +109,7 @@ describe("RepositoryCache", () => {
         expect(yield* read(path.join(result.localPath, "README.md"))).toBe("one\n")
       }).pipe(Effect.provide(cacheLayer(fixture.root))),
     ),
-    { timeout: 20000 },
+    { timeout: 45_000 },
   )
 
   it.live("returns typed validation and clone failures", () =>
@@ -128,7 +130,7 @@ describe("RepositoryCache", () => {
         expect(cloneFailure).toBeInstanceOf(RepositoryCache.CloneFailedError)
       }).pipe(Effect.provide(cacheLayer(fixture.root))),
     ),
-    { timeout: 20000 },
+    { timeout: 45_000 },
   )
 })
 
