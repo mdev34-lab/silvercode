@@ -13,7 +13,7 @@ import { SessionID, MessageID } from "../session/schema"
 import { MessageV2 } from "../session/message-v2"
 import { Agent } from "../agent/agent"
 import { isReviewAgent, LEGACY_REVIEW_AGENTS, resolveReviewer } from "../agent/review-agents"
-import { deriveSubagentSessionPermission } from "../agent/subagent-permissions"
+import { deriveSubagentSessionPermission, deriveSubagentToolDenies } from "../agent/subagent-permissions"
 import type { SessionPrompt } from "../session/prompt"
 import { Config } from "@/config/config"
 import { Cause, Effect, Exit, Option, Ref, Schema, Scope } from "effect"
@@ -361,19 +361,10 @@ export const TaskTool = Tool.define(
         parentSessionPermission: parent.permission ?? [],
         subagent: next,
       })
-      const childToolDenies = [
-        ...(next.permission.some((rule) => rule.permission === "todowrite")
-          ? []
-          : [{ permission: "todowrite" as const, pattern: "*" as const, action: "deny" as const }]),
-        ...(next.permission.some((rule) => rule.permission === id)
-          ? []
-          : [{ permission: id, pattern: "*" as const, action: "deny" as const }]),
-        ...(cfg.experimental?.primary_tools?.map((permission) => ({
-          permission,
-          pattern: "*" as const,
-          action: "deny" as const,
-        })) ?? []),
-      ]
+      const childToolDenies = deriveSubagentToolDenies({
+        subagent: next,
+        primaryTools: cfg.experimental?.primary_tools,
+      })
       const nextSession =
         session ??
         (yield* sessions.create({

@@ -19,6 +19,7 @@ import PROMPT_TRINITY from "./prompt/trinity.txt"
 import PROMPT_STE_LITE from "./prompt/ste-lite.txt"
 import type { Provider } from "@/provider/provider"
 import { Agent } from "@/agent/agent"
+import { subagentWorktreeEditCapability } from "@/agent/subagent-permissions"
 import { Permission } from "@/permission"
 import { Skill } from "@/skill"
 import { AbsolutePath } from "@opencode-ai/core/schema"
@@ -146,6 +147,9 @@ const layer = Layer.effect(
         // Only primary-style callers drive delegation; subagents execute.
         if (agent.mode === "subagent") return
 
+        const ctx = yield* InstanceState.context
+        const cfg = yield* config.get()
+
         // Built from the live registry: any non-primary, non-hidden agent the
         // merged agent + session permission ruleset may delegate to. The
         // caller is filtered out only where the guidance is advertised, so
@@ -162,15 +166,26 @@ const layer = Layer.effect(
         // hardcoded agent names, so renames and custom agents keep working.
         // Read-only explorers and reviewers match neither pattern.
         const planners = eligible.filter((item) => /\bplan/i.test(item.name) || /\bplan/i.test(item.description ?? ""))
-        const implementers = eligible.filter(
-          (item) =>
-            !planners.includes(item) &&
-            (/\bcode\b/i.test(item.name) || /\bengineer/i.test(item.description ?? "")) &&
-            // Capability check, not just a name match: a read-only candidate
-            // (reviewer, auditor) that the registry forbids to edit can never
-            // implement, whatever its description claims.
-            Permission.evaluate("edit", "*", item.permission).action !== "deny",
-        )
+        // Capability check, not just a name match: a read-only candidate
+        // (reviewer, auditor) that the registry forbids to edit can never
+        // implement, whatever its description claims. Evaluated against the
+        // ruleset the spawned child session would actually run under, probed
+        // at real worktree paths, so session-level and worktree-scoped denies
+        // suppress the promise; a deny scoped to a subtree keeps the
+        // advertisement but marks it partial so the guidance stays accurate.
+        const capability = new Map<string, "full" | "partial" | "denied">()
+        const implementers = eligible.filter((item) => {
+          if (planners.includes(item)) return false
+          if (!/\bcode\b/i.test(item.name) && !/\bengineer/i.test(item.description ?? "")) return false
+          const level = subagentWorktreeEditCapability({
+            worktree: ctx.worktree,
+            subagent: item,
+            parentSessionPermission: permission ?? [],
+            primaryTools: cfg.experimental?.primary_tools,
+          })
+          capability.set(item.name, level)
+          return level !== "denied"
+        })
         // The planning agent itself plans; its own prompt governs it. This is
         // an identity check against the discovered planners - only non-primary
         // agents are eligible above, so a primary agent that merely mentions
@@ -180,6 +195,14 @@ const layer = Layer.effect(
         const plannersToAdvertise = delegatable(planners)
         const implementersToAdvertise = delegatable(implementers)
         if (plannersToAdvertise.length === 0 && implementersToAdvertise.length === 0) return
+
+        // Accurate guidance: when session rules restrict subagent edits to
+        // only part of the worktree, the delegation promise must not read as
+        // unrestricted implementation.
+        const partial = implementersToAdvertise.some((item) => capability.get(item.name) === "partial")
+        const scopeNote = partial
+          ? "Session rules restrict subagent edits in parts of the worktree; scope delegated implementation steps to permitted paths."
+          : undefined
 
         const names = (list: Agent.Info[]) => list.map((item) => `\`${item.name}\``).join(" or ")
         if (implementersToAdvertise.length === 0) {
@@ -192,6 +215,7 @@ const layer = Layer.effect(
           return [
             `Delegate by default: you coordinate and ${names(implementersToAdvertise)} implements.`,
             `For anything beyond a small task, delegate each implementation step to ${names(implementersToAdvertise)} with the task tool.`,
+            ...(scopeNote ? [scopeNote] : []),
             "Direct work is the exception, reserved for small tasks - a quick lookup, a tiny edit, a short answer.",
             "You stay responsible for the outcome: give each subagent complete context, then verify and integrate what it returns.",
           ].join("\n")
@@ -199,6 +223,7 @@ const layer = Layer.effect(
         return [
           `Delegate by default: you coordinate, ${names(plannersToAdvertise)} plans, and ${names(implementersToAdvertise)} implements.`,
           `For anything beyond a small task, delegate planning to ${names(plannersToAdvertise)} once, at the start, with the task tool, then delegate each implementation step to ${names(implementersToAdvertise)}.`,
+          ...(scopeNote ? [scopeNote] : []),
           "Direct work is the exception, reserved for small tasks - a quick lookup, a tiny edit, a short answer.",
           "You stay responsible for the outcome: give each subagent complete context, then verify and integrate what it returns instead of re-deriving or re-planning it at every tool call.",
         ].join("\n")
