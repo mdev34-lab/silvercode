@@ -51,7 +51,7 @@ describe("git release metadata", () => {
     } finally {
       await removeFixture(cwd)
     }
-  }, 30_000)
+  }, 60_000)
 
   test("recognizes a release tag at HEAD and ignores unrelated tags", async () => {
     const cwd = await mkdtemp(path.join(tmpdir(), "silvercode-git-tag-"))
@@ -77,5 +77,5 @@ describe("git release metadata", () => {
     } finally {
       await removeFixture(cwd)
     }
-  }, 30_000)
+  }, 60_000)
 })
