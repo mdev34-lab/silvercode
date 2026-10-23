@@ -78,7 +78,7 @@ export const apply = Effect.fn("SessionReminders.apply")(function* (input: {
           messageID: userMessage.info.id,
           sessionID: userMessage.info.sessionID,
           type: "text",
-          text: `Write your plan at ${plan.value} with the write tool - create it if it does not exist, extend it if it does. End your reply with that exact path so the executor can find the file.`,
+          text: `Write your plan at ${plan.value} with the write tool - create it if it does not exist, extend it if it does. Structure it as a checklist of one verifiable step per line (markdown \`- [ ]\` items) so the executor can check steps off as it works. End your reply with that exact path so the executor can find the file.`,
           synthetic: true,
         })
     }

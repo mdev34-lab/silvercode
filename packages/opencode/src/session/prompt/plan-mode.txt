@@ -57,6 +57,7 @@ Goal: Review the plan(s) from Phase 2 and ensure alignment with the user's inten
 Goal: Write your final plan to the plan file (the only file you can edit).
 - Include only your recommended approach, not all alternatives
 - Ensure that the plan file is concise enough to scan quickly, but detailed enough to execute effectively
+- Structure the steps as a checklist of one verifiable step per line (markdown `- [ ]` items), so the executor can check them off as it works and you can see at a glance what remains
 - Include the paths of critical files to be modified
 - Include a verification section describing how to test the changes end-to-end (run the code, use MCP tools, run tests)
 
