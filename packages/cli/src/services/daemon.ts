@@ -76,6 +76,16 @@ export function decideRestart(input: {
   return "proceed"
 }
 
+// True only when no process owns the PID (ESRCH). EPERM and any other probe
+// error read as alive: they refuse, which is the safe side. A PID recycled by
+// an unrelated process also reads as alive, so reuse can cause a false
+// refusal but never a false "exited".
+export function kill0MeansExited(cause: unknown): boolean {
+  return (
+    cause !== null && typeof cause === "object" && (cause as { code?: unknown }).code === "ESRCH"
+  )
+}
+
 const ACTIVE_PROBE_TIMEOUT = "2 seconds"
 const ACTIVE_PROBE_TIMEOUT_MS = 2_000
 const STOP_IDLE_PATH = "/api/daemon/stop-if-idle"
@@ -94,6 +104,11 @@ const Registration = Schema.Struct({
   version: Schema.optional(Schema.String),
   url: Schema.String,
   pid: Schema.Int.check(Schema.isGreaterThan(0)),
+  // Process start time recorded by the serving process itself. A live PID is
+  // not proof of identity (the OS recycles PIDs); comparing this against
+  // `ps -p <pid> -o lstart=` is the operator's identity check before any
+  // manual kill. Optional so older registrations still decode.
+  startedAt: Schema.optional(Schema.String),
 })
 type Registration = typeof Registration.Type
 
@@ -158,6 +173,12 @@ export const layer = Layer.effect(
     })
 
     const stopProcess = Effect.fnUntraced(function* (info: Registration) {
+      // The healthy() re-check right before each signal narrows the
+      // check-to-signal race but cannot close it: the PID can still exit and
+      // be recycled between probe and signal. sameRegistration is the guard
+      // that keeps that residual window from reaching an unrelated process in
+      // practice, and no stronger userspace guarantee exists without
+      // platform-specific PID handles.
       const current = yield* healthy().pipe(Effect.option)
       if (Option.isNone(current) || !sameRegistration(current.value, info)) return
 
@@ -283,10 +304,6 @@ export const layer = Layer.effect(
       return isConnectionRefused(Cause.squash(response.cause)) ? ("listener-gone" as const) : ("unknown" as const)
     })
 
-    // True only when no process owns the PID (ESRCH). EPERM and any probe
-    // error read as alive: they refuse, which is the safe side. A PID recycled
-    // by an unrelated process also reads as alive, so reuse can cause a false
-    // refusal but never a false "exited".
     const processExited = Effect.fnUntraced(function* (pid: number) {
       return yield* Effect.try({
         try: () => {
@@ -294,7 +311,7 @@ export const layer = Layer.effect(
           return false
         },
         catch: (cause) => cause,
-      }).pipe(Effect.catch((cause) => Effect.succeed((cause as { code?: unknown }).code === "ESRCH")))
+      }).pipe(Effect.catch((cause) => Effect.succeed(kill0MeansExited(cause))))
     })
 
     const recheckAfterUnknown = Effect.fn("cli.daemon.recheckAfterUnknown")(function* (info: Registration) {
@@ -312,9 +329,50 @@ export const layer = Layer.effect(
       return (yield* processExited(info.pid)) ? ({ status: "stopping" } as const) : ({ status: "orphaned" } as const)
     })
 
+    // Classifies a registration whose health check failed at ENTRY (no stop
+    // was requested). Anything that still answers HTTP is alive-but-unhealthy
+    // for this client, which is unknown and refuses. Two consecutive refusals
+    // prove only the listener is gone; the PID then separates a stale
+    // registration (ESRCH) from a wedged-or-recycled process that still holds
+    // the PID, which refuses as orphaned. Nothing here spawns or removes.
+    const classifyUnhealthyEntry = Effect.fn("cli.daemon.classifyUnhealthyEntry")(function* (info: Registration) {
+      const first = yield* probeLiveness(info)
+      if (first !== "listener-gone") return { status: "unknown" } as const
+      yield* Effect.sleep("250 millis")
+      const second = yield* probeLiveness(info)
+      if (second !== "listener-gone") return { status: "unknown" } as const
+      return (yield* processExited(info.pid)) ? ({ status: "stopping" } as const) : ({ status: "orphaned" } as const)
+    })
+
     const start = Effect.fn("cli.daemon.start")(function* () {
       const existing = yield* healthy().pipe(Effect.option)
-      const found = Option.getOrUndefined(existing)
+      let found = Option.getOrUndefined(existing)
+      if (found === undefined) {
+        // Same entry rule as restart: a failed health check is not absence.
+        // Classify the registration before spawning anything; a wedged or
+        // unconfirmable registered process refuses instead of being orphaned.
+        const raw = yield* registration().pipe(Effect.option)
+        if (Option.isSome(raw)) {
+          const entry = yield* classifyUnhealthyEntry(raw.value)
+          if (entry.status === "orphaned") {
+            return yield* Effect.fail(
+              new Error(
+                `Start refused: the registered service (PID ${raw.value.pid}) no longer answers its listener, but a process still holds that PID. A live PID is not proof of identity - it may be a wedged server or an unrelated process that reused the PID. Nothing was signaled, spawned, or removed; the registration stays at ${file}. Verify the process identity independently (compare ps -p ${raw.value.pid} -o lstart,args against the registration) and end it manually only if it is the silvercode server.`,
+              ),
+            )
+          }
+          if (entry.status === "unknown") {
+            return yield* Effect.fail(
+              new Error(
+                "Start refused: the registered service answers its listener but failed the health check, and its state could not be confirmed. Nothing was signaled or spawned. Retry when the service is healthy, or verify and end it manually.",
+              ),
+            )
+          }
+          // The registered process is gone (ESRCH): the registration is stale
+          // and removed so the spawn below starts clean.
+          yield* fs.remove(file).pipe(Effect.ignore)
+        }
+      }
       const compiled = path.basename(process.execPath).replace(/\.exe$/, "") !== "bun"
       const factoryDefault =
         process.env.OPENCODE_FACTORY_DEFAULT === "1" || process.env.OPENCODE_FACTORY_DEFAULT === "true"
@@ -341,7 +399,7 @@ export const layer = Layer.effect(
       if (decision === "refuse-unknown" && found) {
         return yield* Effect.fail(
           new Error(
-            'Could not confirm whether the background service has active runs (active-run probe failed). The service was left running. Retry, or run "service stop" to end it explicitly.',
+            "Start refused: the background service state could not be confirmed (active-run probe failed). Nothing was signaled or spawned. Retry when the service answers its probes again.",
           ),
         )
       }
@@ -369,9 +427,23 @@ export const layer = Layer.effect(
 
     const restart = Effect.fn("cli.daemon.restart")(function* () {
       const existing = yield* healthy().pipe(Effect.option)
-      const found = Option.getOrUndefined(existing)
-      let stopIdle: StopIdleResult = found === undefined ? { status: "stopping" } : yield* stopIfIdle(found)
-      if (found !== undefined && stopIdle.status === "unknown") stopIdle = yield* recheckAfterUnknown(found)
+      let found = Option.getOrUndefined(existing)
+      let stopIdle: StopIdleResult
+      if (found !== undefined) {
+        stopIdle = yield* stopIfIdle(found)
+        if (stopIdle.status === "unknown") stopIdle = yield* recheckAfterUnknown(found)
+      } else {
+        // A failed health check does not prove nothing is registered: re-read
+        // the registration and classify it before the service is treated as
+        // absent. Spawning here with a live registered PID would orphan it.
+        const raw = yield* registration().pipe(Effect.option)
+        if (Option.isNone(raw)) {
+          stopIdle = { status: "stopping" }
+        } else {
+          found = raw.value
+          stopIdle = yield* classifyUnhealthyEntry(found)
+        }
+      }
       const restartDecision = decideRestart({ registered: found !== undefined, stop: stopIdle })
       if (restartDecision === "refuse-active") {
         const runs = stopIdle.status === "busy" ? stopIdle.activeRuns : undefined
@@ -385,14 +457,14 @@ export const layer = Layer.effect(
       if (restartDecision === "refuse-unknown") {
         return yield* Effect.fail(
           new Error(
-            'Could not confirm the background service is idle (stop-if-idle refused or unconfirmed); the service was left up, and its state could not be verified. Retry, or run "service stop" to end it explicitly.',
+            "Restart refused: the background service state could not be confirmed (stop-if-idle was refused or its answer was lost). Nothing was signaled or spawned. Retry when the service answers its health endpoint again.",
           ),
         )
       }
       if (restartDecision === "refuse-orphaned") {
         return yield* Effect.fail(
           new Error(
-            `Background service (PID ${found?.pid}) stopped answering its listener but the process is still running; it may be hung. Restart refused so a replacement does not orphan it. Run "service stop" to clear the registration, then verify the process is the opencode server (ps -p ${found?.pid} -o args=) and end it manually (kill ${found?.pid}).`,
+            `Restart refused: the registered service (PID ${found?.pid}) no longer answers its listener, but a process still holds that PID. A live PID is not proof of identity - it may be a wedged server or an unrelated process that reused the PID, and a command-line match alone does not settle that. Nothing was signaled, spawned, or removed; the registration stays at ${file}. Verify the process identity independently (compare ps -p ${found?.pid} -o lstart,args against the registration) and end it manually only if it is the silvercode server.`,
           ),
         )
       }
@@ -434,17 +506,20 @@ export const layer = Layer.effect(
         return yield* fs.remove(file).pipe(Effect.ignore)
       }
       // The registered server did not authenticate (wedged, hung, or stale).
-      // Its PID is NOT safe to signal unauthenticated, but leaving a hung
-      // process unmentioned would orphan it silently: report the precise
-      // manual route before clearing the registration.
+      // Its PID is NOT safe to signal unauthenticated. A dead PID makes the
+      // registration stale, so it is removed; a live PID keeps it, because
+      // the registration is the only record the operator has for the manual
+      // route, and removing it before a verified kill would lose that.
       const raw = yield* registration().pipe(Effect.option)
-      yield* fs.remove(file).pipe(Effect.ignore)
       if (Option.isNone(raw)) return
       const pid = raw.value.pid
       const gone = yield* processExited(pid)
-      if (gone) return
+      if (gone) {
+        yield* fs.remove(file).pipe(Effect.ignore)
+        return
+      }
       yield* Effect.logWarning(
-        `The registered service (PID ${pid}) did not answer its health endpoint, so it was not signaled; only its registration was removed. If it is hung, verify it is the opencode server (ps -p ${pid} -o args=) and end it manually (kill ${pid}).`,
+        `The registered service (PID ${pid}) did not answer its health endpoint and was not signaled. A process still holds that PID, but a live PID is not proof of identity (wedged server or recycled PID), and a command-line match alone does not settle that. The registration was kept at ${file}. Verify the process identity independently (compare ps -p ${pid} -o lstart,args against the registration) and end it manually only if it is the silvercode server, then remove the registration.`,
       )
     })
 
@@ -454,7 +529,13 @@ export const layer = Layer.effect(
       yield* fs.makeDirectory(directory, { recursive: true })
       yield* fs.writeFileString(
         temp,
-        JSON.stringify({ id, version: InstallationVersion, url: HttpServer.formatAddress(address), pid: process.pid }),
+        JSON.stringify({
+          id,
+          version: InstallationVersion,
+          url: HttpServer.formatAddress(address),
+          pid: process.pid,
+          startedAt: new Date(Date.now() - process.uptime() * 1000).toISOString(),
+        }),
         { mode: 0o600 },
       )
       yield* fs.rename(temp, file)

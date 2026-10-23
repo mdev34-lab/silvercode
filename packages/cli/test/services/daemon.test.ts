@@ -332,7 +332,7 @@ describe("daemon start: verified active-run boundary (integration)", () => {
           for (const operation of ["start", "transport"] as const) {
             const result = await runDaemon<unknown, unknown>((daemon) => daemon[operation]())
             expect(result.ok).toBe(false)
-            if (!result.ok) expect(result.message).toContain("Could not confirm")
+            if (!result.ok) expect(result.message).toContain("could not be confirmed")
           }
           expect(requests.filter((req) => req.path === "/api/session/active")).toHaveLength(2)
         },
@@ -455,7 +455,7 @@ describe("daemon restart: server-side stop-if-idle (integration)", () => {
         async ({ requests }) => {
           const restarted = await runDaemon((daemon) => daemon.restart())
           expect(restarted.ok).toBe(false)
-          if (!restarted.ok) expect(restarted.message).toContain("Could not confirm")
+          if (!restarted.ok) expect(restarted.message).toContain("could not be confirmed")
           expect(requests.filter((req) => req.path === "/api/daemon/stop-if-idle")).toHaveLength(1)
         },
       )
@@ -475,7 +475,7 @@ describe("daemon restart: server-side stop-if-idle (integration)", () => {
         async ({ requests }) => {
           const restarted = await runDaemon((daemon) => daemon.restart())
           expect(restarted.ok).toBe(false)
-          if (!restarted.ok) expect(restarted.message).toContain("Could not confirm")
+          if (!restarted.ok) expect(restarted.message).toContain("could not be confirmed")
           expect(requests.filter((req) => req.path === "/api/daemon/stop-if-idle")).toHaveLength(1)
         },
       )
@@ -521,7 +521,7 @@ describe("daemon restart: server-side stop-if-idle (integration)", () => {
       async ({ requests }) => {
         const restarted = await runDaemon((daemon) => daemon.restart())
         expect(restarted.ok).toBe(false)
-        if (!restarted.ok) expect(restarted.message).toContain("Could not confirm")
+        if (!restarted.ok) expect(restarted.message).toContain("could not be confirmed")
         expect(requests.filter((req) => req.path === "/api/daemon/stop-if-idle")).toHaveLength(1)
         expect(requests.filter((req) => req.path === "/api/health").length).toBeGreaterThan(0)
       },
@@ -542,7 +542,7 @@ describe("daemon restart: server-side stop-if-idle (integration)", () => {
         setTimeout(() => server.stop(true), 100)
         const restarted = await runDaemon((daemon) => daemon.restart())
         expect(restarted.ok).toBe(false)
-        if (!restarted.ok) expect(restarted.message).toContain("still running")
+        if (!restarted.ok) expect(restarted.message).toContain("still holds that PID")
         expect(alive(child.pid)).toBe(true)
         expect(existsSync(markerOut)).toBe(false)
         expect(readFileSync(serverFile, "utf8")).toBe(originalRegistration)
@@ -586,7 +586,7 @@ describe("daemon restart: server-side stop-if-idle (integration)", () => {
       async () => {
         const restarted = await runDaemon((daemon) => daemon.restart())
         expect(restarted.ok).toBe(false)
-        if (!restarted.ok) expect(restarted.message).toContain("Could not confirm")
+        if (!restarted.ok) expect(restarted.message).toContain("could not be confirmed")
       },
     )
   }, 60_000)
@@ -602,7 +602,7 @@ describe("daemon restart: server-side stop-if-idle (integration)", () => {
       async () => {
         const restarted = await runDaemon((daemon) => daemon.restart())
         expect(restarted.ok).toBe(false)
-        if (!restarted.ok) expect(restarted.message).toContain("Could not confirm")
+        if (!restarted.ok) expect(restarted.message).toContain("could not be confirmed")
       },
     )
   }, 60_000)
@@ -614,5 +614,130 @@ describe("daemon restart: server-side stop-if-idle (integration)", () => {
       if (!restarted.ok) expect(restarted.message).toContain("Failed to start server")
       expect(readFileSync(markerOut, "utf8")).toBe("serve --register")
     })
+  }, 60_000)
+})
+
+describe("kill(0) classification (unit)", () => {
+  test("ESRCH means exited; EPERM and any other failure mean alive (refuse-safe)", () => {
+    expect(mod.kill0MeansExited({ code: "ESRCH" })).toBe(true)
+    expect(mod.kill0MeansExited({ code: "EPERM" })).toBe(false)
+    expect(mod.kill0MeansExited({ code: "EINVAL" })).toBe(false)
+    expect(mod.kill0MeansExited(new Error("boom"))).toBe(false)
+    expect(mod.kill0MeansExited(undefined)).toBe(false)
+  })
+})
+
+// A URL whose port nothing listens on: bound once, then closed.
+async function closedPortUrl() {
+  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response("x") })
+  const url = server.url.origin
+  server.stop(true)
+  return url
+}
+
+describe("daemon restart: unhealthy registration at ENTRY (integration)", () => {
+  test("listener gone since entry and the PID held by another process: refuses as orphaned - no spawn, no signal, registration kept (regression: healthy() failure is not absence)", async () => {
+    await withMarker(async () => {
+      const child = Bun.spawn(["sleep", "30"], { stdio: ["ignore", "ignore", "ignore"] })
+      const url = await closedPortUrl()
+      writeRegistration({ version: installationVersion, url, pid: child.pid })
+      const originalRegistration = readFileSync(serverFile, "utf8")
+      try {
+        const restarted = await runDaemon((daemon) => daemon.restart())
+        expect(restarted.ok).toBe(false)
+        if (!restarted.ok) {
+          expect(restarted.message).toContain("Restart refused")
+          expect(restarted.message).toContain("not proof of identity")
+        }
+        expect(alive(child.pid)).toBe(true)
+        expect(existsSync(markerOut)).toBe(false)
+        expect(readFileSync(serverFile, "utf8")).toBe(originalRegistration)
+      } finally {
+        child.kill()
+      }
+    })
+  }, 60_000)
+
+  test("listener gone since entry and the PID exited: stale registration is cleared and restart proceeds", async () => {
+    await withMarker(async () => {
+      const child = Bun.spawn(["sleep", "30"], { stdio: ["ignore", "ignore", "ignore"] })
+      const url = await closedPortUrl()
+      writeRegistration({ version: installationVersion, url, pid: child.pid })
+      child.kill("SIGTERM")
+      await new Promise((resolve) => setTimeout(resolve, 200))
+      try {
+        const restarted = await runDaemon((daemon) => daemon.restart())
+        expect(restarted.ok).toBe(false)
+        if (!restarted.ok) expect(restarted.message).toContain("Failed to start server")
+        expect(readFileSync(markerOut, "utf8")).toBe("serve --register")
+      } finally {
+        child.kill()
+      }
+    })
+  }, 60_000)
+
+  test("a transient refusal that answers again refuses as unknown: nothing signaled, spawned, or removed", async () => {
+    await withMarker(async () => {
+      const child = Bun.spawn(["sleep", "30"], { stdio: ["ignore", "ignore", "ignore"] })
+      const gone = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response("x") })
+      const port = gone.port
+      const url = gone.url.origin
+      gone.stop(true)
+      writeRegistration({ version: installationVersion, url, pid: child.pid })
+      const originalRegistration = readFileSync(serverFile, "utf8")
+      let revived: ReturnType<typeof Bun.serve> | undefined
+      try {
+        // The listener comes back between the two entry probes: the second
+        // probe answers HTTP, which is alive-but-unconfirmed, never orphaned.
+        setTimeout(() => {
+          revived = Bun.serve({
+            hostname: "127.0.0.1",
+            port,
+            fetch: () => Response.json({ healthy: true }),
+          })
+        }, 150)
+        const restarted = await runDaemon((daemon) => daemon.restart())
+        expect(restarted.ok).toBe(false)
+        if (!restarted.ok) expect(restarted.message).toContain("could not be confirmed")
+        expect(alive(child.pid)).toBe(true)
+        expect(existsSync(markerOut)).toBe(false)
+        expect(readFileSync(serverFile, "utf8")).toBe(originalRegistration)
+      } finally {
+        child.kill()
+        revived?.stop(true)
+      }
+    })
+  }, 60_000)
+
+  test("service stop never signals an unauthenticated PID and keeps the registration while the PID is alive (PID-reuse safety)", async () => {
+    const child = Bun.spawn(["sleep", "30"], { stdio: ["ignore", "ignore", "ignore"] })
+    const url = await closedPortUrl()
+    writeRegistration({ version: installationVersion, url, pid: child.pid })
+    const originalRegistration = readFileSync(serverFile, "utf8")
+    try {
+      const stopped = await runDaemon((daemon) => daemon.stop())
+      expect(stopped.ok).toBe(true)
+      expect(alive(child.pid)).toBe(true)
+      expect(readFileSync(serverFile, "utf8")).toBe(originalRegistration)
+    } finally {
+      child.kill()
+      rmSync(serverFile, { force: true })
+    }
+  }, 60_000)
+
+  test("service stop removes a stale registration once the PID is gone", async () => {
+    const child = Bun.spawn(["sleep", "30"], { stdio: ["ignore", "ignore", "ignore"] })
+    const url = await closedPortUrl()
+    writeRegistration({ version: installationVersion, url, pid: child.pid })
+    child.kill("SIGTERM")
+    await new Promise((resolve) => setTimeout(resolve, 200))
+    try {
+      const stopped = await runDaemon((daemon) => daemon.stop())
+      expect(stopped.ok).toBe(true)
+      expect(existsSync(serverFile)).toBe(false)
+    } finally {
+      child.kill()
+      rmSync(serverFile, { force: true })
+    }
   }, 60_000)
 })
