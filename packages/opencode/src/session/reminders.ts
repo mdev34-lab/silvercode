@@ -1,6 +1,6 @@
 import path from "path"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
-import { Effect } from "effect"
+import { Effect, Option } from "effect"
 import { Agent } from "@/agent/agent"
 import { Agent as AgentSchema } from "@opencode-ai/schema/agent"
 import { FSUtil } from "@opencode-ai/core/fs-util"
@@ -19,20 +19,35 @@ const scratchpad = (plan: string) =>
 
 // Plan files belong to the root session: a Think running as a delegated
 // subagent writes the same plan file its caller's session later reads.
-const rootPlan = Effect.fn("SessionReminders.rootPlan")(function* (session: Session.Info) {
-  const sessions = yield* Session.Service
-  const ctx = yield* InstanceState.context
+// A missing ancestor row means the true root is unknown: resolve to none
+// rather than inventing the deepest resolved session as the root, which
+// would name the wrong plan file.
+// Pure form for callers that already hold the service (tool execute contexts
+// cannot require the Session tag).
+export const walkToRoot = Effect.fn("SessionReminders.walkToRoot")(function* (
+  sessions: Session.Interface,
+  session: Session.Info,
+) {
   let root = session
   while (root.parentID) {
-    // A missing ancestor row must not break prompt assembly; fall back to
-    // the deepest session that resolved.
     const parent = yield* sessions
       .get(root.parentID)
       .pipe(Effect.catchIf(NotFoundError.isInstance, () => Effect.succeed(undefined)))
-    if (!parent) break
+    if (!parent) return Option.none<Session.Info>()
     root = parent
   }
-  return Session.plan(root, ctx)
+  return Option.some(root)
+})
+
+export const rootSession = Effect.fn("SessionReminders.rootSession")(function* (session: Session.Info) {
+  const sessions = yield* Session.Service
+  return yield* walkToRoot(sessions, session)
+})
+
+const rootPlan = Effect.fn("SessionReminders.rootPlan")(function* (session: Session.Info) {
+  const ctx = yield* InstanceState.context
+  const root = yield* rootSession(session)
+  return Option.map(root, (root) => Session.plan(root, ctx))
 })
 
 export const apply = Effect.fn("SessionReminders.apply")(function* (input: {
@@ -57,18 +72,19 @@ export const apply = Effect.fn("SessionReminders.apply")(function* (input: {
         text: PROMPT_PLAN,
         synthetic: true,
       })
-      userMessage.parts.push({
-        id: PartID.ascending(),
-        messageID: userMessage.info.id,
-        sessionID: userMessage.info.sessionID,
-        type: "text",
-        text: `Write your plan at ${plan} with the write tool - create it if it does not exist, extend it if it does. End your reply with that exact path so the executor can find the file.`,
-        synthetic: true,
-      })
+      if (Option.isSome(plan))
+        userMessage.parts.push({
+          id: PartID.ascending(),
+          messageID: userMessage.info.id,
+          sessionID: userMessage.info.sessionID,
+          type: "text",
+          text: `Write your plan at ${plan.value} with the write tool - create it if it does not exist, extend it if it does. End your reply with that exact path so the executor can find the file.`,
+          synthetic: true,
+        })
     }
     if (input.agent.name === "work") {
       const plan = yield* rootPlan(input.session)
-      const exists = yield* fsys.existsSafe(plan)
+      const exists = Option.isSome(plan) && (yield* fsys.existsSafe(plan.value))
       const wasPlan = input.messages.some(
         (msg) => msg.info.role === "assistant" && AgentSchema.canonicalID(msg.info.agent ?? "") === "think",
       )
@@ -78,10 +94,10 @@ export const apply = Effect.fn("SessionReminders.apply")(function* (input: {
           messageID: userMessage.info.id,
           sessionID: userMessage.info.sessionID,
           type: "text",
-          text: exists ? `${WORK_SWITCH}\n\n${scratchpad(plan)}` : WORK_SWITCH,
+          text: exists && Option.isSome(plan) ? `${WORK_SWITCH}\n\n${scratchpad(plan.value)}` : WORK_SWITCH,
           synthetic: true,
         })
-      } else if (exists) {
+      } else if (exists && Option.isSome(plan)) {
         // Delegation flow: no plan->work switch happened in this session, but a
         // planner (usually a delegated Think) already wrote the plan file.
         userMessage.parts.push({
@@ -89,7 +105,7 @@ export const apply = Effect.fn("SessionReminders.apply")(function* (input: {
           messageID: userMessage.info.id,
           sessionID: userMessage.info.sessionID,
           type: "text",
-          text: scratchpad(plan),
+          text: scratchpad(plan.value),
           synthetic: true,
         })
       }
@@ -100,13 +116,13 @@ export const apply = Effect.fn("SessionReminders.apply")(function* (input: {
   const assistantMessage = input.messages.findLast((msg) => msg.info.role === "assistant")
   if (input.agent.name !== "think" && AgentSchema.canonicalID(assistantMessage?.info.agent ?? "") === "think") {
     const plan = yield* rootPlan(input.session)
-    const exists = yield* fsys.existsSafe(plan)
+    const exists = Option.isSome(plan) && (yield* fsys.existsSafe(plan.value))
     const part = yield* sessions.updatePart({
       id: PartID.ascending(),
       messageID: userMessage.info.id,
       sessionID: userMessage.info.sessionID,
       type: "text",
-      text: exists ? `${WORK_SWITCH}\n\n${scratchpad(plan)}` : WORK_SWITCH,
+      text: exists && Option.isSome(plan) ? `${WORK_SWITCH}\n\n${scratchpad(plan.value)}` : WORK_SWITCH,
       synthetic: true,
     })
     userMessage.parts.push(part)
@@ -116,17 +132,20 @@ export const apply = Effect.fn("SessionReminders.apply")(function* (input: {
   if (input.agent.name !== "think" || AgentSchema.canonicalID(assistantMessage?.info.agent ?? "") === "think") return input.messages
 
   const plan = yield* rootPlan(input.session)
-  const exists = yield* fsys.existsSafe(plan)
-  if (!exists) yield* fsys.ensureDir(path.dirname(plan)).pipe(Effect.catch(Effect.die))
+  const exists = Option.isSome(plan) && (yield* fsys.existsSafe(plan.value))
+  if (Option.isSome(plan) && !exists)
+    yield* fsys.ensureDir(path.dirname(plan.value)).pipe(Effect.catch(Effect.die))
   const part = yield* sessions.updatePart({
     id: PartID.ascending(),
     messageID: userMessage.info.id,
     sessionID: userMessage.info.sessionID,
     type: "text",
     text: PLAN_MODE.replace("${planInfo}", () =>
-      exists
-        ? `A plan file already exists at ${plan}. You can read it and make incremental edits using the edit tool.`
-        : `No plan file exists yet. You should create your plan at ${plan} using the write tool.`,
+      Option.isNone(plan)
+        ? "A plan file path could not be resolved because an ancestor session is missing from storage. Do not create or edit any plan file."
+        : exists
+          ? `A plan file already exists at ${plan.value}. You can read it and make incremental edits using the edit tool.`
+          : `No plan file exists yet. You should create your plan at ${plan.value} using the write tool.`,
     ),
     synthetic: true,
   })

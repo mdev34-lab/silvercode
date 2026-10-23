@@ -1,9 +1,10 @@
 import path from "path"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
-import { Effect, Schema } from "effect"
+import { Effect, Option, Schema } from "effect"
 import * as Tool from "./tool"
 import { Question } from "../question"
 import { Session } from "@/session/session"
+import { walkToRoot } from "@/session/reminders"
 import { MessageV2 } from "../session/message-v2"
 import { Provider } from "@/provider/provider"
 import { InstanceState } from "@/effect/instance-state"
@@ -25,11 +26,16 @@ export const PlanExitTool = Tool.define(
       execute: (_params: {}, ctx: Tool.Context) =>
         Effect.gen(function* () {
           const instance = yield* InstanceState.context
-          let info = yield* session.get(ctx.sessionID)
-          while (info.parentID) {
-            info = yield* session.get(info.parentID)
-          }
-          const plan = path.relative(instance.worktree, Session.plan(info, instance))
+          const info = yield* session.get(ctx.sessionID)
+          const root = yield* walkToRoot(session, info)
+          if (Option.isNone(root))
+            return {
+              title: "Cannot switch to work agent",
+              output:
+                "Could not resolve the root session: an ancestor session is missing from storage, so the plan file location is unknown. Resolve the session storage issue and try again.",
+              metadata: {},
+            }
+          const plan = path.relative(instance.worktree, Session.plan(root.value, instance))
           const answers = yield* question.ask({
             sessionID: ctx.sessionID,
             questions: [
