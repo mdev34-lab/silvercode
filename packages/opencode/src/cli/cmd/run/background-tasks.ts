@@ -39,7 +39,10 @@ export const make = (rootSessionID: string) => {
       // delivery already arrived was resumed (task_id): a new run, so it is
       // pending again.
       if (launched.has(key)) {
-        if (!resolved.has(key)) return false
+        // An explicit run identifies one execution forever. Replaying its
+        // launch after delivery cannot resurrect completed work. Only legacy
+        // session-only launches lack enough identity to distinguish resume.
+        if (input.run !== undefined || !resolved.has(key)) return false
         resolved.delete(key)
       }
       launched.set(key, { sessionID: input.sessionID, parentSessionID: input.parentSessionID })
