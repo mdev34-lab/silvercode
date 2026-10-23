@@ -741,3 +741,124 @@ describe("daemon restart: unhealthy registration at ENTRY (integration)", () => 
     }
   }, 60_000)
 })
+
+describe("daemon teardown: verified-exit protocol (integration)", () => {
+  test("service stop refuses when the health re-check during teardown hangs: registration kept, process untouched (regression: a failed re-check is not a verified exit)", async () => {
+    const child = Bun.spawn(["sleep", "30"], { stdio: ["ignore", "ignore", "ignore"] })
+    const server = fakeServer({ active: { kind: "ok", runs: 0 }, stop: { kind: "grant" }, health: { then: "hang" } })
+    writeRegistration({ version: installationVersion, url: server.url.origin, pid: child.pid })
+    const originalRegistration = readFileSync(serverFile, "utf8")
+    try {
+      const stopped = await runDaemon((daemon) => daemon.stop())
+      expect(stopped.ok).toBe(false)
+      if (!stopped.ok) {
+        expect(stopped.message).toContain("could not be verified")
+        expect(stopped.message).toContain("registration stays")
+      }
+      expect(alive(child.pid)).toBe(true)
+      expect(readFileSync(serverFile, "utf8")).toBe(originalRegistration)
+      expect(existsSync(markerOut)).toBe(false)
+    } finally {
+      child.kill()
+      server.stop(true)
+      rmSync(serverFile, { force: true })
+    }
+  }, 60_000)
+
+  test("restart refuses when the granted stop cannot be verified (health hangs during teardown): no spawn, no removal, process untouched", async () => {
+    await withMarker(async () => {
+      const child = Bun.spawn(["sleep", "30"], { stdio: ["ignore", "ignore", "ignore"] })
+      const server = fakeServer({
+        active: { kind: "ok", runs: 0 },
+        stop: { kind: "grant" }, // grants but the process stays alive
+        health: { then: "hang" },
+      })
+      writeRegistration({ version: installationVersion, url: server.url.origin, pid: child.pid })
+      const originalRegistration = readFileSync(serverFile, "utf8")
+      try {
+        const restarted = await runDaemon((daemon) => daemon.restart())
+        expect(restarted.ok).toBe(false)
+        if (!restarted.ok) {
+          expect(restarted.message).toContain("could not be verified")
+          expect(restarted.message).not.toContain("Failed to start server")
+        }
+        expect(alive(child.pid)).toBe(true)
+        expect(existsSync(markerOut)).toBe(false)
+        expect(readFileSync(serverFile, "utf8")).toBe(originalRegistration)
+      } finally {
+        child.kill()
+        server.stop(true)
+        rmSync(serverFile, { force: true })
+      }
+    })
+  }, 60_000)
+
+  test("start replacement refuses when teardown cannot be verified: nothing spawned, registration kept, process untouched", async () => {
+    await withRegisteredService(
+      { active: { kind: "ok", runs: 0 }, stop: { kind: "grant" }, health: { then: "hang" }, version: "0.0.0-outdated" },
+      async () => {
+        const started = await runDaemon((daemon) => daemon.start())
+        expect(started.ok).toBe(false)
+        if (!started.ok) expect(started.message).toContain("could not be verified")
+      },
+    )
+  }, 60_000)
+
+  test("EPERM on kill(0) and on signals is never treated as exited: stop refuses and the process is left alone", async () => {
+    const child = Bun.spawn(["sleep", "30"], { stdio: ["ignore", "ignore", "ignore"] })
+    const server = fakeServer({ active: { kind: "ok", runs: 0 }, stop: { kind: "grant" } })
+    writeRegistration({ version: installationVersion, url: server.url.origin, pid: child.pid })
+    const originalRegistration = readFileSync(serverFile, "utf8")
+    const originalKill = process.kill
+    process.kill = (() => {
+      throw Object.assign(new Error("operation not permitted"), { code: "EPERM" })
+    }) as typeof process.kill
+    let stopped: Outcome
+    try {
+      stopped = await runDaemon((daemon) => daemon.stop())
+    } finally {
+      process.kill = originalKill
+    }
+    try {
+      expect(stopped!.ok).toBe(false)
+      if (!stopped!.ok) expect(stopped!.message).toContain("could not be verified")
+      expect(alive(child.pid)).toBe(true)
+      expect(readFileSync(serverFile, "utf8")).toBe(originalRegistration)
+    } finally {
+      child.kill()
+      server.stop(true)
+      rmSync(serverFile, { force: true })
+    }
+  }, 60_000)
+
+  test("status no longer removes the registration on a failed health check while the PID is alive", async () => {
+    const child = Bun.spawn(["sleep", "30"], { stdio: ["ignore", "ignore", "ignore"] })
+    const url = await closedPortUrl()
+    writeRegistration({ version: installationVersion, url, pid: child.pid })
+    const originalRegistration = readFileSync(serverFile, "utf8")
+    try {
+      const status = await runDaemon((daemon) => daemon.status())
+      expect(status.ok).toBe(true)
+      expect(readFileSync(serverFile, "utf8")).toBe(originalRegistration)
+    } finally {
+      child.kill()
+      rmSync(serverFile, { force: true })
+    }
+  }, 60_000)
+
+  test("status removes the registration only once the PID is verified gone", async () => {
+    const child = Bun.spawn(["sleep", "30"], { stdio: ["ignore", "ignore", "ignore"] })
+    const url = await closedPortUrl()
+    writeRegistration({ version: installationVersion, url, pid: child.pid })
+    child.kill("SIGTERM")
+    await new Promise((resolve) => setTimeout(resolve, 200))
+    try {
+      const status = await runDaemon((daemon) => daemon.status())
+      expect(status.ok).toBe(true)
+      expect(existsSync(serverFile)).toBe(false)
+    } finally {
+      child.kill()
+      rmSync(serverFile, { force: true })
+    }
+  }, 60_000)
+})
