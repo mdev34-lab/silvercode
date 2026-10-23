@@ -219,6 +219,10 @@ export const layer = Layer.effect(
     // exists without platform-specific PID handles.
     const stopProcess = Effect.fnUntraced(function* (info: Registration) {
       // Nothing to signal when nobody owns the PID: ESRCH is a verified exit.
+      // This says only that the ORIGINAL process is gone; it says nothing
+      // about who owns the registration file now. Callers must condition any
+      // removal on ownership (removeIfSame) - a different service may have
+      // registered while this teardown ran.
       if (yield* processExited(info.pid)) return { status: "stopped" }
 
       const current = yield* healthy().pipe(Effect.option)
@@ -256,6 +260,23 @@ export const layer = Layer.effect(
       )
       if (Option.isSome(final)) return { status: "stopped" }
       return { status: "unverified", reason: `a process still holds PID ${info.pid} after SIGKILL` }
+    })
+
+    // Ownership-conditioned removal: the registration is deleted only when
+    // the file still describes the exact record this caller tore down. If a
+    // different service registered meanwhile ("changed"), its file is
+    // preserved and the caller must rediscover or refuse - never delete or
+    // replace a registration it does not own. The compare-to-remove gap
+    // cannot be closed from userspace without file locks; the backstop is
+    // server-side: a serving process re-reads its registration every 10s and
+    // exits when it no longer finds itself, so a lost race fails visible
+    // instead of leaving a hidden orphan.
+    const removeIfSame = Effect.fnUntraced(function* (expected: Registration) {
+      const current = yield* registration().pipe(Effect.option)
+      if (Option.isNone(current)) return "absent" as const
+      if (!sameRegistration(current.value, expected)) return "changed" as const
+      yield* fs.remove(file).pipe(Effect.ignore)
+      return "removed" as const
     })
 
     // Verified active-run count for the registered server. Only a 2xx response
@@ -427,43 +448,61 @@ export const layer = Layer.effect(
       const compiled = path.basename(process.execPath).replace(/\.exe$/, "") !== "bun"
       const factoryDefault =
         process.env.OPENCODE_FACTORY_DEFAULT === "1" || process.env.OPENCODE_FACTORY_DEFAULT === "true"
-      // Keep probing even for compatible servers: verified idle retains the
-      // development/factory replacement behavior. Unknown permits only reuse,
-      // not replacement, and is never converted to a zero active-run count.
-      const activeCount = yield* probeActiveRuns(found)
+      // Replacement races a fresh registration: A exits, B registers, A's
+      // teardown verifies A's exit and must NOT delete B's file. Removal is
+      // ownership-checked; a changed registration is rediscovered and the
+      // decision re-runs against it. Bounded: a second change refuses.
+      for (let pass = 0; ; pass++) {
+        // Keep probing even for compatible servers: verified idle retains the
+        // development/factory replacement behavior. Unknown permits only reuse,
+        // not replacement, and is never converted to a zero active-run count.
+        const activeCount = yield* probeActiveRuns(found)
 
-      const decision = decideStart({
-        registered: found !== undefined,
-        sameVersion: found?.version === InstallationVersion,
-        compiled,
-        factoryDefault,
-        activeRuns: activeCount,
-      })
-      if (decision === "reuse" && found) return found.url
-      if (decision === "refuse-active" && found) {
-        return yield* Effect.fail(
-          new Error(
-            `Background service ${found.version ?? "unknown"} does not match this client and has ${activeCount} active run(s). Wait for them to finish, or run "service stop" to end them explicitly, then start again.`,
-          ),
-        )
-      }
-      if (decision === "refuse-unknown" && found) {
-        return yield* Effect.fail(
-          new Error(
-            "Start refused: the background service state could not be confirmed (active-run probe failed). Nothing was signaled or spawned. Retry when the service answers its probes again.",
-          ),
-        )
-      }
-      if (found) {
-        const teardown = yield* stopProcess(found)
-        if (teardown.status !== "stopped") {
+        const decision = decideStart({
+          registered: found !== undefined,
+          sameVersion: found?.version === InstallationVersion,
+          compiled,
+          factoryDefault,
+          activeRuns: activeCount,
+        })
+        if (decision === "reuse" && found) return found.url
+        if (decision === "refuse-active" && found) {
           return yield* Effect.fail(
             new Error(
-              `Start refused: teardown of the registered service (PID ${found.pid}) could not be verified (${teardown.reason}). Nothing was spawned or removed; the registration stays at ${file}. Verify the process state before retrying.`,
+              `Background service ${found.version ?? "unknown"} does not match this client and has ${activeCount} active run(s). Wait for them to finish, or run "service stop" to end them explicitly, then start again.`,
             ),
           )
         }
-        yield* fs.remove(file).pipe(Effect.ignore)
+        if (decision === "refuse-unknown" && found) {
+          return yield* Effect.fail(
+            new Error(
+              "Start refused: the background service state could not be confirmed (active-run probe failed). Nothing was signaled or spawned. Retry when the service answers its probes again.",
+            ),
+          )
+        }
+        if (found) {
+          const teardown = yield* stopProcess(found)
+          if (teardown.status !== "stopped") {
+            return yield* Effect.fail(
+              new Error(
+                `Start refused: teardown of the registered service (PID ${found.pid}) could not be verified (${teardown.reason}). Nothing was spawned or removed; the registration stays at ${file}. Verify the process state before retrying.`,
+              ),
+            )
+          }
+          const removal = yield* removeIfSame(found)
+          if (removal === "changed") {
+            if (pass >= 1) {
+              return yield* Effect.fail(
+                new Error(
+                  "Start refused: the service registration changed repeatedly during teardown. Nothing was spawned or removed. Retry once the registration is stable.",
+                ),
+              )
+            }
+            found = Option.getOrUndefined(yield* registration().pipe(Effect.option))
+            continue
+          }
+        }
+        break
       }
 
       const entrypoint = compiled ? undefined : process.argv[1]
@@ -542,7 +581,16 @@ export const layer = Layer.effect(
             ),
           )
         }
-        yield* fs.remove(file).pipe(Effect.ignore)
+        // A different service may have registered during the teardown; its
+        // registration is not ours to delete or replace.
+        const removal = yield* removeIfSame(found)
+        if (removal === "changed") {
+          return yield* Effect.fail(
+            new Error(
+              `Restart refused: the original service (PID ${found.pid}) was stopped, but a different service registered at ${file} meanwhile. That registration was kept and nothing was spawned. Retry to act on the current registration.`,
+            ),
+          )
+        }
       }
       return yield* start()
     })
@@ -566,7 +614,9 @@ export const layer = Layer.effect(
       // process holds the PID the registration is the operator's only record.
       const raw = yield* registration().pipe(Effect.option)
       if (Option.isSome(raw) && (yield* processExited(raw.value.pid))) {
-        yield* fs.remove(file).pipe(Effect.ignore)
+        // Same ownership rule as the other callers: remove only if the file
+        // still describes the record we just proved stale.
+        yield* removeIfSame(raw.value)
       }
       return undefined
     })
@@ -584,7 +634,16 @@ export const layer = Layer.effect(
             ),
           )
         }
-        return yield* fs.remove(file).pipe(Effect.ignore)
+        // The requested service is verified gone. The registration is removed
+        // only if it still belongs to that service: a different service may
+        // have registered during the teardown, and its file is kept.
+        const removal = yield* removeIfSame(existing.value)
+        if (removal === "changed") {
+          yield* Effect.logWarning(
+            `The requested service (PID ${existing.value.pid}) is stopped, but the registration at ${file} now describes a different service and was kept.`,
+          )
+        }
+        return
       }
       // The registered server did not authenticate (wedged, hung, or stale).
       // Its PID is NOT safe to signal unauthenticated. A dead PID makes the
@@ -596,7 +655,7 @@ export const layer = Layer.effect(
       const pid = raw.value.pid
       const gone = yield* processExited(pid)
       if (gone) {
-        yield* fs.remove(file).pipe(Effect.ignore)
+        yield* removeIfSame(raw.value)
         return
       }
       yield* Effect.logWarning(

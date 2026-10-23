@@ -142,7 +142,15 @@ type StopMode =
 // it. `hang` never responds; `{ status }` answers with that status.
 type HealthMode = "ok" | { then: "hang" | { status: number } }
 
-function fakeServer(input: { active: ActiveMode; stop: StopMode; health?: HealthMode; onGrant?: () => void }) {
+function fakeServer(input: {
+  active: ActiveMode
+  stop: StopMode
+  health?: HealthMode
+  onGrant?: () => void
+  // Called synchronously with the running health-request count before each
+  // answer; lets a test rewrite the registration file mid-protocol.
+  onHealth?: (n: number) => void
+}) {
   const requests: Array<{ path: string; authorization: string | null }> = []
   let healthRequests = 0
   const server = Bun.serve({
@@ -153,6 +161,7 @@ function fakeServer(input: { active: ActiveMode; stop: StopMode; health?: Health
       requests.push({ path: url.pathname, authorization: req.headers.get("Authorization") })
       if (url.pathname === "/api/health") {
         healthRequests++
+        input.onHealth?.(healthRequests)
         const health = input.health ?? "ok"
         if (health === "ok" || healthRequests === 1) return Response.json({ healthy: true })
         if (health.then === "hang") return new Promise<Response>(() => {})
@@ -860,5 +869,151 @@ describe("daemon teardown: verified-exit protocol (integration)", () => {
       child.kill()
       rmSync(serverFile, { force: true })
     }
+  }, 60_000)
+})
+
+describe("daemon teardown: ownership and wait-path regressions (integration)", () => {
+  test("EPERM injected on the WAIT path (probe and signals allowed): stop refuses, registration kept, nothing spawned", async () => {
+    // A child that ignores SIGTERM, so the wait path is what decides.
+    const child = Bun.spawn(["sh", "-c", "trap '' TERM; exec sleep 30"], { stdio: ["ignore", "ignore", "ignore"] })
+    const server = fakeServer({ active: { kind: "ok", runs: 0 }, stop: { kind: "grant" } })
+    writeRegistration({ version: installationVersion, url: server.url.origin, pid: child.pid })
+    const originalRegistration = readFileSync(serverFile, "utf8")
+    const originalKill = process.kill
+    let signaled = false
+    process.kill = ((pid: number, sig?: NodeJS.Signals | 0) => {
+      if (sig === 0 || sig === undefined) {
+        if (signaled) throw Object.assign(new Error("operation not permitted"), { code: "EPERM" })
+        return originalKill(pid, 0)
+      }
+      signaled = true
+      return originalKill(pid, sig)
+    }) as typeof process.kill
+    let stopped: Outcome
+    try {
+      stopped = await runDaemon((daemon) => daemon.stop())
+    } finally {
+      process.kill = originalKill
+    }
+    try {
+      // The wait never saw a verified exit (EPERM after SIGTERM and after
+      // SIGKILL), so teardown must refuse even though the signals landed.
+      expect(stopped!.ok).toBe(false)
+      if (!stopped!.ok) {
+        expect(stopped!.message).toContain("could not be verified")
+        expect(stopped!.message).toContain("after SIGKILL")
+      }
+      expect(readFileSync(serverFile, "utf8")).toBe(originalRegistration)
+      expect(existsSync(markerOut)).toBe(false)
+    } finally {
+      child.kill("SIGKILL")
+      server.stop(true)
+      rmSync(serverFile, { force: true })
+    }
+  }, 60_000)
+
+  test("registration changed before the teardown re-check: stop refuses without signaling, the new registration is preserved (regression: ownership race)", async () => {
+    const childA = Bun.spawn(["sleep", "30"], { stdio: ["ignore", "ignore", "ignore"] })
+    const childB = Bun.spawn(["sleep", "30"], { stdio: ["ignore", "ignore", "ignore"] })
+    const server = fakeServer({
+      active: { kind: "ok", runs: 0 },
+      stop: { kind: "grant" },
+      onHealth: () => {
+        // B registers while A's stop is between its first probe and the
+        // teardown re-check.
+        writeRegistration({ version: installationVersion, url: server.url.origin, pid: childB.pid })
+      },
+    })
+    writeRegistration({ version: installationVersion, url: server.url.origin, pid: childA.pid })
+    try {
+      const stopped = await runDaemon((daemon) => daemon.stop())
+      expect(stopped.ok).toBe(false)
+      if (!stopped.ok) expect(stopped.message).toContain("could not be verified")
+      const kept = JSON.parse(readFileSync(serverFile, "utf8"))
+      expect(kept.pid).toBe(childB.pid)
+      expect(alive(childA.pid)).toBe(true)
+      expect(alive(childB.pid)).toBe(true)
+      expect(existsSync(markerOut)).toBe(false)
+    } finally {
+      childA.kill()
+      childB.kill()
+      server.stop(true)
+      rmSync(serverFile, { force: true })
+    }
+  }, 60_000)
+
+  test("a different service registers while replacement tears down: stop preserves it (regression: A exit + B register + A teardown must not delete B)", async () => {
+    const childA = Bun.spawn(["sleep", "30"], { stdio: ["ignore", "ignore", "ignore"] })
+    const childB = Bun.spawn(["sleep", "30"], { stdio: ["ignore", "ignore", "ignore"] })
+    let bFile = ""
+    const server = fakeServer({
+      active: { kind: "ok", runs: 0 },
+      stop: { kind: "grant" },
+      onHealth: (n) => {
+        // B registers during A's teardown health re-check (second probe).
+        if (n === 2) {
+          writeRegistration({ version: installationVersion, url: server.url.origin, pid: childB.pid })
+          bFile = readFileSync(serverFile, "utf8")
+        }
+      },
+    })
+    writeRegistration({ version: installationVersion, url: server.url.origin, pid: childA.pid })
+    try {
+      const stopped = await runDaemon((daemon) => daemon.stop())
+      // A's teardown is verified (SIGTERM after authentication); B's file must
+      // survive untouched.
+      expect(stopped.ok).toBe(true)
+      expect(alive(childA.pid)).toBe(false)
+      expect(alive(childB.pid)).toBe(true)
+      expect(bFile).not.toBe("")
+      expect(readFileSync(serverFile, "utf8")).toBe(bFile)
+      expect(existsSync(markerOut)).toBe(false)
+    } finally {
+      childA.kill()
+      childB.kill()
+      server.stop(true)
+      rmSync(serverFile, { force: true })
+    }
+  }, 60_000)
+
+  test("start replacement that loses the registration race rediscovers the new service instead of deleting it without ownership", async () => {
+    const childA = Bun.spawn(["sleep", "30"], { stdio: ["ignore", "ignore", "ignore"] })
+    const childB = Bun.spawn(["sleep", "30"], { stdio: ["ignore", "ignore", "ignore"] })
+    let bFile = ""
+    const server = fakeServer({
+      active: { kind: "ok", runs: 0 },
+      stop: { kind: "grant" },
+      onHealth: (n) => {
+        if (n === 2) {
+          writeRegistration({ version: installationVersion, url: server.url.origin, pid: childB.pid })
+          bFile = readFileSync(serverFile, "utf8")
+        }
+      },
+    })
+    // A is outdated and verified idle: start would replace it. B (current
+    // version) registers during A's teardown.
+    writeRegistration({ version: "0.0.0-outdated", url: server.url.origin, pid: childA.pid })
+    await withMarker(async () => {
+      try {
+        const started = await runDaemon((daemon) => daemon.start())
+        // A is torn down, B is rediscovered and the decision re-runs against
+        // B: a dev build replaces a verified-idle same-version service, so B
+        // is torn down too - but ONLY after stopProcess authenticates B and
+        // removeIfSame confirms the file still belongs to B. The marker
+        // records the resulting spawn; it cannot serve, so start reports the
+        // spawn failure.
+        expect(started.ok).toBe(false)
+        if (!started.ok) expect(started.message).toContain("Failed to start server")
+        expect(alive(childA.pid)).toBe(false)
+        expect(alive(childB.pid)).toBe(false)
+        expect(readFileSync(markerOut, "utf8")).toBe("serve --register")
+        expect(bFile).not.toBe("")
+      } finally {
+        childA.kill()
+        childB.kill()
+        server.stop(true)
+        rmSync(serverFile, { force: true })
+      }
+    })
   }, 60_000)
 })
