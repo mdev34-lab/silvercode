@@ -272,6 +272,17 @@ function parsed(data: string): Chunk | undefined {
   return isRecord(value) ? (value as Chunk) : undefined
 }
 
+/** In-band provider error frame for a stream cut short before its completion. */
+function truncatedFrame() {
+  return `data: ${JSON.stringify({
+    error: {
+      code: "server_error",
+      message: "Zen stream ended before the completion finished",
+      type: "server_error",
+    },
+  })}\n\n`
+}
+
 function streamError(value: unknown) {
   const detail = isRecord(value) && typeof value["message"] === "string" ? value["message"] : JSON.stringify(value)
   return new ProviderError.ResponseStreamError(`Zen stream error: ${detail}`)
@@ -596,7 +607,11 @@ type StreamGuardInput = {
  * fails the stream instead of faking a normal stop.
  */
 function guardStream(response: Response, injectedOnly: Set<string>, input: StreamGuardInput = {}): Response {
-  if (injectedOnly.size === 0 || !response.body) return response
+  // No early return when there is nothing to strip: the truncation contract
+  // below applies to every streamed chat completion, and a caller whose
+  // catalog already carries the fingerprint tools (injectedOnly empty) would
+  // otherwise lose it.
+  if (!response.body) return response
 
   const reader = response.body.getReader()
   const decoder = new TextDecoder()
@@ -606,6 +621,14 @@ function guardStream(response: Response, injectedOnly: Set<string>, input: Strea
   let sawInjected = false
   let sawCaller = false
   let emittedContent = false
+  // Zen ends a completion with a finish-reason chunk followed by a `[DONE]`
+  // frame (same contract aggregate() enforces). A body that ends with neither
+  // was cut short; ending it cleanly would let the SDK synthesize a
+  // reason-less "unknown" finish and hide the interruption, so the cut is
+  // converted into the in-band provider error a real gateway failure
+  // produces - the caller's retry pipeline then recovers the turn.
+  let sawDone = false
+  let sawFinish = false
 
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
@@ -622,14 +645,15 @@ function guardStream(response: Response, injectedOnly: Set<string>, input: Strea
         }
         const data = trimmed.slice("data:".length).trim()
         if (data === "[DONE]") {
-          controller.enqueue(encoder.encode(line + "\n"))
-          return
-        }
-        if (slots.size === 0 && !data.includes('"tool_calls"')) {
+          sawDone = true
           controller.enqueue(encoder.encode(line + "\n"))
           return
         }
 
+        // Completion is proven only by a PARSED finish_reason (or the [DONE]
+        // frame above). A raw substring search would accept a truncated frame
+        // that dies inside the finish value, and generated content can itself
+        // quote the literal - both must still read as a cut stream.
         let chunk: unknown
         try {
           chunk = JSON.parse(data)
@@ -642,7 +666,11 @@ function guardStream(response: Response, injectedOnly: Set<string>, input: Strea
           return
         }
 
+        let modified = false
         for (const choice of chunk["choices"] as Array<Record<string, unknown>>) {
+          if (isRecord(choice) && choice["finish_reason"] !== undefined && choice["finish_reason"] !== null) {
+            sawFinish = true
+          }
           if (!isRecord(choice)) continue
           const delta = choice["delta"]
           if (isRecord(delta) && delta["content"]) emittedContent = true
@@ -673,6 +701,7 @@ function guardStream(response: Response, injectedOnly: Set<string>, input: Strea
             if (kept.length !== fragments.length) {
               if (kept.length > 0) delta["tool_calls"] = kept
               else delete delta["tool_calls"]
+              modified = true
             }
           }
           if (choice["finish_reason"] === "tool_calls" && sawInjected && !sawCaller) {
@@ -683,11 +712,13 @@ function guardStream(response: Response, injectedOnly: Set<string>, input: Strea
               else choice["delta"] = { content: "" }
               emittedContent = true
             }
+            modified = true
           }
         }
 
-        const out = `data: ${JSON.stringify(chunk)}\n`
-        controller.enqueue(encoder.encode(out))
+        // Unmodified frames keep their original bytes; only a frame the
+        // guard actually rewrote is re-serialized.
+        controller.enqueue(encoder.encode(modified ? `data: ${JSON.stringify(chunk)}\n` : line + "\n"))
       }
 
       let buffer = ""
@@ -703,6 +734,9 @@ function guardStream(response: Response, injectedOnly: Set<string>, input: Strea
             if (buffer.length > 0) {
               processLine(buffer)
             }
+            if (!sawDone && !sawFinish && !signal?.aborted) {
+              controller.enqueue(encoder.encode(truncatedFrame()))
+            }
             controller.close()
             break
           }
@@ -714,7 +748,17 @@ function guardStream(response: Response, injectedOnly: Set<string>, input: Strea
           }
         }
       } catch (err) {
-        controller.error(err)
+        // An aborted read is the caller's own cancel, and a ResponseStreamError
+        // is this guard's own deliberate failure (e.g. the required-tool_choice
+        // contract): both keep the original error path. A genuine transport
+        // failure mid-stream becomes the same in-band truncation error as the
+        // cut EOF above, so the SDK cannot mistake it for a clean completion.
+        if (signal?.aborted || err instanceof ProviderError.ResponseStreamError) {
+          controller.error(err)
+        } else {
+          controller.enqueue(encoder.encode(truncatedFrame()))
+          controller.close()
+        }
       } finally {
         signal?.removeEventListener("abort", cancel)
         watch?.clear()

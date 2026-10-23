@@ -21,6 +21,8 @@ import { SessionSummary } from "./summary"
 import type { Provider } from "@/provider/provider"
 import { Question } from "@/question"
 import { ProviderError } from "@/provider/error"
+import { GenerationLimit } from "./llm/generation-limit"
+import { RepetitionGuard } from "./llm/repetition-guard"
 import { errorMessage } from "@/util/error"
 import { isRecord } from "@/util/record"
 import { EventV2Bridge } from "@/event-v2-bridge"
@@ -122,16 +124,21 @@ const layer = Layer.effect(
       let aborted = false
       // Set from every step-finish event. A stream that ends with no
       // step-finish died instead of completing - without this check the turn
-      // ends silently with no error and no retry. An "unknown" reason alone
-      // is not proof of a drop: it means the provider transmitted no finish
-      // reason (per the provider-spec contract), which a completed response
-      // may also do, so the usage accounting below disambiguates.
+      // ends silently with no error and no retry. An "unknown" reason is NOT
+      // death: it means the provider transmitted no finish reason (per the
+      // provider-spec contract), which a completed response may legitimately
+      // do, and retrying a completed response replays its tool calls. Genuine
+      // interruptions must be detected at the provider's transport layer
+      // (e.g. the Zen adapter's [DONE]-framing guard), which surfaces them as
+      // stream errors this pipeline already retries.
       let stepFinishReason: string | undefined = undefined
-      // Set from every step-finish event. A completed response carries the
-      // provider's usage accounting (opencode requests includeUsage for
-      // openai-compatible models) even when the provider omitted the finish
-      // reason itself; a dropped stream never receives the usage chunk.
-      let stepFinishUsage: Usage | undefined = undefined
+      // Set when this attempt's stream carried any tool activity. A retry
+      // re-issues THIS step's request; results from already-completed steps
+      // ride that request's history, but a result produced mid-step never
+      // lands in it, so the provider would issue the call again and repeat
+      // its side effects. An attempt that touched tools is therefore never
+      // retried; a text-only attempt is always safe to.
+      let sawToolActivity = false
       const clock = createGenerationClock()
 
       const parse = (e: unknown) =>
@@ -405,6 +412,7 @@ const layer = Layer.effect(
           }
 
           case "tool-call": {
+            sawToolActivity = true
             if (ctx.assistantMessage.summary) {
               throw new Error(`Tool call not allowed while generating summary: ${value.name}`)
             }
@@ -462,6 +470,7 @@ const layer = Layer.effect(
           }
 
           case "tool-result": {
+            sawToolActivity = true
             const toolCall = yield* readToolCall(value.id)
             if (!toolCall && value.result.type === "error") return
             if (value.result.type === "error") {
@@ -495,6 +504,7 @@ const layer = Layer.effect(
           }
 
           case "tool-error": {
+            sawToolActivity = true
             yield* failToolCall(value.id, value.error ?? new Error(value.message))
             return
           }
@@ -521,7 +531,6 @@ const layer = Layer.effect(
 
           case "step-finish": {
             stepFinishReason = value.reason
-            stepFinishUsage = value.usage
             const completedSnapshot = yield* snapshot.track()
             yield* Effect.forEach(Object.keys(ctx.reasoningMap), finishReasoning)
             const usage = Session.getUsage({
@@ -738,7 +747,7 @@ const layer = Layer.effect(
           yield* Effect.gen(function* () {
             ctx.currentText = undefined
             stepFinishReason = undefined
-            stepFinishUsage = undefined
+            sawToolActivity = false
             // A retry after a stalled or failed stream must not leave the previous attempt's thought open.
             yield* Effect.forEach(Object.keys(ctx.reasoningMap), finishReasoning)
             ctx.reasoningMap = {}
@@ -755,25 +764,12 @@ const layer = Layer.effect(
               Stream.takeUntil(() => ctx.needsCompaction),
               Stream.runDrain,
             )
-            // A stream that ended without a definitive finish reason died
+            // A stream that ended without any step-finish died
             // mid-generation. Route it into the retry pipeline as a stream
             // error; aborts and compaction takeUntil are legitimate early
-            // ends and stay untouched. "unknown" means the provider
-            // transmitted no finish reason - that happens on a dropped
-            // stream, but a provider may also complete a response without
-            // the metadata, and retrying a completed response would replay
-            // its work. The usage accounting is the lifecycle signal: it
-            // arrives only with a completed response, never with a drop.
-            const usageReported =
-              stepFinishUsage !== undefined &&
-              ((stepFinishUsage.totalTokens ?? 0) > 0 ||
-                (stepFinishUsage.inputTokens ?? 0) > 0 ||
-                (stepFinishUsage.outputTokens ?? 0) > 0)
-            if (
-              !aborted &&
-              !ctx.needsCompaction &&
-              (stepFinishReason === undefined || (stepFinishReason === "unknown" && !usageReported))
-            ) {
+            // ends and stay untouched, and an "unknown" finish reason is a
+            // completed response whose provider omitted metadata, not a death.
+            if (!aborted && !ctx.needsCompaction && stepFinishReason === undefined) {
               return yield* Effect.fail(
                 new ProviderError.ResponseStreamError("response stream ended without a finish reason"),
               )
@@ -789,7 +785,35 @@ const layer = Layer.effect(
             ),
             Effect.catchCauseIf(
               (cause) => !Cause.hasInterruptsOnly(cause),
-              (cause) => Effect.fail(Cause.squash(cause)),
+              (cause) => {
+                const squashed = Cause.squash(cause)
+                // A stream that dies mid-step after tool activity must
+                // surface as a terminal interruption, not a retry: the retry
+                // re-issues this step's request without the results those
+                // calls produced, so the provider would issue them again and
+                // repeat their side effects. Text-only attempts stay on the
+                // normal retry path - replaying them regenerates words, never
+                // actions. Classifications the rest of the pipeline depends
+                // on (context overflow drives compaction; the generation cap
+                // and repetition guard must keep their own messages; aborts
+                // are the caller's own) are never re-labeled.
+                const message = squashed instanceof Error ? squashed.message : String(squashed)
+                if (
+                  sawToolActivity &&
+                  !(squashed instanceof DOMException && squashed.name === "AbortError") &&
+                  !SessionV1.ContextOverflowError.isInstance(squashed) &&
+                  !message.includes(GenerationLimit.GENERATION_LIMIT_MESSAGE) &&
+                  !message.includes(RepetitionGuard.REPETITION_MESSAGE)
+                ) {
+                  return Effect.fail(
+                    new ProviderError.StreamInterruptedAfterToolCallError(
+                      "Response stream interrupted after tool calls were issued; the turn was not retried so tool side effects are not repeated. Continue the conversation to resume.",
+                      { cause: squashed },
+                    ),
+                  )
+                }
+                return Effect.fail(squashed)
+              },
             ),
             Effect.retry(
               SessionRetry.policy({

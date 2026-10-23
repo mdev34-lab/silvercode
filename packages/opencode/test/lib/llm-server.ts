@@ -542,6 +542,23 @@ export class Reply {
     return this
   }
 
+  /**
+   * In-band provider error frame: the shape a gateway emits when it reports a
+   * failure inside the SSE stream itself (as opposed to a transport drop).
+   * The Zen adapter converts transport cuts into this same frame.
+   */
+  cut(message: unknown = "boom") {
+    this.#finish = undefined
+    this.#hang = false
+    this.#error = undefined
+    this.#reset = false
+    this.#tail = [
+      ...this.#tail,
+      { error: { code: "server_error", message: typeof message === "string" ? message : "boom", type: "server_error" } },
+    ]
+    return this
+  }
+
   reset() {
     this.#finish = undefined
     this.#hang = false
@@ -656,6 +673,7 @@ namespace TestLLMServer {
     readonly toolHang: (name: string, input: unknown) => Effect.Effect<void>
     readonly reason: (value: string, opts?: { text?: string; usage?: Usage }) => Effect.Effect<void>
     readonly fail: (message?: unknown) => Effect.Effect<void>
+    readonly cut: (message?: unknown) => Effect.Effect<void>
     readonly error: (status: number, body: unknown, headers?: Record<string, string>) => Effect.Effect<void>
     readonly hang: Effect.Effect<void>
     readonly hold: (value: string, wait: PromiseLike<unknown>) => Effect.Effect<void>
@@ -786,6 +804,9 @@ export class TestLLMServer extends Context.Service<TestLLMServer, TestLLMServer.
         }),
         fail: Effect.fn("TestLLMServer.fail")(function* (message: unknown = "boom") {
           queue(reply().streamError(message).item())
+        }),
+        cut: Effect.fn("TestLLMServer.cut")(function* (message: unknown = "Zen stream ended before the completion finished") {
+          queue(reply().cut(message).item())
         }),
         error: Effect.fn("TestLLMServer.error")(function* (
           status: number,
