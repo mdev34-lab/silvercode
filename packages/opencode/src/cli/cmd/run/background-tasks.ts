@@ -13,6 +13,9 @@ export const make = (rootSessionID: string) => {
   // Latest launch attribution per session, for the reachability walk.
   const parents = new Map<string, string>()
   const resolved = new Set<string>()
+  // Task part IDs are stable across event replay, even on older servers that
+  // do not emit run IDs. A real task_id resume has its own task part.
+  const launchParts = new Set<string>()
 
   const known = (sessionID: string): boolean => {
     const seen = new Set<string>()
@@ -31,8 +34,12 @@ export const make = (rootSessionID: string) => {
       .map(([, entry]) => entry.sessionID)
 
   return {
-    launch(input: { sessionID: string; parentSessionID: string; run?: string }) {
+    launch(input: { sessionID: string; parentSessionID: string; run?: string; launchID?: string }) {
       if (input.sessionID === rootSessionID) return false
+      if (input.launchID !== undefined) {
+        if (launchParts.has(input.launchID)) return false
+        launchParts.add(input.launchID)
+      }
       parents.set(input.sessionID, input.parentSessionID)
       const key = input.run ?? input.sessionID
       // Explicit execution keys stay idempotent after delivery. Legacy keys

@@ -756,7 +756,7 @@ export const RunCommand = effectCmd({
                     "metadata" in part.state && typeof part.state.metadata?.runId === "string"
                       ? part.state.metadata.runId
                       : undefined
-                  background.launch({ sessionID: taskID!, parentSessionID: part.sessionID, run })
+                  background.launch({ sessionID: taskID!, parentSessionID: part.sessionID, run, launchID: part.id })
                 }
               }
               if (part.type === "text") {
