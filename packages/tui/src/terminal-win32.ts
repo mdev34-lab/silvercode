@@ -93,13 +93,19 @@ export function win32InstallCtrlCGuard(stdin: NodeJS.ReadStream = process.stdin)
   if (unhook) return unhook
   const source = consoleInput(stdin)
   if (!source) return
-  const original = stdin.setRawMode
+  let original: NodeJS.ReadStream["setRawMode"]
   const handle = source.handle
   const buf = new Uint32Array(1)
 
-  if (k32!.symbols.GetConsoleMode(handle, ptr(buf)) === 0) {
+  try {
+    original = stdin.setRawMode
+    if (k32!.symbols.GetConsoleMode(handle, ptr(buf)) === 0) {
+      source.close()
+      return
+    }
+  } catch (error) {
     source.close()
-    return
+    throw error
   }
   const initial = buf[0]!
   let done = false

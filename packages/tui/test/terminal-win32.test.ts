@@ -16,6 +16,8 @@ function fixture(
     modeFails?: boolean
     intervalThrows?: boolean
     rawThrows?: boolean
+    getterThrows?: boolean
+    probeThrows?: boolean
   } = {},
 ) {
   let mode = 7
@@ -23,6 +25,7 @@ function fixture(
   const closed: number[] = []
   const reads: number[] = []
   const writes: number[][] = []
+  const order: string[] = []
   const immediates: (() => void)[] = []
   const intervals = new Set<() => void>()
   let raw = 0
@@ -48,6 +51,19 @@ function fixture(
         throw new Error("raw setter failed")
       },
     })
+  let getterFails = input.getterThrows
+  if (input.getterThrows)
+    Object.defineProperty(conin, "setRawMode", {
+      get: () => {
+        if (getterFails) {
+          getterFails = false
+          throw new Error("raw getter failed")
+        }
+        return original
+      },
+      set: () => {},
+    })
+  let probeFails = input.probeThrows
   const api = vm.runInNewContext(
     `(() => { ${source}; return { win32InstallCtrlCGuard, win32DisableProcessedInput } })()`,
     {
@@ -63,15 +79,21 @@ function fixture(
             },
             CloseHandle: (handle: number) => {
               closed.push(handle)
+              order.push("close")
               return 1
             },
             GetConsoleMode: (handle: number, buf: Uint32Array) => {
               reads.push(handle)
+              if (probeFails) {
+                probeFails = false
+                throw new Error("console mode probe failed")
+              }
               buf[0] = mode
               return input.modeFails ? 0 : 1
             },
             SetConsoleMode: (handle: number, next: number) => {
               writes.push([handle, next])
+              order.push(`mode:${next}`)
               mode = next
               return 1
             },
@@ -89,6 +111,7 @@ function fixture(
   )
   return {
     api,
+    order,
     stdin,
     conin,
     original,
@@ -130,6 +153,7 @@ test("guards the renderer CONIN$ stream when process stdin is redirected", () =>
   expect(f.conin.setRawMode).toBe(f.original)
   expect(f.mode).toBe(7)
   expect(f.closed).toEqual([22])
+  expect(f.order.slice(-2)).toEqual(["mode:7", "close"])
   expect(f.intervals.size).toBe(0)
   const reads = f.reads.length
   for (const immediate of f.immediates) immediate()
@@ -184,5 +208,21 @@ for (const failure of ["rawThrows", "intervalThrows"] as const) {
     const reads = f.reads.length
     for (const immediate of f.immediates) immediate()
     expect(f.reads.length).toBe(reads)
+  })
+}
+
+for (const failure of ["getterThrows", "probeThrows"] as const) {
+  test(`closes the owned console handle when initial ${failure} throws`, () => {
+    const f = fixture({ [failure]: true })
+    expect(() => f.api.win32InstallCtrlCGuard(f.conin)).toThrow()
+    expect(f.closed).toEqual([22])
+    expect(f.order).toEqual(["close"])
+    expect(f.intervals.size).toBe(0)
+    // A failed probe must not leave a stale global unhook behind.
+    const retry = f.api.win32InstallCtrlCGuard(f.conin)
+    expect(typeof retry).toBe("function")
+    retry()
+    expect(f.closed).toEqual([22, 22])
+    expect(f.order.slice(-2)).toEqual(["mode:7", "close"])
   })
 }
