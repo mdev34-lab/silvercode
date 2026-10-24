@@ -160,6 +160,117 @@ describe("reasoning inactivity watchdog", () => {
     }),
   )
 
+  it.effect("does not time out while a local tool executes, then rearms after its result", () =>
+    Effect.gen(function* () {
+      const source = Stream.concat(
+        Stream.concat(
+          Stream.make(LLMEvent.toolCall({ id: "call-1", name: "bash", input: {} })),
+          Stream.fromEffect(
+            Effect.sleep("2 minutes").pipe(
+              Effect.as(LLMEvent.toolError({ id: "call-1", name: "bash", message: "finished with error" })),
+            ),
+          ),
+        ),
+        Stream.never,
+      )
+      const fiber = yield* ReasoningWatchdog.guard(source, { executableTools: new Set(["bash"]) }).pipe(
+        Stream.runDrain,
+        Effect.forkScoped({ startImmediately: true }),
+      )
+      yield* adjust("90 seconds")
+      yield* pending(fiber)
+      yield* adjust("30 seconds")
+      yield* pending(fiber)
+      yield* adjust("59 seconds")
+      yield* pending(fiber)
+      yield* adjust("1 second")
+      const error = yield* Fiber.join(fiber).pipe(Effect.flip)
+      expect(error).toBeInstanceOf(ProviderError.ResponseStreamError)
+    }),
+  )
+
+  it.effect("waits for every overlapping local tool and ignores unmatched settlements", () =>
+    Effect.gen(function* () {
+      const source = Stream.concat(
+        Stream.make(
+          LLMEvent.toolCall({ id: "a", name: "bash", input: {} }),
+          LLMEvent.toolCall({ id: "b", name: "bash", input: {} }),
+        ),
+        Stream.concat(
+          Stream.fromEffect(
+            Effect.sleep("90 seconds").pipe(Effect.as(LLMEvent.toolError({ id: "a", name: "bash", message: "done" }))),
+          ),
+          Stream.concat(
+            Stream.make(LLMEvent.toolError({ id: "unknown", name: "bash", message: "unmatched" })),
+            Stream.concat(
+              Stream.fromEffect(
+                Effect.sleep("90 seconds").pipe(
+                  Effect.as(LLMEvent.toolResult({ id: "b", name: "bash", result: { type: "text", value: "done" } })),
+                ),
+              ),
+              Stream.never,
+            ),
+          ),
+        ),
+      )
+      const fiber = yield* ReasoningWatchdog.guard(source, { executableTools: new Set(["bash"]) }).pipe(
+        Stream.runDrain,
+        Effect.forkScoped({ startImmediately: true }),
+      )
+      yield* adjust("90 seconds")
+      yield* pending(fiber)
+      yield* adjust("90 seconds")
+      yield* pending(fiber)
+      yield* adjust("59 seconds")
+      yield* pending(fiber)
+      yield* adjust("1 second")
+      expect(yield* Fiber.join(fiber).pipe(Effect.flip)).toBeInstanceOf(ProviderError.ResponseStreamError)
+    }),
+  )
+
+  for (const providerExecuted of [true, false]) {
+    it.effect(`does not suspend for ${providerExecuted ? "provider-executed" : "unavailable"} tool calls`, () =>
+      Effect.gen(function* () {
+        const source = hanging(
+          LLMEvent.toolCall({ id: "a", name: providerExecuted ? "bash" : "remote", input: {}, providerExecuted }),
+        )
+        const fiber = yield* ReasoningWatchdog.guard(source, { executableTools: new Set(["bash"]) }).pipe(
+          Stream.runDrain,
+          Effect.forkScoped({ startImmediately: true }),
+        )
+        yield* adjust(TIMEOUT)
+        expect(yield* Fiber.join(fiber).pipe(Effect.flip)).toBeInstanceOf(ProviderError.ResponseStreamError)
+      }),
+    )
+  }
+
+  it.effect("keeps the token deadline while tool arguments are still being generated", () =>
+    Effect.gen(function* () {
+      const source = hanging(
+        LLMEvent.toolInputStart({ id: "a", name: "bash" }),
+        LLMEvent.toolInputDelta({ id: "a", name: "bash", text: "{" }),
+      )
+      const fiber = yield* ReasoningWatchdog.guard(source, { executableTools: new Set(["bash"]) }).pipe(
+        Stream.runDrain,
+        Effect.forkScoped({ startImmediately: true }),
+      )
+      yield* adjust(TIMEOUT)
+      expect(yield* Fiber.join(fiber).pipe(Effect.flip)).toBeInstanceOf(ProviderError.ResponseStreamError)
+    }),
+  )
+
+  it.effect("keeps explicit cancellation effective during a tool", () =>
+    Effect.gen(function* () {
+      const fiber = yield* ReasoningWatchdog.guard(hanging(LLMEvent.toolCall({ id: "a", name: "bash", input: {} })), {
+        executableTools: new Set(["bash"]),
+      }).pipe(Stream.runDrain, Effect.forkScoped({ startImmediately: true }))
+      yield* adjust("2 minutes")
+      yield* pending(fiber)
+      yield* Fiber.interrupt(fiber)
+      expect(fiber.pollUnsafe()?._tag).toBe("Failure")
+    }),
+  )
+
   it.effect("recognizes summarized reasoning options and bypasses the guard", () =>
     Effect.gen(function* () {
       expect(ReasoningWatchdog.hasSummary({ reasoningSummary: "auto" })).toBe(true)
