@@ -15,6 +15,7 @@ import { BackgroundJob } from "@/background/job"
 import { isReviewAgent, LEGACY_REVIEW_AGENTS, resolveReviewer } from "../agent/review-agents"
 import { Agent } from "../agent/agent"
 import { Permission } from "@/permission"
+import { resultChunks, textResult, TEXT_RESULT_TAG } from "@/session/subagent-result"
 
 const DeclaredReasons = ["success", "waiting_for_subagent", "subagent_wait", "failure"] as const
 
@@ -48,8 +49,7 @@ export const Parameters = Schema.Struct({
       "Why the turn ends: success, waiting_for_subagent (yield while your own background subagents run, including from a subagent session), subagent_wait, or failure.",
   }),
   result: Schema.String.annotate({
-    description:
-      "Concise summary of the outcome, shown to the user.",
+    description: "Concise summary of the outcome, shown to the user.",
   }),
   validation: Schema.optional(
     Schema.Struct({
@@ -62,8 +62,7 @@ export const Parameters = Schema.Struct({
       ),
     }),
   ).annotate({
-    description:
-      "Optional validation evidence, one entry per check.",
+    description: "Optional validation evidence, one entry per check.",
   }),
 })
 
@@ -172,6 +171,23 @@ export const FinishTool = Tool.define(
           const messages = yield* sessions
             .messages({ sessionID: ctx.sessionID })
             .pipe(Effect.mapError((error) => new ToolFailure({ message: error.message })))
+          const currentMessage = messages.find((message) => message.info.id === ctx.messageID)
+          const chunks = currentMessage ? resultChunks(messages, currentMessage) : []
+          const ownerSession = yield* sessions
+            .get(ctx.sessionID)
+            .pipe(Effect.catchIf(NotFoundError.isInstance, () => Effect.succeed(undefined)))
+          const isChild =
+            ownerSession?.parentID !== undefined ||
+            (yield* background.list()).some(
+              (job) => job.type === "task" && BackgroundJob.runsSession(job, ctx.sessionID),
+            )
+          if (isChild && !isReviewAgent(ctx.agent) && !textResult([...chunks, params.result]).ok) {
+            return yield* Effect.fail(
+              new ToolFailure({
+                message: `Subagent finish rejected: emit a non-empty <${TEXT_RESULT_TAG}>final text result</${TEXT_RESULT_TAG}> envelope in this execution, or include it in finish.result, then call finish again. Progress text and tool output are not a delivered result.`,
+              }),
+            )
+          }
           // The Review subagent completes its run through this same finish
           // tool, so the structured review result is gated here, at the
           // control-flow boundary: without a parseable report envelope the
@@ -180,11 +196,7 @@ export const FinishTool = Tool.define(
           // never recursively reviewed by the effort policy below — their
           // own report contract is the whole gate.
           if (isReviewAgent(ctx.agent)) {
-            const currentMessage = messages.find((message) => message.info.id === ctx.messageID)
-            const delivery = ReviewReport.extract([
-              ...(currentMessage?.parts ?? []).flatMap((part) => (part.type === "text" ? [part.text] : [])),
-              params.result,
-            ])
+            const delivery = ReviewReport.extract([...chunks, params.result])
             if (!delivery.ok) {
               yield* Effect.logWarning("finish declined: review result missing or unparseable", {
                 sessionID: ctx.sessionID,
@@ -303,7 +315,8 @@ export const FinishTool = Tool.define(
               : yield* Effect.gen(function* () {
                   if (!session)
                     return {
-                      available: false as const, code: "session-unreadable" as const,
+                      available: false as const,
+                      code: "session-unreadable" as const,
                       reason: "the session could not be read to verify reviewer dispatch context",
                     }
                   // One reviewer exists after the specialist consolidation:
@@ -313,12 +326,14 @@ export const FinishTool = Tool.define(
                   const reviewer = yield* agents.get(resolved)
                   if (!reviewer)
                     return {
-                      available: false as const, code: "reviewer-missing" as const,
+                      available: false as const,
+                      code: "reviewer-missing" as const,
                       reason: `reviewer agent "${resolved}" is not available`,
                     }
                   if (reviewer.mode === "primary")
                     return {
-                      available: false as const, code: "reviewer-missing" as const,
+                      available: false as const,
+                      code: "reviewer-missing" as const,
                       reason: `reviewer agent "${resolved}" is a primary agent and cannot be delegated to`,
                     }
                   // The dispatch permission gate asks through `ctx.ask`,
@@ -332,7 +347,8 @@ export const FinishTool = Tool.define(
                   const caller = yield* agents.get(ctx.agent)
                   if (!caller)
                     return {
-                      available: false as const, code: "caller-unreadable" as const,
+                      available: false as const,
+                      code: "caller-unreadable" as const,
                       reason: `running agent "${ctx.agent}" could not be read to verify its dispatch permissions`,
                     }
                   const ruleset = Permission.merge(caller.permission, session.permission ?? [])
@@ -353,7 +369,8 @@ export const FinishTool = Tool.define(
                   const bypassAgentCheck = ctx.extra?.bypassAgentCheck === true
                   if (!bypassAgentCheck && (yield* permission.denies({ permission: "task", patterns, ruleset })))
                     return {
-                      available: false as const, code: "permission-denied" as const,
+                      available: false as const,
+                      code: "permission-denied" as const,
                       reason: `permission config denies task "${resolved}"`,
                     }
                   let depth = 0
@@ -365,7 +382,8 @@ export const FinishTool = Tool.define(
                       .pipe(Effect.catchIf(NotFoundError.isInstance, () => Effect.succeed(undefined)))
                     if (!parent)
                       return {
-                        available: false as const, code: "session-unreadable" as const,
+                        available: false as const,
+                        code: "session-unreadable" as const,
                         reason: "session ancestry could not be read to verify the subagent depth limit",
                       }
                     current = parent
@@ -375,13 +393,15 @@ export const FinishTool = Tool.define(
                   const latestUser = messages.findLast((message) => message.info.role === "user")
                   if (latestUser?.info.role === "user" && latestUser.info.tools?.task === false)
                     return {
-                      available: false as const, code: "task-hidden" as const,
+                      available: false as const,
+                      code: "task-hidden" as const,
                       reason: "the newest user message hides the task tool for this turn",
                     }
                   const depthLimit = cfg.subagent_depth ?? 1
                   if (depth >= depthLimit)
                     return {
-                      available: false as const, code: "subagent-depth" as const,
+                      available: false as const,
+                      code: "subagent-depth" as const,
                       reason: `subagent depth limit reached (${depthLimit})`,
                     }
                   return { available: true as const }
@@ -396,7 +416,8 @@ export const FinishTool = Tool.define(
             ...(availability.available ? {} : { unavailableCode: availability.code }),
             // #233 handoff: a child that cannot dispatch review because of the depth limit hands
             // its unreviewed writes to its parent (review-pending), never claims approval.
-            handoff: !availability.available && session?.parentID !== undefined && availability.code === "subagent-depth",
+            handoff:
+              !availability.available && session?.parentID !== undefined && availability.code === "subagent-depth",
           })
 
           if (!outcome.deliver) {
