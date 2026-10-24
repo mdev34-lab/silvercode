@@ -339,23 +339,33 @@ it.instance(
     Effect.gen(function* () {
       const events = yield* EventV2Bridge.Service
       const release = yield* Deferred.make<void, never>()
+      const announced = yield* Deferred.make<number>()
       const unsub = yield* events.listen((event) =>
-        event.type === Permission.Event.Asked.type ? Deferred.await(release) : Effect.void,
+        Effect.gen(function* () {
+          if (event.type !== Permission.Event.Asked.type) return
+          const request = event.data as PermissionV1.Request
+          if (request.id !== PermissionV1.ID.make("per_timeout_slow_asked")) return
+          yield* Deferred.succeed(announced, request.expiresAt ?? 0)
+          yield* Deferred.await(release)
+        }),
       )
       yield* Effect.addFinalizer(() => unsub)
 
-      const fiber = yield* ask(bash("per_timeout_slow_asked")).pipe(Effect.forkScoped)
-      // A request is registered before it is announced, so it is observable here even
-      // though the ask fiber is still sitting inside the publish.
-      yield* waitForPending(1)
+      return yield* Effect.gen(function* () {
+        const fiber = yield* ask(bash("per_timeout_slow_asked")).pipe(Effect.forkScoped)
+        // Unlike pending membership, this signal survives the deadline. A delayed
+        // observer must not miss the request it is trying to test.
+        const expiresAt = yield* Deferred.await(announced).pipe(Effect.timeout("1 second"))
+        expect(expiresAt).toBeGreaterThan(0)
+        yield* Effect.sleep(Math.max(0, expiresAt - Date.now()) + 500)
+        expect(yield* list()).toHaveLength(0)
+        expect(fiber.pollUnsafe()).toBeUndefined()
 
-      yield* Effect.sleep("1500 millis")
-      expect(yield* list()).toHaveLength(0)
-
-      yield* Deferred.succeed(release, undefined)
-      const exit = yield* Fiber.await(fiber)
-      if (Exit.isSuccess(exit)) throw new Error("expected the unanswered prompt to be denied")
-      expect(Cause.squash(exit.cause)).toBeInstanceOf(PermissionV1.TimedOutError)
+        yield* Deferred.succeed(release, undefined)
+        const exit = yield* Fiber.await(fiber)
+        if (Exit.isSuccess(exit)) throw new Error("expected the unanswered prompt to be denied")
+        expect(Cause.squash(exit.cause)).toBeInstanceOf(PermissionV1.TimedOutError)
+      }).pipe(Effect.ensuring(Deferred.succeed(release, undefined)))
     }),
   { git: true, config: countdown },
 )
