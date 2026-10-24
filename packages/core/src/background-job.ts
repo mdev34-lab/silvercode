@@ -73,6 +73,11 @@ export type StartInput = {
   id?: string
   type: string
   title?: string
+  /**
+   * Producer-owned live metadata for this run. The registry retains this object
+   * through promotion, so late evidence remains visible. Observation results
+   * shallow-copy it; nested values are not isolated snapshots.
+   */
   metadata?: Record<string, unknown>
   onPromote?: Effect.Effect<void>
   run: Effect.Effect<string, unknown>
@@ -364,7 +369,9 @@ export const make = Effect.gen(function* () {
           onPromote: undefined,
           info: {
             ...job.info,
-            metadata: { ...job.info.metadata, background: true },
+            // start retains producer-owned metadata. Keep that ownership
+            // through promotion so later evidence reaches registry consumers.
+            metadata: Object.assign(job.info.metadata ?? {}, { background: true }),
           },
         }
         return [
