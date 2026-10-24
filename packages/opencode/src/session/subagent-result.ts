@@ -28,17 +28,30 @@ export function resultChunks(messages: readonly SessionV1.WithParts[], current: 
 
 /** A text envelope has no JSON escaping burden; the last complete result must be non-empty. */
 export function textResult(chunks: readonly (string | undefined)[]) {
-  const source = chunks.filter((text): text is string => typeof text === "string").join("\n")
-  const start = source.lastIndexOf(`<${TEXT_RESULT_TAG}>`)
-  const close = source.lastIndexOf(`</${TEXT_RESULT_TAG}>`)
-  if (start < 0 || close < start) return { ok: false as const }
-  const prefix = source.slice(0, start)
-  // No nested opening tag may remain unclosed before the final result.
-  if ((prefix.match(/<silvercode-result>/g)?.length ?? 0) !== (prefix.match(/<\/silvercode-result>/g)?.length ?? 0))
-    return { ok: false as const }
-  const text = source.slice(start + TEXT_RESULT_TAG.length + 2, close).trim()
-  if (text.includes(`</${TEXT_RESULT_TAG}>`)) return { ok: false as const }
-  return text ? { ok: true as const, text } : { ok: false as const }
+  for (const source of [...chunks].reverse()) {
+    if (typeof source !== "string") continue
+    const open = `<${TEXT_RESULT_TAG}>`
+    const close = `</${TEXT_RESULT_TAG}>`
+    if (!source.includes(open) && !source.includes(close)) continue
+    let depth = 0
+    let nested = false
+    let begin = 0
+    let result: string | undefined
+    for (const match of source.matchAll(/<\/?silvercode-result>/g)) {
+      if (match[0] === open) {
+        if (depth > 0) nested = true
+        else { begin = match.index! + open.length; nested = false }
+        depth++
+      } else if (depth > 0) {
+        depth--
+        if (depth === 0) result = nested ? undefined : source.slice(begin, match.index).trim()
+      } else result = undefined
+    }
+    // A malformed latest result needs correction, but cannot poison a later
+    // assistant text part or finish.result containing a complete replacement.
+    return depth === 0 && result ? { ok: true as const, text: result } : { ok: false as const }
+  }
+  return { ok: false as const }
 }
 
 export function renderTextResult(text: string) {

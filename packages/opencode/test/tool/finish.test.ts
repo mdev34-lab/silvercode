@@ -1842,3 +1842,20 @@ describe("tool.finish - mandatory generic subagent result", () => {
     }),
   )
 })
+
+it.instance("a subagent can correct a rejected malformed result through finish.result", () =>
+  Effect.gen(function* () {
+    const { chat, assistant } = yield* seedSession("child", "general", SessionID.make("ses_parent"))
+    const sessions = yield* Session.Service
+    const next = { ...assistant, id: MessageID.ascending() }
+    yield* sessions.updateMessage(next)
+    yield* sessions.updatePart({ id: PartID.ascending(), messageID: next.id, sessionID: chat.id,
+      type: "text", text: "<silvercode-result>unfinished" })
+    const def = yield* (yield* FinishTool).init()
+    const ctx = { ...workCtx(chat.id, next.id), agent: "general" }
+    const failure = reviewFailure(yield* def.execute({ reason: "failure", result: "done" }, ctx).pipe(Effect.exit))
+    expect(failure?.message).toContain("Subagent finish rejected")
+    const corrected = yield* def.execute({ reason: "failure", result: "<silvercode-result>Corrected final result.</silvercode-result>" }, ctx)
+    expect(corrected.title).toBe("Task completed")
+  }),
+)

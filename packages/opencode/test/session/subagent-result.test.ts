@@ -75,3 +75,11 @@ test("rejects nested tags and an unfinished newer result instead of using stale 
   expect(textResult(["<silvercode-result>outer<silvercode-result>inner</silvercode-result></silvercode-result>"])).toEqual({ ok: false })
   expect(textResult([renderTextResult("earlier"), "<silvercode-result>unfinished"])).toEqual({ ok: false })
 })
+
+test("a corrected later envelope recovers after an unfinished earlier assistant result", () => {
+  expect(textResult(["<silvercode-result>unfinished", renderTextResult("corrected")])).toEqual({ ok: true, text: "corrected" })
+})
+
+test("a corrected later envelope recovers after a stray closing tag", () => {
+  expect(textResult(["</silvercode-result>", renderTextResult("corrected")])).toEqual({ ok: true, text: "corrected" })
+})
