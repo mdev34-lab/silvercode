@@ -1278,6 +1278,7 @@ describe("session.compaction.process", () => {
       const stub = llm()
       const entered = Deferred.makeUnsafe<void>()
       const release = Deferred.makeUnsafe<void>()
+      const premature: boolean[] = []
       const snapshotLayer = Layer.effect(
         Snapshot.Service,
         Effect.gen(function* () {
@@ -1288,6 +1289,8 @@ describe("session.compaction.process", () => {
               Effect.gen(function* () {
                 yield* Deferred.succeed(entered, undefined)
                 yield* Deferred.await(release)
+                // Observe entry to real cleanup, not its slow completion.
+                premature.push(!(yield* Deferred.isDone(release)))
                 return yield* actual.patch(hash)
               }),
           })
@@ -1345,8 +1348,12 @@ describe("session.compaction.process", () => {
         const interrupt = yield* Fiber.interrupt(fiber).pipe(Effect.forkChild)
         const beforeRelease = yield* Effect.gen(function* () {
           yield* Deferred.await(entered).pipe(Effect.timeout("5 seconds"))
+          // Let the wrapper progress past its entry signal if the gate is missing.
+          yield* Effect.yieldNow
+          expect(premature).toEqual([])
           return interrupt.pollUnsafe()
-        }).pipe(Effect.ensuring(Deferred.succeed(release, undefined)))
+        })
+        yield* Deferred.succeed(release, undefined)
         expect(beforeRelease).toBeUndefined()
         yield* Fiber.join(interrupt).pipe(Effect.timeout("5 seconds"))
         const exit = yield* Fiber.await(fiber)
@@ -1357,7 +1364,12 @@ describe("session.compaction.process", () => {
           (part) => part.type === "patch" && part.files.some((file) => file.endsWith("during-retry.txt")),
         )
         expect(patch).toBeDefined()
-      }).pipe(withCompaction({ llm: stub.llmLayer, snapshot: snapshotLayer }))
+        expect(premature).toEqual([false])
+      }).pipe(
+        // Cover setup, readiness, interruption, and assertions before child teardown.
+        Effect.ensuring(Deferred.succeed(release, undefined)),
+        withCompaction({ llm: stub.llmLayer, snapshot: snapshotLayer }),
+      )
     },
     { git: true },
     { timeout: 10_000 },
