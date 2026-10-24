@@ -172,6 +172,9 @@ export class MockRegistry {
 
   private handle(req: http.IncomingMessage, res: http.ServerResponse) {
     const rawUrl = req.url || ""
+    if (process.env.OPENCODE_TEST_INSTALL_OWNER_DIAGNOSTICS === "1") {
+      console.log("INSTALL_OWNER", JSON.stringify({ phase: "registry-request", at: Date.now(), pid: process.pid, registry: this.url, method: req.method, path: req.url?.includes("opencode-ai") ? "plugin-package" : req.url?.includes("security/advisories") ? "npm-audit" : "other-redacted" }))
+    }
     this.requests.push({
       method: req.method || "GET",
       url: rawUrl,
