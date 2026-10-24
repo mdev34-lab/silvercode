@@ -86,7 +86,7 @@ describe("BackgroundJob", () => {
         run: Deferred.succeed(latch, undefined).pipe(Effect.andThen(Effect.never)),
       })
       yield* Deferred.await(latch)
-      const second = yield* jobs.start({ id: "ses_duplicate_start", type: "task", run: Ref.update(reruns, (n) => n + 1) })
+      const second = yield* jobs.start({ id: "ses_duplicate_start", type: "task", run: Ref.update(reruns, (n) => n + 1).pipe(Effect.as("rerun")) })
       expect(second).toMatchObject({ id: first.id, status: "running", started_at: first.started_at })
       yield* Effect.yieldNow
       expect(yield* Ref.get(reruns)).toBe(0)
