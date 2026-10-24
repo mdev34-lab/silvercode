@@ -5391,3 +5391,32 @@ it.instance("cancel while bash permission is pending cannot run the command on l
     expect(Exit.isFailure(late)).toBe(true)
     expect(yield* Effect.promise(() => Bun.file(file).exists())).toBe(false)
   }), { timeout: 20000 })
+it.instance("a child can finish on the next generation after writing its result envelope", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig((url) => ({
+      ...providerCfg(url),
+      agent: { general: { finishTool: true } },
+    }))
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const parent = yield* sessions.create({ title: "Parent" })
+    const child = yield* sessions.create({
+      title: "Child", parentID: parent.id,
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+    const plan = "Create the scene, place the camera, then validate the HTML."
+    yield* llm.push(reply().text(`<silvercode-result>${plan}</silvercode-result>`).tool("glob", { pattern: "*" }))
+    yield* llm.push(reply().tool("finish", { reason: "success", result: "Task completed" }).stop())
+    const result = yield* prompt.prompt({
+      sessionID: child.id, agent: "general", model: ref,
+      parts: [{ type: "text", text: "Plan the scene, inspect file names, then finish." }],
+    })
+    expect(yield* llm.calls).toBe(2)
+    expectCompletedFinish(result)
+    const history = yield* sessions.messages({ sessionID: child.id })
+    expect(history.some((message) => message.info.id !== result.info.id && message.parts.some(
+      (part) => part.type === "text" && part.text.includes(plan),
+    ))).toBe(true)
+    expectNoFinishNudge(history)
+  }),
+)

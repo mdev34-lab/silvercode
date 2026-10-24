@@ -155,7 +155,7 @@ function reply(input: SessionPrompt.PromptInput, text: string): SessionV1.WithPa
         messageID: id,
         sessionID: input.sessionID,
         type: "text",
-        text,
+        text: input.agent === "review" ? text : `<silvercode-result>${text || "No additional text."}</silvercode-result>`,
       },
     ],
   }
@@ -1516,7 +1516,7 @@ describe("tool.task", () => {
         expect(runs).toBe(1)
 
         yield* Deferred.succeed(done, undefined)
-        expect((yield* jobs.wait({ id: result.metadata.sessionId })).info?.output).toBe("background done")
+        expect((yield* jobs.wait({ id: result.metadata.sessionId })).info?.output).toBe("<silvercode-result>\nbackground done\n</silvercode-result>")
         expect((yield* Deferred.await(injected)).parts[0]?.type).toBe("text")
         expect(runs).toBe(1)
       }),
@@ -1620,14 +1620,14 @@ describe("tool.task", () => {
       expect(result.output).toContain("Background task updated")
       first.resolve()
       expect((yield* jobs.get(started.metadata.sessionId))?.status).toBe("running")
-      expect((yield* Effect.promise(() => updated.promise)).parts).toEqual([
+      expect((yield* Effect.promise(() => updated.promise)).parts).toEqual(expect.arrayContaining([
         { type: "text", text: "also inspect cancellation" },
-      ])
+      ]))
 
       second.resolve()
       const waited = yield* jobs.wait({ id: started.metadata.sessionId, timeout: 1_000 })
       expect(waited.info?.status).toBe("completed")
-      expect(waited.info?.output).toBe("second done")
+      expect(waited.info?.output).toBe("<silvercode-result>\nsecond done\n</silvercode-result>")
       const notification = yield* Effect.promise(() => injected.promise)
       expect(notification.variant).toBe("xhigh")
       expect(notification.parts[0]?.type).toBe("text")
@@ -1664,7 +1664,7 @@ describe("tool.task", () => {
       const waited = yield* jobs.wait({ id: result.metadata.sessionId, timeout: 1_000 })
       expect(waited.timedOut).toBe(false)
       expect(waited.info?.status).toBe("completed")
-      expect(waited.info?.output).toBe("background done")
+      expect(waited.info?.output).toBe("<silvercode-result>\nbackground done\n</silvercode-result>")
     }),
   )
 
@@ -2759,7 +2759,7 @@ describe("tool.task - storage failures", () => {
           )
           .pipe(Effect.exit)
         expect(Exit.isFailure(exit)).toBe(true)
-        expect(recovered).toBe(1)
+        expect(recovered).toBe(outcome === "completed" ? 2 : 1)
         expect(unsubscribed).toBe(1)
         expect((yield* jobs.get(child.id))?.status).toBe("error")
         expect(runExit && Exit.isFailure(runExit)).toBe(true)
@@ -3204,7 +3204,7 @@ it.instance("a child that yields for its own subagents keeps its job running and
               ...replied,
               parts: [
                 ...replied.parts,
-                finishPart(replied.info.id, input.sessionID, "waiting_for_subagent", "waiting"),
+                finishPart(replied.info.id, input.sessionID, "waiting_for_subagent", "<silvercode-result>Delegated work is pending.</silvercode-result>"),
               ],
             }
           })
@@ -3419,7 +3419,7 @@ it.instance(
             const finish = yield* (yield* FinishTool).init()
             const accepted = yield* Effect.orDie(
               finish.execute(
-                { reason: "waiting_for_subagent", result: "waiting" },
+                { reason: "waiting_for_subagent", result: "<silvercode-result>Delegated work is pending.</silvercode-result>" },
                 {
                   sessionID: input.sessionID,
                   messageID: dispatch.id,
@@ -3432,7 +3432,7 @@ it.instance(
               ),
             )
             expect(accepted.metadata.waiting).toBe(true)
-            const part = finishPart(dispatch.id, input.sessionID, "waiting_for_subagent", "waiting")
+            const part = finishPart(dispatch.id, input.sessionID, "waiting_for_subagent", "<silvercode-result>Delegated work is pending.</silvercode-result>")
             if (part.state.status === "completed") {
               part.state.output = accepted.output
               part.state.metadata = accepted.metadata
@@ -3672,7 +3672,7 @@ testEffect(layer({}, [], [SessionPrompt.node])).instance(
             const finish = yield* (yield* FinishTool).init()
             const accepted = yield* Effect.orDie(
               finish.execute(
-                { reason: "waiting_for_subagent", result: "waiting" },
+                { reason: "waiting_for_subagent", result: "<silvercode-result>Delegated work is pending.</silvercode-result>" },
                 {
                   sessionID: input.sessionID,
                   messageID: dispatch.id,
@@ -3685,7 +3685,7 @@ testEffect(layer({}, [], [SessionPrompt.node])).instance(
               ),
             )
             expect(accepted.metadata.waiting).toBe(true)
-            const part = finishPart(dispatch.id, input.sessionID, "waiting_for_subagent", "waiting")
+            const part = finishPart(dispatch.id, input.sessionID, "waiting_for_subagent", "<silvercode-result>Delegated work is pending.</silvercode-result>")
             if (part.state.status === "completed") {
               part.state.output = accepted.output
               part.state.metadata = accepted.metadata
@@ -3911,7 +3911,7 @@ for (const teardown of [false, true]) {
               const finish = yield* (yield* FinishTool).init()
               const accepted = yield* Effect.orDie(
                 finish.execute(
-                  { reason: "waiting_for_subagent", result: "waiting" },
+                  { reason: "waiting_for_subagent", result: "<silvercode-result>Delegated work is pending.</silvercode-result>" },
                   {
                     sessionID: input.sessionID,
                     messageID: dispatch.id,
@@ -3924,7 +3924,7 @@ for (const teardown of [false, true]) {
                 ),
               )
               expect(accepted.metadata.waiting).toBe(true)
-              const part = finishPart(dispatch.id, input.sessionID, "waiting_for_subagent", "waiting")
+              const part = finishPart(dispatch.id, input.sessionID, "waiting_for_subagent", "<silvercode-result>Delegated work is pending.</silvercode-result>")
               if (part.state.status === "completed") {
                 part.state.output = accepted.output
                 part.state.metadata = accepted.metadata
@@ -4031,6 +4031,64 @@ describe("tool.task delegation enumeration", () => {
     expect(makeParameters("same input")).toBe(makeParameters("same input"))
   })
 })
+
+it.instance(
+  "delivers a prior assistant plan to the parent rather than only the finish marker",
+  () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const plan = "Create a camera, build the scene, then validate the HTML."
+      const result = yield* def.execute(
+        { description: "plan the scene", prompt: "plan the scene", subagent_type: "general", background: false },
+        {
+          sessionID: chat.id,
+          messageID: assistant.id,
+          agent: "work",
+          abort: new AbortController().signal,
+          messages: [],
+          metadata: () => Effect.void,
+          ask: () => Effect.void,
+          extra: {
+            promptOps: {
+              ...stubOps(),
+              prompt: (input: SessionPrompt.PromptInput) =>
+                Effect.gen(function* () {
+                  const user = yield* sessions.updateMessage({
+                    id: input.messageID!,
+                    role: "user",
+                    sessionID: input.sessionID,
+                    agent: "general",
+                    model: ref,
+                    time: { created: Date.now() },
+                  })
+                  const first = reply({ ...input, messageID: user.id }, plan)
+                  yield* sessions.updateMessage(first.info)
+                  for (const part of first.parts) yield* sessions.updatePart(part)
+                  const last = replyParts({ ...input, messageID: user.id }, [""])
+                  yield* sessions.updateMessage(last.info)
+                  const finish: SessionV1.ToolPart = {
+                  id: PartID.ascending(), messageID: last.info.id, sessionID: input.sessionID,
+                  type: "tool", tool: "finish", callID: "finish-plan",
+                  state: { status: "completed", input: { reason: "success", result: "Task completed" },
+                    output: "Task completed", title: "finish", metadata: {},
+                    time: { start: Date.now(), end: Date.now() } },
+                }
+                  yield* sessions.updatePart(finish)
+                  return { info: last.info, parts: [...last.parts, finish] }
+                }),
+            },
+          },
+        },
+      )
+      expect(result.output).toContain(`<silvercode-result>\n${plan}\n</silvercode-result>`)
+      expect(result.output).not.toContain("Task completed</task_result>")
+      expect(result.output).toContain('<termination reason="success"')
+    }),
+  { config: FOREGROUND },
+)
 
 it.instance("does not report a provider-failed child assistant as successful empty output", () =>
   Effect.gen(function* () {

@@ -23,6 +23,7 @@ const GRANDCHILD_PROMPT = "do the nested work"
 const GRANDCHILD_RESULT = "grandchild answer GRANDONLY_OK"
 const CHILD_RESULT = "child answer CHILDONLY_OK"
 const ROOT_ANSWER = "ROOT_FINAL_OK"
+const resultEnvelope = (text: string) => `<silvercode-result>${text}</silvercode-result>`
 
 type Message = { role?: string; content?: unknown }
 type Body = { messages?: Message[] }
@@ -32,7 +33,11 @@ const messages = (body: Body) => body.messages ?? []
 const last = (body: Body) => messages(body)[messages(body).length - 1]
 const lastText = (body: Body) => {
   const content = last(body)?.content
-  return typeof content === "string" ? content : JSON.stringify(content ?? "")
+  if (typeof content === "string") return content
+  if (Array.isArray(content)) return content.map((part) =>
+    part && typeof part === "object" && typeof part.text === "string" ? part.text : "",
+  ).join("\n")
+  return JSON.stringify(content ?? "")
 }
 
 // The prompt of a fresh turn arrives as the last message; a continuation after
@@ -83,7 +88,7 @@ describe("opencode run with a subagent that yields for its own subagent", () => 
             release.unref?.()
             return true
           },
-          reply().tool("finish", { reason: "waiting_for_subagent", result: "child yields for the grandchild" }),
+          reply().tool("finish", { reason: "waiting_for_subagent", result: resultEnvelope("child yields for the grandchild") }),
         )
         // The main session yields for the child it launched, once the child is
         // parked on the grandchild.
@@ -99,13 +104,13 @@ describe("opencode run with a subagent that yields for its own subagent", () => 
           (hit) => opened(hit.body as Body, GRANDCHILD_PROMPT),
           reply()
             .wait(new Promise((resolve) => setTimeout(resolve, HOLD_MS)))
-            .text(GRANDCHILD_RESULT)
+            .text(resultEnvelope(GRANDCHILD_RESULT))
             .tool("finish", { reason: "success", result: "grandchild done" }),
         )
         // The child resumes for its grandchild's report and delivers its own result.
         yield* llm.pushMatch(
           (hit) => lastText(hit.body as Body).includes("GRANDONLY_OK"),
-          reply().tool("finish", { reason: "success", result: CHILD_RESULT }),
+          reply().tool("finish", { reason: "success", result: resultEnvelope(CHILD_RESULT) }),
         )
         // The main session resumes for the child's final result.
         yield* llm.pushMatch(
@@ -227,7 +232,7 @@ describe("opencode run with a report deferred during a successful child turn", (
           (hit) => followed(hit.body as Body, "grandchild dispatch"),
           reply()
             .wait(Promise.all([rootGate, failedGate]))
-            .tool("finish", { reason: "waiting_for_subagent", result: "check the wait guard" }),
+            .tool("finish", { reason: "waiting_for_subagent", result: resultEnvelope("check the wait guard") }),
         )
         // This refusal is evidence that the last grandchild has actually
         // settled. No fabricated finish and no assumed event interleaving.
@@ -242,7 +247,7 @@ describe("opencode run with a report deferred during a successful child turn", (
             guardRefused = true
             return true
           },
-          reply().tool("finish", { reason: "success", result: "CHILD_EARLY_DONE" }),
+          reply().tool("finish", { reason: "success", result: resultEnvelope("CHILD_EARLY_DONE") }),
         )
         yield* llm.pushMatch(
           (hit) => {
@@ -252,7 +257,7 @@ describe("opencode run with a report deferred during a successful child turn", (
             reportDelivered()
             return true
           },
-          reply().tool("finish", { reason: "success", result: "late report received" }),
+          reply().tool("finish", { reason: "success", result: resultEnvelope("late report received") }),
         )
         // The root's resume must not assume WHICH result the child ended with:
         // on slow runners the child absorbs the deferred report itself (its own
