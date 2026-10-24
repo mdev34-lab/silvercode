@@ -558,29 +558,63 @@ describe("plugin.openai.ws-pool", () => {
     fetch.close()
   })
 
-  test("keeps websocket retry state until the failed stream becomes idle", async () => {
+  test("keeps websocket retry state before the failed stream reaches pool idle age", async () => {
     let connections = 0
+    let clockReads = 0
+    let at = 0
     await using server = await createWebSocketServer((socket) => {
       connections += 1
-      socket.once("message", () => {})
+      socket.once("message", () => { at = 100 })
     })
     const fetch = OpenAIWebSocketPool.createWebSocketFetch({
       url: server.url,
-      idleTimeout: 500,
+      idleTimeout: 20,
       streamRetries: 1,
+      now: () => { clockReads++; return at },
     })
+    try {
+      const first = await fetch(server.url, streamRequest())
+      expect((await readTextError(first.text())).message).toContain("idle timeout waiting for websocket")
+      at = 119 // One unit before the idle deadline measured from stream failure.
+      const afterFailure = clockReads
+      // Observe an actual prune tick, but keep logical pool idle age below its deadline.
+      // Scheduler delay cannot turn a before-deadline assertion into an after-deadline one.
+      await waitFor(() => clockReads > afterFailure, "pool prune tick did not run")
+      const second = await fetch(server.url, streamRequest())
+      expect(await second.text()).toBe("http")
+      expect(connections).toBe(2)
+      expect(server.httpRequests).toHaveLength(1)
+    } finally {
+      fetch.close()
+    }
+  })
 
-    await new Promise((resolve) => setTimeout(resolve, 250))
-    const first = await fetch(server.url, streamRequest())
-    expect((await readTextError(first.text())).message).toContain("idle timeout waiting for websocket")
-    await new Promise((resolve) => setTimeout(resolve, 300))
-
-    const second = await fetch(server.url, streamRequest())
-
-    expect(await second.text()).toBe("http")
-    expect(connections).toBe(2)
-    expect(server.httpRequests).toHaveLength(1)
-    fetch.close()
+  test("prunes failed websocket retry state once pool idle age reaches its deadline", async () => {
+    let connections = 0
+    let at = 0
+    let deadlineObserved = false
+    await using server = await createWebSocketServer((socket) => {
+      connections += 1
+      socket.once("message", () => { at = 100 })
+    })
+    const fetch = OpenAIWebSocketPool.createWebSocketFetch({
+      url: server.url,
+      idleTimeout: 20,
+      streamRetries: 1,
+      now: () => { if (at === 120) deadlineObserved = true; return at },
+    })
+    try {
+      const first = await fetch(server.url, streamRequest())
+      expect((await readTextError(first.text())).message).toContain("idle timeout waiting for websocket")
+      at = 120
+      await waitFor(() => deadlineObserved, "pool did not inspect the idle deadline")
+      const second = await fetch(server.url, streamRequest())
+      expect((await readTextError(second.text())).message).toContain("idle timeout waiting for websocket")
+      expect(connections).toBe(2)
+      expect(server.httpRequests).toHaveLength(0)
+    } finally {
+      fetch.close()
+    }
   })
 
   test("retries failed websocket streams before using HTTP fallback", async () => {
