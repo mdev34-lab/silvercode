@@ -286,37 +286,49 @@ describe("Config Dependency Install Integration with MockRegistry", () => {
   })
 
   test("config get returns immediately on registry stall and waitForDependencies respects timeout", async () => {
-    await using tmp = await tmpdir()
-    await using registry = await MockRegistry.start([
-      {
-        name: "@opencode-ai/plugin",
-        version: "1.0.0",
-      },
-    ])
-    registry.setBehavior({ mode: "stall" })
+    const previousTimeout = process.env.OPENCODE_CONFIG_DEP_INSTALL_TIMEOUT_MS
+    process.env.OPENCODE_CONFIG_DEP_INSTALL_TIMEOUT_MS = "1000"
+    try {
+      await using tmp = await tmpdir()
+      await using registry = await MockRegistry.start([
+        {
+          name: "@opencode-ai/plugin",
+          version: "1.0.0",
+        },
+      ])
+      registry.setBehavior({ mode: "stall" })
 
-    const cacheDir = path.join(tmp.path, "cache")
-    const npmCacheDir = path.join(tmp.path, "npm-cache")
-    await fs.mkdir(cacheDir, { recursive: true })
+      const cacheDir = path.join(tmp.path, "cache")
+      const npmCacheDir = path.join(tmp.path, "npm-cache")
+      await fs.mkdir(cacheDir, { recursive: true })
 
-    const { ctx } = await createProjectFixture(tmp.path, registry.url, npmCacheDir)
-    const layer = makeIntegrationLayer(cacheDir)
+      const { ctx } = await createProjectFixture(tmp.path, registry.url, npmCacheDir)
+      const layer = makeIntegrationLayer(cacheDir)
 
-    const result = await Effect.gen(function* () {
-      const cfg = yield* Config.Service
-      // Config.get() returns promptly even if background install stalls
-      const configInfo = yield* cfg.get()
+      const result = await Effect.gen(function* () {
+        const cfg = yield* Config.Service
+        return yield* Effect.gen(function* () {
+          // Config.get() returns promptly even if background install stalls.
+          const configInfo = yield* cfg.get()
+          const waitResult = yield* cfg.waitForDependencies().pipe(Effect.timeout("200 millis"), Effect.exit)
+          return { configInfo, waitResult }
+        }).pipe(
+          // A caller timeout does not cancel detached installs. Drain before their
+          // registry, lock state, or temp directory is disposed, including errors.
+          Effect.ensuring(cfg.waitForDependencies()),
+        )
+      }).pipe(Effect.provideService(InstanceRef, ctx), Effect.scoped, Effect.provide(layer), Effect.runPromiseExit)
 
-      // waitForDependencies times out cleanly
-      const waitResult = yield* cfg.waitForDependencies().pipe(Effect.timeout("200 millis"), Effect.exit)
-
-      return { configInfo, waitResult }
-    }).pipe(Effect.provideService(InstanceRef, ctx), Effect.scoped, Effect.provide(layer), Effect.runPromiseExit)
-
-    expect(result._tag).toBe("Success")
-    if (result._tag === "Success") {
-      expect(result.value.configInfo).toBeDefined()
-      expect(result.value.waitResult._tag).toBe("Failure")
+      // Lock cleanup must finish before the enclosing temp directory is removed.
+      expect(await fs.readdir(path.join(cacheDir, "state", "locks"))).toEqual([])
+      expect(result._tag).toBe("Success")
+      if (result._tag === "Success") {
+        expect(result.value.configInfo).toBeDefined()
+        expect(result.value.waitResult._tag).toBe("Failure")
+      }
+    } finally {
+      if (previousTimeout === undefined) delete process.env.OPENCODE_CONFIG_DEP_INSTALL_TIMEOUT_MS
+      else process.env.OPENCODE_CONFIG_DEP_INSTALL_TIMEOUT_MS = previousTimeout
     }
   })
 
