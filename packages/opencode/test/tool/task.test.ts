@@ -3733,7 +3733,7 @@ it.instance(
       expect(settled.info?.output).toContain("child final result")
       const deliveryPart = childPrompts[1]?.parts[0]
       expect(deliveryPart?.type === "text" && deliveryPart.text.includes("UNREVIEWED")).toBe(true)
-      expect(deliveryPart?.metadata?.reviewLoop).toMatchObject({
+      expect(deliveryPart?.type === "text" ? deliveryPart.metadata?.reviewLoop : undefined).toMatchObject({
         writesFiles: true,
       })
 
