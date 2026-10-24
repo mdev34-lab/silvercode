@@ -6,7 +6,6 @@ import { HttpClient } from "effect/unstable/http"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
-import { NpmConfig } from "@opencode-ai/core/npm-config"
 import { Npm } from "@opencode-ai/core/npm"
 import { Global } from "@opencode-ai/core/global"
 import { httpClient } from "@opencode-ai/core/effect/app-node-platform"
@@ -38,7 +37,6 @@ const makeIntegrationLayer = (cacheDir: string) =>
         Global.layerWith({
           cache: cacheDir,
           state: path.join(cacheDir, "state"),
-          config: path.join(cacheDir, "config"),
         }),
       ],
       [httpClient, Layer.succeed(HttpClient.HttpClient, unexpectedHttp)],
@@ -55,7 +53,22 @@ const createProjectFixture = async (
   const opencodeDir = path.join(projectDir, ".opencode")
   await fs.mkdir(opencodeDir, { recursive: true })
 
-  const globalConfigDir = path.join(baseDir, "cache", "config")
+  for (const key of Object.keys(process.env)) if (/^npm_config_/i.test(key)) delete process.env[key]
+  const globalConfigDir = path.join(baseDir, "global-config")
+  // ConfigPaths reads this module-level path, not Global.Service.config.
+  Global.Path.config = globalConfigDir
+  const home = path.join(baseDir, "home")
+  await fs.mkdir(home, { recursive: true })
+  process.env.HOME = home
+  process.env.USERPROFILE = home
+  process.env.OPENCODE_TEST_HOME = home
+  process.env.NPM_CONFIG_REGISTRY = registryUrl
+  process.env.NPM_CONFIG_USERCONFIG = path.join(home, ".npmrc")
+  process.env.NPM_CONFIG_GLOBALCONFIG = path.join(baseDir, "global.npmrc")
+  await Promise.all([
+    fs.writeFile(process.env.NPM_CONFIG_USERCONFIG, ""),
+    fs.writeFile(process.env.NPM_CONFIG_GLOBALCONFIG, ""),
+  ])
   await fs.mkdir(globalConfigDir, { recursive: true })
   const npmrc = [
     `registry=${registryUrl}/`,
@@ -80,132 +93,140 @@ const createProjectFixture = async (
 }
 
 const originalFlag = process.env.OPENCODE_DISABLE_CONFIG_DEP_INSTALL
+const originalConfig = Global.Path.config
+let savedEnvironment: Record<string, string | undefined>
+const isolatedKey = (key: string) => /^(npm_config_|home$|userprofile$|opencode_test_home$)/i.test(key)
 
 beforeEach(async () => {
+  savedEnvironment = Object.fromEntries(Object.entries(process.env).filter(([key]) => isolatedKey(key)))
+  for (const key of Object.keys(process.env)) if (/^npm_config_/i.test(key)) delete process.env[key]
   delete process.env.OPENCODE_DISABLE_CONFIG_DEP_INSTALL
   await InstanceRuntime.disposeAllInstances()
 })
 
 afterEach(async () => {
+  await InstanceRuntime.disposeAllInstances()
+  Global.Path.config = originalConfig
+  for (const key of Object.keys(process.env)) if (isolatedKey(key)) delete process.env[key]
+  Object.assign(process.env, savedEnvironment)
   if (originalFlag === undefined) {
     delete process.env.OPENCODE_DISABLE_CONFIG_DEP_INSTALL
   } else {
     process.env.OPENCODE_DISABLE_CONFIG_DEP_INSTALL = originalFlag
   }
-  await InstanceRuntime.disposeAllInstances()
 })
 
 describe("Config Dependency Install Integration with MockRegistry", () => {
-  test("isolates both config install directories and routes both to the mock registry", async () => {
-    await using tmp = await tmpdir()
-    const registry = "http://127.0.0.1:1"
-    const { opencodeDir, globalConfigDir } = await createProjectFixture(
-      tmp.path,
-      registry,
-      path.join(tmp.path, "npm-cache"),
-    )
-    expect(globalConfigDir.startsWith(tmp.path + path.sep)).toBe(true)
-    const layer = makeIntegrationLayer(path.join(tmp.path, "cache"))
-    const actual = await Effect.runPromise(
-      Effect.map(Global.Service, (global) => global.config).pipe(Effect.provide(layer)),
-    )
-    expect(actual).toBe(globalConfigDir)
-    for (const dir of [opencodeDir, globalConfigDir]) {
-      expect(await Effect.runPromise(NpmConfig.registry(dir))).toBe(registry)
-    }
-  })
-
   // The windows CI runner pays a heavy per-process spawn cost (CreateProcess + AV
   // scan), and this test shells out to a real package install, so it gets double the
   // suite's 30s budget instead of flaking at the bound. A cold install no longer fits
   // in 60s on that runner (timed out at exactly 60006ms twice), so windows gets 120s.
   const budget = process.platform === "win32" ? 120_000 : 60_000
-  test("installs @opencode-ai/plugin in background and waitForDependencies joins successfully", async () => {
-    await using tmp = await tmpdir()
-    await using registry = await MockRegistry.start([
-      {
-        name: "@opencode-ai/plugin",
-        version: "1.0.0",
-        files: {
-          "package/package.json": JSON.stringify({
-            name: "@opencode-ai/plugin",
-            version: "1.0.0",
-            main: "index.js",
-          }),
-          "package/index.js": "module.exports = { mockPluginLoaded: true };\n",
+  test(
+    "installs @opencode-ai/plugin in background and waitForDependencies joins successfully",
+    async () => {
+      await using tmp = await tmpdir()
+      await using registry = await MockRegistry.start([
+        {
+          name: "@opencode-ai/plugin",
+          version: "1.0.0",
+          files: {
+            "package/package.json": JSON.stringify({
+              name: "@opencode-ai/plugin",
+              version: "1.0.0",
+              main: "index.js",
+            }),
+            "package/index.js": "module.exports = { mockPluginLoaded: true };\n",
+          },
         },
-      },
-    ])
+      ])
 
-    const cacheDir = path.join(tmp.path, "cache")
-    const npmCacheDir = path.join(tmp.path, "npm-cache")
-    await fs.mkdir(cacheDir, { recursive: true })
+      const cacheDir = path.join(tmp.path, "cache")
+      const npmCacheDir = path.join(tmp.path, "npm-cache")
+      await fs.mkdir(cacheDir, { recursive: true })
 
-    const { opencodeDir, ctx } = await createProjectFixture(tmp.path, registry.url, npmCacheDir)
-    const layer = makeIntegrationLayer(cacheDir)
+      // Deliberately hostile inherited config must not influence the real installs.
+      const hostileHome = path.join(tmp.path, "host-home")
+      await fs.mkdir(hostileHome, { recursive: true })
+      await fs.writeFile(path.join(hostileHome, ".npmrc"), "registry=http://127.0.0.1:1/\n")
+      process.env.HOME = hostileHome
+      process.env.USERPROFILE = hostileHome
+      process.env.npm_config_registry = "http://127.0.0.1:1"
+      process.env.NPM_CONFIG_USERCONFIG = path.join(hostileHome, ".npmrc")
+      const { opencodeDir, globalConfigDir, ctx } = await createProjectFixture(tmp.path, registry.url, npmCacheDir)
+      const layer = makeIntegrationLayer(cacheDir)
 
-    const result = await Effect.gen(function* () {
-      const cfg = yield* Config.Service
-      const configInfo = yield* cfg.get()
-      yield* cfg.waitForDependencies()
-      return configInfo
-    }).pipe(
-      Effect.provideService(InstanceRef, ctx),
-      Effect.scoped,
-      Effect.provide(layer),
-      Effect.runPromiseExit,
-    )
+      const result = await Effect.gen(function* () {
+        const cfg = yield* Config.Service
+        const configInfo = yield* cfg.get()
+        yield* cfg.waitForDependencies()
+        expect(yield* cfg.directories()).toEqual([globalConfigDir, opencodeDir])
+        return configInfo
+      }).pipe(Effect.provideService(InstanceRef, ctx), Effect.scoped, Effect.provide(layer), Effect.runPromiseExit)
 
-    expect(result._tag).toBe("Success")
+      expect(result._tag).toBe("Success")
 
-    // Check that @opencode-ai/plugin is installed in .opencode/node_modules
-    const pluginPkgJsonPath = path.join(opencodeDir, "node_modules", "@opencode-ai", "plugin", "package.json")
-    const installed = await fs.readFile(pluginPkgJsonPath, "utf8")
-    expect(JSON.parse(installed).name).toBe("@opencode-ai/plugin")
+      // Check that @opencode-ai/plugin is installed in .opencode/node_modules
+      const pluginPkgJsonPath = path.join(opencodeDir, "node_modules", "@opencode-ai", "plugin", "package.json")
+      const installed = await fs.readFile(pluginPkgJsonPath, "utf8")
+      expect(JSON.parse(installed)).toMatchObject({ name: "@opencode-ai/plugin", version: "1.0.0" })
+      const globalInstalled = JSON.parse(
+        await fs.readFile(path.join(globalConfigDir, "node_modules", "@opencode-ai", "plugin", "package.json"), "utf8"),
+      )
+      expect(globalInstalled).toMatchObject({ name: "@opencode-ai/plugin", version: "1.0.0" })
+      for (const dir of [globalConfigDir, opencodeDir]) {
+        const lock = JSON.parse(await fs.readFile(path.join(dir, "package-lock.json"), "utf8"))
+        const resolved = Object.values(lock.packages as Record<string, { resolved?: string }>).flatMap((pkg) =>
+          pkg.resolved ? [pkg.resolved] : [],
+        )
+        expect(resolved.length).toBeGreaterThan(0)
+        expect(resolved.every((url: string) => url.startsWith(registry.url + "/"))).toBe(true)
+      }
 
-    // Verify mock registry received requests
-    const urls = registry.requests.map((r) => r.url)
-    expect(urls.some((u) => u.includes("@opencode-ai") || u.includes("plugin"))).toBe(true)
-  }, budget)
+      // Verify mock registry received requests
+      const urls = registry.requests.map((r) => r.url)
+      expect(urls.some((u) => u.includes("@opencode-ai") || u.includes("plugin"))).toBe(true)
+    },
+    budget,
+  )
 
   // Same windows spawn-cost class as the background-install test above: the
   // recover path crossed the suite's 30s flag on a loaded runner (#485).
   const budget500 = process.platform === "win32" ? 90_000 : 30_000
-  test("config loads successfully and waitForDependencies recovers when mock registry returns HTTP 500", async () => {
-    await using tmp = await tmpdir()
-    await using registry = await MockRegistry.start([
-      {
-        name: "@opencode-ai/plugin",
-        version: "1.0.0",
-      },
-    ])
-    registry.setBehavior({ mode: "error", statusCode: 500 })
+  test(
+    "config loads successfully and waitForDependencies recovers when mock registry returns HTTP 500",
+    async () => {
+      await using tmp = await tmpdir()
+      await using registry = await MockRegistry.start([
+        {
+          name: "@opencode-ai/plugin",
+          version: "1.0.0",
+        },
+      ])
+      registry.setBehavior({ mode: "error", statusCode: 500 })
 
-    const cacheDir = path.join(tmp.path, "cache")
-    const npmCacheDir = path.join(tmp.path, "npm-cache")
-    await fs.mkdir(cacheDir, { recursive: true })
+      const cacheDir = path.join(tmp.path, "cache")
+      const npmCacheDir = path.join(tmp.path, "npm-cache")
+      await fs.mkdir(cacheDir, { recursive: true })
 
-    const { ctx } = await createProjectFixture(tmp.path, registry.url, npmCacheDir)
-    const layer = makeIntegrationLayer(cacheDir)
+      const { ctx } = await createProjectFixture(tmp.path, registry.url, npmCacheDir)
+      const layer = makeIntegrationLayer(cacheDir)
 
-    const result = await Effect.gen(function* () {
-      const cfg = yield* Config.Service
-      const configInfo = yield* cfg.get()
-      // waitForDependencies should join the background fiber without throwing unhandled error
-      yield* cfg.waitForDependencies()
-      return configInfo
-    }).pipe(
-      Effect.provideService(InstanceRef, ctx),
-      Effect.scoped,
-      Effect.provide(layer),
-      Effect.runPromiseExit,
-    )
+      const result = await Effect.gen(function* () {
+        const cfg = yield* Config.Service
+        const configInfo = yield* cfg.get()
+        // waitForDependencies should join the background fiber without throwing unhandled error
+        yield* cfg.waitForDependencies()
+        return configInfo
+      }).pipe(Effect.provideService(InstanceRef, ctx), Effect.scoped, Effect.provide(layer), Effect.runPromiseExit)
 
-    expect(result._tag).toBe("Success")
-    if (result._tag === "Success") {
-      expect(result.value).toBeDefined()
-    }
-  }, budget500)
+      expect(result._tag).toBe("Success")
+      if (result._tag === "Success") {
+        expect(result.value).toBeDefined()
+      }
+    },
+    budget500,
+  )
 
   test("config loads successfully when mock registry connection is abruptly closed", async () => {
     await using tmp = await tmpdir()
@@ -229,12 +250,7 @@ describe("Config Dependency Install Integration with MockRegistry", () => {
       const configInfo = yield* cfg.get()
       yield* cfg.waitForDependencies()
       return configInfo
-    }).pipe(
-      Effect.provideService(InstanceRef, ctx),
-      Effect.scoped,
-      Effect.provide(layer),
-      Effect.runPromiseExit,
-    )
+    }).pipe(Effect.provideService(InstanceRef, ctx), Effect.scoped, Effect.provide(layer), Effect.runPromiseExit)
 
     expect(result._tag).toBe("Success")
   })
@@ -262,12 +278,7 @@ describe("Config Dependency Install Integration with MockRegistry", () => {
       const configInfo = yield* cfg.get()
       yield* cfg.waitForDependencies()
       return configInfo
-    }).pipe(
-      Effect.provideService(InstanceRef, ctx),
-      Effect.scoped,
-      Effect.provide(layer),
-      Effect.runPromiseExit,
-    )
+    }).pipe(Effect.provideService(InstanceRef, ctx), Effect.scoped, Effect.provide(layer), Effect.runPromiseExit)
 
     expect(result._tag).toBe("Success")
     // Mock registry must NOT have received any requests
@@ -300,12 +311,7 @@ describe("Config Dependency Install Integration with MockRegistry", () => {
       const waitResult = yield* cfg.waitForDependencies().pipe(Effect.timeout("200 millis"), Effect.exit)
 
       return { configInfo, waitResult }
-    }).pipe(
-      Effect.provideService(InstanceRef, ctx),
-      Effect.scoped,
-      Effect.provide(layer),
-      Effect.runPromiseExit,
-    )
+    }).pipe(Effect.provideService(InstanceRef, ctx), Effect.scoped, Effect.provide(layer), Effect.runPromiseExit)
 
     expect(result._tag).toBe("Success")
     if (result._tag === "Success") {
@@ -349,12 +355,7 @@ describe("Config Dependency Install Integration with MockRegistry", () => {
         return configInfo
       })
         .pipe(Effect.provide(Logger.layer([captureLog])))
-        .pipe(
-          Effect.provideService(InstanceRef, ctx),
-          Effect.scoped,
-          Effect.provide(layer),
-          Effect.runPromiseExit,
-        )
+        .pipe(Effect.provideService(InstanceRef, ctx), Effect.scoped, Effect.provide(layer), Effect.runPromiseExit)
       const elapsed = Date.now() - startedAt
 
       expect(result._tag).toBe("Success")
