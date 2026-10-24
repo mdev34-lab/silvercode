@@ -1931,7 +1931,8 @@ describe("tool.task", () => {
         expect(result.metadata.termination.reason).toBe("cancelled")
         expect(result.output).toContain(`<task id="${child}" state="cancelled">`)
         expect(result.output).toContain('<termination reason="cancelled">')
-        expect(result.output).toContain("cancelled by the user")
+        expect(result.output).toContain("cancelled before it delivered a result")
+        expect(result.output).not.toMatch(/the user|user cancelled/i)
         // The cancel reached the child's execution handle itself, not only the
         // envelope handed back to the parent.
         expect((yield* jobs.get(child))?.status).toBe("cancelled")
@@ -1992,7 +1993,8 @@ describe("tool.task", () => {
       expect(text).toMatch(new RegExp(`<task id="${child}" run="${child}@\\d+" state="cancelled">`))
       expect(text).toContain("<summary>Background task cancelled: inspect bug</summary>")
       expect(text).toContain('<termination reason="cancelled">')
-      expect(text).toContain("cancelled by the user")
+      expect(text).toContain("cancelled before it delivered a result")
+      expect(text).not.toMatch(/the user|user cancelled/i)
     }),
   )
 
@@ -2069,6 +2071,9 @@ describe("tool.task", () => {
       expect(silent).toHaveLength(1)
       const receipt = silent[0]?.parts[0]
       expect(receipt?.type === "text" && receipt.text).toContain('state="cancelled"')
+      // Parent teardown is not evidence that a person explicitly cancelled this child.
+      expect(receipt?.type === "text" && receipt.text).toContain("cancelled before it delivered a result")
+      expect(receipt?.type === "text" && receipt.text).not.toMatch(/the user|user cancelled/i)
       expect(receipt?.type === "text" && receipt.metadata?.backgroundNoReply).toBe(true)
     }),
   )
