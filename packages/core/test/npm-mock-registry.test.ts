@@ -1,12 +1,34 @@
 import fs from "fs/promises"
 import path from "path"
-import { describe, expect, test } from "bun:test"
+import { afterEach, beforeEach, describe, expect, test } from "bun:test"
 import { Effect, Fiber, Cause } from "effect"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { Global } from "@opencode-ai/core/global"
 import { Npm } from "@opencode-ai/core/npm"
 import { tmpdir } from "./fixture/tmpdir"
 import { MockRegistry } from "./fixture/mock-registry"
+
+// Config env values override project .npmrc, including its fresh tarball cache.
+// Keep host npm settings out of these real-registry fault tests.
+const isolated = (key: string) => /^(npm_config_|home$|userprofile$)/i.test(key)
+let savedEnv: Record<string, string | undefined>
+let home: Awaited<ReturnType<typeof tmpdir>>
+beforeEach(async () => {
+  savedEnv = Object.fromEntries(Object.entries(process.env).filter(([key]) => isolated(key)))
+  for (const key of Object.keys(process.env)) if (isolated(key)) delete process.env[key]
+  home = await tmpdir()
+  process.env.HOME = home.path
+  process.env.USERPROFILE = home.path
+  process.env.npm_config_userconfig = path.join(home.path, "user.npmrc")
+  process.env.npm_config_globalconfig = path.join(home.path, "global.npmrc")
+  await fs.writeFile(process.env.npm_config_userconfig, "")
+  await fs.writeFile(process.env.npm_config_globalconfig, "")
+})
+afterEach(async () => {
+  for (const key of Object.keys(process.env)) if (isolated(key)) delete process.env[key]
+  Object.assign(process.env, savedEnv)
+  await home?.[Symbol.asyncDispose]()
+})
 
 const npmLayer = (cache: string) =>
   AppNodeBuilder.build(Npm.node, [[Global.node, Global.layerWith({ cache, state: path.join(cache, "state") })]])
@@ -261,6 +283,7 @@ describe("Npm with MockRegistry - Failures and Error Handling", () => {
     }).pipe(Effect.scoped, Effect.provide(layer), Effect.runPromiseExit)
 
     expect(result._tag).toBe("Failure")
+    expect(registry.requests.some((request) => request.url.endsWith(".tgz"))).toBe(true)
   })
 
   test("fails cleanly with InstallFailedError when registry connection is abruptly closed", async () => {
@@ -319,6 +342,7 @@ describe("Npm with MockRegistry - Failures and Error Handling", () => {
     }).pipe(Effect.scoped, Effect.provide(layer), Effect.runPromiseExit)
 
     expect(result._tag).toBe("Failure")
+    expect(registry.requests.some((request) => request.url.endsWith(".tgz"))).toBe(true)
 
     // The packument fetch succeeded; only the tarball leg was killed.
     expect(registry.requests.some((r) => r.url.includes(".tgz"))).toBe(true)
@@ -392,8 +416,10 @@ describe("Npm with MockRegistry - Stall, Interruption, and Cleanup", () => {
         })
         .pipe(Effect.forkChild)
 
-      // Let the fiber start and hit the stall
-      yield* Effect.sleep("100 millis")
+      // Rendezvous at the tarball, not an arbitrary delay before the request.
+      yield* Effect.gen(function* () {
+        while (!registry.requests.some((request) => request.url.endsWith(".tgz"))) yield* Effect.sleep("5 millis")
+      }).pipe(Effect.timeout("5 seconds"))
       yield* Fiber.interrupt(fiber)
       return yield* Fiber.join(fiber).pipe(Effect.exit)
     }).pipe(Effect.scoped, Effect.provide(layer), Effect.runPromise)
