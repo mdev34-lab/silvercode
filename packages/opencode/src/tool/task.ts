@@ -563,6 +563,12 @@ export const TaskTool = Tool.define(
 
         yield* projectWrites(result.parts)
         yield* Ref.update(wroteFiles, (prev) => prev || result.parts.some((part) => declaresFileWrites(part)))
+        if (result.info.role === "assistant" && result.info.error) {
+          const error = result.info.error
+          const message = error.data && "message" in error.data ? error.data.message : error.name
+          return yield* Effect.fail(new Error(`Subagent failed: ${message}`))
+        }
+
         const finish = result.parts.findLast(
           (item): item is SessionV1.ToolPart =>
             item.type === "tool" && item.tool === FinishTool.id && item.state.status === "completed",
