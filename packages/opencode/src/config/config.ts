@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { httpClient } from "@opencode-ai/core/effect/app-node-platform"
 import { serviceUse } from "@opencode-ai/core/effect/service-use"
@@ -171,6 +172,8 @@ function writableGlobal(info: Info) {
   if ("shell" in next && next.shell === "") return { ...next, shell: undefined }
   return next
 }
+
+let diagnosticAdmissionSequence = 0
 
 const layer = Layer.effect(
   Service,
@@ -471,7 +474,12 @@ const layer = Layer.effect(
 
           yield* ensureGitignore(dir).pipe(Effect.orDie)
 
-          if (!Flag.OPENCODE_DISABLE_CONFIG_DEP_INSTALL) {
+          const installDisabled = Flag.OPENCODE_DISABLE_CONFIG_DEP_INSTALL
+          const diagnosticAdmission = process.env.OPENCODE_TEST_INSTALL_OWNER_DIAGNOSTICS === "1" ? `${process.pid}-admission-${++diagnosticAdmissionSequence}` : undefined
+          if (diagnosticAdmission) {
+            console.log("INSTALL_OWNER", JSON.stringify({ phase: "config-admission", admission: diagnosticAdmission, at: Date.now(), pid: process.pid, dir: createHash("sha256").update(dir).digest("hex").slice(0, 16), disabled: installDisabled }))
+          }
+          if (!installDisabled) {
             // Bound the background install (design proposal: 60s, override with
             // OPENCODE_CONFIG_DEP_INSTALL_TIMEOUT_MS). A stalled registry install must
             // not keep waitForDependencies — and therefore plugin loading and instance
@@ -492,6 +500,7 @@ const layer = Layer.effect(
                 ],
               })
               .pipe(
+                Effect.provideService(Npm.DiagnosticAdmission, diagnosticAdmission),
                 Effect.timeout(Duration.millis(timeoutMs)),
                 Effect.catchTag("TimeoutError", () =>
                   Effect.logWarning("background dependency install timed out, continuing without it", {
