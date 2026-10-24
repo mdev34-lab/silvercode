@@ -5423,7 +5423,13 @@ it.instance("a child can finish on the next generation after writing its result 
 
 
 it.instance("cancel registered custom tool permission prevents a late side effect", () =>
-  Effect.gen(function* () {
+  Effect.acquireUseRelease(
+    Effect.sync(() => {
+      const previous = process.env.OPENCODE_DISABLE_CONFIG_DEP_INSTALL
+      process.env.OPENCODE_DISABLE_CONFIG_DEP_INSTALL = "1"
+      return previous
+    }),
+    () => Effect.gen(function* () {
     const dir = (yield* TestInstance).directory
     const tools = path.join(dir, ".opencode", "tools")
     const marker = path.join(dir, "plugin-late-write.txt")
@@ -5461,4 +5467,9 @@ it.instance("cancel registered custom tool permission prevents a late side effec
     yield* permissions.reply({ requestID: next.id, reply: "once" })
     yield* Fiber.join(fresh).pipe(Effect.timeout("5 seconds"))
     expect(yield* Effect.promise(() => Bun.file(marker).text())).toBe("LATE_SIDE_EFFECT")
-  }), { timeout: 20000 })
+    }),
+    (previous) => Effect.sync(() => {
+      if (previous === undefined) delete process.env.OPENCODE_DISABLE_CONFIG_DEP_INSTALL
+      else process.env.OPENCODE_DISABLE_CONFIG_DEP_INSTALL = previous
+    }),
+  ), { timeout: 20000 })
