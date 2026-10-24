@@ -1,5 +1,6 @@
 import { sessionAgent } from "../session/session-agent"
 import * as Tool from "./tool"
+import { resultChunks, textResult, renderTextResult } from "@/session/subagent-result"
 import { FinishTool, deliveredReason, readTermination, type Reason, type TerminationReason } from "@/tool/finish"
 import DESCRIPTION from "./task.txt"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
@@ -333,9 +334,7 @@ export const TaskTool = Tool.define(
           // skipped, and the common case - a request routing did not rewrite -
           // still prompts under exactly one name.
           patterns: [
-            ...(subagentType === params.subagent_type
-              ? [params.subagent_type]
-              : [params.subagent_type, subagentType]),
+            ...(subagentType === params.subagent_type ? [params.subagent_type] : [params.subagent_type, subagentType]),
             // The retired specialist names stay valid rule targets: a deny or
             // grant written against `work-review`/`code-review` gated the
             // reviewer before the consolidation, and there is exactly one
@@ -558,9 +557,19 @@ export const TaskTool = Tool.define(
           },
           variant: next.model ? undefined : variant,
           agent: next.name,
-          parts,
+          parts: [
+            ...parts,
+            {
+              type: "text",
+              text: isReviewAgent(next.name)
+                ? "Deliver your final review in the required <silvercode-review> envelope before finish, in this execution."
+                : "Before every finish call, deliver a non-empty <silvercode-result>final result text</silvercode-result> envelope. It may be in the same assistant turn, an earlier assistant turn of this execution, or finish.result. Do not put progress in the result envelope.",
+            },
+          ],
         })
 
+        const transcript = yield* sessions.messages({ sessionID: nextSession.id })
+        const chunks = resultChunks(transcript, result)
         yield* projectWrites(result.parts)
         yield* Ref.update(wroteFiles, (prev) => prev || result.parts.some((part) => declaresFileWrites(part)))
         const finish = result.parts.findLast(
@@ -597,10 +606,7 @@ export const TaskTool = Tool.define(
             )
           }
           const summary = finish.state.input.result
-          const delivery = ReviewReport.extract([
-            ...result.parts.flatMap((part) => (part.type === "text" ? [part.text] : [])),
-            typeof summary === "string" ? summary : undefined,
-          ])
+          const delivery = ReviewReport.extract([...chunks, typeof summary === "string" ? summary : undefined])
           if (!delivery.ok)
             return yield* Effect.fail(
               new Error(
@@ -614,12 +620,15 @@ export const TaskTool = Tool.define(
           return ReviewReport.render(delivery)
         }
 
-        const text = result.parts.findLast((item) => item.type === "text")?.text
-        if (text !== undefined) return text
-        // Subagents end their turn with the finish tool; its result argument is
-        // the task summary.
         const summary = finish?.state.status === "completed" ? finish.state.input.result : undefined
-        return typeof summary === "string" ? summary : ""
+        const delivery = textResult([...chunks, typeof summary === "string" ? summary : undefined])
+        if (!delivery.ok)
+          return yield* Effect.fail(
+            new Error(
+              "Subagent result delivery failed: missing non-empty <silvercode-result> envelope in this execution.",
+            ),
+          )
+        return renderTextResult(delivery.text)
       })
 
       const runTask = Effect.fn("TaskTool.runTask")(function* () {
@@ -745,7 +754,8 @@ export const TaskTool = Tool.define(
       const childJobs = Effect.fn("TaskTool.childJobs")(function* () {
         const jobs = yield* background.list()
         return jobs.filter(
-          (job) => job.type === id && BackgroundJob.isSubagentOf(job, nextSession.id) && job.metadata?.background !== false,
+          (job) =>
+            job.type === id && BackgroundJob.isSubagentOf(job, nextSession.id) && job.metadata?.background !== false,
         )
       })
 
