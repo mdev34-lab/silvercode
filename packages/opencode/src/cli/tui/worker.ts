@@ -1,6 +1,6 @@
 import { Server } from "@/server/server"
 import { InstanceRuntime } from "@/project/instance-runtime"
-import { watchOwnerProcess } from "@/cli/tui/owner-watch"
+import { probeOwnerAlive, watchOwnerProcess } from "@/cli/tui/owner-watch"
 import { Rpc } from "@/util/rpc"
 import { Config } from "@/config/config"
 import { GlobalBus } from "@/bus/global"
@@ -125,17 +125,6 @@ export function resolveIsTuiWorker(env: NodeJS.ProcessEnv, hasProcessSend: boole
   return env["SILVERCODE_TUI_WORKER"] === "1" || hasProcessSend
 }
 
-// Signal-0 probe: the only portable liveness check that does not depend on
-// `process.ppid`, which a detached Bun child cannot trust (see owner-watch.ts).
-function processAlive(pid: number) {
-  try {
-    process.kill(pid, 0)
-    return true
-  } catch {
-    return false
-  }
-}
-
 let server: Awaited<ReturnType<typeof Server.listen>> | undefined
 let stopRpcListener: (() => void) | undefined
 
@@ -199,33 +188,35 @@ if (isTuiWorker) {
 
   if (processWorker) {
     stopRpcListener = Rpc.listenProcess(rpc)
-    // Only a subprocess can outlive the UI, and only POSIX spawns it detached
-    // (see worker-process.ts). A thread worker shares the process, so it
-    // always exits with the UI.
-    if (process.platform !== "win32") {
-      const ownerPID = Number.parseInt(process.env["SILVERCODE_TUI_WORKER_OWNER_PID"] ?? "", 10)
-      watchOwnerProcess({
-        subscribeDisconnect: (handler) => {
-          process.on("disconnect", handler)
-          return () => {
-            process.off("disconnect", handler)
-          }
-        },
-        ownerAlive: Number.isFinite(ownerPID) && ownerPID > 0 ? () => processAlive(ownerPID) : undefined,
-        onOrphan() {
-          // A hard exit bounds the graceful path so a hung dispose cannot
-          // leave the orphan alive anyway.
-          const force = setTimeout(() => process.exit(0), 5000)
-          force.unref?.()
-          // .then with two branches, not .finally: a shutdown that failed
-          // must not exit 0 and look graceful to a supervisor.
-          void rpc.shutdown().then(
-            () => process.exit(0),
-            () => process.exit(1),
-          )
-        },
-      })
-    }
+    // Owner-death cleanup for the subprocess worker (see worker-process.ts).
+    // On Windows the primary guarantee is the parent-side job object: the OS
+    // kills the worker when the owner dies. This watchdog stays installed
+    // there only as a fallback for a failed job assignment - #480 showed
+    // neither IPC disconnect nor the signal-0 probe observes a hard-killed
+    // owner on win32, so it cannot be the mechanism there. A thread worker
+    // shares the owner's process and needs neither.
+    const ownerPID = Number.parseInt(process.env["SILVERCODE_TUI_WORKER_OWNER_PID"] ?? "", 10)
+    watchOwnerProcess({
+      subscribeDisconnect: (handler) => {
+        process.on("disconnect", handler)
+        return () => {
+          process.off("disconnect", handler)
+        }
+      },
+      ownerAlive: Number.isFinite(ownerPID) && ownerPID > 0 ? () => probeOwnerAlive(ownerPID) : undefined,
+      onOrphan() {
+        // A hard exit bounds the graceful path so a hung dispose cannot
+        // leave the orphan alive anyway.
+        const force = setTimeout(() => process.exit(0), 5000)
+        force.unref?.()
+        // .then with two branches, not .finally: a shutdown that failed
+        // must not exit 0 and look graceful to a supervisor.
+        void rpc.shutdown().then(
+          () => process.exit(0),
+          () => process.exit(1),
+        )
+      },
+    })
   } else {
     stopRpcListener = Rpc.listen(rpc)
     // Bootstrap beacon (#398): a thread worker's identity rests entirely on

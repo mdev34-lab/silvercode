@@ -1,4 +1,5 @@
 import path from "path"
+import { adoptWorkerProcess } from "@/cli/tui/win-job"
 
 export type WorkerExit = {
   code: number | null
@@ -12,6 +13,8 @@ type WorkerMessageTarget = {
 }
 
 type Subprocess = {
+  /** Spawned PID, used to hand the child to the owner's kill-on-close job. */
+  readonly pid?: number
   readonly exitCode: number | null
   readonly signalCode: string | number | null
   readonly exited: Promise<number>
@@ -77,6 +80,11 @@ export interface WorkerProcessOptions {
   spawnWorker?: (target: string, init: { env?: Record<string, string> }) => ThreadWorkerLike
   /** Thread-mode bootstrap watchdog timeout in ms (tests). Default 10_000. */
   bootstrapTimeoutMs?: number
+  /**
+   * Parent-side owner-death hook for every spawned subprocess, restarts
+   * included (tests). Defaults to the win32 kill-on-close job object.
+   */
+  adoptWorker?: (pid: number | undefined, log: (message: string) => void) => void
 }
 
 /**
@@ -115,6 +123,7 @@ export function createWorkerProcess(target: string, options: WorkerProcessOption
   const spawn = options.spawn ?? ((command, spawnOptions) => Bun.spawn(command, spawnOptions))
   const maxRestarts = options.maxRestarts ?? MAX_RESTARTS
   const log = options.log ?? console.error
+  const adoptWorker = options.adoptWorker ?? adoptWorkerProcess
 
   let current: Subprocess | undefined
   let stopping = false
@@ -210,6 +219,11 @@ export function createWorkerProcess(target: string, options: WorkerProcessOption
         transport.onmessage?.({ data: message } as MessageEvent<string>)
       },
     })
+
+    // Parent-side owner-death guard. Windows cannot rely on the worker's own
+    // watchdog, so the owner puts the child in a job object the OS tears down
+    // with the owner (#442). No-op on every other platform.
+    adoptWorker(current.pid, log)
 
     const child = current
     void child.exited.then((code) => {
