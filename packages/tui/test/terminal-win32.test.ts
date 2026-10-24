@@ -8,7 +8,16 @@ const source = new Bun.Transpiler({ loader: "ts" }).transformSync(
     .replaceAll("export function ", "function "),
 )
 
-function fixture(input: { platform?: string; tty?: boolean; open?: number; modeFails?: boolean } = {}) {
+function fixture(
+  input: {
+    platform?: string
+    tty?: boolean
+    open?: number
+    modeFails?: boolean
+    intervalThrows?: boolean
+    rawThrows?: boolean
+  } = {},
+) {
   let mode = 7
   const opened: unknown[][] = []
   const closed: number[] = []
@@ -32,6 +41,13 @@ function fixture(input: { platform?: string; tty?: boolean; open?: number; modeF
     },
   }
   const original = conin.setRawMode
+  if (input.rawThrows)
+    Object.defineProperty(conin, "setRawMode", {
+      get: () => original,
+      set: () => {
+        throw new Error("raw setter failed")
+      },
+    })
   const api = vm.runInNewContext(
     `(() => { ${source}; return { win32InstallCtrlCGuard, win32DisableProcessedInput } })()`,
     {
@@ -64,6 +80,7 @@ function fixture(input: { platform?: string; tty?: boolean; open?: number; modeF
       },
       setImmediate: (fn: () => void) => immediates.push(fn),
       setInterval: (fn: () => void) => {
+        if (input.intervalThrows) throw new Error("timer setup failed")
         intervals.add(fn)
         return { unref() {} }
       },
@@ -137,7 +154,7 @@ test("normal tty stdin retains the borrowed standard handle", () => {
 })
 
 test("failed CONIN$ open does not install a guard or close an invalid handle", () => {
-  const f = fixture({ open: -1 })
+  const f = fixture({ open: 0xffffffffffffffff })
   expect(f.api.win32InstallCtrlCGuard(f.conin)).toBeUndefined()
   expect(f.reads).toEqual([])
   expect(f.closed).toEqual([])
@@ -157,3 +174,15 @@ test("POSIX does not open console handles", () => {
   f.api.win32DisableProcessedInput(f.conin)
   expect(f.opened).toEqual([])
 })
+
+for (const failure of ["rawThrows", "intervalThrows"] as const) {
+  test(`closes the owned console handle when ${failure} interrupts guard setup`, () => {
+    const f = fixture({ [failure]: true })
+    expect(() => f.api.win32InstallCtrlCGuard(f.conin)).toThrow()
+    expect(f.closed).toEqual([22])
+    expect(f.conin.setRawMode).toBe(f.original)
+    const reads = f.reads.length
+    for (const immediate of f.immediates) immediate()
+    expect(f.reads.length).toBe(reads)
+  })
+}
