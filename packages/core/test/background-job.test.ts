@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import { BackgroundJob } from "@opencode-ai/core/background-job"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
-import { Deferred, Effect, Exit, Scope } from "effect"
+import { Deferred, Effect, Exit, Ref, Scope } from "effect"
 import { it } from "./lib/effect"
 
 const jobsLayer = LayerNode.compile(BackgroundJob.node)
@@ -72,6 +72,24 @@ describe("BackgroundJob", () => {
       }
       expect(new Set(starts).size).toBe(3)
       expect(starts).toEqual([0, 1, 2])
+    }).pipe(Effect.provide(jobsLayer)),
+  )
+
+  it.effect("starting the same explicit id twice returns the running job and does not rerun it", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const latch = yield* Deferred.make<void>()
+      const reruns = yield* Ref.make(0)
+      const first = yield* jobs.start({
+        id: "ses_duplicate_start",
+        type: "task",
+        run: Deferred.succeed(latch, undefined).pipe(Effect.andThen(Effect.never)),
+      })
+      yield* Deferred.await(latch)
+      const second = yield* jobs.start({ id: "ses_duplicate_start", type: "task", run: Ref.update(reruns, (n) => n + 1) })
+      expect(second).toMatchObject({ id: first.id, status: "running", started_at: first.started_at })
+      yield* Effect.yieldNow
+      expect(yield* Ref.get(reruns)).toBe(0)
     }).pipe(Effect.provide(jobsLayer)),
   )
 
