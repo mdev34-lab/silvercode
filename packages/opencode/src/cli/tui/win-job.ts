@@ -182,6 +182,10 @@ function loadWindowsJobApi(): WindowsJobApi {
  * Once job creation has failed there is nothing left to try on later spawns,
  * so the failure is remembered and logged a single time instead of on every
  * restart. A failed *assignment* keeps the job: the next restart can succeed.
+ * Assignment failures are also logged a single time per failure episode - a
+ * worker that keeps respawning while the job refuses it would otherwise spam
+ * one warning per adoption - and a successful assignment rearms the warning
+ * so a later episode is still reported.
  */
 export function createOwnerJobAdopter(input: { platform?: NodeJS.Platform; loadApi?: () => WindowsJobApi } = {}) {
   const platform = input.platform ?? process.platform
@@ -189,6 +193,7 @@ export function createOwnerJobAdopter(input: { platform?: NodeJS.Platform; loadA
   let api: WindowsJobApi | undefined
   let job: unknown
   let failure: string | undefined
+  let assignmentWarning: string | undefined
 
   return function adopt(pid: number | undefined, log: (message: string) => void) {
     if (platform !== "win32" || pid === undefined || !Number.isInteger(pid) || pid <= 0) return
@@ -205,7 +210,17 @@ export function createOwnerJobAdopter(input: { platform?: NodeJS.Platform; loadA
         job = created.job
       }
       const assigned = addProcessToJob(api, job, pid)
-      if (!assigned.ok) log(`[silvercode] ${assigned.reason}; the worker may outlive a hard-killed owner (#442)`)
+      if (!assigned.ok) {
+        // Retrying stays useful (the next spawn may assign fine), but the
+        // warning must not repeat per attempt: log the first failure of an
+        // episode and stay quiet until an assignment succeeds again.
+        if (assignmentWarning === undefined) {
+          assignmentWarning = assigned.reason
+          log(`[silvercode] ${assigned.reason}; the worker may outlive a hard-killed owner (#442)`)
+        }
+      } else {
+        assignmentWarning = undefined
+      }
     } catch (error) {
       // A broken FFI load or a missing kernel32 symbol must never take the TUI
       // down: remember it, say so once, and leave the watchdog as the fallback.

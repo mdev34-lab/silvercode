@@ -202,6 +202,63 @@ describe("windows job object", () => {
     expect(fake.calls).toContain(`OpenProcess(${JOB_ASSIGN_ACCESS},202)`)
   })
 
+  test("warns once while assignment keeps failing, and keeps retrying every spawn", () => {
+    const fake = fakeApi({ assign: () => false })
+    const adopt = createOwnerJobAdopter({ platform: "win32", loadApi: () => fake.api })
+    const messages: string[] = []
+
+    adopt(101, (message) => messages.push(message))
+    adopt(202, (message) => messages.push(message))
+    adopt(303, (message) => messages.push(message))
+
+    // The single-warning fallback contract: persistent assignment failure is
+    // one warning, not one per adoption - but every later spawn is still
+    // attempted against the same retained job.
+    expect(messages).toHaveLength(1)
+    expect(messages[0]).toContain("AssignProcessToJobObject(101) failed")
+    expect(messages[0]).toContain("#442")
+    expect(fake.calls.filter((call) => call === "CreateJobObjectW")).toHaveLength(1)
+    expect(fake.calls.filter((call) => call.startsWith("OpenProcess"))).toEqual([
+      `OpenProcess(${JOB_ASSIGN_ACCESS},101)`,
+      `OpenProcess(${JOB_ASSIGN_ACCESS},202)`,
+      `OpenProcess(${JOB_ASSIGN_ACCESS},303)`,
+    ])
+    expect(fake.calls).not.toContain("CloseHandle(job)")
+  })
+
+  test("warns once while the worker process cannot be opened", () => {
+    const fake = fakeApi({ open: () => null })
+    const adopt = createOwnerJobAdopter({ platform: "win32", loadApi: () => fake.api })
+    const messages: string[] = []
+
+    adopt(101, (message) => messages.push(message))
+    adopt(202, (message) => messages.push(message))
+
+    expect(messages).toHaveLength(1)
+    expect(messages[0]).toContain("OpenProcess(101) failed")
+    expect(fake.calls.filter((call) => call.startsWith("OpenProcess"))).toEqual([
+      `OpenProcess(${JOB_ASSIGN_ACCESS},101)`,
+      `OpenProcess(${JOB_ASSIGN_ACCESS},202)`,
+    ])
+  })
+
+  test("a successful assignment rearms the warning for a later failure episode", () => {
+    const results = [false, true, false]
+    const fake = fakeApi({ assign: () => results.shift() ?? true })
+    const adopt = createOwnerJobAdopter({ platform: "win32", loadApi: () => fake.api })
+    const messages: string[] = []
+
+    adopt(101, (message) => messages.push(message))
+    adopt(202, (message) => messages.push(message))
+    adopt(303, (message) => messages.push(message))
+
+    // Failure, success, failure: the warning fired for the first episode,
+    // stayed quiet through the success, and fires again for the new episode.
+    expect(messages).toHaveLength(2)
+    expect(messages[0]).toContain("AssignProcessToJobObject(101) failed")
+    expect(messages[1]).toContain("AssignProcessToJobObject(303) failed")
+  })
+
   test("survives a broken FFI load and warns once", () => {
     let loads = 0
     const adopt = createOwnerJobAdopter({
