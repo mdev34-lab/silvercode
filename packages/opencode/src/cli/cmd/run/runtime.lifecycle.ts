@@ -176,10 +176,11 @@ function queueSplash(
 // the entry splash, RunFooter takes over the footer region.
 export async function createRuntimeLifecycle(input: LifecycleInput): Promise<Lifecycle> {
   const source = resolveInteractiveStdin()
-  const unguard = win32InstallCtrlCGuard(source.stdin)
+  let unguard: (() => void) | undefined
   let unregisterKeymap: (() => void) | undefined
 
   try {
+    unguard = win32InstallCtrlCGuard(source.stdin)
     const renderer = await createCliRenderer({
       stdin: source.stdin,
       targetFps: 30,

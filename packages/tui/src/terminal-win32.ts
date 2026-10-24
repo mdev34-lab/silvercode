@@ -120,34 +120,36 @@ export function win32InstallCtrlCGuard(stdin: NodeJS.ReadStream = process.stdin)
 
   let wrapped: NodeJS.ReadStream["setRawMode"] | undefined
 
-  if (typeof original === "function") {
-    wrapped = (mode: boolean) => {
-      const result = original.call(stdin, mode)
-      later()
-      return result
-    }
-
-    stdin.setRawMode = wrapped
-  }
-
-  // Ensure it's cleared immediately too (covers any earlier mode changes).
-  later()
-
-  const interval = setInterval(enforce, 100)
-  interval.unref()
-
-  unhook = () => {
+  let interval: ReturnType<typeof setInterval> | undefined
+  const cleanup = () => {
     if (done) return
     done = true
-
-    clearInterval(interval)
-    if (wrapped && stdin.setRawMode === wrapped) {
-      stdin.setRawMode = original
+    if (interval) clearInterval(interval)
+    try {
+      if (wrapped && stdin.setRawMode === wrapped) stdin.setRawMode = original
+      k32!.symbols.SetConsoleMode(handle, initial)
+    } finally {
+      source.close()
+      unhook = undefined
     }
+  }
 
-    k32!.symbols.SetConsoleMode(handle, initial)
-    source.close()
-    unhook = undefined
+  try {
+    if (typeof original === "function") {
+      wrapped = (mode: boolean) => {
+        const result = original.call(stdin, mode)
+        later()
+        return result
+      }
+      stdin.setRawMode = wrapped
+    }
+    later()
+    interval = setInterval(enforce, 100)
+    interval.unref()
+    unhook = cleanup
+  } catch (error) {
+    cleanup()
+    throw error
   }
 
   return unhook
