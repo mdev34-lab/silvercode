@@ -1537,7 +1537,7 @@ const itRetryRunning = processorWithLLM(() => {
   ).pipe(Stream.concat(Stream.fromEffect(
     runningRetryHandle.updateToolCall("metadata-running", (part) => ({ ...part,
       state: { status: "running", input: { command: "already started" }, time: { start: Date.now() }, metadata: { evidence: "retained" } },
-    })).pipe(Effect.andThen(Effect.fail(new SessionV1.APIError({ message: "temporary metadata stream error", isRetryable: true })))),
+    })).pipe(Effect.andThen(Effect.die(new SessionV1.APIError({ message: "temporary metadata stream error", isRetryable: true })))),
   )))
   return Stream.fromEffect(runningRetryHandle.completeToolCall("metadata-running", {
     title: "started tool", output: "RUNNING_EVIDENCE", metadata: { evidence: "retained" },
