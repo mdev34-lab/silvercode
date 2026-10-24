@@ -3582,6 +3582,9 @@ it.instance(
             return Effect.sync(() => reply(input, "notified"))
           }
           childPrompts.push(input)
+          // Fake prompt adapter: manually model incoming persistence here. This
+          // does not exercise production SessionPrompt or prove its end-to-end
+          // acceptance; it keeps the TaskTool ancestor assertion scoped honestly.
           if (childPrompts.length > 1) {
             return Effect.gen(function* () {
               const incoming = yield* sessions.updateMessage({
