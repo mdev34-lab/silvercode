@@ -12,7 +12,7 @@ import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { Ripgrep } from "@opencode-ai/core/ripgrep"
 import { Session } from "@/session/session"
 import { NotFoundError } from "@/storage/storage"
-import type { SessionPrompt } from "../../src/session/prompt"
+import { SessionPrompt } from "../../src/session/prompt"
 import { MessageID, PartID, SessionID } from "../../src/session/schema"
 import { SessionRunState } from "@/session/run-state"
 import { SessionStatus } from "@/session/status"
@@ -3489,7 +3489,7 @@ it.instance(
 // notification path stands down for a session that is a running task job's
 // subject - so the child is resumed exactly once and its final result still
 // reaches its own parent.
-it.instance(
+testEffect(layer({}, [], [SessionPrompt.node])).instance(
   "a foreground descendant promoted before writing carries review evidence when its parent resumes",
   () =>
     Effect.gen(function* () {
@@ -3582,27 +3582,13 @@ it.instance(
             return Effect.sync(() => reply(input, "notified"))
           }
           childPrompts.push(input)
-          // Fake prompt adapter: manually model incoming persistence here. This
-          // does not exercise production SessionPrompt or prove its end-to-end
-          // acceptance; it keeps the TaskTool ancestor assertion scoped honestly.
+          // Execute production incoming-part resolution and persistence. Only the
+          // model response remains synthetic in this TaskTool integration test.
           if (childPrompts.length > 1) {
             return Effect.gen(function* () {
-              const incoming = yield* sessions.updateMessage({
-                id: input.messageID ?? MessageID.ascending(),
-                role: "user",
-                sessionID: input.sessionID,
-                agent: "general",
-                model: ref,
-                time: { created: Date.now() },
-              })
-              for (const part of input.parts)
-                if (part.type === "text")
-                  yield* sessions.updatePart({
-                    ...part,
-                    id: PartID.ascending(),
-                    messageID: incoming.id,
-                    sessionID: input.sessionID,
-                  })
+              const prompt = yield* SessionPrompt.Service
+              const persisted = yield* prompt.prompt({ ...input, noReply: true })
+              expect(persisted.parts.some((part) => part.type === "text" && part.metadata?.reviewLoop?.writesFiles === true)).toBe(true)
               const replied = reply(input, "child final result")
               return {
                 ...replied,
