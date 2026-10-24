@@ -565,7 +565,7 @@ export const TaskTool = Tool.define(
         yield* Ref.update(wroteFiles, (prev) => prev || result.parts.some((part) => declaresFileWrites(part)))
         if (result.info.role === "assistant" && result.info.error) {
           const error = result.info.error
-          const message = "message" in error.data ? error.data.message : error.name
+          const message = error.data && "message" in error.data ? error.data.message : error.name
           return yield* Effect.fail(new Error(`Subagent failed: ${message}`))
         }
 

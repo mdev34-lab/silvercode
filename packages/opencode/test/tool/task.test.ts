@@ -4056,3 +4056,26 @@ it.instance("does not report a provider-failed child assistant as successful emp
   }),
   { config: FOREGROUND },
 )
+
+it.instance("keeps the error name if an upstream child error has no data", () =>
+  Effect.gen(function* () {
+    const { chat, assistant } = yield* seed()
+    const def = yield* (yield* TaskTool).init()
+    const exit = yield* def.execute(
+      { description: "quota failure", prompt: "inspect", subagent_type: "general", background: false },
+      {
+        sessionID: chat.id, messageID: assistant.id, agent: "work", abort: new AbortController().signal,
+        messages: [], metadata: () => Effect.void, ask: () => Effect.void,
+        extra: { promptOps: {
+          ...stubOps(), prompt: (input: SessionPrompt.PromptInput) => Effect.sync(() => {
+            const result = reply(input, "")
+            return { ...result, info: { ...result.info, error: { name: "APIError" } as NonNullable<typeof result.info.error> }, parts: [] }
+          }),
+        } },
+      },
+    ).pipe(Effect.exit)
+    expect(Exit.isFailure(exit)).toBe(true)
+    if (Exit.isFailure(exit)) expect(Cause.pretty(exit.cause)).toContain("Subagent failed: APIError")
+  }),
+  { config: FOREGROUND },
+)
