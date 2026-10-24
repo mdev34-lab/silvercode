@@ -4069,7 +4069,7 @@ it.instance("keeps the error name if an upstream child error has no data", () =>
         extra: { promptOps: {
           ...stubOps(), prompt: (input: SessionPrompt.PromptInput) => Effect.sync(() => {
             const result = reply(input, "")
-            return { ...result, info: { ...result.info, error: { name: "APIError" } as NonNullable<typeof result.info.error> }, parts: [] }
+            return { ...result, info: { ...result.info, error: { name: "APIError" } as NonNullable<SessionV1.Assistant["error"]> }, parts: [] }
           }),
         } },
       },
