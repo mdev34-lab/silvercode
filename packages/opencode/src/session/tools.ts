@@ -98,7 +98,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
           tool: { messageID: input.processor.message.id, callID: options.toolCallId },
           ruleset: Permission.merge(input.agent.permission, input.session.permission ?? []),
         })
-        .pipe(Effect.orDie),
+        .pipe(Effect.orDie, Effect.interruptible),
   })
 
   for (const item of yield* registry.tools({
@@ -149,7 +149,13 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
               yield* input.processor.completeToolCall(options.toolCallId, output)
             }
             return output
-          }),
+          }).pipe(
+            // Bash already observes ctx.abort and returns captured output after
+            // process teardown. Keep that finalization, but permission waits in
+            // ctx.ask remain interruptible so cancellation cannot authorize work.
+            item.id === "bash" ? Effect.uninterruptible : (effect) => effect,
+          ),
+          { signal: options.abortSignal },
         )
       },
     })
@@ -237,6 +243,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
             }
             return output
           }),
+          { signal: opts.abortSignal },
         )
       },
     })
@@ -320,6 +327,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
             }
             return output
           }),
+          { signal: opts.abortSignal },
         )
       },
     })
@@ -402,6 +410,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
             }
             return output
           }),
+          { signal: opts.abortSignal },
         )
       },
     })
@@ -525,6 +534,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
           }
           return output
         }),
+        { signal: opts.abortSignal },
       )
     tools[key] = item
   }

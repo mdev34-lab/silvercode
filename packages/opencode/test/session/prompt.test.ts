@@ -5302,3 +5302,92 @@ it.instance(
     }),
   { timeout: 30_000 },
 )
+
+it.instance("cancel while edit permission is pending removes the request and prevents a late write", () =>
+  Effect.gen(function* () {
+    const { dir, llm } = yield* useServerConfig((url) => ({ ...providerCfg(url), permission: { "*": "allow", edit: "ask" }, permission_timeout: { enabled: false } }))
+    const file = path.join(dir, "abort-locked.txt")
+    yield* Effect.promise(() => Bun.write(file, "ORIGINAL_CONTENT\n"))
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const permission = yield* Permission.Service
+    const chat = yield* sessions.create({ title: "Pinned" })
+    yield* llm.push(reply().tool("read", { filePath: file }))
+    yield* llm.push(reply().tool("edit", { filePath: file, oldString: "ORIGINAL_CONTENT", newString: "ABORTED_TURN_OVERWRITE" }))
+    yield* user(chat.id, "read and edit")
+    const first = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+    const request = yield* pollWithTimeout(permission.list().pipe(Effect.map((items) => items.find((r) => r.sessionID === chat.id))), "edit permission did not arrive")
+    yield* prompt.cancel(chat.id)
+    yield* Fiber.await(first)
+    const remaining = yield* permission.list()
+    // Probe the stale UI reply even if it should now be rejected.
+    yield* permission.reply({ requestID: request.id, reply: "once" }).pipe(Effect.ignore)
+    yield* Effect.sleep("100 millis")
+    expect(yield* Effect.promise(() => Bun.file(file).text())).toBe("ORIGINAL_CONTENT\n")
+    expect(remaining.some((r) => r.id === request.id)).toBe(false)
+    // A fresh edit of the same path must acquire the prior turn's semaphore.
+    yield* llm.push(reply().tool("edit", { filePath: file, oldString: "ORIGINAL_CONTENT", newString: "FRESH_TURN_WRITE" }))
+    yield* llm.text("fresh done")
+    yield* user(chat.id, "fresh edit")
+    const fresh = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+    const next = yield* pollWithTimeout(permission.list().pipe(Effect.map((items) => items.find((r) => r.sessionID === chat.id))), "fresh edit remained locked")
+    yield* permission.reply({ requestID: next.id, reply: "once" })
+    yield* Fiber.join(fresh).pipe(Effect.timeout("5 seconds"))
+    expect(yield* Effect.promise(() => Bun.file(file).text())).toBe("FRESH_TURN_WRITE\n")
+  }), { timeout: 20000 })
+
+it.instance("cancel while a question is pending removes it before a stale answer can complete the tool", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const questions = yield* Question.Service
+    const chat = yield* sessions.create({ title: "Pinned" })
+    yield* llm.push(reply().tool("question", { questions: [{ question: "Continue?", header: "Choice", options: [{ label: "Yes", description: "Continue" }] }] }))
+    yield* user(chat.id, "ask a question")
+    const first = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+    const request = yield* pollWithTimeout(questions.list().pipe(Effect.map((items) => items.find((r) => r.sessionID === chat.id))), "question did not arrive")
+    yield* prompt.cancel(chat.id)
+    yield* Fiber.await(first)
+    expect((yield* questions.list()).some((r) => r.id === request.id)).toBe(false)
+    const late = yield* questions.reply({ requestID: request.id, answers: [["Yes"]] }).pipe(Effect.exit)
+    expect(Exit.isFailure(late)).toBe(true)
+  }), { timeout: 20000 })
+
+const itAbortMcp = testEffect(makeHttp({ mcpTools: { probe_lookup: mcpTool("lookup", "Look up a note") } }))
+itAbortMcp.instance("cancel while an MCP permission is pending removes it before late approval", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig((url) => ({ ...providerCfg(url), permission: { "*": "allow", probe_lookup: "ask" }, permission_timeout: { enabled: false }, tool_search: { enabled: false } }))
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const permissions = yield* Permission.Service
+    const chat = yield* sessions.create({ title: "Pinned" })
+    yield* llm.push(reply().tool("probe_lookup", { query: "milk" }))
+    yield* user(chat.id, "look up note")
+    const first = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+    const request = yield* pollWithTimeout(permissions.list().pipe(Effect.map((items) => items.find((r) => r.sessionID === chat.id))), "MCP permission did not arrive")
+    yield* prompt.cancel(chat.id)
+    yield* Fiber.await(first)
+    expect((yield* permissions.list()).some((r) => r.id === request.id)).toBe(false)
+    const late = yield* permissions.reply({ requestID: request.id, reply: "once" }).pipe(Effect.exit)
+    expect(Exit.isFailure(late)).toBe(true)
+  }), { timeout: 20000 })
+
+it.instance("cancel while bash permission is pending cannot run the command on late approval", () =>
+  Effect.gen(function* () {
+    const { dir, llm } = yield* useServerConfig((url) => ({ ...providerCfg(url), permission: { "*": "allow", bash: "ask" }, permission_timeout: { enabled: false } }))
+    const file = path.join(dir, "aborted-command.txt")
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const permissions = yield* Permission.Service
+    const chat = yield* sessions.create({ title: "Pinned" })
+    yield* llm.push(reply().tool("bash", { command: "echo SHOULD_NOT_RUN > aborted-command.txt", description: "write marker", workdir: dir }))
+    yield* user(chat.id, "write marker")
+    const first = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+    const request = yield* pollWithTimeout(permissions.list().pipe(Effect.map((items) => items.find((r) => r.sessionID === chat.id))), "bash permission did not arrive")
+    yield* prompt.cancel(chat.id)
+    yield* Fiber.await(first)
+    const late = yield* permissions.reply({ requestID: request.id, reply: "once" }).pipe(Effect.exit)
+    expect(Exit.isFailure(late)).toBe(true)
+    expect(yield* Effect.promise(() => Bun.file(file).exists())).toBe(false)
+  }), { timeout: 20000 })
