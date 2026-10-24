@@ -302,6 +302,8 @@ describe("Config Dependency Install Integration with MockRegistry", () => {
       const npmCacheDir = path.join(tmp.path, "npm-cache")
       await fs.mkdir(cacheDir, { recursive: true })
 
+      // Establish the observation path even if the install times out before locking.
+      await fs.mkdir(path.join(cacheDir, "state", "locks"), { recursive: true })
       const { ctx } = await createProjectFixture(tmp.path, registry.url, npmCacheDir)
       const layer = makeIntegrationLayer(cacheDir)
 
