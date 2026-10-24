@@ -1,6 +1,7 @@
 import { test, expect, describe, afterEach, beforeEach } from "bun:test"
 import path from "path"
 import fs from "fs/promises"
+import { writeSync } from "node:fs"
 import http from "node:http"
 import { Cause, Deferred, Effect, Exit, Fiber, Layer, Logger } from "effect"
 import { HttpClient } from "effect/unstable/http"
@@ -22,6 +23,10 @@ import { AuthTest } from "../fake/auth"
 import { AccountTest } from "../fake/account"
 import { tmpdir } from "../fixture/fixture"
 import { MockRegistry } from "../fixture/mock-registry"
+
+// Diagnostic-only: keep process identity and phase visible if Windows exits before Bun reports (#590).
+const installPhase = (phase: string) =>
+  writeSync(2, `[dependency-install-phase] ${JSON.stringify({ phase, pid: process.pid, ppid: process.ppid, at: Date.now() })}\n`)
 
 const unexpectedHttp = HttpClient.make((request) =>
   Effect.die(`unexpected http request: ${request.method} ${request.url}`),
@@ -287,6 +292,7 @@ describe("Config Dependency Install Integration with MockRegistry", () => {
   })
 
   test("config get returns immediately on registry stall and waitForDependencies respects timeout", async () => {
+    installPhase("caller-timeout:enter")
     const previousTimeout = process.env.OPENCODE_CONFIG_DEP_INSTALL_TIMEOUT_MS
     process.env.OPENCODE_CONFIG_DEP_INSTALL_TIMEOUT_MS = "1000"
     try {
@@ -328,12 +334,14 @@ describe("Config Dependency Install Integration with MockRegistry", () => {
         expect(result.value.waitResult._tag).toBe("Failure")
       }
     } finally {
+      installPhase("caller-timeout:finally")
       if (previousTimeout === undefined) delete process.env.OPENCODE_CONFIG_DEP_INSTALL_TIMEOUT_MS
       else process.env.OPENCODE_CONFIG_DEP_INSTALL_TIMEOUT_MS = previousTimeout
     }
   })
 
   test("total install budget interrupts slow startup before HTTP and waitForDependencies joins", async () => {
+    installPhase("startup:enter")
     const previousTimeout = process.env.OPENCODE_CONFIG_DEP_INSTALL_TIMEOUT_MS
     process.env.OPENCODE_CONFIG_DEP_INSTALL_TIMEOUT_MS = "250"
     const logs: string[] = []
@@ -393,6 +401,7 @@ describe("Config Dependency Install Integration with MockRegistry", () => {
       })
         .pipe(Effect.provide(Logger.layer([captureLog])))
         .pipe(Effect.provideService(InstanceRef, ctx), Effect.scoped, Effect.provide(layer), Effect.runPromiseExit)
+      installPhase("startup:joined")
       const elapsed = Date.now() - startedAt
 
       expect(result._tag).toBe("Success")
@@ -409,18 +418,24 @@ describe("Config Dependency Install Integration with MockRegistry", () => {
       expect(logs.some((message) => message.includes("background dependency install timed out"))).toBe(true)
       expect(logs.some((message) => message.includes("background dependency install failed"))).toBe(false)
     } finally {
+      installPhase("startup:finally")
       if (previousTimeout === undefined) delete process.env.OPENCODE_CONFIG_DEP_INSTALL_TIMEOUT_MS
       else process.env.OPENCODE_CONFIG_DEP_INSTALL_TIMEOUT_MS = previousTimeout
     }
   })
 
   test("interrupting a real stalled registry request closes its TCP socket and releases locks", async () => {
+    installPhase("tcp:enter")
     await using tmp = await tmpdir()
     const entered = Deferred.makeUnsafe<void>()
     const closed = Deferred.makeUnsafe<void>()
     const server = http.createServer((request) => {
+      installPhase("tcp:request")
       // Observe the socket carrying this exact stalled request, not an unrelated close.
-      request.socket.once("close", () => Deferred.doneUnsafe(closed, Effect.void))
+      request.socket.once("close", () => {
+        installPhase("tcp:socket-closed")
+        Deferred.doneUnsafe(closed, Effect.void)
+      })
       Deferred.doneUnsafe(entered, Effect.void)
     })
     const sockets = new Set<import("node:net").Socket>()
@@ -431,6 +446,7 @@ describe("Config Dependency Install Integration with MockRegistry", () => {
       })
     })
     await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve))
+    installPhase("tcp:listening")
     try {
       const address = server.address()
       if (!address || typeof address === "string") throw new Error("missing registry address")
@@ -448,16 +464,21 @@ describe("Config Dependency Install Integration with MockRegistry", () => {
           })
           .pipe(Effect.forkChild)
         yield* Deferred.await(entered).pipe(Effect.timeout("5 seconds"))
+        yield* Effect.sync(() => installPhase("tcp:interrupting"))
         yield* Fiber.interrupt(fiber)
+        yield* Effect.sync(() => installPhase("tcp:interrupted"))
         yield* Deferred.await(closed).pipe(Effect.timeout("5 seconds"))
         return yield* Fiber.await(fiber)
       }).pipe(Effect.scoped, Effect.provide(makeIntegrationLayer(cacheDir)), Effect.runPromise)
+      installPhase("tcp:joined")
       expect(Exit.isFailure(result)).toBe(true)
       if (Exit.isFailure(result)) expect(Cause.hasInterrupts(result.cause)).toBe(true)
       expect(await fs.readdir(path.join(cacheDir, "state", "locks"))).toEqual([])
     } finally {
+      installPhase("tcp:finally")
       for (const socket of sockets) socket.destroy()
       await new Promise<void>((resolve) => server.close(() => resolve()))
+      installPhase("tcp:cleanup-complete")
     }
   }, 15000)
 })
