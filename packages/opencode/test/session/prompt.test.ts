@@ -5420,3 +5420,45 @@ it.instance("a child can finish on the next generation after writing its result 
     expectNoFinishNudge(history)
   }),
 )
+
+
+it.instance("cancel registered custom tool permission prevents a late side effect", () =>
+  Effect.gen(function* () {
+    const dir = (yield* TestInstance).directory
+    const tools = path.join(dir, ".opencode", "tools")
+    const marker = path.join(dir, "plugin-late-write.txt")
+    yield* Effect.promise(() => Bun.write(path.join(tools, "plugin_write.ts"), `export default {
+      description: "Request permission then write a marker", args: {},
+      async execute(args, ctx) {
+        await ctx.ask({ permission: "plugin_write", patterns: ["*"], always: ["*"], metadata: {} })
+        await Bun.write(${JSON.stringify(marker)}, "LATE_SIDE_EFFECT")
+        return "written"
+      }
+    }`))
+    const { llm } = yield* useServerConfig((url) => ({ ...providerCfg(url), permission: { "*": "allow", plugin_write: "ask" }, permission_timeout: { enabled: false }, tool_search: { enabled: false } }))
+    expect((yield* (yield* ToolRegistry.Service).all()).some((t) => t.id === "plugin_write")).toBe(true)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const permissions = yield* Permission.Service
+    const chat = yield* sessions.create({ title: "Pinned" })
+    yield* llm.push(reply().tool("plugin_write", {}))
+    yield* user(chat.id, "run the custom tool")
+    const first = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+    const request = yield* pollWithTimeout(permissions.list().pipe(Effect.map((items) => items.find((r) => r.sessionID === chat.id))), "custom tool permission did not arrive")
+    yield* prompt.cancel(chat.id)
+    yield* Fiber.await(first)
+    const remaining = yield* permissions.list()
+    yield* permissions.reply({ requestID: request.id, reply: "once" }).pipe(Effect.ignore)
+    yield* Effect.sleep("100 millis")
+    expect(yield* Effect.promise(() => Bun.file(marker).exists())).toBe(false)
+    expect(remaining.some((r) => r.id === request.id)).toBe(false)
+    // Cancellation must not poison the next legitimate plugin invocation.
+    yield* llm.push(reply().tool("plugin_write", {}))
+    yield* llm.text("approved plugin invocation completed")
+    yield* user(chat.id, "run again with approval")
+    const fresh = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+    const next = yield* pollWithTimeout(permissions.list().pipe(Effect.map((items) => items.find((r) => r.sessionID === chat.id))), "fresh custom tool permission did not arrive")
+    yield* permissions.reply({ requestID: next.id, reply: "once" })
+    yield* Fiber.join(fresh).pipe(Effect.timeout("5 seconds"))
+    expect(yield* Effect.promise(() => Bun.file(marker).text())).toBe("LATE_SIDE_EFFECT")
+  }), { timeout: 20000 })
