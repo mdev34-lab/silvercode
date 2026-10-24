@@ -331,7 +331,8 @@ describe("Runner", () => {
     }),
   )
 
-  it.live(
+  // Pure fiber/latch handoff: use TestClock rather than a wall-clock readiness race.
+  it.effect(
     "cancel does not mask shell defects",
     Effect.gen(function* () {
       const s = yield* Scope.Scope
@@ -350,7 +351,9 @@ describe("Runner", () => {
       yield* ready.await.pipe(Effect.timeout("250 millis"))
 
       yield* runner.cancel
-      expect(Exit.isFailure(yield* Fiber.await(sh))).toBe(true)
+      const exit = yield* Fiber.await(sh)
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isFailure(exit)) expect(Cause.squash(exit.cause)).toBe("boom")
     }),
   )
 
