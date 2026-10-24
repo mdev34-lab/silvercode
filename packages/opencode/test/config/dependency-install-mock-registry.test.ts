@@ -282,7 +282,7 @@ describe("Config Dependency Install Integration with MockRegistry", () => {
 
     expect(result._tag).toBe("Success")
     // Mock registry must NOT have received any requests
-    expect(registry.requests.length).toBe(0)
+    expect(registry.requests).toEqual([])
   })
 
   test("config get returns immediately on registry stall and waitForDependencies respects timeout", async () => {
