@@ -369,7 +369,7 @@ describe("Runner", () => {
       const ready = yield* Latch.make()
       const cause = Cause.combine(Cause.interrupt(), Cause.die("mixed boom"))
       const sh = yield* runner
-        .startShell(ready.open.pipe(Effect.andThen(Effect.never), Effect.ensuring(Effect.failCause(cause))), ready)
+        .startShell(ready.open.pipe(Effect.andThen(Effect.never), Effect.onExit(() => Effect.failCause(cause))), ready)
         .pipe(Effect.forkChild)
       const readiness = yield* ready.await.pipe(Effect.timeout("250 millis"), Effect.forkChild)
       yield* Effect.yieldNow
@@ -394,7 +394,7 @@ describe("Runner", () => {
       const ready = yield* Latch.make()
       const cause = Cause.combine(Cause.interrupt(), Cause.fail("shell failure"))
       const sh = yield* runner
-        .startShell(ready.open.pipe(Effect.andThen(Effect.never), Effect.ensuring(Effect.failCause(cause))), ready)
+        .startShell(ready.open.pipe(Effect.andThen(Effect.never), Effect.onExit(() => Effect.failCause(cause))), ready)
         .pipe(Effect.forkChild)
       const readiness = yield* ready.await.pipe(Effect.timeout("250 millis"), Effect.forkChild)
       yield* Effect.yieldNow
