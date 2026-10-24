@@ -38,7 +38,10 @@ export async function openEditor(input: { value: string; renderer: CliRenderer; 
     // instead of input the editor can handle. The Ctrl+C guard re-asserts this
     // after raw-mode toggles, but it only wraps the stream it was installed on,
     // so re-assert at the handoff as well (#441).
-    win32DisableProcessedInput()
+    const stdin = input.stdin
+    win32DisableProcessedInput(
+      typeof stdin === "object" && stdin !== null && "isTTY" in stdin ? (stdin as NodeJS.ReadStream) : process.stdin,
+    )
     await new Promise<void>((resolve, reject) => {
       const parts = editor.split(" ")
       const child = spawn(parts[0]!, [...parts.slice(1), file], {

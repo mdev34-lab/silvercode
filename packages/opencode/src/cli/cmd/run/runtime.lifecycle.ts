@@ -13,6 +13,7 @@ import { CliRenderEvents, createCliRenderer, type CliRenderer, type ScrollbackWr
 import { createDefaultOpenTuiKeymap } from "@opentui/keymap/opentui"
 import { Global } from "@opencode-ai/core/global"
 import { openEditor } from "@opencode-ai/tui/editor"
+import { win32InstallCtrlCGuard } from "@opencode-ai/tui/terminal-win32"
 import { registerOpencodeKeymap } from "@opencode-ai/tui/keymap"
 import { Session as SessionApi } from "@/session/session"
 import * as Locale from "@/util/locale"
@@ -175,6 +176,7 @@ function queueSplash(
 // the entry splash, RunFooter takes over the footer region.
 export async function createRuntimeLifecycle(input: LifecycleInput): Promise<Lifecycle> {
   const source = resolveInteractiveStdin()
+  const unguard = win32InstallCtrlCGuard(source.stdin)
   let unregisterKeymap: (() => void) | undefined
 
   try {
@@ -346,7 +348,11 @@ export async function createRuntimeLifecycle(input: LifecycleInput): Promise<Lif
         if (!wroteExit) {
           process.stdout.write("\n")
         }
-        source.cleanup?.()
+        try {
+          unguard?.()
+        } finally {
+          source.cleanup?.()
+        }
       }
     }
 
@@ -400,7 +406,11 @@ export async function createRuntimeLifecycle(input: LifecycleInput): Promise<Lif
     }
   } catch (error) {
     unregisterKeymap?.()
-    source.cleanup?.()
+    try {
+      unguard?.()
+    } finally {
+      source.cleanup?.()
+    }
     throw error
   }
 }
