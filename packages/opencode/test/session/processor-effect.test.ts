@@ -1489,3 +1489,40 @@ for (const scenario of [
     ),
   )
 }
+
+// A failed argument stream has not executed a tool, so retry is safe, but its
+// registered pending call must not remain a sibling finish waits on forever.
+let retryPendingCalls = 0
+let retryPendingHandle: SessionProcessor.Handle
+const itRetryPending = processorWithLLM(() => {
+  retryPendingCalls++
+  if (retryPendingCalls === 1) return Stream.make(
+    LLMEvent.stepStart({ index: 0 }),
+    LLMEvent.toolInputStart({ id: "abandoned-arguments", name: "bash" }),
+  ).pipe(Stream.concat(Stream.die(new SessionV1.APIError({ message: "temporary argument stream error", isRetryable: true }))))
+  return Stream.fromEffect(retryPendingHandle.waitForOtherTools("finish-retry")).pipe(
+    Stream.flatMap(() => Stream.make(
+      LLMEvent.stepStart({ index: 0 }),
+      LLMEvent.stepFinish({ index: 0, reason: "stop" }),
+      LLMEvent.finish({ reason: "stop" }),
+    )),
+  )
+})
+itRetryPending.live("clears abandoned argument calls before retry so finish can settle", () =>
+  provideTmpdirInstance((dir) => Effect.gen(function* () {
+    retryPendingCalls = 0
+    const { processors, session, provider } = yield* boot()
+    const chat = yield* session.create({})
+    const parent = yield* user(chat.id, "argument retry")
+    const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+    const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+    retryPendingHandle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
+    const result = yield* retryPendingHandle.process({ user: parent as SessionV1.User,
+      sessionID: chat.id, model: mdl, agent: agent(), system: [],
+      messages: [{ role: "user", content: "argument retry" }], tools: {},
+    }).pipe(Effect.timeout("8 seconds"), Effect.exit)
+    expect(retryPendingCalls).toBe(2)
+    expect(Exit.isSuccess(result)).toBe(true)
+    const parts = yield* MessageV2.parts(msg.id)
+    expect(parts.some((part) => part.type === "tool" && part.callID === "abandoned-arguments")).toBe(false)
+  }), { config: cfg }), { timeout: 15000 })
