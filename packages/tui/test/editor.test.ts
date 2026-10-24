@@ -122,3 +122,36 @@ test("skips requestRender when teardown lands after a successful resume (#377)",
   expect(renderer.calls.resume).toBe(1)
   expect(renderer.calls.requestRender).toBe(0)
 })
+
+test("never draws to a suspended renderer during editor handoff", async () => {
+  useNoopEditor()
+  let suspended = false
+  const renderer = makeRenderer({
+    suspend() { renderer.calls.suspend++; suspended = true },
+    async resume() { renderer.calls.resume++; suspended = false },
+  })
+  Object.defineProperty(renderer, "currentRenderBuffer", { get() {
+    if (suspended) throw new Error("Session scene drawing requires an active next frame")
+    return { clear() {} }
+  } })
+  await expect(openEditor({ value: "draft", renderer: renderer as never })).resolves.toBe("draft")
+  expect(renderer.calls.resume).toBe(1)
+  expect(renderer.calls.requestRender).toBe(1)
+})
+
+test("a failed editor spawn still restores a renderer with guarded suspended buffers", async () => {
+  delete process.env.VISUAL
+  process.env.EDITOR = "opencode-editor-that-does-not-exist"
+  let suspended = false
+  const renderer = makeRenderer({
+    suspend() { renderer.calls.suspend++; suspended = true },
+    async resume() { renderer.calls.resume++; suspended = false },
+  })
+  Object.defineProperty(renderer, "currentRenderBuffer", { get() {
+    if (suspended) throw new Error("Session scene drawing requires an active next frame")
+    return { clear() {} }
+  } })
+  await expect(openEditor({ value: "draft", renderer: renderer as never })).rejects.toThrow()
+  expect(renderer.calls.resume).toBe(1)
+  expect(renderer.calls.requestRender).toBe(1)
+})
