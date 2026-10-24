@@ -5,10 +5,140 @@
 // `OPENCODE_CONFIG_CONTENT` providing the test provider config inline.
 import { describe, expect } from "bun:test"
 import { Effect } from "effect"
-import { reply } from "../../lib/llm-server"
+import { raw, reply } from "../../lib/llm-server"
 import { cliIt } from "../../lib/cli-process"
 
 describe("opencode run (non-interactive subprocess)", () => {
+  cliIt.live(
+    "Zen quota SSE rejection on a continued session exits nonzero",
+    ({ llm, opencode }) =>
+      Effect.gen(function* () {
+        yield* llm.text("initial session response")
+        const first = yield* opencode.run("initial request", {
+          timeoutMs: 20_000,
+          model: "opencode/local-quota-test",
+          env: {
+            OPENCODE_CONFIG_CONTENT: JSON.stringify({
+              agent: { work: { finishTool: false } },
+              provider: {
+                opencode: {
+                  npm: "@ai-sdk/openai-compatible",
+                  options: { baseURL: llm.url, apiKey: "public" },
+                  models: {
+                    "local-quota-test": {
+                      name: "local quota test",
+                      limit: { context: 128000, output: 4096 },
+                      cost: { input: 0, output: 0 },
+                    },
+                  },
+                },
+              },
+              permission: { "*": "allow" },
+            }),
+          },
+        })
+        expect(first.exitCode).toBe(0)
+        yield* llm.push(
+          raw({
+            chunks: [
+              { error: { message: "Free usage limit reached", type: "quota_exceeded", code: "FreeUsageLimitError" } },
+            ],
+          }),
+        )
+        const result = yield* opencode.run("quota rejection", {
+          timeoutMs: 20_000,
+          extraArgs: ["--continue"],
+          model: "opencode/local-quota-test",
+          env: {
+            OPENCODE_CONFIG_CONTENT: JSON.stringify({
+              agent: { work: { finishTool: false } },
+              provider: {
+                opencode: {
+                  npm: "@ai-sdk/openai-compatible",
+                  options: { baseURL: llm.url, apiKey: "public" },
+                  models: {
+                    "local-quota-test": {
+                      name: "local quota test",
+                      limit: { context: 128000, output: 4096 },
+                      cost: { input: 0, output: 0 },
+                    },
+                  },
+                },
+              },
+              permission: { "*": "allow" },
+            }),
+          },
+        })
+        expect(result.exitCode).not.toBe(0)
+        expect(result.stderr).toContain("Free usage limit reached")
+        expect(result.durationMs).toBeLessThan(20_000)
+      }),
+    30_000,
+  )
+
+  for (const status of [403, 429]) {
+    cliIt.live(
+      `Zen HTTP ${status} quota rejection on a continued session exits nonzero`,
+      ({ llm, opencode }) =>
+        Effect.gen(function* () {
+          const env = {
+            OPENCODE_CONFIG_CONTENT: JSON.stringify({
+              agent: { work: { finishTool: false } },
+              provider: {
+                opencode: {
+                  npm: "@ai-sdk/openai-compatible",
+                  options: { baseURL: llm.url, apiKey: "public" },
+                  models: {
+                    "local-quota-test": {
+                      name: "local quota test",
+                      limit: { context: 128000, output: 4096 },
+                      cost: { input: 0, output: 0 },
+                    },
+                  },
+                },
+              },
+              permission: { "*": "allow" },
+            }),
+          }
+          yield* llm.text("initial session response")
+          const first = yield* opencode.run("initial request", {
+            timeoutMs: 20_000,
+            model: "opencode/local-quota-test",
+            env,
+          })
+          expect(first.exitCode).toBe(0)
+          const before = (yield* llm.hits).length
+          // Exercise HTTP failure before SSE headers, not an in-band error frame.
+          // 429 follows the existing bounded retry policy. Short server-provided
+          // retry delays keep this local test fast without changing that policy.
+          const attempts = status === 429 ? 6 : 1
+          for (let i = 0; i < attempts; i++)
+            yield* llm.error(
+              status,
+              { error: { message: "Free usage limit reached", type: "quota_exceeded", code: "FreeUsageLimitError" } },
+              { "retry-after-ms": "1" },
+            )
+          const result = yield* opencode.run("quota rejection", {
+            timeoutMs: 20_000,
+            extraArgs: ["--continue"],
+            model: "opencode/local-quota-test",
+            env,
+          })
+          expect(result.exitCode).not.toBe(0)
+          expect(result.stderr).toContain("Free usage limit reached")
+          expect(result.durationMs).toBeLessThan(20_000)
+          const newHits = (yield* llm.hits).slice(before)
+          const primary = newHits.filter(
+            (hit) => !JSON.stringify(hit.body).includes("Generate a title for this conversation"),
+          )
+          expect(primary.length).toBe(attempts)
+          expect(yield* llm.misses).toEqual([])
+          expect(yield* llm.pending).toBe(0)
+        }),
+      60_000,
+    )
+  }
+
   // Happy path: prompt completes, output reaches stdout, process exits 0.
   // If this fails, all the others likely will too — debug here first.
   cliIt.live(
