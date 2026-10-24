@@ -5,6 +5,10 @@ import { LLMEvent } from "@opencode-ai/llm"
 import { ProviderError } from "@/provider/error"
 import { ReasoningWatchdog } from "@/session/llm/reasoning-watchdog"
 import { it } from "../lib/effect"
+import { streamText, tool } from "ai"
+import { MockLanguageModelV3, convertArrayToReadableStream } from "ai/test"
+import z from "zod"
+import { LLMAISDK } from "@/session/llm/ai-sdk"
 
 const TIMEOUT = "1 minute"
 
@@ -268,6 +272,55 @@ describe("reasoning inactivity watchdog", () => {
       yield* pending(fiber)
       yield* Fiber.interrupt(fiber)
       expect(fiber.pollUnsafe()?._tag).toBe("Failure")
+    }),
+  )
+
+  it.live("allows an actual AI SDK execute callback to outlast the token deadline", () =>
+    Effect.gen(function* () {
+      let executions = 0
+      const model = new MockLanguageModelV3({
+        doStream: {
+          stream: convertArrayToReadableStream([
+            { type: "stream-start", warnings: [] },
+            { type: "tool-call", toolCallId: "actual-call", toolName: "slow", input: "{}" },
+            {
+              type: "finish",
+              finishReason: { unified: "tool-calls", raw: "tool_calls" },
+              usage: {
+                inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 },
+                outputTokens: { total: 1, text: 1, reasoning: 0 },
+              },
+            },
+          ]),
+        },
+      })
+      const result = streamText({
+        model,
+        prompt: "Use slow",
+        tools: {
+          slow: tool({
+            inputSchema: z.object({}),
+            execute: async () => {
+              executions++
+              await new Promise((resolve) => setTimeout(resolve, 1000))
+              return "completed"
+            },
+          }),
+        },
+      })
+      const state = LLMAISDK.adapterState()
+      const events = yield* ReasoningWatchdog.guard(
+        Stream.fromAsyncIterable(result.fullStream, (error) => error).pipe(
+          Stream.mapEffect((event) => LLMAISDK.toLLMEvents(state, event)),
+          Stream.flatMap((events) => Stream.fromIterable(events)),
+        ),
+        { timeout: "250 millis", executableTools: new Set(["slow"]) },
+      ).pipe(Stream.runCollect)
+      expect(executions).toBe(1)
+      expect(model.doStreamCalls).toHaveLength(1)
+      expect(events.filter((event) => event.type === "tool-call")).toHaveLength(1)
+      expect(events.filter((event) => event.type === "tool-result")).toHaveLength(1)
+      expect(events.some((event) => event.type === "tool-error")).toBe(false)
     }),
   )
 
