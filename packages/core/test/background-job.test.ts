@@ -31,6 +31,35 @@ describe("BackgroundJob", () => {
     }).pipe(Effect.provide(jobsLayer)),
   )
 
+  it.live("promotion retains producer metadata while observation results stay shallow copies", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const latch = yield* Deferred.make<void>()
+      const metadata: Record<string, unknown> = { background: false, before: "initial" }
+      const started = yield* jobs.start({ type: "task", metadata, run: Deferred.await(latch).pipe(Effect.as("done")) })
+      metadata.before = "updated"
+      const promoted = yield* jobs.promote(started.id)
+      expect(metadata.background).toBe(true)
+      expect(promoted?.metadata).toMatchObject({ before: "updated", background: true })
+      metadata.reviewLoop = { writesFiles: true }
+      expect(promoted?.metadata).not.toHaveProperty("reviewLoop")
+      if (promoted?.metadata) promoted.metadata.before = "not the registry"
+      expect((yield* jobs.get(started.id))?.metadata).toMatchObject({
+        before: "updated",
+        reviewLoop: { writesFiles: true },
+      })
+      expect((yield* jobs.list()).find((job) => job.id === started.id)?.metadata).toMatchObject({
+        reviewLoop: { writesFiles: true },
+      })
+      expect(started.metadata).toEqual({ background: false, before: "initial" })
+      yield* Deferred.succeed(latch, undefined)
+      expect((yield* jobs.wait({ id: started.id })).info?.metadata).toMatchObject({
+        background: true,
+        reviewLoop: { writesFiles: true },
+      })
+    }).pipe(Effect.provide(jobsLayer)),
+  )
+
   it.live("publishes jobs before starting immediately settling work", () =>
     Effect.gen(function* () {
       const jobs = yield* BackgroundJob.Service
