@@ -11,7 +11,7 @@ export function resultChunks(messages: readonly SessionV1.WithParts[], current: 
   if (current.info.role !== "assistant") return []
   const promptID = current.info.parentID
   const start = ordered.findIndex((message) => message.info.id === promptID && message.info.role === "user")
-  if (start < 0) return current.parts.flatMap((part) => (part.type === "text" ? [part.text] : []))
+  if (start < 0) return current.parts.flatMap((part) => (part.type === "text" && !part.ignored && !part.synthetic ? [part.text] : []))
   const prior = ordered.slice(start + 1, end)
   const finished = prior.findLastIndex((message) =>
     message.parts.some((part) => part.type === "tool" && part.tool === "finish" && part.state.status === "completed"),
@@ -21,7 +21,7 @@ export function resultChunks(messages: readonly SessionV1.WithParts[], current: 
     .slice(boundary, end + 1)
     .flatMap((message) =>
       message.info.role === "assistant" && message.info.parentID === promptID
-        ? message.parts.flatMap((part) => (part.type === "text" ? [part.text] : []))
+        ? message.parts.flatMap((part) => (part.type === "text" && !part.ignored && !part.synthetic ? [part.text] : []))
         : [],
     )
 }
@@ -29,8 +29,15 @@ export function resultChunks(messages: readonly SessionV1.WithParts[], current: 
 /** A text envelope has no JSON escaping burden; the last complete result must be non-empty. */
 export function textResult(chunks: readonly (string | undefined)[]) {
   const source = chunks.filter((text): text is string => typeof text === "string").join("\n")
-  const matches = [...source.matchAll(/<silvercode-result>([\s\S]*?)<\/silvercode-result>/g)]
-  const text = matches.at(-1)?.[1]?.trim()
+  const start = source.lastIndexOf(`<${TEXT_RESULT_TAG}>`)
+  const close = source.lastIndexOf(`</${TEXT_RESULT_TAG}>`)
+  if (start < 0 || close < start) return { ok: false as const }
+  const prefix = source.slice(0, start)
+  // No nested opening tag may remain unclosed before the final result.
+  if ((prefix.match(/<silvercode-result>/g)?.length ?? 0) !== (prefix.match(/<\/silvercode-result>/g)?.length ?? 0))
+    return { ok: false as const }
+  const text = source.slice(start + TEXT_RESULT_TAG.length + 2, close).trim()
+  if (text.includes(`</${TEXT_RESULT_TAG}>`)) return { ok: false as const }
   return text ? { ok: true as const, text } : { ok: false as const }
 }
 

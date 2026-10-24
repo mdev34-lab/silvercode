@@ -39,6 +39,8 @@ describe("subagent result execution boundary", () => {
       { type: "reasoning", text: envelope },
       { type: "tool", tool: "read", state: { status: "completed", output: envelope } },
       text("Progress only"),
+      { type: "text", text: envelope, synthetic: true },
+      { type: "text", text: envelope, ignored: true },
     ])
     expect(textResult(resultChunks([user("01"), last], last))).toEqual({ ok: false })
   })
@@ -66,4 +68,10 @@ describe("text result envelope", () => {
   test("uses the latest complete envelope instead of old progress", () => {
     expect(textResult([renderTextResult("old"), envelope])).toEqual({ ok: true, text: plan })
   })
+})
+
+
+test("rejects nested tags and an unfinished newer result instead of using stale text", () => {
+  expect(textResult(["<silvercode-result>outer<silvercode-result>inner</silvercode-result></silvercode-result>"])).toEqual({ ok: false })
+  expect(textResult([renderTextResult("earlier"), "<silvercode-result>unfinished"])).toEqual({ ok: false })
 })
