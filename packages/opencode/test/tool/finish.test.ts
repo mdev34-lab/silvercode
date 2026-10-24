@@ -81,6 +81,10 @@ const seedSession = Effect.fn("FinishTest.seedSession")(function* (
     time: { created: Date.now() },
   }
   yield* session.updateMessage(assistant)
+  if (parentID) yield* session.updatePart({
+    id: PartID.ascending(), messageID: assistant.id, sessionID: chat.id, type: "text",
+    text: "<silvercode-result>Fixture outcome.</silvercode-result>",
+  })
   return { chat, assistant }
 })
 
@@ -950,7 +954,7 @@ describe("tool.finish – waiting for a background subagent", () => {
 
       const failure = reviewFailure(
         yield* def
-          .execute({ reason: "waiting_for_subagent", result: "waiting" }, workCtx(chat.id, assistant.id))
+          .execute({ reason: "waiting_for_subagent", result: "<silvercode-result>Waiting for delegated work.</silvercode-result>" }, workCtx(chat.id, assistant.id))
           .pipe(Effect.exit),
       )
 
@@ -1772,3 +1776,86 @@ describe("tool.finish – stale approval after later work and an errored attempt
     { config: { agent: { effort: "fast" } } },
   )
 })
+
+describe("tool.finish - mandatory generic subagent result", () => {
+  for (const reason of ["success", "failure", "waiting_for_subagent"] as const) {
+    it.instance(`rejects missing envelope before ${reason}`, () =>
+      Effect.gen(function* () {
+        const { chat, assistant } = yield* seedSession()
+        const jobs = yield* BackgroundJob.Service
+        yield* jobs.start({
+          id: `${chat.id}-task`,
+          type: "task",
+          metadata: { sessionId: chat.id, parentSessionId: "ses_parent" },
+          run: Effect.never,
+        })
+        const def = yield* (yield* FinishTool).init()
+        const failure = reviewFailure(
+          yield* def.execute({ reason, result: "Task completed" }, workCtx(chat.id, assistant.id)).pipe(Effect.exit),
+        )
+        expect(failure?.message).toContain("Subagent finish rejected")
+      }),
+    )
+  }
+  it.instance("accepts a model-authored text envelope in finish.result", () =>
+    Effect.gen(function* () {
+      const { chat, assistant } = yield* seedSession("child", "general", SessionID.make("ses_parent"))
+      const def = yield* (yield* FinishTool).init()
+      const result = yield* def.execute(
+        { reason: "failure", result: "<silvercode-result>Cannot inspect the missing input.</silvercode-result>" },
+        { ...workCtx(chat.id, assistant.id), agent: "general" },
+      )
+      expect(result.title).toBe("Task completed")
+      expect(result.output).toContain("Cannot inspect the missing input.")
+    }),
+  )
+  it.instance("accepts a prior assistant result in the current execution", () =>
+    Effect.gen(function* () {
+      const { chat, assistant } = yield* seedSession("child", "general", SessionID.make("ses_parent"))
+      const sessions = yield* Session.Service
+      const next = { ...assistant, id: MessageID.ascending() }
+      yield* sessions.updateMessage(next)
+      const def = yield* (yield* FinishTool).init()
+      const result = yield* def.execute(
+        { reason: "failure", result: "done" },
+        { ...workCtx(chat.id, next.id), agent: "general" },
+      )
+      expect(result.title).toBe("Task completed")
+    }),
+  )
+  it.instance("preserves Review's specialized envelope across assistant turns", () =>
+    Effect.gen(function* () {
+      const { chat, assistant } = yield* seedSession("review", "review")
+      const sessions = yield* Session.Service
+      yield* sessions.updatePart({
+        id: PartID.ascending(),
+        messageID: assistant.id,
+        sessionID: chat.id,
+        type: "text",
+        text: reviewEnvelope(REVIEW_APPROVED),
+      })
+      const next = { ...assistant, id: MessageID.ascending() }
+      yield* sessions.updateMessage(next)
+      const def = yield* (yield* FinishTool).init()
+      const result = yield* def.execute({ reason: "success", result: "done" }, reviewCtx(chat.id, next.id))
+      expect(result.title).toBe("Task completed")
+    }),
+  )
+})
+
+it.instance("a subagent can correct a rejected malformed result through finish.result", () =>
+  Effect.gen(function* () {
+    const { chat, assistant } = yield* seedSession("child", "general", SessionID.make("ses_parent"))
+    const sessions = yield* Session.Service
+    const next = { ...assistant, id: MessageID.ascending() }
+    yield* sessions.updateMessage(next)
+    yield* sessions.updatePart({ id: PartID.ascending(), messageID: next.id, sessionID: chat.id,
+      type: "text", text: "<silvercode-result>unfinished" })
+    const def = yield* (yield* FinishTool).init()
+    const ctx = { ...workCtx(chat.id, next.id), agent: "general" }
+    const failure = reviewFailure(yield* def.execute({ reason: "failure", result: "done" }, ctx).pipe(Effect.exit))
+    expect(failure?.message).toContain("Subagent finish rejected")
+    const corrected = yield* def.execute({ reason: "failure", result: "<silvercode-result>Corrected final result.</silvercode-result>" }, ctx)
+    expect(corrected.title).toBe("Task completed")
+  }),
+)
