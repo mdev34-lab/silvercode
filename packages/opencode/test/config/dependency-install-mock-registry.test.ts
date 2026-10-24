@@ -1,7 +1,8 @@
 import { test, expect, describe, afterEach, beforeEach } from "bun:test"
 import path from "path"
 import fs from "fs/promises"
-import { Effect, Layer, Logger } from "effect"
+import http from "node:http"
+import { Cause, Deferred, Effect, Exit, Fiber, Layer, Logger } from "effect"
 import { HttpClient } from "effect/unstable/http"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { FSUtil } from "@opencode-ai/core/fs-util"
@@ -332,7 +333,7 @@ describe("Config Dependency Install Integration with MockRegistry", () => {
     }
   })
 
-  test("stalled install is cut by OPENCODE_CONFIG_DEP_INSTALL_TIMEOUT_MS and waitForDependencies joins at the bound", async () => {
+  test("total install budget interrupts slow startup before HTTP and waitForDependencies joins", async () => {
     const previousTimeout = process.env.OPENCODE_CONFIG_DEP_INSTALL_TIMEOUT_MS
     process.env.OPENCODE_CONFIG_DEP_INSTALL_TIMEOUT_MS = "250"
     const logs: string[] = []
@@ -355,7 +356,31 @@ describe("Config Dependency Install Integration with MockRegistry", () => {
       await fs.mkdir(cacheDir, { recursive: true })
 
       const { ctx } = await createProjectFixture(tmp.path, registry.url, npmCacheDir)
-      const layer = makeIntegrationLayer(cacheDir)
+      const started: string[] = []
+      const interrupted: string[] = []
+      const slowStart = Layer.effect(
+        Npm.Service,
+        Effect.gen(function* () {
+          const actual = yield* Npm.Service
+          return Npm.Service.of({
+            ...actual,
+            install: (dir, input) =>
+              Effect.sync(() => started.push(dir)).pipe(
+                // The total budget also covers work before the first HTTP request.
+                Effect.andThen(Effect.sleep("300 millis")),
+                Effect.andThen(actual.install(dir, input)),
+                Effect.onInterrupt(() => Effect.sync(() => interrupted.push(dir))),
+              ),
+          })
+        }),
+      ).pipe(Layer.provide(LayerNode.compile(Npm.node)))
+      const layer = LayerNode.compile(Config.node, [
+        [Auth.node, AuthTest.empty],
+        [Account.node, AccountTest.empty],
+        [Npm.node, slowStart],
+        [Global.node, Global.layerWith({ cache: cacheDir, state: path.join(cacheDir, "state") })],
+        [httpClient, Layer.succeed(HttpClient.HttpClient, unexpectedHttp)],
+      ])
 
       const startedAt = Date.now()
       const result = await Effect.gen(function* () {
@@ -377,8 +402,9 @@ describe("Config Dependency Install Integration with MockRegistry", () => {
       // The 10s wall bound needs headroom on the loaded windows runner, where
       // the same join crossed it under load (#485).
       expect(elapsed).toBeLessThan(process.platform === "win32" ? 30_000 : 10_000)
-      // The install really started against the mock registry before stalling.
-      expect(registry.requests.length).toBeGreaterThan(0)
+      expect(started.length).toBeGreaterThan(0)
+      expect(interrupted.sort()).toEqual(started.sort())
+      expect(registry.requests).toHaveLength(0)
       // The bound expiry is reported as a timeout, not as an install failure.
       expect(logs.some((message) => message.includes("background dependency install timed out"))).toBe(true)
       expect(logs.some((message) => message.includes("background dependency install failed"))).toBe(false)
@@ -387,4 +413,51 @@ describe("Config Dependency Install Integration with MockRegistry", () => {
       else process.env.OPENCODE_CONFIG_DEP_INSTALL_TIMEOUT_MS = previousTimeout
     }
   })
+
+  test("interrupting a real stalled registry request closes its TCP socket and releases locks", async () => {
+    await using tmp = await tmpdir()
+    const entered = Deferred.makeUnsafe<void>()
+    const closed = Deferred.makeUnsafe<void>()
+    const server = http.createServer((request) => {
+      // Observe the socket carrying this exact stalled request, not an unrelated close.
+      request.socket.once("close", () => Deferred.doneUnsafe(closed, Effect.void))
+      Deferred.doneUnsafe(entered, Effect.void)
+    })
+    const sockets = new Set<import("node:net").Socket>()
+    server.on("connection", (socket) => {
+      sockets.add(socket)
+      socket.once("close", () => {
+        sockets.delete(socket)
+      })
+    })
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve))
+    try {
+      const address = server.address()
+      if (!address || typeof address === "string") throw new Error("missing registry address")
+      const cacheDir = path.join(tmp.path, "cache")
+      const fixture = await createProjectFixture(
+        tmp.path,
+        `http://127.0.0.1:${address.port}`,
+        path.join(tmp.path, "npm-cache"),
+      )
+      const result = await Effect.gen(function* () {
+        const npm = yield* Npm.Service
+        const fiber = yield* npm
+          .install(fixture.opencodeDir, {
+            add: [{ name: "@opencode-ai/plugin", version: "1.0.0" }],
+          })
+          .pipe(Effect.forkChild)
+        yield* Deferred.await(entered).pipe(Effect.timeout("5 seconds"))
+        yield* Fiber.interrupt(fiber)
+        yield* Deferred.await(closed).pipe(Effect.timeout("5 seconds"))
+        return yield* Fiber.await(fiber)
+      }).pipe(Effect.scoped, Effect.provide(makeIntegrationLayer(cacheDir)), Effect.runPromise)
+      expect(Exit.isFailure(result)).toBe(true)
+      if (Exit.isFailure(result)) expect(Cause.hasInterrupts(result.cause)).toBe(true)
+      expect(await fs.readdir(path.join(cacheDir, "state", "locks"))).toEqual([])
+    } finally {
+      for (const socket of sockets) socket.destroy()
+      await new Promise<void>((resolve) => server.close(() => resolve()))
+    }
+  }, 15000)
 })
