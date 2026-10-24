@@ -3583,11 +3583,32 @@ it.instance(
           }
           childPrompts.push(input)
           if (childPrompts.length > 1) {
-            const replied = reply(input, "child final result")
-            return Effect.sync(() => ({
-              ...replied,
-              parts: [...replied.parts, finishPart(replied.info.id, input.sessionID, "success", "child final result")],
-            }))
+            return Effect.gen(function* () {
+              const incoming = yield* sessions.updateMessage({
+                id: input.messageID ?? MessageID.ascending(),
+                role: "user",
+                sessionID: input.sessionID,
+                agent: "general",
+                model: ref,
+                time: { created: Date.now() },
+              })
+              for (const part of input.parts)
+                if (part.type === "text")
+                  yield* sessions.updatePart({
+                    ...part,
+                    id: PartID.ascending(),
+                    messageID: incoming.id,
+                    sessionID: input.sessionID,
+                  })
+              const replied = reply(input, "child final result")
+              return {
+                ...replied,
+                parts: [
+                  ...replied.parts,
+                  finishPart(replied.info.id, input.sessionID, "success", "child final result"),
+                ],
+              }
+            })
           }
           return Effect.gen(function* () {
             // A real dispatch runs inside a real assistant message of the child
@@ -3609,7 +3630,12 @@ it.instance(
               agent: "general",
               cost: 0,
               path: { cwd: "/tmp", root: "/tmp" },
-              tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+              tokens: {
+                input: 0,
+                output: 0,
+                reasoning: 0,
+                cache: { read: 0, write: 0 },
+              },
               modelID: ref.modelID,
               providerID: ref.providerID,
               variant: "xhigh",
@@ -3707,7 +3733,9 @@ it.instance(
       expect(settled.info?.output).toContain("child final result")
       const deliveryPart = childPrompts[1]?.parts[0]
       expect(deliveryPart?.type === "text" && deliveryPart.text.includes("UNREVIEWED")).toBe(true)
-      expect(deliveryPart?.metadata?.reviewLoop).toMatchObject({ writesFiles: true })
+      expect(deliveryPart?.metadata?.reviewLoop).toMatchObject({
+        writesFiles: true,
+      })
 
       yield* pollWithTimeout(
         Effect.sync(() => (parentPrompts.length === 1 ? true : undefined)),
@@ -3716,6 +3744,7 @@ it.instance(
       const delivered = parentPrompts[0]?.parts[0]?.type === "text" ? parentPrompts[0].parts[0].text : ""
       expect(delivered).toMatch(new RegExp(`<task id="${child}" run="${child}@\\d+" state="completed">`))
       expect(delivered).toContain("child final result")
+      expect(delivered).toContain("UNREVIEWED")
 
       // The child was resumed by the parked job with the settled report, and
       // the notification path did not prompt it a second time for that report.
