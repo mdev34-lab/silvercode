@@ -17,7 +17,7 @@ import { httpError, reply } from "../../lib/llm-server"
 import { testProviderConfig } from "../../lib/test-provider"
 
 const HOLD_MS = 2_000
-const ROOT_PROMPT = "start the nested work"
+const ROOT_PROMPT = "Research the nested report"
 const CHILD_PROMPT = "look into the cache key path"
 const GRANDCHILD_PROMPT = "do the nested work"
 const GRANDCHILD_RESULT = "grandchild answer GRANDONLY_OK"

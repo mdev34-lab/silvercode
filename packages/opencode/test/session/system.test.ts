@@ -146,6 +146,7 @@ const it = testEffect(
       Agent.node,
       Layer.mock(Agent.Service, {
         list: () => Effect.succeed([build, think, code, scout, engineerReviewer, hiddenPlanner]),
+        get: (name) => Effect.succeed([build, think, code, scout, engineerReviewer, hiddenPlanner].find(agent=>agent.name===name)!),
       }),
     ],
     [
@@ -193,6 +194,7 @@ const itPrimaryTools = testEffect(
       Agent.node,
       Layer.mock(Agent.Service, {
         list: () => Effect.succeed([build, think, code, scout, engineerReviewer, hiddenPlanner]),
+        get: (name) => Effect.succeed([build, think, code, scout, engineerReviewer, hiddenPlanner].find(agent=>agent.name===name)!),
       }),
     ],
     [

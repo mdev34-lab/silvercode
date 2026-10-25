@@ -148,7 +148,7 @@ it.live("tool execution produces non-empty session diff (snapshot race)", () =>
         sessionID: session.id,
         agent: "work",
         noReply: true,
-        parts: [{ type: "text", text: "create the file" }],
+        parts: [{ type: "text", text: "create the file for a report" }],
       })
 
       // Run the agent loop
