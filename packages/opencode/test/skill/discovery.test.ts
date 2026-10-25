@@ -1,3 +1,4 @@
+import { PlatformError, SystemError } from "effect/PlatformError"
 import { describe, expect, beforeAll, afterAll } from "bun:test"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { FSUtil } from "@opencode-ai/core/fs-util"
@@ -33,11 +34,11 @@ const observedFs=Layer.effect(FSUtil.Service,Effect.gen(function*(){
  return {...fs,rename:(source:string,destination:string)=>{
   if(forcePromotion&&source.includes(".tmp-")&&destination.endsWith("mutable")){
    forcePromotion=false
-   return Effect.fail(new Error("private controlled promotion",{cause:{code:"EBUSY"}})) as ReturnType<typeof fs.rename>
+   return Effect.fail(new PlatformError(new SystemError({_tag:"Busy",module:"FileSystem",method:"rename",cause:{code:"EBUSY"}})))
   }
   if(forceRollback&&source.includes(".old-")&&destination.endsWith("mutable")){
    forceRollback=false
-   return Effect.fail(new Error("private controlled rollback",{cause:{code:"EPERM"}})) as ReturnType<typeof fs.rename>
+   return Effect.fail(new PlatformError(new SystemError({_tag:"PermissionDenied",module:"FileSystem",method:"rename",cause:{code:"EPERM"}})))
   }
   return fs.rename(source,destination)
  }}
