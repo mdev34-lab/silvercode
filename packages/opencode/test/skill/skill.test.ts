@@ -328,6 +328,19 @@ description: A skill in the .claude/skills directory.
     ),
   )
 
+  it.live("ships the built-in deep-think planning skill", () =>
+    provideTmpdirInstance(
+      () =>
+        Effect.gen(function* () {
+          const skill = yield* Skill.Service
+          const info = yield* skill.require(Skill.DEEP_THINK_SKILL_NAME)
+          expect(info.location).toBe("<built-in>")
+          expect(info.content).toContain("numbered steps")
+        }),
+      { git: true },
+    ),
+  )
+
   it.live("fails with typed error when requiring a missing skill", () =>
     provideTmpdirInstance(
       () =>

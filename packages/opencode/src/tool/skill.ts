@@ -62,6 +62,9 @@ export const SkillTool = Tool.define(
             metadata: {
               name: info.name,
               dir,
+              // Runtime-stamped provenance: only the shipped skill, never a same-named disk skill that shadows it.
+              builtin: info.location === "<built-in>",
+              sessionID: ctx.sessionID,
             },
           }
         }).pipe(Effect.orDie),

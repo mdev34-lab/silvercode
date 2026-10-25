@@ -4,6 +4,9 @@ import type { ReviewHistoryMessage } from "./review-loop"
 
 export const METADATA = "workFlow"
 
+/** Name of the built-in planning skill that satisfies the planning stage. */
+export const DEEP_THINK_SKILL = "deep-think"
+
 function record(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value)
 }
@@ -25,6 +28,19 @@ export function state(messages: readonly History[], sessionID?: string) {
   let delegated = false
   for (const message of messages.slice(start + 1)) {
     for (const part of message.parts) {
+      if (part.type === "tool" && part.tool === "skill" && part.state?.status === "completed") {
+        // Planning is the built-in deep-think skill loaded by the runtime skill tool in this request.
+        const loaded = part.state.metadata
+        if (
+          record(loaded) &&
+          loaded.name === DEEP_THINK_SKILL &&
+          loaded.builtin === true &&
+          loaded.sessionID !== undefined &&
+          (sessionID === undefined || loaded.sessionID === sessionID)
+        )
+          planned = true
+        continue
+      }
       if (part.type !== "tool" || part.tool !== "task" || part.state?.status !== "completed") continue
       const metadata = part.state.metadata
       if (!record(metadata) || !record(metadata[METADATA])) continue

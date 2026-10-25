@@ -198,6 +198,8 @@ const layer = Layer.effect(
                 lsp: "deny",
                 task: {
                   work: "deny",
+                  // Planning is the built-in `deep-think` skill in Work's own loop, not a subagent.
+                  think: "deny",
                 },
               }),
               user,

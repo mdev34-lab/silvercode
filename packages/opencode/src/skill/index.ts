@@ -17,6 +17,7 @@ import { Glob } from "@opencode-ai/core/util/glob"
 import { Discovery } from "./discovery"
 import { isRecord } from "@/util/record"
 import { escapeHtml } from "@/util/html"
+import DEEP_THINK_BODY from "./deep-think.txt"
 
 const CLAUDE_EXTERNAL_DIR = ".claude"
 const AGENTS_EXTERNAL_DIR = ".agents"
@@ -33,6 +34,12 @@ const CUSTOMIZE_OPENCODE_SKILL_NAME = "customize-opencode"
 const CUSTOMIZE_OPENCODE_SKILL_DESCRIPTION =
   "Use ONLY when the user is editing or creating opencode's own configuration: opencode.json, opencode.jsonc, files under .opencode/, or files under ~/.config/opencode/. Also use when creating or fixing opencode agents, subagents, skills, plugins, MCP servers, or permission rules. Do not use for the user's own application code, or for any project that is not configuring opencode itself."
 const CUSTOMIZE_OPENCODE_SKILL_BODY = SkillPlugin.CustomizeOpencodeContent
+
+// Built-in planning skill. Replaces the Think subagent for Work: the same
+// model plans in its own context window and then carries the plan out.
+export const DEEP_THINK_SKILL_NAME = "deep-think"
+const DEEP_THINK_SKILL_DESCRIPTION =
+  "Use once at the start of any non-trivial task (new feature, multi-file change, ambiguous or open-ended goal, build-from-scratch deliverable) before editing or delegating: research, compare approaches, and write a short numbered plan with acceptance criteria. Skip for small, clear tasks."
 
 export const Info = Schema.Struct({
   name: Schema.String,
@@ -280,6 +287,12 @@ const layer = Layer.effect(
           description: CUSTOMIZE_OPENCODE_SKILL_DESCRIPTION,
           location: "<built-in>",
           content: CUSTOMIZE_OPENCODE_SKILL_BODY,
+        }
+        s.skills[DEEP_THINK_SKILL_NAME] = {
+          name: DEEP_THINK_SKILL_NAME,
+          description: DEEP_THINK_SKILL_DESCRIPTION,
+          location: "<built-in>",
+          content: DEEP_THINK_BODY,
         }
         yield* loadSkills(s, yield* InstanceState.get(discovered), events)
         return s

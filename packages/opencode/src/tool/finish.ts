@@ -335,7 +335,7 @@ export const FinishTool = Tool.define(
               return yield* Effect.fail(
                 new ToolFailure({
                   message:
-                    "Programming success requires successful Think planning followed by successful Code implementation in this request.",
+                    "Programming success requires deep-think planning (or a successful Think task) followed by successful Code implementation in this request.",
                 }),
               )
             if (

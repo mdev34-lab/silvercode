@@ -404,7 +404,7 @@ const layer = Layer.effect(
                     new ToolFailure({
                       message:
                         current?.kind === "programming"
-                          ? "Programming is coordinator-only for Work and read-only for Think. Complete Think planning, then delegate implementation and commands to Code."
+                          ? "Programming is coordinator-only for Work and read-only for Think. Complete deep-think planning, then delegate implementation and commands to Code."
                           : "Task intent is uncertain. Inspect read-only or ask whether this is programming or non-programming before execution; only the user's request can select the route.",
                     }),
                   )

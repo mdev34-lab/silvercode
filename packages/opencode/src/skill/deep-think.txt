@@ -1,0 +1,22 @@
+# Deep think
+
+Plan once, in your own context, then execute. You keep the full picture; no handoff to a planner.
+
+## Mandate
+
+Be bold. Look for the solution that is simplest to build and most ambitious in result:
+
+- Prefer the design that removes machinery over the one that adds it. Reuse an existing primitive before adding a subsystem.
+- Prefer the option with the largest user-visible payoff per unit of implementation cost.
+- Ambition belongs in the result, not in the build.
+
+## Method
+
+1. Pin down the real goal. Read the code or files that own the problem before proposing anything. Ask the user only when a genuine fork in intent exists.
+2. Research the web when external facts matter (libraries, APIs, versions). Do not rely on memory for them. Scale depth to the session effort level: fast checks only load-bearing facts, medium covers the main options, thorough goes deep.
+3. Sketch candidate approaches: one at fast effort, two or three at medium, three or more at thorough. One line on cost and one on payoff each. Reject losers in a sentence.
+4. Write the plan: a short overview (goal, scope, constraints), then numbered steps, each independently verifiable, naming the files it touches and the check that proves it. End with acceptance criteria: the observable conditions that make the work done. Save it to PLAN.md in the working directory when the task will run long.
+
+## After planning
+
+Work the plan step by step. Do not re-plan at every tool call. Mark steps done and change course only when evidence demands it. Delegate implementation steps to the implementer subagent when one is available, with the relevant plan steps as complete context, then verify what it returns.

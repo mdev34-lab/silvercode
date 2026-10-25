@@ -42,7 +42,7 @@ export const clarify = Effect.fn("WorkFlow.clarify")(function* (sessionID: Sessi
         question: "Does this request change or debug software, or produce non-programming work?",
         custom: false,
         options: [
-          { label: "Programming", description: "Require Think planning, Code implementation and clean Review" },
+          { label: "Programming", description: "Require deep-think planning, Code implementation and clean Review" },
           { label: "Non-programming", description: "Work or General may execute; do not use Code" },
         ],
       },
