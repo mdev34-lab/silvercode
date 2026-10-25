@@ -375,7 +375,12 @@ for (const tag of ReviewReport.TAGS) {
   }
 }
 
-for (const broken of ['{"summary":"unterminated', '{"summary":"unterminated <silvercode-review>', '{"summary":"trailing\\', '{"summary":"escaped\\"']) {
+for (const broken of [
+  '{"summary":"unterminated',
+  '{"summary":"unterminated <silvercode-review>',
+  '{"summary":"trailing\\',
+  '{"summary":"escaped\\"',
+]) {
   test(`malformed quoted latest report cannot revive older approval: ${broken}`, () => {
     const parsed = ReviewReport.extract([
       envelope({ assessment: "approved", findings: [] }),
