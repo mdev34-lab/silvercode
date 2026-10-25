@@ -6,6 +6,7 @@ test("opt-in runner interrupts full provided execution and finalizes before the 
  for(const [fixture,next] of [
   ["owned-cooperative.ts","next Bun test sees provided layer finalized"],
   ["owned-acquisition.ts","next Bun test sees acquisition scope finalized"],
+  ["owned-default.ts","next Bun test sees default-path layer finalized"],
  ]){
   const {stdout,stderr,code,timedOut}=await collectDeadlineChild([
    process.execPath,"test",path.join(import.meta.dir,"fixtures",fixture),
