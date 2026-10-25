@@ -165,3 +165,14 @@ test("a negated artifact cannot combine with incidental positive language", () =
     expect(WorkFlow.classify("r", text).kind).toBe("nonprogramming")
   expect(WorkFlow.classify("r", "Write a report using Python to calculate totals").kind).toBe("nonprogramming")
 })
+
+test("explicit macro or VBA creation is programming, reports about macros are not", () => {
+  for (const text of [
+    "Create a VBA macro to generate a report",
+    "Crie uma macro VBA para gerar um relatorio",
+    "Create an Excel macro to generate a report",
+  ])
+    expect(WorkFlow.classify("r", text).kind).toBe("programming")
+  for (const text of ["Create an Excel report", "Write a report about macros", "Faca um relatorio sobre macros"])
+    expect(WorkFlow.classify("r", text).kind).toBe("nonprogramming")
+})

@@ -76,7 +76,7 @@ export function classify(requestID: string, raw: string): Route {
     /\b(code|coding|software|function|endpoint|api|bug|repository|repo|codigo|programacao|funcao|aplicativo|application|unit tests?|testes? unitarios?)\b/.test(
       positive,
     )
-  const language = /\b(python|typescript|javascript)\b|\b[\w-]+\.(py|ts|tsx|js|jsx)\b/.test(positive)
+  const language = /\b(python|typescript|javascript|vba|vbscript|macros?)\b|\b[\w-]+\.(py|ts|tsx|js|jsx)\b/.test(positive)
   const office =
     /\b(list the files|list attachments|save this attachment|save the attachment|list my notes|in my notes|look up note|report|pdf|spreadsheet|slides?|presentation|email|e-mail|research|summari[sz]e|organize|rename|relatorio|planilha|apresentacao|pesquis|resum|renome)\w*/.test(
       positive,
@@ -95,7 +95,7 @@ export function classify(requestID: string, raw: string): Route {
   const artifactMatch = new RegExp(
     "\\b(?:create|write|make|generate|add|crie|criar|escreva|escrever|faca|fazer|gere|gerar|adicione)\\s+(?:(?:a|an|the|new|my|some|um|uma|novo|nova)\\s+)?(?:" +
       modifier +
-      "\\s+){0,3}?(?:scripts?|programs?|apps?|applications?|modules?|librar(?:y|ies)|packages?|clis?|bots?|plugins?|extensions?|websites?|functions?|class(?:es)?|components?|programas?|aplicativos?|modulos?|bibliotecas?|funcoes|funcao|sites?)\\b",
+      "\\s+){0,3}?(?:scripts?|macros?|vba|programs?|apps?|applications?|modules?|librar(?:y|ies)|packages?|clis?|bots?|plugins?|extensions?|websites?|functions?|class(?:es)?|components?|programas?|aplicativos?|modulos?|bibliotecas?|funcoes|funcao|sites?)\\b",
   ).test(primary)
   const artifact = artifactMatch && (language || software || !office)
   if (
