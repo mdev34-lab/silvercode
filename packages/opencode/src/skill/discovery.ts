@@ -95,19 +95,24 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | Path.Path | HttpClient
               const token = crypto.randomUUID()
               const staging = `${root}.tmp-${token}`
               const backup = `${root}.old-${token}`
+              let phase = "download"
               yield* Effect.gen(function* () {
                 const downloaded = yield* Effect.forEach(
                   skill.files,
                   (file) => download(new URL(file, `${host}/${skill.name}/`).href, path.join(staging, file)),
                   { concurrency: fileConcurrency },
                 )
-                if (!downloaded.every(Boolean)) return
-                if (!(yield* fs.exists(path.join(staging, "SKILL.md")).pipe(Effect.orDie))) return
+                phase = "check-downloaded"
+                if (!downloaded.every(Boolean)) { console.error("DIAG613 not all downloaded", skill.name, JSON.stringify(downloaded)); return }
+                if (!(yield* fs.exists(path.join(staging, "SKILL.md")).pipe(Effect.orDie))) { console.error("DIAG613 staging SKILL.md missing"); return }
+                phase = "write-version"
                 yield* fs.writeFileString(path.join(staging, ".opencode-version"), version)
                 yield* Effect.uninterruptible(
                   Effect.gen(function* () {
                     const cached = yield* fs.exists(root).pipe(Effect.orDie)
+                    phase = "rename-root-to-backup"
                     if (cached) yield* fs.rename(root, backup)
+                    phase = "rename-staging-to-root"
                     yield* fs.rename(staging, root).pipe(
                       Effect.catch((error) =>
                         Effect.gen(function* () {
@@ -134,7 +139,7 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | Path.Path | HttpClient
                   }),
                 )
               }).pipe(
-                Effect.catch((error) => Effect.logError("failed to refresh skill", { skill: skill.name, error })),
+                Effect.catch((error) => { console.error("DIAG613 refresh failed phase=" + phase, skill.name, String(error), JSON.stringify(error, Object.getOwnPropertyNames(error as object))); return Effect.logError("failed to refresh skill", { skill: skill.name, error }) }),
                 Effect.ensuring(fs.remove(staging, { recursive: true, force: true }).pipe(Effect.ignore)),
               )
             }

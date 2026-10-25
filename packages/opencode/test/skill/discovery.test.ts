@@ -206,6 +206,27 @@ describe("Discovery.pull", () => {
       expect(mutableDownloadCount).toBe(3)
     }),
   )
+  it.live("DIAG613 repeated refresh scenario", () =>
+    Effect.gen(function* () {
+      const url = `http://localhost:${server.port}/mutable/`
+      const discovery = yield* Discovery.Service
+      for (let i = 0; i < 25; i++) {
+        yield* Effect.promise(() => rm(cacheDir, { recursive: true, force: true }))
+        mutableVersion = `d${i}-1`; mutableContent = "# Old"; mutableFiles = ["SKILL.md", "old.md"]
+        const first = yield* discovery.pull(url)
+        yield* Effect.promise(() => Bun.file(path.join(first[0], "SKILL.md")).text())
+        mutableVersion = `d${i}-2`; mutableContent = "# Partial"; mutableFiles = ["SKILL.md", "missing.md"]
+        const second = yield* discovery.pull(url)
+        yield* Effect.promise(() => Bun.file(path.join(second[0], "SKILL.md")).text())
+        mutableVersion = `d${i}-3`; mutableContent = "# New"; mutableFiles = ["SKILL.md"]
+        yield* discovery.pull(url)
+        const text = yield* Effect.promise(() => Bun.file(path.join(second[0], "SKILL.md")).text())
+        if (text !== "# New") console.error("DIAG613 iteration", i, "content", text)
+        expect(text).toBe("# New")
+      }
+    }),
+    120000,
+  )
   for (const scenario of ["single", "double", "empty-cache", "invalid-backup"] as const) {
     it.live(`preserves usable roots after ${scenario} promotion failure`,()=>Effect.gen(function*(){
       yield* Effect.promise(()=>rm(cacheDir,{recursive:true,force:true}))
