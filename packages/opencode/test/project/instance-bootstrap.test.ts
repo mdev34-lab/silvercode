@@ -1,4 +1,4 @@
-import { afterEach, expect } from "bun:test"
+import { afterEach, beforeEach, expect } from "bun:test"
 import { existsSync } from "node:fs"
 import path from "node:path"
 import { pathToFileURL } from "node:url"
@@ -26,8 +26,20 @@ const it = testEffect(
 //
 // The boundaries below are transport-agnostic and stay.
 
+let priorDependencyInstallFlag: string | undefined
+beforeEach(() => {
+  priorDependencyInstallFlag = process.env.OPENCODE_DISABLE_CONFIG_DEP_INSTALL
+  // These fixtures use a local file plugin with no external imports. Keep the
+  // bootstrap ordering contract independent from npm dependency preseed.
+  process.env.OPENCODE_DISABLE_CONFIG_DEP_INSTALL = "1"
+})
 afterEach(async () => {
-  await disposeAllInstances()
+  try {
+    await disposeAllInstances()
+  } finally {
+    if (priorDependencyInstallFlag === undefined) delete process.env.OPENCODE_DISABLE_CONFIG_DEP_INSTALL
+    else process.env.OPENCODE_DISABLE_CONFIG_DEP_INSTALL = priorDependencyInstallFlag
+  }
 })
 
 const bootstrapFixture = Effect.gen(function* () {
