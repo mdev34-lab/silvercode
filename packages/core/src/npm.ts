@@ -1,3 +1,5 @@
+import { withRequestOwner } from "./npm-request-diagnostic"
+export { installRequestOwnerDiagnostic } from "./npm-request-diagnostic"
 import { createHash } from "node:crypto"
 export * as Npm from "./npm"
 
@@ -113,13 +115,15 @@ const layer = Layer.effect(
           ignoreScripts: true,
         })
         return yield* Effect.tryPromise({
-          try: () =>
-            arborist.reify({
+          try: () => {
+            const run = () => arborist.reify({
               ...fetchOptions,
               add,
               save: true,
               saveType: "prod",
-            }),
+            })
+            return diagnostic ? withRequestOwner(owner, admission, run) : run()
+          },
           catch: (cause) =>
             new InstallFailedError({
               cause,

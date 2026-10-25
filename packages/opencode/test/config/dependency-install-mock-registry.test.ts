@@ -24,10 +24,19 @@ import { MockRegistry } from "../fixture/mock-registry"
 
 // Diagnostic-only branch. This opt-in is process-wide while this file runs.
 const priorOwnerDiagnostics = process.env.OPENCODE_TEST_INSTALL_OWNER_DIAGNOSTICS
-beforeAll(() => { process.env.OPENCODE_TEST_INSTALL_OWNER_DIAGNOSTICS = "1" })
+let ownerObserver: ReturnType<typeof Npm.installRequestOwnerDiagnostic> | undefined
+beforeAll(() => {
+  process.env.OPENCODE_TEST_INSTALL_OWNER_DIAGNOSTICS = "1"
+  ownerObserver = Npm.installRequestOwnerDiagnostic()
+})
 afterAll(() => {
-  if (priorOwnerDiagnostics === undefined) delete process.env.OPENCODE_TEST_INSTALL_OWNER_DIAGNOSTICS
-  else process.env.OPENCODE_TEST_INSTALL_OWNER_DIAGNOSTICS = priorOwnerDiagnostics
+  try {
+    const outcome = ownerObserver?.dispose()
+    if (outcome?.conflict) console.log("INSTALL_OWNER", JSON.stringify({ phase: "observer-dispose-conflict" }))
+  } finally {
+    if (priorOwnerDiagnostics === undefined) delete process.env.OPENCODE_TEST_INSTALL_OWNER_DIAGNOSTICS
+    else process.env.OPENCODE_TEST_INSTALL_OWNER_DIAGNOSTICS = priorOwnerDiagnostics
+  }
 })
 
 const unexpectedHttp = HttpClient.make((request) =>
