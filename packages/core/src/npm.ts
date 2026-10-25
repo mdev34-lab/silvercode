@@ -1,3 +1,6 @@
+import { withRequestOwner } from "./npm-request-diagnostic"
+export { installRequestOwnerDiagnostic } from "./npm-request-diagnostic"
+import { createHash } from "node:crypto"
 export * as Npm from "./npm"
 
 import path from "path"
@@ -39,6 +42,7 @@ export interface Interface {
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/Npm") {}
+export const DiagnosticAdmission = Context.Reference<string | undefined>("@opencode/Npm/DiagnosticAdmission", { defaultValue: () => undefined })
 
 const illegal = process.platform === "win32" ? new Set(["<", ">", ":", '"', "|", "?", "*"]) : undefined
 
@@ -69,6 +73,8 @@ interface ArboristTree {
   edgesOut: Map<string, { to?: ArboristNode }>
 }
 
+let ownerSequence = 0
+
 const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
@@ -79,10 +85,19 @@ const layer = Layer.effect(
     const directory = (pkg: string) => path.join(global.cache, "packages", sanitize(pkg))
     const reify = (input: { dir: string; add?: string[] }) =>
       Effect.gen(function* () {
+        const diagnostic = process.env.OPENCODE_TEST_INSTALL_OWNER_DIAGNOSTICS === "1"
+        const admission = yield* DiagnosticAdmission
+        const owner = diagnostic ? `${process.pid}-${++ownerSequence}` : ""
+        const safeDir = diagnostic ? createHash("sha256").update(input.dir).digest("hex").slice(0, 16) : ""
+        if (diagnostic) console.log("INSTALL_OWNER", JSON.stringify({ phase: "reify-before-lock", at: Date.now(), admission: admission ?? "unattributed", owner, dir: safeDir, disabled: process.env.OPENCODE_DISABLE_CONFIG_DEP_INSTALL === undefined ? "absent" : ["1", "true"].includes(process.env.OPENCODE_DISABLE_CONFIG_DEP_INSTALL.toLowerCase()) }))
         yield* flock.acquire(`npm-install:${input.dir}`)
+        if (diagnostic) console.log("INSTALL_OWNER", JSON.stringify({ phase: "reify-after-lock", at: Date.now(), admission: admission ?? "unattributed", owner, dir: safeDir, disabled: process.env.OPENCODE_DISABLE_CONFIG_DEP_INSTALL === undefined ? "absent" : ["1", "true"].includes(process.env.OPENCODE_DISABLE_CONFIG_DEP_INSTALL.toLowerCase()) }))
         const { Arborist } = yield* Effect.promise(() => import("@npmcli/arborist"))
         const add = input.add ?? []
         const npmOptions = yield* NpmConfig.load(input.dir)
+        const registry = typeof npmOptions.registry === "string" ? npmOptions.registry : ""
+        const loopback = /^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(?::[0-9]+)?(?:\/|$)/.test(registry)
+        if (diagnostic) console.log("INSTALL_OWNER", JSON.stringify({ phase: "npm-config-ready", at: Date.now(), admission: admission ?? "unattributed", owner, dir: safeDir, disabled: process.env.OPENCODE_DISABLE_CONFIG_DEP_INSTALL === undefined ? "absent" : ["1", "true"].includes(process.env.OPENCODE_DISABLE_CONFIG_DEP_INSTALL.toLowerCase()), registry: loopback ? new URL(registry).origin : "non-loopback-redacted" }))
         // Arborist has no Effect-aware cancellation: interrupting the fiber alone would
         // abandon the reify promise while registry fetches keep running in the
         // background. Thread an AbortSignal through Arborist -> pacote ->
@@ -100,13 +115,15 @@ const layer = Layer.effect(
           ignoreScripts: true,
         })
         return yield* Effect.tryPromise({
-          try: () =>
-            arborist.reify({
+          try: () => {
+            const run = () => arborist.reify({
               ...fetchOptions,
               add,
               save: true,
               saveType: "prod",
-            }),
+            })
+            return diagnostic ? withRequestOwner(owner, admission, run) : run()
+          },
           catch: (cause) =>
             new InstallFailedError({
               cause,

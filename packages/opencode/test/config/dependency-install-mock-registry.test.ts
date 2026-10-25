@@ -1,4 +1,4 @@
-import { test, expect, describe, afterEach, beforeEach } from "bun:test"
+import { test, expect, describe, afterEach, beforeEach, beforeAll, afterAll } from "bun:test"
 import path from "path"
 import fs from "fs/promises"
 import { Effect, Layer, Logger } from "effect"
@@ -21,6 +21,23 @@ import { AuthTest } from "../fake/auth"
 import { AccountTest } from "../fake/account"
 import { tmpdir } from "../fixture/fixture"
 import { MockRegistry } from "../fixture/mock-registry"
+
+// Diagnostic-only branch. This opt-in is process-wide while this file runs.
+const priorOwnerDiagnostics = process.env.OPENCODE_TEST_INSTALL_OWNER_DIAGNOSTICS
+let ownerObserver: ReturnType<typeof Npm.installRequestOwnerDiagnostic> | undefined
+beforeAll(() => {
+  process.env.OPENCODE_TEST_INSTALL_OWNER_DIAGNOSTICS = "1"
+  ownerObserver = Npm.installRequestOwnerDiagnostic()
+})
+afterAll(() => {
+  try {
+    const outcome = ownerObserver?.dispose()
+    if (outcome?.conflict) console.log("INSTALL_OWNER", JSON.stringify({ phase: "observer-dispose-conflict" }))
+  } finally {
+    if (priorOwnerDiagnostics === undefined) delete process.env.OPENCODE_TEST_INSTALL_OWNER_DIAGNOSTICS
+    else process.env.OPENCODE_TEST_INSTALL_OWNER_DIAGNOSTICS = priorOwnerDiagnostics
+  }
+})
 
 const unexpectedHttp = HttpClient.make((request) =>
   Effect.die(`unexpected http request: ${request.method} ${request.url}`),
@@ -256,6 +273,7 @@ describe("Config Dependency Install Integration with MockRegistry", () => {
   })
 
   test("skips dependency install when OPENCODE_DISABLE_CONFIG_DEP_INSTALL is set", async () => {
+    console.log("INSTALL_OWNER", JSON.stringify({ phase: "disabled-case-start", pid: process.pid }))
     process.env.OPENCODE_DISABLE_CONFIG_DEP_INSTALL = "1"
 
     await using tmp = await tmpdir()
@@ -282,6 +300,7 @@ describe("Config Dependency Install Integration with MockRegistry", () => {
 
     expect(result._tag).toBe("Success")
     // Mock registry must NOT have received any requests
+    console.log("INSTALL_OWNER", JSON.stringify({ phase: "disabled-case-requests", pid: process.pid, registry: registry.url, requests: registry.requests.map((r) => ({ path: r.url.includes("opencode-ai") ? "plugin-package" : "other-redacted", method: r.method, timestamp: r.timestamp })) }))
     expect(registry.requests).toEqual([])
   })
 
