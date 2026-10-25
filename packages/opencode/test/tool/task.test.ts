@@ -4465,3 +4465,18 @@ it.instance("independent primary Code keeps its normal Review dispatch contract"
       }),
     { config: FOREGROUND },
   )
+
+it.instance("actual Task output truncation cannot authorize Code from a successful Think",()=>Effect.gen(function*(){
+ const {chat,assistant}=yield* seed()
+ const sessions=yield* Session.Service
+ const history=yield* sessions.messages({sessionID:chat.id})
+ const user=history.find(message=>message.info.role === "user")!
+ yield* sessions.updatePart({id:PartID.ascending(),sessionID:chat.id,messageID:user.info.id,type:"text",text:"Implement Python software"})
+ const def=yield* (yield* TaskTool).init()
+ const ctx={sessionID:chat.id,messageID:assistant.id,agent:"work",abort:new AbortController().signal,messages:[],metadata:()=>Effect.void,ask:()=>Effect.void,extra:{promptOps:reviewRunOps([`<silvercode-result>${"Detailed plan. ".repeat(200)}</silvercode-result>`],"done","success")}}
+ const planned=yield* def.execute({description:"long plan",prompt:"plan",subagent_type:"think",background:false},ctx)
+ expect(planned.metadata.truncated).toBe(true)
+ yield* sessions.updatePart({id:PartID.ascending(),sessionID:chat.id,messageID:assistant.id,type:"tool",tool:"task",callID:"truncated-plan",state:{status:"completed",input:{subagent_type:"think"},output:planned.output,title:"plan",metadata:planned.metadata,time:{start:Date.now(),end:Date.now()}}})
+ const blocked=yield* def.execute({description:"implement",prompt:"implement",subagent_type:"code",background:false},ctx).pipe(Effect.exit)
+ expect(Exit.isFailure(blocked)).toBe(true)
+}),{config:{tool_output:{max_bytes:300,max_lines:20}}})
