@@ -152,6 +152,7 @@ const layer = Layer.effect(
           }),
           ({ skill, root, versionFile, files }) =>
             Effect.gen(function* () {
+              let availableRoot = root
               const version = skill.version
               const current =
                 version === undefined
@@ -185,7 +186,20 @@ const layer = Layer.effect(
                       yield* fs.rename(staging, root).pipe(
                         Effect.catch((error) =>
                           Effect.gen(function* () {
-                            if (cached) yield* fs.rename(backup, root).pipe(Effect.ignore)
+                            if (cached) {
+                              yield* fs.rename(backup, root).pipe(
+                                Effect.catch(() =>
+                                  Effect.gen(function* () {
+                                    // Preserve the only previous copy when restoration fails.
+                                    availableRoot = backup
+                                    yield* Effect.logError("failed to restore skill backup", {
+                                      skill: skill.name,
+                                      restorationFailed: true,
+                                    })
+                                  }),
+                                ),
+                              )
+                            }
                             return yield* Effect.fail(error)
                           }),
                         ),
@@ -199,9 +213,9 @@ const layer = Layer.effect(
                 )
               }
               const exists =
-                (yield* fs.exists(path.join(root, "SKILL.md")).pipe(Effect.orDie)) ||
-                (yield* fs.exists(path.join(root, `${skill.name}.md`)).pipe(Effect.orDie))
-              return exists ? [AbsolutePath.make(root)] : []
+                (yield* fs.exists(path.join(availableRoot, "SKILL.md")).pipe(Effect.orDie)) ||
+                (yield* fs.exists(path.join(availableRoot, `${skill.name}.md`)).pipe(Effect.orDie))
+              return exists ? [AbsolutePath.make(availableRoot)] : []
             }),
           { concurrency: skillConcurrency },
         ).pipe(Effect.map((directories) => directories.flat()))

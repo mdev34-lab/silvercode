@@ -1,3 +1,4 @@
+import { route as workRoute } from "./work-flow"
 import { Agent } from "@/agent/agent"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Provider } from "@/provider/provider"
@@ -49,6 +50,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
   messages: SessionV1.WithParts[]
   promptOps: TaskPromptOps
 }) {
+  const sessions = yield* Session.Service
   const tools: Record<string, AITool> = {}
   const run = yield* EffectBridge.make()
   const plugin = yield* Plugin.Service
@@ -98,7 +100,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
           tool: { messageID: input.processor.message.id, callID: options.toolCallId },
           ruleset: Permission.merge(input.agent.permission, input.session.permission ?? []),
         })
-        .pipe(Effect.orDie),
+        .pipe(Effect.orDie, Effect.interruptible),
   })
 
   for (const item of yield* registry.tools({
@@ -106,6 +108,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
     providerID: input.model.providerID,
     agent: input.agent,
     permission: input.session.permission,
+    sessionID: input.session.id,
   })) {
     const definition = ToolJsonSchema.fromTool(item)
     const entry: ToolCatalog.Entry = {
@@ -149,7 +152,13 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
               yield* input.processor.completeToolCall(options.toolCallId, output)
             }
             return output
-          }),
+          }).pipe(
+            // Bash already observes ctx.abort and returns captured output after
+            // process teardown. Keep that finalization, but permission waits in
+            // ctx.ask remain interruptible so cancellation cannot authorize work.
+            item.id === "bash" ? Effect.uninterruptible : (effect) => effect,
+          ),
+          { signal: options.abortSignal },
         )
       },
     })
@@ -237,6 +246,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
             }
             return output
           }),
+          { signal: opts.abortSignal },
         )
       },
     })
@@ -320,6 +330,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
             }
             return output
           }),
+          { signal: opts.abortSignal },
         )
       },
     })
@@ -402,12 +413,20 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
             }
             return output
           }),
+          { signal: opts.abortSignal },
         )
       },
     })
   }
 
-  if (flags.experimentalCodeMode) {
+  const agents = yield* Agent.Service
+  const controlled =
+    input.agent.native === true &&
+    [yield* agents.get("work"), yield* agents.get("think")].some((agent) => agent === input.agent)
+  const admission = controlled
+    ? yield* workRoute(input.session.id).pipe(Effect.provideService(Session.Service, sessions), Effect.orDie)
+    : undefined
+  if ((controlled && admission?.kind !== "nonprogramming") || flags.experimentalCodeMode) {
     yield* catalog.sync(entries, toolSearch)
     return tools
   }
@@ -439,6 +458,16 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
       run.promise(
         Effect.gen(function* () {
           const ctx = context(args, opts)
+          if (
+            controlled &&
+            (yield* workRoute(input.session.id).pipe(Effect.provideService(Session.Service, sessions))).kind !==
+              "nonprogramming"
+          )
+            return yield* Effect.die(
+              new Error(
+                "Task scope changed: Work and Think cannot execute MCP tools before programming routing or clarification.",
+              ),
+            )
           yield* plugin.trigger(
             "tool.execute.before",
             { tool: key, sessionID: ctx.sessionID, callID: opts.toolCallId },
@@ -525,6 +554,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
           }
           return output
         }),
+        { signal: opts.abortSignal },
       )
     tools[key] = item
   }

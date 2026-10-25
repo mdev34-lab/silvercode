@@ -227,7 +227,7 @@ describe("opencode run (non-interactive subprocess)", () => {
         yield* llm.cut("upstream provider exploded mid-stream")
         // The stream death is retried; the recovery reply completes the turn.
         yield* llm.text("recovered response")
-        const result = yield* opencode.run("trigger midstream error", { timeoutMs: 30_000 })
+        const result = yield* opencode.run("Generate a report with a midstream error", { timeoutMs: 30_000 })
         expect(result.exitCode).toBe(0)
         expect(result.stdout).toBe("partial response\nrecovered response\n")
         expect(result.stderr).not.toContain("upstream provider exploded mid-stream")
@@ -307,7 +307,7 @@ describe("opencode run (non-interactive subprocess)", () => {
         )
         yield* llm.text("after")
 
-        const result = yield* opencode.run("exercise json records", {
+        const result = yield* opencode.run("Generate a report of json records", {
           format: "json",
           extraArgs: ["--thinking", "--dangerously-skip-permissions"],
         })
@@ -357,7 +357,7 @@ describe("opencode run (non-interactive subprocess)", () => {
         yield* llm.cut("provider failed")
         // The in-band stream error is retried; the recovery reply completes the turn.
         yield* llm.text("recovered json")
-        const result = yield* opencode.run("fail after output", { format: "json" })
+        const result = yield* opencode.run("Generate a report after output", { format: "json" })
 
         const events = opencode.parseJsonEvents(result.stdout)
         expect(result.exitCode).toBe(0)
@@ -387,7 +387,7 @@ describe("opencode run (non-interactive subprocess)", () => {
       Effect.gen(function* () {
         yield* llm.tool("bash", { command: "rm -f denied-file", description: "Remove a test file" })
         yield* llm.text("continued after rejection")
-        const denied = yield* opencode.run("request permission", { permission: { bash: "ask" } })
+        const denied = yield* opencode.run("Generate a report with permission", { permission: { bash: "ask" } })
         opencode.expectExit(denied, 0)
         expect(denied.stderr).toContain("permission requested: bash")
         expect(denied.stdout).toBe("")
@@ -395,7 +395,7 @@ describe("opencode run (non-interactive subprocess)", () => {
         yield* llm.reset
         yield* llm.tool("bash", { command: "rm -f allowed-file", description: "Remove a test file" })
         yield* llm.text("continued after approval")
-        const allowed = yield* opencode.run("request permission", {
+        const allowed = yield* opencode.run("Generate a report with permission", {
           permission: { bash: "ask" },
           extraArgs: ["--dangerously-skip-permissions"],
         })
@@ -406,7 +406,7 @@ describe("opencode run (non-interactive subprocess)", () => {
         yield* llm.reset
         yield* llm.tool("bash", { command: "touch explicitly-denied", description: "Create a denied marker" })
         yield* llm.text("continued after explicit denial")
-        const explicitlyDenied = yield* opencode.run("request denied permission", {
+        const explicitlyDenied = yield* opencode.run("Generate a report with denied permission", {
           permission: { bash: "deny" },
           extraArgs: ["--dangerously-skip-permissions"],
         })

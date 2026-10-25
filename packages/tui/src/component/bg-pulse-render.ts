@@ -1,4 +1,4 @@
-import { OptimizedBuffer, RGBA, TextAttributes } from "@opentui/core"
+import { type BufferAccess, type OptimizedBuffer, RGBA, TextAttributes } from "@opentui/core"
 import { go } from "../logo"
 
 const PERIOD = 4600
@@ -172,15 +172,19 @@ export class GoUpsellArtPainter {
     // frame must not freeze the animation (#378 review).
     const rgb = options.rgb === true
     this.elapsed = (this.elapsed + (options.deltaTime ?? 0)) % PERIOD
+    frameBuffer.withBuffers((cells) => this.paint(cells, rgb, options.cache !== false))
+  }
+
+  private paint(frameBuffer: BufferAccess, rgb: boolean, cache: boolean) {
     // A zero/negative layout transition or a stale native buffer view would
     // index past the typed arrays below (#378); skip the frame instead.
-    const buffers = frameBuffer.buffers
+    const buffers = frameBuffer
     const cells = frameBuffer.width * frameBuffer.height
     if (cells <= 0) return
     if (buffers.char.length < cells || buffers.attributes.length < cells) return
     if (buffers.fg.length < cells * 4 || buffers.bg.length < cells * 4) return
     this.rebuildGeometry(frameBuffer, rgb)
-    if (options.cache !== false) {
+    if (cache) {
       this.drawCached(frameBuffer, rgb)
       return
     }
@@ -194,7 +198,7 @@ export class GoUpsellArtPainter {
     this.frameCache = []
   }
 
-  private rebuildGeometry(frameBuffer: OptimizedBuffer, rgb: boolean) {
+  private rebuildGeometry(frameBuffer: BufferAccess, rgb: boolean) {
     const width = frameBuffer.width
     const height = frameBuffer.height
     const geometryChanged = width !== this.geometryWidth || height !== this.geometryHeight
@@ -231,7 +235,7 @@ export class GoUpsellArtPainter {
     this.rebuildCellTemplate(frameBuffer, rgb)
   }
 
-  private drawCached(frameBuffer: OptimizedBuffer, rgb: boolean) {
+  private drawCached(frameBuffer: BufferAccess, rgb: boolean) {
     if (this.cacheDirty) this.startFrameCache(frameBuffer, rgb)
     if (this.cacheBuildIndex < CACHE_FRAME_COUNT) {
       this.buildFrameCache(frameBuffer, rgb)
@@ -245,39 +249,39 @@ export class GoUpsellArtPainter {
       // TypedArray.set throws when the cached frame is longer than the
       // current buffer (stale view after a failed resize, #378); drop the
       // cache and draw directly instead.
-      if (frame.fg.length !== frameBuffer.buffers.fg.length || frame.bg.length !== frameBuffer.buffers.bg.length) {
+      if (frame.fg.length !== frameBuffer.fg.length || frame.bg.length !== frameBuffer.bg.length) {
         this.invalidateCache()
         this.drawBackground(frameBuffer, this.elapsed)
         this.drawLogo(frameBuffer, this.elapsed, rgb)
         return
       }
-      frameBuffer.buffers.fg.set(frame.fg)
-      frameBuffer.buffers.bg.set(frame.bg)
+      frameBuffer.fg.set(frame.fg)
+      frameBuffer.bg.set(frame.bg)
     }
   }
 
-  private startFrameCache(frameBuffer: OptimizedBuffer, rgb: boolean) {
+  private startFrameCache(frameBuffer: BufferAccess, rgb: boolean) {
     this.frameCache = []
     this.cacheBuildIndex = 0
     this.rebuildCellTemplate(frameBuffer, rgb)
     this.cacheDirty = false
   }
 
-  private buildFrameCache(frameBuffer: OptimizedBuffer, rgb: boolean) {
+  private buildFrameCache(frameBuffer: BufferAccess, rgb: boolean) {
     const end = Math.min(CACHE_FRAME_COUNT, this.cacheBuildIndex + CACHE_FRAMES_PER_RENDER)
     for (; this.cacheBuildIndex < end; this.cacheBuildIndex++) {
       const t = (this.cacheBuildIndex / CACHE_FRAME_COUNT) * PERIOD
       this.drawBackground(frameBuffer, t)
       this.drawLogo(frameBuffer, t, rgb)
       this.frameCache.push({
-        fg: new Uint16Array(frameBuffer.buffers.fg),
-        bg: new Uint16Array(frameBuffer.buffers.bg),
+        fg: new Uint16Array(frameBuffer.fg),
+        bg: new Uint16Array(frameBuffer.bg),
       })
     }
   }
 
-  private rebuildCellTemplate(frameBuffer: OptimizedBuffer, rgb: boolean) {
-    const buffers = frameBuffer.buffers
+  private rebuildCellTemplate(frameBuffer: BufferAccess, rgb: boolean) {
+    const buffers = frameBuffer
     buffers.char.fill(SPACE)
     buffers.attributes.fill(0)
 
@@ -311,8 +315,8 @@ export class GoUpsellArtPainter {
     }
   }
 
-  private drawBackground(frameBuffer: OptimizedBuffer, t: number) {
-    const buffers = frameBuffer.buffers
+  private drawBackground(frameBuffer: BufferAccess, t: number) {
+    const buffers = frameBuffer
     const fg = buffers.fg
     const bg = buffers.bg
     const distances = this.distances
@@ -394,10 +398,10 @@ export class GoUpsellArtPainter {
     this.pulsePrimary = primary > 1 ? 1 : primary
   }
 
-  private drawLogo(frameBuffer: OptimizedBuffer, t: number, rgb: boolean) {
+  private drawLogo(frameBuffer: BufferAccess, t: number, rgb: boolean) {
     if (this.logoIndexes.length === 0) return
 
-    const buffers = frameBuffer.buffers
+    const buffers = frameBuffer
     const fg = buffers.fg
     const bg = buffers.bg
     const shadow: Rgb = [

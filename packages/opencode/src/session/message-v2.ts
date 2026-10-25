@@ -690,6 +690,7 @@ export function fromError(
           isRetryable: false,
           metadata: {
             code: e.name,
+            ...ProviderError.interruptedStreamCause(e.cause),
           },
         },
         { cause: e },

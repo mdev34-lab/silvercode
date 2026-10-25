@@ -123,3 +123,35 @@ describe("SkillV2", () => {
     ),
   )
 })
+
+it.live("loads a retained remote backup root with relative references", () =>
+  Effect.acquireRelease(
+    Effect.promise(() => tmpdir()),
+    (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+  ).pipe(
+    Effect.flatMap((tmp) =>
+      Effect.gen(function* () {
+        const root = path.join(tmp.path, "retained.old-previous")
+        yield* Effect.promise(async () => {
+          await fs.mkdir(root, { recursive: true })
+          await fs.writeFile(
+            path.join(root, "SKILL.md"),
+            "---\nname: retained\ndescription: Retained previous skill\n---\nSee [guide](guide.md)",
+          )
+          await fs.writeFile(path.join(root, "guide.md"), "Previous reference")
+        })
+        urls.set("https://example.test/retained/", [AbsolutePath.make(root)])
+        const skill = yield* SkillV2.Service
+        yield* skill.transform((editor) => editor.source({ type: "url", url: "https://example.test/retained/" }))
+        const items = (yield* skill.list()).filter((item) => item.name === "retained")
+        expect(items).toHaveLength(1)
+        expect(items[0].name).toBe("retained")
+        expect(items[0].location).toBe(AbsolutePath.make(path.join(root, "SKILL.md")))
+        expect(items[0].content).toContain("guide.md")
+        expect(
+          yield* Effect.promise(() => fs.readFile(path.join(path.dirname(items[0].location), "guide.md"), "utf8")),
+        ).toBe("Previous reference")
+      }),
+    ),
+  ),
+)
