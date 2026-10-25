@@ -1,4 +1,3 @@
-import { HOST_DEFAULT_TIMEOUT_MS } from "./host-timeout"
 import { ownedDeadlineTest, validateOwnedDeadline, type OwnedDeadline } from "./owned-deadline"
 import { test, type TestOptions } from "bun:test"
 import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
@@ -69,13 +68,14 @@ const sharedRun: Runner = (value, layer) =>
   }).pipe(Effect.runPromise)
 
 // A Bun test-level timeout only rejects the test promise; it does not interrupt the Effect
-// fiber, so scoped finalizers could run after the next test started. Own cancellation a
-// little before the host timeout so the fiber is interrupted and joined first. The default
-// host timeout is applied by test/preload.ts from the same constant.
-const DEFAULT_HOST_TIMEOUT_MS = HOST_DEFAULT_TIMEOUT_MS
+// fiber, so scoped finalizers could run after the next test started. When the test declares
+// its own host timeout, own cancellation a little before it so the fiber is interrupted and
+// joined first. Bun does not expose the configured default (CLI --timeout or its 5000ms
+// default), so tests without an explicit timeout keep the previous unowned behavior rather
+// than guessing a budget.
 function ownedFor(opts?: number | TestOptions): OwnedDeadline | undefined {
-  const hostTimeoutMs = typeof opts === "number" ? opts : (opts?.timeout ?? DEFAULT_HOST_TIMEOUT_MS)
-  if (!Number.isFinite(hostTimeoutMs) || hostTimeoutMs <= 0) return undefined
+  const hostTimeoutMs = typeof opts === "number" ? opts : opts?.timeout
+  if (hostTimeoutMs === undefined || !Number.isFinite(hostTimeoutMs) || hostTimeoutMs <= 0) return undefined
   const cleanupHeadroomMs = Math.max(1, Math.min(500, Math.floor(hostTimeoutMs / 10)))
   const deadlineMs = hostTimeoutMs - cleanupHeadroomMs
   if (deadlineMs <= 0) return undefined

@@ -4,10 +4,7 @@ import os from "os"
 import path from "path"
 import fs from "fs/promises"
 import { setTimeout as sleep } from "node:timers/promises"
-import { afterAll, setDefaultTimeout } from "bun:test"
-import { HOST_DEFAULT_TIMEOUT_MS } from "./lib/host-timeout"
-
-setDefaultTimeout(HOST_DEFAULT_TIMEOUT_MS)
+import { afterAll } from "bun:test"
 
 // Set XDG env vars FIRST, before any src/ imports
 const dir = path.join(os.tmpdir(), "opencode-test-data-" + process.pid)
