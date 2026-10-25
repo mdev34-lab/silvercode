@@ -132,3 +132,17 @@ test("software artifact requests are programming, incidental Python for a delive
   expect(WorkFlow.classify("r", "Write a report summary").kind).toBe("nonprogramming")
   expect(WorkFlow.classify("r", "Do not create a script; write a report").kind).not.toBe("programming")
 })
+
+test("office deliverables mentioning software words are not forced to Code", () => {
+  for (const text of [
+    "Create a report comparing mobile apps",
+    "Write an email about library packages",
+    "Faca um relatorio sobre aplicativos",
+    "Create a report of class attendance",
+    "Write a report about how to create a Python script",
+  ])
+    expect(WorkFlow.classify("r", text).kind).toBe("nonprogramming")
+  expect(WorkFlow.classify("r", "Write a script for a presentation").kind).toBe("uncertain")
+  expect(WorkFlow.classify("r", "Create a small bash script").kind).toBe("programming")
+  expect(WorkFlow.classify("r", "Create a Python script to save this attachment").kind).toBe("programming")
+})

@@ -81,11 +81,18 @@ export function classify(requestID: string, raw: string): Route {
     /\b(list the files|list attachments|save this attachment|save the attachment|list my notes|in my notes|look up note|report|pdf|spreadsheet|slides?|presentation|email|e-mail|research|summari[sz]e|organize|rename|relatorio|planilha|apresentacao|pesquis|resum|renome)\w*/.test(
       positive,
     )
-  // Asking for a software artifact is programming even when the content is office-flavored.
-  const artifact =
-    /\b(create|write|make|generate|add|crie|criar|escreva|escrever|faca|fazer|gere|gerar|adicione)\b[^.]{0,60}\b(scripts?|programs?|apps?|applications?|modules?|librar(?:y|ies)|packages?|clis?|bots?|plugins?|extensions?|websites?|functions?|class(?:es)?|components?|programas?|aplicativos?|modulos?|bibliotecas?|funcoes|funcao|sites?)\b/.test(
-      positive,
-    )
+  // Asking for a software artifact is programming only when the verb's direct object is the
+  // artifact. Office deliverables ("a report comparing apps") and explanations about how to
+  // build something stay out of this rule.
+  const primary = positive.split(/\b(?:about|how to|explain\w*|describ\w*|regarding|on how|sobre|como)\b/)[0]
+  const modifier =
+    "(?!(?:report|email|e-mail|summary|presentation|slides?|pdf|spreadsheet|memo|note|notes|essay|letter|relatorio|resumo|planilha|apresentacao|about|for|of|on|in|with|to|comparing|sobre|para|de)\\b)[a-z0-9+#.-]+"
+  const artifactMatch = new RegExp(
+    "\\b(?:create|write|make|generate|add|crie|criar|escreva|escrever|faca|fazer|gere|gerar|adicione)\\s+(?:(?:a|an|the|new|my|some|um|uma|novo|nova)\\s+)?(?:" +
+      modifier +
+      "\\s+){0,3}?(?:scripts?|programs?|apps?|applications?|modules?|librar(?:y|ies)|packages?|clis?|bots?|plugins?|extensions?|websites?|functions?|class(?:es)?|components?|programas?|aplicativos?|modulos?|bibliotecas?|funcoes|funcao|sites?)\\b",
+  ).test(primary)
+  const artifact = artifactMatch && (language || software || !office)
   if (
     artifact ||
     (action && software) ||
@@ -97,7 +104,7 @@ export function classify(requestID: string, raw: string): Route {
       source: "user-request",
       reason: "explicit software implementation or debugging request",
     }
-  if (office && !software && !action && !potentiallyDroppedImplementation)
+  if (office && !software && !action && !artifactMatch && !potentiallyDroppedImplementation)
     return { requestID, kind: "nonprogramming", source: "user-request", reason: "explicit non-software deliverable" }
   return {
     requestID,
