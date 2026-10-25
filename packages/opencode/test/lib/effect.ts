@@ -67,21 +67,36 @@ const sharedRun: Runner = (value, layer) =>
     return yield* exit
   }).pipe(Effect.runPromise)
 
+// A Bun test-level timeout only rejects the test promise; it does not interrupt the Effect
+// fiber, so scoped finalizers could run after the next test started. When the test declares
+// its own host timeout, own cancellation a little before it so the fiber is interrupted and
+// joined first. Bun does not expose the configured default (CLI --timeout or its 5000ms
+// default), so tests without an explicit timeout keep the previous unowned behavior rather
+// than guessing a budget.
+function ownedFor(opts?: number | TestOptions): OwnedDeadline | undefined {
+  const hostTimeoutMs = typeof opts === "number" ? opts : opts?.timeout
+  if (hostTimeoutMs === undefined || !Number.isFinite(hostTimeoutMs) || hostTimeoutMs <= 0) return undefined
+  const cleanupHeadroomMs = Math.max(1, Math.min(500, Math.floor(hostTimeoutMs / 10)))
+  const deadlineMs = hostTimeoutMs - cleanupHeadroomMs
+  if (deadlineMs <= 0) return undefined
+  return { deadlineMs, hostTimeoutMs, cleanupHeadroomMs }
+}
+
 const make = <R, E>(testLayer: Layer.Layer<R, E>, liveLayer: Layer.Layer<R, E>, run: Runner = isolatedRun) => {
   const effect = <A, E2>(name: string, value: Body<A, E2, R | Scope.Scope>, opts?: number | TestOptions) =>
-    test(name, () => run(value, testLayer), opts)
+    test(name, () => run(value, testLayer, ownedFor(opts)), opts)
 
   effect.only = <A, E2>(name: string, value: Body<A, E2, R | Scope.Scope>, opts?: number | TestOptions) =>
-    test.only(name, () => run(value, testLayer), opts)
+    test.only(name, () => run(value, testLayer, ownedFor(opts)), opts)
 
   effect.skip = <A, E2>(name: string, value: Body<A, E2, R | Scope.Scope>, opts?: number | TestOptions) =>
     test.skip(name, () => run(value, testLayer), opts)
 
   const live = <A, E2>(name: string, value: Body<A, E2, R | Scope.Scope>, opts?: number | TestOptions) =>
-    test(name, () => run(value, liveLayer), opts)
+    test(name, () => run(value, liveLayer, ownedFor(opts)), opts)
 
   live.only = <A, E2>(name: string, value: Body<A, E2, R | Scope.Scope>, opts?: number | TestOptions) =>
-    test.only(name, () => run(value, liveLayer), opts)
+    test.only(name, () => run(value, liveLayer, ownedFor(opts)), opts)
 
   live.skip = <A, E2>(name: string, value: Body<A, E2, R | Scope.Scope>, opts?: number | TestOptions) =>
     test.skip(name, () => run(value, liveLayer), opts)
@@ -95,7 +110,7 @@ const make = <R, E>(testLayer: Layer.Layer<R, E>, liveLayer: Layer.Layer<R, E>, 
     const args = instanceArgs(options, opts)
     return test(
       name,
-      () => run(body(value).pipe(withTmpdirInstance(args.instanceOptions)), liveLayer),
+      () => run(body(value).pipe(withTmpdirInstance(args.instanceOptions)), liveLayer, ownedFor(args.testOptions)),
       args.testOptions,
     )
   }
@@ -109,7 +124,7 @@ const make = <R, E>(testLayer: Layer.Layer<R, E>, liveLayer: Layer.Layer<R, E>, 
     const args = instanceArgs(options, opts)
     return test.only(
       name,
-      () => run(body(value).pipe(withTmpdirInstance(args.instanceOptions)), liveLayer),
+      () => run(body(value).pipe(withTmpdirInstance(args.instanceOptions)), liveLayer, ownedFor(args.testOptions)),
       args.testOptions,
     )
   }
@@ -123,7 +138,7 @@ const make = <R, E>(testLayer: Layer.Layer<R, E>, liveLayer: Layer.Layer<R, E>, 
     const args = instanceArgs(options, opts)
     return test.skip(
       name,
-      () => run(body(value).pipe(withTmpdirInstance(args.instanceOptions)), liveLayer),
+      () => run(body(value).pipe(withTmpdirInstance(args.instanceOptions)), liveLayer, ownedFor(args.testOptions)),
       args.testOptions,
     )
   }
