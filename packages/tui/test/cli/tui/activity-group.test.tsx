@@ -1200,6 +1200,9 @@ describe("activity group TUI", () => {
     "synthetic",
     "new-request",
     "missing-parts",
+    "ignored-parent",
+    "unknown-part",
+    "file-request",
     "waiting",
     "error",
     "ordinary",
@@ -1218,7 +1221,16 @@ describe("activity group TUI", () => {
       try {
         const message = {
           ...assistant("duration-final", at(9)),
-          parentID: ["synthetic", "new-request", "missing-parts"].includes(scenario) ? "synthetic-parent" : "msg_user",
+          parentID: [
+            "synthetic",
+            "new-request",
+            "missing-parts",
+            "ignored-parent",
+            "unknown-part",
+            "file-request",
+          ].includes(scenario)
+            ? "synthetic-parent"
+            : "msg_user",
           time: { created: at(9), completed: at(12) },
         }
         const user = {
@@ -1260,14 +1272,38 @@ describe("activity group TUI", () => {
                 },
               ]
             : []),
-          ...(["synthetic", "new-request", "missing-parts"].includes(scenario)
+          ...(["synthetic", "new-request", "missing-parts", "ignored-parent", "unknown-part", "file-request"].includes(
+            scenario,
+          )
             ? [
                 {
                   message: { ...user, id: "synthetic-parent", time: { created: at(10) } },
                   parts:
                     scenario === "missing-parts"
                       ? []
-                      : [{ ...textPart("synthetic-parent", "Continue after finish error"), synthetic: true }],
+                      : scenario === "ignored-parent"
+                        ? [{ ...textPart("synthetic-parent", "ignored"), ignored: true }]
+                        : scenario === "unknown-part"
+                          ? [
+                              {
+                                id: nextPartID(),
+                                sessionID: SESSION,
+                                messageID: "synthetic-parent",
+                                type: "step-start" as const,
+                              },
+                            ]
+                          : scenario === "file-request"
+                            ? [
+                                {
+                                  id: nextPartID(),
+                                  sessionID: SESSION,
+                                  messageID: "synthetic-parent",
+                                  type: "file" as const,
+                                  mime: "text/plain",
+                                  url: "file:///fixture/request.txt",
+                                },
+                              ]
+                            : [{ ...textPart("synthetic-parent", "Continue after finish error"), synthetic: true }],
                 },
               ]
             : []),
@@ -1283,6 +1319,7 @@ describe("activity group TUI", () => {
         const footer = frame.split("\n").find((line: string) => line.includes("Work · model")) ?? ""
         if (scenario === "success" || scenario === "synthetic") expect(footer).toContain("12.0s")
         else if (scenario === "new-request") expect(footer).toContain("7.0s")
+        else if (scenario === "file-request") expect(footer).toContain("2.0s")
         else expect(footer).not.toMatch(/ · [0-9.]+s/)
       } finally {
         app.renderer.destroy()

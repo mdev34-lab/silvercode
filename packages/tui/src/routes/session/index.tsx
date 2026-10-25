@@ -1686,6 +1686,9 @@ export function AssistantMessageRow(props: { message: AssistantMessage; parts: P
       if (!parts) return undefined
       if (parts.some((part) => part.type === "file" || (part.type === "text" && !part.synthetic && !part.ignored)))
         return message.time.created
+      // Only known synthetic continuations may be crossed. Empty, ignored
+      // or other part-only user rows do not prove the earlier request owns it.
+      if (!parts.length || !parts.every((part) => part.type === "text" && part.synthetic === true)) return undefined
     }
     return undefined
   })
