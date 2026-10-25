@@ -176,20 +176,33 @@ test("explicit macro or VBA creation is programming, reports about macros are no
   for (const text of ["Create an Excel report", "Write a report about macros", "Faca um relatorio sobre macros"])
     expect(WorkFlow.classify("r", text).kind).toBe("nonprogramming")
 })
-const skill = (name: string, status = "completed") => ({
+const skill = (name: string, status = "completed", extra: Record<string, unknown> = {}) => ({
   info: { role: "assistant" },
-  parts: [{ type: "tool", tool: "skill", state: { status, metadata: { name, dir: "<built-in>" } } }],
+  parts: [
+    {
+      type: "tool",
+      tool: "skill",
+      state: { status, metadata: { name, dir: "<built-in>", builtin: true, sessionID: "parent", ...extra } },
+    },
+  ],
 })
-test("a completed deep-think skill load in this request satisfies planning for Code", () => {
-  expect(WorkFlow.state([user, skill("deep-think"), task("code", "success", true)])).toEqual({
+test("a completed built-in deep-think load in this session and request satisfies planning for Code", () => {
+  expect(WorkFlow.state([user, skill("deep-think"), task("code", "success", true)], "parent")).toEqual({
     planned: true,
     implemented: true,
     delegated: false,
     requestID: "request",
   })
 })
-test("other skills, running loads and loads from an earlier request are not planning proof", () => {
-  expect(WorkFlow.state([user, skill("alpha-skill")]).planned).toBe(false)
-  expect(WorkFlow.state([user, skill("deep-think", "running")]).planned).toBe(false)
-  expect(WorkFlow.state([user, skill("deep-think"), user]).planned).toBe(false)
+test("other skills, running loads, earlier requests, shadowing disk skills and foreign sessions are not planning proof", () => {
+  expect(WorkFlow.state([user, skill("alpha-skill")], "parent").planned).toBe(false)
+  expect(WorkFlow.state([user, skill("deep-think", "running")], "parent").planned).toBe(false)
+  expect(WorkFlow.state([user, skill("deep-think"), user], "parent").planned).toBe(false)
+  expect(
+    WorkFlow.state([user, skill("deep-think", "completed", { builtin: false, dir: "/repo/.opencode/skills/deep-think" })], "parent")
+      .planned,
+  ).toBe(false)
+  expect(WorkFlow.state([user, skill("deep-think", "completed", { builtin: undefined })], "parent").planned).toBe(false)
+  expect(WorkFlow.state([user, skill("deep-think", "completed", { sessionID: "other" })], "parent").planned).toBe(false)
+  expect(WorkFlow.state([user, skill("deep-think", "completed", { sessionID: undefined })], "parent").planned).toBe(false)
 })

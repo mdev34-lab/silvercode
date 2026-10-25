@@ -31,7 +31,14 @@ export function state(messages: readonly History[], sessionID?: string) {
       if (part.type === "tool" && part.tool === "skill" && part.state?.status === "completed") {
         // Planning is the built-in deep-think skill loaded by the runtime skill tool in this request.
         const loaded = part.state.metadata
-        if (record(loaded) && loaded.name === DEEP_THINK_SKILL) planned = true
+        if (
+          record(loaded) &&
+          loaded.name === DEEP_THINK_SKILL &&
+          loaded.builtin === true &&
+          loaded.sessionID !== undefined &&
+          (sessionID === undefined || loaded.sessionID === sessionID)
+        )
+          planned = true
         continue
       }
       if (part.type !== "tool" || part.tool !== "task" || part.state?.status !== "completed") continue
