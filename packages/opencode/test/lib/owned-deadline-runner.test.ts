@@ -26,3 +26,26 @@ test("a hanging child is killed and joined before collection settles",async()=>{
  expect(result.code).not.toBe(0)
  expect(()=>process.kill(result.pid,0)).toThrow()
 },5000)
+test("collection failure kills and joins the child before rejecting",async()=>{
+ const original=Bun.spawn
+ const sentinel=new Error("controlled collection failure")
+ const events:string[]=[]
+ let settle:(code:number)=>void=()=>{}
+ const exited=new Promise<number>(resolve=>{settle=resolve})
+ const fake={
+  pid:123,exitCode:null,
+  get stdout(){throw sentinel},stderr:null,exited,
+  kill(){events.push("kill");setTimeout(()=>{events.push("exited");settle(1)},30)},
+ }
+ // Deliberately partial process double for the exceptional collection path.
+ Bun.spawn=(()=>fake) as unknown as typeof Bun.spawn
+ try{
+  try{await collectDeadlineChild(["unused"],cwd,1000);throw new Error("expected rejection")}
+  catch(error){events.push("rejected");expect(error).toBe(sentinel)}
+  expect(events).toEqual(["kill","exited","rejected"])
+ }finally{
+  Bun.spawn=original
+  settle(1)
+  await exited
+ }
+})
