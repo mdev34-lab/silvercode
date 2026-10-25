@@ -1,3 +1,4 @@
+import { ToolCatalog } from "@/tool/catalog"
 import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Database } from "@opencode-ai/core/database/database"
@@ -222,6 +223,7 @@ const promptRoot = LayerNode.group([
   Question.node,
   Todo.node,
   ToolRegistry.node,
+  ToolCatalog.node,
   Skill.node,
   Git.node,
   Ripgrep.node,
@@ -5473,3 +5475,21 @@ it.instance("cancel registered custom tool permission prevents a late side effec
       else process.env.OPENCODE_DISABLE_CONFIG_DEP_INSTALL = previous
     }),
   ), { timeout: 20000 })
+
+withMcpTools.instance("captured noncoding MCP executor rechecks a newer programming root before executing",()=>Effect.gen(function*(){
+ yield* useServerConfig(url=>({...providerCfg(url),tool_search:{enabled:false},permission:{"*":"allow"}}))
+ const sessions=yield* Session.Service
+ const agents=yield* AgentSvc.Service
+ const provider=yield* ProviderSvc.Service
+ const chat=yield* sessions.create({title:"overlap"})
+ const seeded=yield* seed(chat.id)
+ yield* user(chat.id,"Research notes and write a report")
+ const {SessionTools}=yield* Effect.promise(()=>import("../../src/session/tools"))
+ const tools=yield* SessionTools.resolve({agent:yield* agents.get("work"),model:yield* provider.getModel(ref.providerID,ref.modelID),session:chat,processor:{message:seeded.assistant,updateToolCall:()=>Effect.void,completeToolCall:()=>Effect.void,waitForOtherTools:()=>Effect.void},bypassAgentCheck:false,messages:yield* sessions.messages({sessionID:chat.id}),promptOps:{resolvePromptParts:()=>Effect.succeed([]),cancel:()=>Effect.void,prompt:()=>Effect.die("No child expected")}})
+ const execute=tools.notes_search_notes?.execute
+ expect(execute).toBeDefined()
+ yield* user(chat.id,"Implement API endpoint")
+ const exit=yield* Effect.tryPromise(()=>execute!({query:"private"},{toolCallId:"old",messages:[],abortSignal:new AbortController().signal})).pipe(Effect.exit)
+ expect(Exit.isFailure(exit)).toBe(true)
+ if(Exit.isFailure(exit)) expect(Cause.pretty(exit.cause)).toContain("Task scope changed")
+}))

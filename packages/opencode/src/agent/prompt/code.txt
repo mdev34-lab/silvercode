@@ -12,4 +12,4 @@ Boundaries:
 
 Delegation:
 - You cannot delegate tasks to Work or to Code itself. Work can delegate software-engineering tasks to Code using the task tool.
-- Keep delegation nesting within the configured subagent_depth limit.
+- When delegated by Work for its programming workflow, return your implementation result to Work. In that workflow Work owns Review; do not recursively dispatch Think, Code or Review. Independent primary Code sessions keep their normal Review dispatch contract.

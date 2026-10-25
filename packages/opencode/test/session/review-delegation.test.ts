@@ -1,3 +1,4 @@
+import { scriptWorkStages, stageMatch } from "../fixture/work-flow"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { expect } from "bun:test"
@@ -300,7 +301,7 @@ const reviewerMatch = (hit: { body: unknown }) => bodyString(hit).includes("## V
 // reach these matchers.
 const policyMatch = (hit: { body: unknown }) => {
   const body = bodyString(hit)
-  return body.includes("## Review Loop") && !reviewerMatch(hit)
+  return body.includes("## Review Loop") && !reviewerMatch(hit) && !stageMatch(hit)
 }
 
 const noPolicyMatch = (hit: { body: unknown }) => {
@@ -466,7 +467,7 @@ it.instance(
       })
       yield* llm.tool("write", { filePath: `${dir}/first-write.txt`, content: "hello" })
       yield* llm.hang
-      yield* user(chat.id, "create first-write.txt")
+      yield* user(chat.id, "Write a report in first-write.txt")
       const fiber = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
       yield* awaitWithTimeout(llm.wait(2), "timed out waiting for the post-write request", "10 seconds")
 
@@ -576,10 +577,12 @@ it.instance(
         title: "Pinned",
         permission: [{ permission: "*", pattern: "*", action: "allow" }],
       })
+      yield* serverConfig({plan:{finishTool:true},think:{finishTool:true},code:{finishTool:true}})
+      yield* scriptWorkStages(policyMatch)
       yield* scriptPolicyFollowingModel
 
       yield* seedPriorWrite(chat.id)
-      yield* user(chat.id, "fix the off-by-one in the cache key and add a test")
+      yield* user(chat.id, "Fix the software bug in the cache key and add a test")
       const result = yield* prompt.loop({ sessionID: chat.id })
       expect(result.info.role).toBe("assistant")
 
@@ -613,7 +616,7 @@ it.instance(
       const msgs = yield* MessageV2.filterCompactedEffect(chat.id)
       const taskPart = msgs
         .flatMap((msg) => msg.parts)
-        .find((part): part is SessionV1.ToolPart => part.type === "tool" && part.tool === "task")
+        .find((part): part is SessionV1.ToolPart => part.type === "tool" && part.tool === "task" && part.state.input.subagent_type === "review")
       expect(taskPart?.state.status).toBe("completed")
       const completed = taskPart as CompletedToolPart
       expect(completed.state.metadata?.background).not.toBe(true)
@@ -641,8 +644,8 @@ it.instance(
 
       // The findings were consumed: the parent's follow-up request contains
       // the report and the instructions to act on it.
-      expect(policyHits).toHaveLength(2)
-      const followUp = bodyString(policyHits[1])
+      expect(policyHits).toHaveLength(4)
+      const followUp = bodyString(policyHits[3])
       expect(followUp).toContain("Needs fixes")
       expect(followUp).toContain("src/cache.ts:42")
       expect(followUp).toContain("instruction to act, not an acknowledgment")
@@ -754,7 +757,7 @@ for (const [parent, reviewer] of [
       `default ${reviewer} delivers review before ${parent} finishes (${effort})`,
       () =>
         Effect.gen(function* () {
-          const { dir, llm } = yield* serverConfig({ [parent]: { finishTool: true } })
+          const { dir, llm } = yield* serverConfig({ [parent]: { finishTool: true }, ...(parent === "work" ? {plan:{finishTool:true},think:{finishTool:true},code:{finishTool:true}} : {}) })
           const sessions = yield* Session.Service
           const prompt = yield* SessionPrompt.Service
           const chat = yield* sessions.create({
@@ -763,8 +766,9 @@ for (const [parent, reviewer] of [
             metadata: { agentEffort: effort },
             permission: [{ permission: "*", pattern: "*", action: "allow" }],
           })
-          const parentMatch = (hit: { body: unknown }) => !reviewerMatch(hit)
-          yield* llm.pushMatch(
+          const parentMatch = (hit: { body: unknown }) => !reviewerMatch(hit) && (parent !== "work" || !stageMatch(hit))
+          if (parent === "work") yield* scriptWorkStages(parentMatch,{filePath:path.join(dir,"result.txt"),content:"verified work"})
+          else yield* llm.pushMatch(
             parentMatch,
             reply().tool("write", { filePath: path.join(dir, "result.txt"), content: "verified work" }),
           )
@@ -776,16 +780,29 @@ for (const [parent, reviewer] of [
           const report = `<silvercode-review>\n${JSON.stringify({ ...REVIEW_REPORT, assessment: "approved", summary: "No findings.", findings: [] })}\n</silvercode-review>`
           yield* llm.pushMatch(reviewerMatch, reply().tool("finish", { reason: "success", result: report }))
           yield* llm.pushMatch(parentMatch, reply().tool("finish", { reason: "success", result: "reviewed work" }))
-          yield* user(chat.id, "write result.txt and review it", parent)
+          yield* user(chat.id, parent === "work" ? "Implement software and write result.txt, then review it" : "write result.txt and review it", parent)
           yield* prompt.loop({ sessionID: chat.id })
           const history = yield* sessions.messages({ sessionID: chat.id })
+          if(process.env.WORK_FLOW_CAPTURE && parent === "work") {
+            const children=yield* sessions.children(chat.id)
+            const childMessages:Record<string,unknown>={}
+            for(const child of children) childMessages[child.id]=yield* sessions.messages({sessionID:child.id})
+            yield* Effect.promise(()=>Bun.write(`/tmp/wf-runtime-success-${effort}.json`,JSON.stringify({session:chat,messages:history,children,childMessages})))
+          }
           const tools = history
             .flatMap((message) => message.parts)
             .filter((part): part is SessionV1.ToolPart => part.type === "tool")
-          expect(tools.find((part) => part.tool === "write")?.state.status).toBe("completed")
+          if(parent === "work") {
+            const implementation=tools.find(part=>part.tool === "task" && part.state.input.subagent_type === "code")
+            expect(implementation?.state.status).toBe("completed")
+            if(implementation?.state.status === "completed") {
+              const childHistory=yield* sessions.messages({sessionID:SessionID.make(implementation.state.metadata.sessionId)})
+              expect(childHistory.flatMap(message=>message.parts).find(part=>part.type === "tool" && part.tool === "write")?.state.status).toBe("completed")
+            }
+          } else expect(tools.find((part) => part.tool === "write")?.state.status).toBe("completed")
           const finishes = tools.filter((part) => part.tool === "finish")
           expect(finishes.map((part) => part.state.status)).toEqual(["error", "completed"])
-          const task = tools.find((part) => part.tool === "task")
+          const task = tools.find((part) => part.tool === "task" && part.state.input.subagent_type === "review")
           expect(task?.state.status).toBe("completed")
           if (task?.state.status !== "completed") return
           expect(task.state.metadata.background).toBe(false)

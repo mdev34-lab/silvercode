@@ -1,3 +1,4 @@
+import { route as workRoute } from "./work-flow"
 import { Agent } from "@/agent/agent"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Provider } from "@/provider/provider"
@@ -49,6 +50,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
   messages: SessionV1.WithParts[]
   promptOps: TaskPromptOps
 }) {
+  const sessions = yield* Session.Service
   const tools: Record<string, AITool> = {}
   const run = yield* EffectBridge.make()
   const plugin = yield* Plugin.Service
@@ -106,6 +108,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
     providerID: input.model.providerID,
     agent: input.agent,
     permission: input.session.permission,
+    sessionID: input.session.id,
   })) {
     const definition = ToolJsonSchema.fromTool(item)
     const entry: ToolCatalog.Entry = {
@@ -416,7 +419,12 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
     })
   }
 
-  if (flags.experimentalCodeMode) {
+  const agents = yield* Agent.Service
+  const controlled =
+    input.agent.native === true &&
+    [yield* agents.get("work"), yield* agents.get("think")].some((agent) => agent === input.agent)
+  const admission = controlled ? yield* workRoute(input.session.id) : undefined
+  if ((controlled && admission?.kind !== "nonprogramming") || flags.experimentalCodeMode) {
     yield* catalog.sync(entries, toolSearch)
     return tools
   }
@@ -448,6 +456,16 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
       run.promise(
         Effect.gen(function* () {
           const ctx = context(args, opts)
+          if (
+            controlled &&
+            (yield* workRoute(input.session.id).pipe(Effect.provideService(Session.Service, sessions))).kind !==
+              "nonprogramming"
+          )
+            return yield* Effect.die(
+              new Error(
+                "Task scope changed: Work and Think cannot execute MCP tools before programming routing or clarification.",
+              ),
+            )
           yield* plugin.trigger(
             "tool.execute.before",
             { tool: key, sessionID: ctx.sessionID, callID: opts.toolCallId },
