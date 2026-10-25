@@ -1,18 +1,21 @@
 import { describe, expect, it } from "bun:test"
-import type { OptimizedBuffer } from "@opentui/core"
+import { OptimizedBuffer, ResourceContext } from "@opentui/core"
 import { GoUpsellArtPainter } from "../../src/component/bg-pulse-render"
 
 function makeBuffer(width: number, height: number, cellOverride?: number): OptimizedBuffer {
   const cells = cellOverride ?? width * height
+  const buffers = {
+    char: new Uint32Array(cells),
+    fg: new Uint16Array(cells * 4),
+    bg: new Uint16Array(cells * 4),
+    attributes: new Uint32Array(cells),
+  }
   return {
     width,
     height,
-    buffers: {
-      char: new Uint32Array(cells),
-      fg: new Uint16Array(cells * 4),
-      bg: new Uint16Array(cells * 4),
-      attributes: new Uint32Array(cells),
-    },
+    buffers,
+    withBuffers: (callback: (cells: typeof buffers & { width: number; height: number }) => unknown) =>
+      callback({ ...buffers, width, height }),
   } as unknown as OptimizedBuffer
 }
 
@@ -73,5 +76,23 @@ describe("GoUpsellArtPainter skipped frames (#378 review)", () => {
     direct.render(reference, { deltaTime: 800 })
 
     expect(Array.from(afterSkips.buffers.bg)).toEqual(Array.from(reference.buffers.bg))
+  })
+})
+
+describe("GoUpsellArtPainter scoped Context-owned storage", () => {
+  it("paints direct and cached frames through a live borrowed scope", () => {
+    const owner = new ResourceContext({ objectCapacity: 256, renderCellsMax: 100000 })
+    const buffer = OptimizedBuffer.create(80, 24, "unicode", { owner })
+    try {
+      expect(() => buffer.buffers).toThrow("Use withBuffers()")
+      const painter = makePainter()
+      painter.render(buffer, { deltaTime: 16, cache: false })
+      for (let i = 0; i < 80; i++) painter.render(buffer, { deltaTime: 100, cache: true, rgb: true })
+      expect(buffer.withBuffers((cells) => cells.bg.some((value) => value !== 0))).toBe(true)
+      expect(() => buffer.buffers).toThrow("Use withBuffers()")
+    } finally {
+      buffer.destroy()
+      owner.destroy()
+    }
   })
 })
