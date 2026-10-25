@@ -81,7 +81,13 @@ export function classify(requestID: string, raw: string): Route {
     /\b(list the files|list attachments|save this attachment|save the attachment|list my notes|in my notes|look up note|report|pdf|spreadsheet|slides?|presentation|email|e-mail|research|summari[sz]e|organize|rename|relatorio|planilha|apresentacao|pesquis|resum|renome)\w*/.test(
       positive,
     )
+  // Asking for a software artifact is programming even when the content is office-flavored.
+  const artifact =
+    /\b(create|write|make|generate|add|crie|criar|escreva|escrever|faca|fazer|gere|gerar|adicione)\b[^.]{0,60}\b(scripts?|programs?|apps?|applications?|modules?|librar(?:y|ies)|packages?|clis?|bots?|plugins?|extensions?|websites?|functions?|class(?:es)?|components?|programas?|aplicativos?|modulos?|bibliotecas?|funcoes|funcao|sites?)\b/.test(
+      positive,
+    )
   if (
+    artifact ||
     (action && software) ||
     (action && language && (!office || /\b(fix|debug|repair|corrig|corrij|consert)\w*/.test(positive)))
   )

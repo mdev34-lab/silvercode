@@ -123,3 +123,12 @@ test("CLI-quoted single argument classifies the wrapped request", () => {
     expect(WorkFlow.classify("r", 'review "fix the python API bug" in my notes').kind).not.toBe("programming")
   }
 })
+
+test("software artifact requests are programming, incidental Python for a deliverable is not", () => {
+  expect(WorkFlow.classify("r", "Create a Python script to save this attachment").kind).toBe("programming")
+  expect(WorkFlow.classify("r", '"Create a Python script to save this attachment"').kind).toBe("programming")
+  expect(WorkFlow.classify("r", "Escreva um script Python para o relatorio").kind).toBe("programming")
+  expect(WorkFlow.classify("r", "Use Python to calculate totals and produce a PDF report").kind).toBe("nonprogramming")
+  expect(WorkFlow.classify("r", "Write a report summary").kind).toBe("nonprogramming")
+  expect(WorkFlow.classify("r", "Do not create a script; write a report").kind).not.toBe("programming")
+})
