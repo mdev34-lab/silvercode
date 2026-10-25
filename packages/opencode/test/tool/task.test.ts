@@ -4481,3 +4481,106 @@ it.instance("actual Task output truncation cannot authorize Code from a successf
  const blocked=yield* def.execute({description:"implement",prompt:"implement",subagent_type:"code",background:false},ctx).pipe(Effect.exit)
  expect(Exit.isFailure(blocked)).toBe(true)
 }),{config:{tool_output:{max_bytes:300,max_lines:20}}})
+
+const deepThinkPart = (sessionID: SessionID, messageID: MessageID, metadata: Record<string, unknown>) => ({
+  id: PartID.ascending(),
+  sessionID,
+  messageID,
+  type: "tool" as const,
+  tool: "skill",
+  callID: `skill-${Math.random()}`,
+  state: {
+    status: "completed" as const,
+    input: { name: "deep-think" },
+    output: "",
+    title: "Loaded skill: deep-think",
+    metadata,
+    time: { start: Date.now(), end: Date.now() },
+  },
+})
+
+it.instance("programming: a real deep-think skill load admits Code, otherwise Code and finish success stay rejected", () =>
+  Effect.gen(function* () {
+    const { chat, assistant } = yield* seed()
+    const sessions = yield* Session.Service
+    const user = (yield* sessions.messages({ sessionID: chat.id })).find((message) => message.info.role === "user")!
+    yield* sessions.updatePart({
+      id: PartID.ascending(),
+      messageID: user.info.id,
+      sessionID: chat.id,
+      type: "text",
+      text: "Fix the Python software bug",
+    })
+    const agent = yield* Agent.Service
+    const work = yield* agent.get("work")
+    const registry = yield* ToolRegistry.Service
+    const skillTool = (yield* registry.tools({ ...ref, agent: work! })).find((tool) => tool.id === "skill")!
+    const def = yield* (yield* TaskTool).init()
+    const finish = yield* (yield* FinishTool).init()
+    const ctx = {
+      sessionID: chat.id,
+      messageID: assistant.id,
+      agent: "work",
+      abort: new AbortController().signal,
+      messages: [],
+      metadata: () => Effect.void,
+      ask: () => Effect.void,
+      extra: { promptOps: reviewRunOps(["<silvercode-result>Implemented.</silvercode-result>"], "done", "success") },
+    }
+    const code = { description: "implement", prompt: "implement", subagent_type: "code", background: false }
+
+    // No planning yet: Code is refused.
+    expect(Exit.isFailure(yield* def.execute(code, ctx).pipe(Effect.exit))).toBe(true)
+
+    // A same-named project skill that shadows the built-in carries no provenance.
+    yield* sessions.updatePart(
+      deepThinkPart(chat.id, assistant.id, { name: "deep-think", dir: "/repo/.opencode/skills/deep-think", builtin: false, sessionID: chat.id }),
+    )
+    expect(Exit.isFailure(yield* def.execute(code, ctx).pipe(Effect.exit))).toBe(true)
+    // So does a load stamped for a different session.
+    yield* sessions.updatePart(
+      deepThinkPart(chat.id, assistant.id, { name: "deep-think", dir: "<built-in>", builtin: true, sessionID: "ses_other" }),
+    )
+    expect(Exit.isFailure(yield* def.execute(code, ctx).pipe(Effect.exit))).toBe(true)
+
+    // The real skill tool loads the built-in and stamps its own provenance.
+    const loaded = yield* skillTool.execute({ name: "deep-think" }, ctx as never)
+    expect(loaded.metadata.builtin).toBe(true)
+    yield* sessions.updatePart(deepThinkPart(chat.id, assistant.id, loaded.metadata as Record<string, unknown>))
+
+    // Planning alone is not success.
+    const early = yield* finish
+      .execute({ reason: "success", result: "<silvercode-result>Done.</silvercode-result>" }, ctx as never)
+      .pipe(Effect.exit)
+    expect(Exit.isFailure(early)).toBe(true)
+    expect(Cause.pretty((early as Exit.Failure<unknown, unknown>).cause)).toContain("Programming success requires")
+
+    // The built-in load admits Code, carrying planned=true into its proof.
+    const implemented = yield* def.execute(code, ctx)
+    expect(implemented.metadata.workFlow?.agent).toBe("code")
+    expect(implemented.metadata.workFlow?.planned).toBe(true)
+
+    // Code without a clean Review still cannot finish with success.
+    yield* sessions.updatePart({
+      id: PartID.ascending(),
+      sessionID: chat.id,
+      messageID: assistant.id,
+      type: "tool",
+      tool: "task",
+      callID: "code-impl",
+      state: {
+        status: "completed",
+        input: { subagent_type: "code" },
+        output: implemented.output,
+        title: "implement",
+        metadata: implemented.metadata,
+        time: { start: Date.now(), end: Date.now() },
+      },
+    })
+    const unreviewed = yield* finish
+      .execute({ reason: "success", result: "<silvercode-result>Done.</silvercode-result>" }, ctx as never)
+      .pipe(Effect.exit)
+    expect(Exit.isFailure(unreviewed)).toBe(true)
+    expect(Cause.pretty((unreviewed as Exit.Failure<unknown, unknown>).cause)).toContain("Review is missing")
+  }),
+)
