@@ -249,39 +249,42 @@ const layer = Layer.effect(
     // interrupts forkScoped fibers) waiting on it.
     const timeoutMs = Flag.OPENCODE_CONFIG_DEP_INSTALL_TIMEOUT_MS
     const installDir = (dir: string) =>
-      npm
-        .install(dir, {
-          add: [
-            {
-              name: "@opencode-ai/plugin",
-              version: InstallationLocal ? undefined : InstallationVersion,
-            },
-          ],
-        })
-        .pipe(
-          Effect.timeout(Duration.millis(timeoutMs)),
-          Effect.catchTag("TimeoutError", () =>
-            Effect.logWarning("background dependency install timed out, continuing without it", {
-              dir,
-              timeoutMs,
-            }),
-          ),
-          Effect.exit,
-          Effect.tap((exit) =>
-            Exit.isFailure(exit)
-              ? Effect.sync(() => {
-                  failures.set(dir, failureMessage(exit.cause))
-                }).pipe(
-                  Effect.andThen(
-                    Effect.logWarning("background dependency install failed", { dir, error: String(exit.cause) }),
-                  ),
-                )
-              : Effect.sync(() => {
-                  failures.delete(dir)
-                }),
-          ),
-          Effect.asVoid,
-        )
+      Effect.suspend(() => {
+        if (Flag.OPENCODE_DISABLE_CONFIG_DEP_INSTALL) return Effect.void
+        return npm
+          .install(dir, {
+            add: [
+              {
+                name: "@opencode-ai/plugin",
+                version: InstallationLocal ? undefined : InstallationVersion,
+              },
+            ],
+          })
+          .pipe(
+            Effect.timeout(Duration.millis(timeoutMs)),
+            Effect.catchTag("TimeoutError", () =>
+              Effect.logWarning("background dependency install timed out, continuing without it", {
+                dir,
+                timeoutMs,
+              }),
+            ),
+            Effect.exit,
+            Effect.tap((exit) =>
+              Exit.isFailure(exit)
+                ? Effect.sync(() => {
+                    failures.set(dir, failureMessage(exit.cause))
+                  }).pipe(
+                    Effect.andThen(
+                      Effect.logWarning("background dependency install failed", { dir, error: String(exit.cause) }),
+                    ),
+                  )
+                : Effect.sync(() => {
+                    failures.delete(dir)
+                  }),
+            ),
+            Effect.asVoid,
+          )
+      })
     const deps = yield* Effect.forEach(data.dirs, (dir) => Effect.forkScoped(installDir(dir)), {
       concurrency: "unbounded",
     })

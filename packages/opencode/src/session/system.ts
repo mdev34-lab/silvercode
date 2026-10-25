@@ -143,12 +143,24 @@ const layer = Layer.effect(
         ].join("\n")
       }),
 
-      delegation: Effect.fn("SystemPrompt.delegation")(function* (agent: Agent.Info, permission?: PermissionV1.Ruleset) {
+      delegation: Effect.fn("SystemPrompt.delegation")(function* (
+        agent: Agent.Info,
+        permission?: PermissionV1.Ruleset,
+      ) {
         // Only primary-style callers drive delegation; subagents execute.
         if (agent.mode === "subagent") return
 
         const ctx = yield* InstanceState.context
         const cfg = yield* config.get()
+
+        const work = yield* agents.get("work")
+        if (work?.native === true && agent === work)
+          return [
+            "Programming requests require completed Think planning before Code implementation, then a clean Review. Work cannot implement programming directly, including tiny edits.",
+            "Non-programming work must not go to Code. At fast effort, medium-sized work may be manual; complex or thorough work goes to General; medium effort balances direct work and General delegation.",
+            "Uncertain requests allow inspection and questions only before execution. Use the question tool to clarify task scope through the runtime-owned question. Do not relabel programming to evade its workflow.",
+            "Failed, cancelled or pending children are not successful stage completion. A pass budget cannot excuse reporting success with blocking findings.",
+          ].join("\n")
 
         // Built from the live registry: any non-primary, non-hidden agent the
         // merged agent + session permission ruleset may delegate to. The

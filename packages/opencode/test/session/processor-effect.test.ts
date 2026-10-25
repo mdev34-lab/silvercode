@@ -1489,3 +1489,79 @@ for (const scenario of [
     ),
   )
 }
+
+// A failed argument stream has not executed a tool, so retry is safe, but its
+// registered pending call must not remain a sibling finish waits on forever.
+let retryPendingCalls = 0
+let retryPendingHandle: SessionProcessor.Handle
+const itRetryPending = processorWithLLM(() => {
+  retryPendingCalls++
+  if (retryPendingCalls === 1) return Stream.make(
+    LLMEvent.stepStart({ index: 0 }),
+    LLMEvent.toolInputStart({ id: "abandoned-arguments", name: "bash" }),
+  ).pipe(Stream.concat(Stream.die(new SessionV1.APIError({ message: "temporary argument stream error", isRetryable: true }))))
+  return Stream.fromEffect(retryPendingHandle.waitForOtherTools("finish-retry")).pipe(
+    Stream.flatMap(() => Stream.make(
+      LLMEvent.stepStart({ index: 0 }),
+      LLMEvent.stepFinish({ index: 0, reason: "stop" }),
+      LLMEvent.finish({ reason: "stop" }),
+    )),
+  )
+})
+itRetryPending.live("clears abandoned argument calls before retry so finish can settle", () =>
+  provideTmpdirInstance((dir) => Effect.gen(function* () {
+    retryPendingCalls = 0
+    const { processors, session, provider } = yield* boot()
+    const chat = yield* session.create({})
+    const parent = yield* user(chat.id, "argument retry")
+    const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+    const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+    retryPendingHandle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
+    const result = yield* retryPendingHandle.process({ user: parent as SessionV1.User,
+      sessionID: chat.id, model: mdl, agent: agent(), system: [],
+      messages: [{ role: "user", content: "argument retry" }], tools: {},
+    }).pipe(Effect.timeout("8 seconds"), Effect.exit)
+    expect(retryPendingCalls).toBe(2)
+    expect(Exit.isSuccess(result)).toBe(true)
+    const parts = yield* MessageV2.parts(msg.id)
+    expect(parts.some((part) => part.type === "tool" && part.callID === "abandoned-arguments")).toBe(false)
+  }), { config: cfg }), { timeout: 15000 })
+
+let runningRetryCalls = 0
+let runningRetryHandle: SessionProcessor.Handle
+const itRetryRunning = processorWithLLM(() => {
+  runningRetryCalls++
+  if (runningRetryCalls === 1) return Stream.make(
+    LLMEvent.stepStart({ index: 0 }),
+    LLMEvent.toolInputStart({ id: "metadata-running", name: "bash" }),
+  ).pipe(Stream.concat(Stream.fromEffect(
+    runningRetryHandle.updateToolCall("metadata-running", (part) => ({ ...part,
+      state: { status: "running", input: { command: "already started" }, time: { start: Date.now() }, metadata: { evidence: "retained" } },
+    })).pipe(Effect.andThen(Effect.die(new SessionV1.APIError({ message: "temporary metadata stream error", isRetryable: true })))),
+  )))
+  return Stream.fromEffect(runningRetryHandle.completeToolCall("metadata-running", {
+    title: "started tool", output: "RUNNING_EVIDENCE", metadata: { evidence: "retained" },
+  })).pipe(Stream.flatMap(() => Stream.make(
+    LLMEvent.stepStart({ index: 0 }),
+    LLMEvent.stepFinish({ index: 0, reason: "stop" }),
+    LLMEvent.finish({ reason: "stop" }),
+  )))
+})
+itRetryRunning.live("preserves a metadata-promoted running call during retry cleanup", () =>
+  provideTmpdirInstance((dir) => Effect.gen(function* () {
+    runningRetryCalls = 0
+    const { processors, session, provider } = yield* boot()
+    const chat = yield* session.create({})
+    const parent = yield* user(chat.id, "running retry")
+    const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+    const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+    runningRetryHandle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
+    yield* runningRetryHandle.process({ user: parent as SessionV1.User, sessionID: chat.id, model: mdl,
+      agent: agent(), system: [], messages: [{ role: "user", content: "running retry" }], tools: {},
+    }).pipe(Effect.timeout("8 seconds"))
+    const parts = yield* MessageV2.parts(msg.id)
+    const call = parts.find((part): part is SessionV1.ToolPart => part.type === "tool" && part.callID === "metadata-running")
+    expect(runningRetryCalls).toBe(2)
+    expect(call?.state.status).toBe("completed")
+    if (call?.state.status === "completed") expect(call.state.output).toBe("RUNNING_EVIDENCE")
+  }), { config: cfg }), { timeout: 15000 })

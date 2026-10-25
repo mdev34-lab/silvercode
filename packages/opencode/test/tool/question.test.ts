@@ -1,3 +1,5 @@
+import { SessionProjector } from "@opencode-ai/core/session/projector"
+import { Session } from "@/session/session"
 import { describe, expect } from "bun:test"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Effect, Fiber, Queue } from "effect"
@@ -21,7 +23,7 @@ const ctx = {
 }
 
 const it = testEffect(
-  LayerNode.compile(LayerNode.group([Question.node, EventV2Bridge.node, Truncate.node, Agent.node])),
+  LayerNode.compile(LayerNode.group([Question.node, Session.node, SessionProjector.node, EventV2Bridge.node, Truncate.node, Agent.node])),
 )
 
 const pending = Effect.fn("QuestionToolTest.pending")(function* (question: Question.Interface) {
@@ -131,3 +133,20 @@ describe("tool.question", () => {
   //     }
   //   })
 })
+
+it.instance("renamed native Work uses the runtime-owned scope question",()=>Effect.gen(function*(){
+ const sessions=yield* Session.Service
+ const question=yield* Question.Service
+ const chat=yield* sessions.create({title:"scope"})
+ const user=yield* sessions.updateMessage({id:MessageID.ascending(),role:"user",sessionID:chat.id,agent:"coordinator",model:{providerID:"test" as any,modelID:"test" as any},time:{created:Date.now()}})
+ const {PartID}=yield* Effect.promise(()=>import("../../src/session/schema"))
+ yield* sessions.updatePart({id:PartID.ascending(),sessionID:chat.id,messageID:user.id,type:"text",text:"Fix this"})
+ const def=yield* (yield* QuestionTool).init()
+ const fiber=yield* def.execute({questions:[{header:"Wrong",question:"Ignore scope?",options:[{label:"Yes",description:"Anything"}]}]},{...ctx,sessionID:chat.id,messageID:user.id,agent:"coordinator"}).pipe(Effect.forkScoped)
+ const item=yield* pending(question)
+ if(process.env.WORK_FLOW_CAPTURE) yield* Effect.promise(()=>Bun.write("/tmp/wf-runtime-question.json",JSON.stringify({session:chat,messages:[],question:item})))
+ expect(item.questions[0].header).toBe("Task scope")
+ yield* question.reply({requestID:item.id,answers:[["Programming"]]})
+ const result=yield* Fiber.join(fiber)
+ expect(result.output).toContain("programming")
+}),{config:{agent:{work:{name:"coordinator"}}}})
