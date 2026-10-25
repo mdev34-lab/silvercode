@@ -321,3 +321,56 @@ describe("verdict parsing with the report envelope", () => {
     expect(parseReviewVerdict("The implementation looks good, but no final assessment was emitted.")).toBeUndefined()
   })
 })
+
+for (const mention of [
+  "Mention <silvercode-review> in prose.",
+  "Mention </silvercode-review> in prose.",
+  "Mention <alphacode-review> in prose.",
+]) {
+  test(`render preserves report despite literal tag mention: ${mention}`, () => {
+    const initial = ReviewReport.extract([envelope(), mention])
+    expect(initial.ok).toBe(true)
+    if (!initial.ok) return
+    const reparsed = ReviewReport.extract([ReviewReport.render(initial)])
+    expect(reparsed.ok).toBe(true)
+    if (!reparsed.ok) return
+    expect(reparsed.report).toEqual(report)
+    expect(reparsed.analysis).toContain(mention)
+  })
+}
+test("literal tags inside JSON strings survive extraction", () => {
+  const tagged = { ...report, summary: "Mention <silvercode-review> and </silvercode-review> literally." }
+  const parsed = ReviewReport.extract([ReviewReport.envelope(tagged)])
+  expect(parsed.ok).toBe(true)
+  if (parsed.ok) expect(parsed.report).toEqual(tagged)
+})
+test("a malformed final complete report never falls back to older approval", () => {
+  const parsed = ReviewReport.extract([
+    envelope({ assessment: "approved", findings: [] }),
+    "<silvercode-review>not json</silvercode-review>",
+  ])
+  expect(parsed.ok).toBe(false)
+})
+
+for (const tag of ReviewReport.TAGS) {
+  for (const summary of [
+    `Literal <${tag}> opener`,
+    `Literal </${tag}> closer`,
+    `Escaped quote \" then <${tag}> and </${tag}>`,
+  ]) {
+    test(`literal JSON tag data roundtrips: ${summary}`, () => {
+      const tagged = { ...report, summary }
+      const initial = ReviewReport.extract([
+        `Prose <${tag}> mention.`,
+        ReviewReport.envelope(tagged),
+        `Prose </${tag}> mention.`,
+      ])
+      expect(initial.ok).toBe(true)
+      if (!initial.ok) return
+      expect(initial.report).toEqual(tagged)
+      const next = ReviewReport.extract([ReviewReport.render(initial)])
+      expect(next.ok).toBe(true)
+      if (next.ok) expect(next.report).toEqual(tagged)
+    })
+  }
+}

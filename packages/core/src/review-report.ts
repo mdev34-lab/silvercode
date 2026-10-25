@@ -93,11 +93,47 @@ const SCHEMA_HINT =
  */
 export function extract(chunks: readonly (string | undefined)[]): Delivery {
   const text = chunks.filter((chunk): chunk is string => typeof chunk === "string").join("\n")
-  // The backreference pairs a closing tag with its own opening tag, so a
-  // mismatched pair (silvercode open, alphacode close) is not a complete
-  // envelope and stays a delivery failure instead of parsing half a report.
-  const matches = [...text.matchAll(new RegExp(`<(${TAGS.join("|")})>([\\s\\S]*?)</\\1>`, "g"))]
-  const last = matches.at(-1)
+  // Pair only matching tag spellings while allowing an unmatched prose opening
+  // before the real report. A tag inside a JSON string is ordinary report data.
+  const tokens = new RegExp(`<(/?)(${TAGS.join("|")})>`, "g")
+  let pending: { tag: string; start: number; body: number } | undefined
+  let last: { index: number; end: number; inner: string } | undefined
+  let quoted = false
+  let escaped = false
+  let json: boolean | undefined
+  let cursor = 0
+  for (const token of text.matchAll(tokens)) {
+    const start = token.index
+    if (pending) {
+      // Tags inside JSON strings are data, not envelope boundaries.
+      for (; cursor < start; cursor++) {
+        const char = text[cursor]
+        if (json === undefined && !/\s/.test(char)) json = char === "{"
+        if (!json) continue
+        if (escaped) {
+          escaped = false
+          continue
+        }
+        if (quoted && char === "\\") {
+          escaped = true
+          continue
+        }
+        if (char === '"') quoted = !quoted
+      }
+      if (quoted) continue
+    }
+    if (!token[1]) {
+      // An unmatched prose opening must not consume a later real envelope.
+      pending = { tag: token[2], start, body: start + token[0].length }
+      quoted = false
+      escaped = false
+      json = undefined
+    } else if (pending?.tag === token[2]) {
+      last = { index: pending.start, end: start + token[0].length, inner: text.slice(pending.body, start) }
+      pending = undefined
+    }
+    cursor = start + token[0].length
+  }
   if (!last) {
     const analysis = text.trim()
     const opened = TAGS.find((tag) => text.includes(`<${tag}>`))
@@ -111,11 +147,11 @@ export function extract(chunks: readonly (string | undefined)[]): Delivery {
   }
 
   const start = last.index ?? 0
-  const analysis = [text.slice(0, start).trimEnd(), text.slice(start + last[0].length).trimStart()]
+  const analysis = [text.slice(0, start).trimEnd(), text.slice(last.end).trimStart()]
     .filter((part) => part.length > 0)
     .join("\n\n")
 
-  const inner = (last[2] ?? "").trim()
+  const inner = last.inner.trim()
   const parsed = Option.getOrUndefined(decodeJson(inner))
   if (!isRecord(parsed))
     return {

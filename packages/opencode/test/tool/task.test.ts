@@ -1112,6 +1112,19 @@ describe("tool.task", () => {
   )
 
   it.instance(
+    "literal tag prose survives rendered review metadata association",
+    () =>
+      Effect.gen(function* () {
+        const result = yield* runReview(reviewRunOps([reviewEnvelope(), "Mention <silvercode-review> in prose."]))
+        expect(result.metadata.review.report).toEqual(REVIEW_REPORT)
+        expect(result.metadata.review.revision).toBe("uncommitted")
+        expect(result.metadata.review.sessionId).toBe(result.metadata.sessionId)
+        expect(result.output).toContain("Mention <silvercode-review> in prose.")
+      }),
+    { config: FOREGROUND },
+  )
+
+  it.instance(
     "a missing review report envelope fails delivery explicitly",
     () =>
       Effect.gen(function* () {
