@@ -1195,7 +1195,15 @@ describe("activity group TUI", () => {
     }
   })
 
-  for (const scenario of ["success", "waiting", "error", "ordinary"] as const) {
+  for (const scenario of [
+    "success",
+    "synthetic",
+    "new-request",
+    "missing-parts",
+    "waiting",
+    "error",
+    "ordinary",
+  ] as const) {
     test(`last Work footer duration after ${scenario} tool call`, async () => {
       const { app, sync } = await mountActivity({
         render: (store) => {
@@ -1208,7 +1216,11 @@ describe("activity group TUI", () => {
         },
       })
       try {
-        const message = { ...assistant("duration-final", at(9)), time: { created: at(9), completed: at(12) } }
+        const message = {
+          ...assistant("duration-final", at(9)),
+          parentID: ["synthetic", "new-request", "missing-parts"].includes(scenario) ? "synthetic-parent" : "msg_user",
+          time: { created: at(9), completed: at(12) },
+        }
         const user = {
           id: "msg_user",
           sessionID: SESSION,
@@ -1231,14 +1243,47 @@ describe("activity group TUI", () => {
             state: { status: "error", input, error: "invalid finish", time: { start: at(10), end: at(12) } },
           }
         seed(sync, [
-          { message: user, parts: [] },
+          { message: user, parts: [textPart(user.id, "Build tasklog")] },
+          ...(scenario === "new-request"
+            ? [
+                {
+                  message: { ...user, id: "new-request", time: { created: at(5) } },
+                  parts: [textPart("new-request", "Now change the output")],
+                },
+              ]
+            : []),
+          ...(scenario === "synthetic"
+            ? [
+                {
+                  message: { ...user, id: "background-delivery", time: { created: at(4) } },
+                  parts: [{ ...textPart("background-delivery", "Code completed"), synthetic: true }],
+                },
+              ]
+            : []),
+          ...(["synthetic", "new-request", "missing-parts"].includes(scenario)
+            ? [
+                {
+                  message: { ...user, id: "synthetic-parent", time: { created: at(10) } },
+                  parts:
+                    scenario === "missing-parts"
+                      ? []
+                      : [{ ...textPart("synthetic-parent", "Continue after finish error"), synthetic: true }],
+                },
+              ]
+            : []),
           { message, parts: [reasoningPart(message.id, "Ready to finish"), tool] },
+          // A later human message must not change a historical row's boundary.
+          {
+            message: { ...user, id: "later-user", time: { created: at(20) } },
+            parts: [textPart("later-user", "Unrelated next request")],
+          },
         ])
         await waitFrame(app, (frame: string) => frame.includes("Work · model"))
         const frame = await frameOf(app)
         const footer = frame.split("\n").find((line: string) => line.includes("Work · model")) ?? ""
-        if (scenario === "success") expect(footer).toContain("12.0s")
-        else expect(footer).not.toContain("12.0s")
+        if (scenario === "success" || scenario === "synthetic") expect(footer).toContain("12.0s")
+        else if (scenario === "new-request") expect(footer).toContain("7.0s")
+        else expect(footer).not.toMatch(/ · [0-9.]+s/)
       } finally {
         app.renderer.destroy()
       }

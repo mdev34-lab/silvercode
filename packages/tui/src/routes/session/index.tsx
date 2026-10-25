@@ -1671,12 +1671,31 @@ export function AssistantMessageRow(props: { message: AssistantMessage; parts: P
     ),
   )
 
+  // Synthetic user messages (background deliveries and finish retries) resume
+  // the same request. Anchor elapsed time to the latest real request at or
+  // before this message's parent, not a later user turn in the transcript.
+  const requestStart = createMemo(() => {
+    const rows = messages()
+    const parent = rows.findIndex((message) => message.id === props.message.parentID)
+    if (parent < 0) return undefined
+    for (let index = parent; index >= 0; index--) {
+      const message = rows[index]
+      if (message.role !== "user") continue
+      const parts = sync.data.part[message.id]
+      // Missing parts cannot establish whether this is a real request.
+      if (!parts) return undefined
+      if (parts.some((part) => part.type === "file" || (part.type === "text" && !part.synthetic && !part.ignored)))
+        return message.time.created
+    }
+    return undefined
+  })
+
   const duration = createMemo(() => {
     if (!final() && !completedFinish()) return 0
     if (!props.message.time.completed) return 0
-    const user = messages().find((x) => x.role === "user" && x.id === props.message.parentID)
-    if (!user || !user.time) return 0
-    return props.message.time.completed - user.time.created
+    const start = requestStart()
+    if (start === undefined) return 0
+    return Math.max(0, props.message.time.completed - start)
   })
 
   // The last turn counts up while it runs, and stays highlighted until it ends.
@@ -1686,9 +1705,9 @@ export function AssistantMessageRow(props: { message: AssistantMessage; parts: P
   const clock = useClock(running)
   const liveDuration = createMemo(() => {
     if (!running()) return undefined
-    const user = messages().find((x) => x.role === "user" && x.id === props.message.parentID)
-    if (!user || !user.time) return undefined
-    return elapsed(clock() - user.time.created)
+    const start = requestStart()
+    if (start === undefined) return undefined
+    return elapsed(Math.max(0, clock() - start))
   })
   const footerMuted = createMemo(() => (running() ? theme.text : theme.textMuted))
 
