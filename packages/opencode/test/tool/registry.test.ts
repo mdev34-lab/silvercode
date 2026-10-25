@@ -1,3 +1,4 @@
+import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { afterEach, describe, expect } from "bun:test"
 import path from "path"
 import fs from "fs/promises"
@@ -12,6 +13,8 @@ import { TestConfig } from "../fixture/config"
 import { Config } from "@/config/config"
 import { Plugin } from "@/plugin"
 import { Agent } from "@/agent/agent"
+import { Session } from "@/session/session"
+import { PartID } from "@/session/schema"
 import { InstanceState } from "@/effect/instance-state"
 
 import { ToolJsonSchema } from "@/tool/json-schema"
@@ -50,7 +53,7 @@ const brokenPluginLayer = Layer.succeed(
   }),
 )
 
-const root = LayerNode.group([ToolRegistry.node, Agent.node])
+const root = LayerNode.group([ToolRegistry.node, Agent.node, Session.node, SessionProjector.node])
 const replacements = [
   [Config.node, configLayer],
   [RuntimeFlags.node, RuntimeFlags.layer()],
@@ -670,3 +673,21 @@ describe("tool.registry", () => {
     }),
   )
 })
+
+it.instance("programming Work and Think expose only native inspection tools, noncoding Work keeps commands", () => Effect.gen(function* () {
+  const sessions=yield* Session.Service
+  const agents=yield* Agent.Service
+  const registry=yield* ToolRegistry.Service
+  for (const [text,restricted] of [["Fix Python software",true],["Research hotels",false]] as const) {
+    const chat=yield* sessions.create({title:"admission"})
+    const user=yield* sessions.updateMessage({id:MessageID.ascending(),role:"user",sessionID:chat.id,agent:"work",model:{providerID:ProviderV2.ID.make("test"),modelID:ModelV2.ID.make("test")},time:{created:Date.now()}})
+    yield* sessions.updatePart({id:PartID.ascending(),messageID:user.id,sessionID:chat.id,type:"text",text})
+    for (const role of ["work","think"]) {
+      const found=yield* registry.tools({sessionID:chat.id,agent:yield* agents.get(role),providerID:ProviderV2.ID.make("test"),modelID:ModelV2.ID.make("test")})
+      const ids=found.map(tool=>tool.id)
+      expect(ids.includes("read")).toBe(true)
+      expect(ids.includes("edit")).toBe(!restricted)
+      expect(ids.includes("bash")).toBe(!restricted)
+    }
+  }
+}))

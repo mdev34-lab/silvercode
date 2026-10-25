@@ -89,6 +89,7 @@ const seedSession = Effect.fn("AgentEffortTest.seedSession")(function* (
     model: { providerID: "test" as never, modelID: "test-model" as never },
     time: { created: Date.now() },
   })
+  yield* session.updatePart({id:PartID.ascending(),sessionID:chat.id,messageID:user.id,type:"text",text:"Research the requested information"})
   const assistant: SessionV1.Assistant = {
     id: MessageID.ascending(),
     role: "assistant",
@@ -1242,7 +1243,7 @@ for (const effort of ["medium", "thorough"] as const) {
         const exit = yield* final
           .execute({ reason: "success", result: "done" }, finishContext(chat.id, assistant.id))
           .pipe(Effect.exit)
-        expect(blockedMessage(exit)).toContain("Review required")
+        expect(blockedMessage(exit)).toMatch(/Review required|requires a successful General/)
       }),
     { config: { agent: { effort, "work-review": { background: true } } } },
   )

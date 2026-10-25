@@ -750,6 +750,20 @@ const layer = Layer.effect(
 
         return yield* Effect.gen(function* () {
           yield* Effect.gen(function* () {
+            // Argument-only calls from a failed attempt never executed. A safe
+            // retry must discard these drafts and settle their rendezvous before
+            // the next finish call waits for siblings. Executed calls are never
+            // retried and must keep their persisted evidence.
+            for (const toolCallID of Object.keys(ctx.toolcalls)) {
+              const match = yield* readToolCall(toolCallID)
+              if (!match || match.part.state.status !== "pending") continue
+              yield* session.removePart({
+                sessionID: match.call.sessionID,
+                messageID: match.call.messageID,
+                partID: match.call.partID,
+              })
+              yield* settleToolCall(toolCallID)
+            }
             ctx.currentText = undefined
             stepFinishReason = undefined
             sawToolActivity = false

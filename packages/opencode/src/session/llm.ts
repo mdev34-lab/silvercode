@@ -35,7 +35,6 @@ import { RepetitionGuard } from "./llm/repetition-guard"
 import { SystemPrompt } from "./system"
 import { ToolCatalog } from "@/tool/catalog"
 
-
 // A tool call whose arguments never parsed as JSON is almost always a response
 // cut off at the output-token limit mid-payload (or genuinely malformed JSON).
 // Name the likely cause and the recovery instead of relaying the bare parser
@@ -300,6 +299,11 @@ const live: Layer.Layer<
           return {
             type: "native" as const,
             stream: native.stream,
+            executableTools: new Set(
+              Object.entries(prepared.tools)
+                .filter(([, tool]) => tool.execute)
+                .map(([name]) => name),
+            ),
             summarizedReasoning,
             maxGenerationChars,
             repetitionThresholds,
@@ -331,6 +335,11 @@ const live: Layer.Layer<
       // LLMAISDK.toLLMEvents below normalizes fullStream parts for the processor.
       return {
         type: "ai-sdk" as const,
+        executableTools: new Set(
+          Object.entries(prepared.tools)
+            .filter(([, tool]) => tool.execute)
+            .map(([name]) => name),
+        ),
         summarizedReasoning,
         maxGenerationChars,
         repetitionThresholds,
@@ -465,7 +474,10 @@ const live: Layer.Layer<
                   )
             return GenerationLimit.guard(
               RepetitionGuard.guard(
-                ReasoningWatchdog.guard(inner, { summarized: result.summarizedReasoning }),
+                ReasoningWatchdog.guard(inner, {
+                  summarized: result.summarizedReasoning,
+                  executableTools: result.executableTools,
+                }),
                 { thresholds: result.repetitionThresholds },
               ),
               { maxChars: result.maxGenerationChars },

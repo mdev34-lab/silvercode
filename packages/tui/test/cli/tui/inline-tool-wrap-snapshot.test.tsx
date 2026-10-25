@@ -8,6 +8,8 @@ import {
   formatSubagentRetry,
   formatSubagentTitle,
   formatSubagentToolcalls,
+  formatUndeliveredSubagentDetail,
+  subagentDeliveredState,
   formatToolSearchResult,
   InlineToolRow,
   inlineToolState,
@@ -545,5 +547,17 @@ describe("TUI inline tool wrapping", () => {
     await testSetup.renderOnce()
     expect(scroll?.scrollHeight).toBe(3)
     expect(scroll?.scrollTop).toBe(Math.max(0, scroll!.scrollHeight - scroll!.viewport.height))
+  })
+})
+
+describe("subagent delivery outcome", () => {
+  test("a completed Task call reports the child's own state", () => {
+    const envelope = (state: string) => `task_id: x\n<task id="x" state="${state}">\n<task_result>\nbody\n</task_result>\n</task>`
+    expect(subagentDeliveredState(envelope("cancelled"))).toBe("cancelled")
+    expect(subagentDeliveredState(envelope("error"))).toBe("error")
+    expect(subagentDeliveredState(envelope("completed"))).toBe("completed")
+    expect(subagentDeliveredState("plain text, no envelope")).toBeUndefined()
+    expect(subagentDeliveredState('quoted <task id="x" state="cancelled"> inside prose')).toBeUndefined()
+    expect(formatUndeliveredSubagentDetail("cancelled")).toBe("Cancelled before delivering a result")
   })
 })

@@ -29,9 +29,8 @@ export async function openEditor(input: { value: string; renderer: CliRenderer; 
   if (!editor) return
   const file = path.join(os.tmpdir(), `${Date.now()}.md`)
   await writeFile(file, input.value)
-  await input.renderer.suspend()
-  input.renderer.currentRenderBuffer.clear()
   try {
+    await input.renderer.suspend()
     // suspend() restores the console mode it found, which re-enables processed
     // input. On Windows that turns Ctrl+C into a console event for every process
     // attached to the console (the editor, this process, and any npm launcher)
@@ -63,7 +62,6 @@ export async function openEditor(input: { value: string; renderer: CliRenderer; 
     // Resuming a destroyed renderer throws on the native guard; skip it and
     // let the teardown path own the terminal instead.
     if (!input.renderer.isDestroyed) {
-      input.renderer.currentRenderBuffer.clear()
       try {
         await input.renderer.resume()
         // resume() is async: teardown can land while it is in flight, so
