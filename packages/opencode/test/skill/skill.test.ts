@@ -63,7 +63,30 @@ const withHome = <A, E, R>(home: string, self: Effect.Effect<A, E, R>) =>
       }),
   )
 
+const itWithBackupRoot=testEffect(Layer.mergeAll(
+ LayerNode.compile(Skill.node,[[Discovery.node,Layer.succeed(Discovery.Service,{
+  pull:()=>Effect.sync(()=>[retainedBackupRoot]),
+ })]]),node,testInstanceStoreLayer,
+))
+let retainedBackupRoot=""
+
 describe("skill", () => {
+  itWithBackupRoot.live("loads a retained remote backup root and its relative references",()=>provideTmpdirInstance(
+   dir=>Effect.gen(function*(){
+    retainedBackupRoot=path.join(dir,"remote-cache","mutable.old-controlled")
+    yield* Effect.promise(()=>Bun.write(path.join(retainedBackupRoot,"SKILL.md"),"---\nname: retained-remote\ndescription: old cached skill\n---\n\nRead [old reference](old.md).\n"))
+    yield* Effect.promise(()=>Bun.write(path.join(retainedBackupRoot,"old.md"),"old reference"))
+    yield* Effect.promise(()=>Bun.write(path.join(dir,"opencode.json"),JSON.stringify({skills:{urls:["https://synthetic.invalid/skills"]}})))
+    const skill=yield* Skill.Service
+    const item=yield* skill.get("retained-remote")
+    expect(item?.location).toBe(path.join(retainedBackupRoot,"SKILL.md"))
+    expect(item?.content).toContain("old.md")
+    expect(yield* Effect.promise(()=>Bun.file(path.join(path.dirname(item!.location),"old.md")).text())).toBe("old reference")
+    expect((yield* skill.all()).filter(item=>item.name==="retained-remote")).toHaveLength(1)
+    expect(yield* skill.dirs()).toContain(retainedBackupRoot)
+   }),{git:true},
+  ))
+
   it.effect("formats verbose locations as XML-safe filesystem paths", () =>
     Effect.sync(() => {
       const output = Skill.fmt(

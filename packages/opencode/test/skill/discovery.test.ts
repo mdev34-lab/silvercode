@@ -1,7 +1,8 @@
 import { describe, expect, beforeAll, afterAll } from "bun:test"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { FSUtil } from "@opencode-ai/core/fs-util"
-import { Effect } from "effect"
+import { Effect, Layer } from "effect"
+import { PlatformError, SystemError } from "effect/PlatformError"
 import { Discovery } from "../../src/skill/discovery"
 import { Global } from "@opencode-ai/core/global"
 import { Filesystem } from "@/util/filesystem"
@@ -19,7 +20,29 @@ let mutableFiles = ["SKILL.md"]
 
 const fixturePath = path.join(import.meta.dir, "../fixture/skills")
 const cacheDir = path.join(Global.Path.cache, "skills")
-const it = testEffect(LayerNode.compile(LayerNode.group([Discovery.node, FSUtil.node])))
+let failPromotion = false
+let failRollback = false
+let removeBackupSkill = false
+const promotionFailures: string[] = []
+const wrappedFs = Layer.effect(FSUtil.Service, Effect.gen(function* () {
+  const fs = yield* FSUtil.Service
+  return { ...fs, rename: (source: string, dest: string) => {
+    if (failPromotion && source.includes(".tmp-") && dest.endsWith("mutable")) {
+      failPromotion = false
+      promotionFailures.push("injected-promotion-failure")
+      return Effect.fail(new PlatformError(new SystemError({_tag:"Busy",module:"FileSystem",method:"rename",cause:{code:"EBUSY"}})))
+    }
+    if (failRollback && source.includes(".old-") && dest.endsWith("mutable")) {
+      failRollback=false
+      promotionFailures.push("injected-rollback-failure")
+      return (removeBackupSkill ? fs.remove(path.join(source,"SKILL.md")) : Effect.void).pipe(
+        Effect.andThen(Effect.fail(new PlatformError(new SystemError({_tag:"PermissionDenied",module:"FileSystem",method:"rename",cause:{code:"EPERM"}})))),
+      )
+    }
+    return fs.rename(source, dest)
+  } }
+})).pipe(Layer.provide(LayerNode.compile(FSUtil.node)))
+const it = testEffect(LayerNode.compile(LayerNode.group([Discovery.node, FSUtil.node]), [[FSUtil.node, wrappedFs]]))
 
 beforeAll(async () => {
   await rm(cacheDir, { recursive: true, force: true })
@@ -183,4 +206,31 @@ describe("Discovery.pull", () => {
       expect(mutableDownloadCount).toBe(3)
     }),
   )
+  for (const scenario of ["single", "double", "empty-cache", "invalid-backup"] as const) {
+    it.live(`preserves usable roots after ${scenario} promotion failure`,()=>Effect.gen(function*(){
+      yield* Effect.promise(()=>rm(cacheDir,{recursive:true,force:true}))
+      mutableVersion="rollback-1";mutableContent="# Old";mutableFiles=["SKILL.md","old.md"]
+      promotionFailures.length=0
+      const discovery=yield* Discovery.Service
+      const url=`http://localhost:${server.port}/mutable/`
+      const first=scenario==="empty-cache"?[]:yield* discovery.pull(url)
+      mutableVersion="rollback-2";mutableContent="# New";mutableFiles=["SKILL.md"]
+      failPromotion=true;failRollback=scenario==="double"||scenario==="invalid-backup"
+      removeBackupSkill=scenario==="invalid-backup"
+      try {
+        const result=yield* discovery.pull(url)
+        if(scenario==="double"||scenario==="single"){
+          expect(result).toHaveLength(1)
+          expect(result[0].includes(".old-")).toBe(scenario==="double")
+          expect(yield* Effect.promise(()=>Bun.file(path.join(result[0],"SKILL.md")).text())).toBe("# Old")
+          expect(yield* Effect.promise(()=>Bun.file(path.join(result[0],"old.md")).text())).toBe("old reference")
+          if(scenario==="single")expect(result[0]).toBe(first[0])
+          const recovered=yield* discovery.pull(url)
+          expect(yield* Effect.promise(()=>Bun.file(path.join(recovered[0],"SKILL.md")).text())).toBe("# New")
+          if(scenario==="double")expect(yield* Effect.promise(()=>Bun.file(path.join(result[0],"old.md")).text())).toBe("old reference")
+        }else expect(result).toEqual([])
+      }finally{failPromotion=false;failRollback=false;removeBackupSkill=false}
+    }))
+  }
+
 })
