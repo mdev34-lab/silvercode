@@ -135,3 +135,46 @@ test("a resolved session resumed through task_id is pending again until its new 
   tasks.resolve(child)
   expect(tasks.settled()).toBe(true)
 })
+
+test("a completed explicit run launch replay stays settled while a new run remains pending", () => {
+  const tasks = BackgroundTasks.make(root)
+  tasks.launch({ ...launch(root, child), run: `${child}@1` })
+  tasks.resolve(`${child}@1`)
+  expect(tasks.settled()).toBe(true)
+  expect(tasks.launch({ ...launch(root, child), run: `${child}@1` })).toBe(false)
+  expect(tasks.settled()).toBe(true)
+  tasks.launch({ ...launch(root, child), run: `${child}@2` })
+  expect(tasks.launch({ ...launch(root, child), run: `${child}@1` })).toBe(false)
+  expect(tasks.pending()).toEqual([child])
+  tasks.resolve(`${child}@2`)
+  expect(tasks.settled()).toBe(true)
+})
+
+test("legacy launch part replay cannot resurrect a delivered run, but a distinct task part can resume", () => {
+  const tasks = BackgroundTasks.make(root)
+  const first = { ...launch(root, child), launchID: "prt_first" }
+  expect(tasks.launch(first)).toBe(true)
+  tasks.resolve(child)
+  expect(tasks.launch(first)).toBe(false)
+  expect(tasks.settled()).toBe(true)
+  expect(tasks.launch({ ...launch(root, child), launchID: "prt_resume" })).toBe(true)
+  expect(tasks.launch(first)).toBe(false)
+  expect(tasks.pending()).toEqual([child])
+  tasks.resolve(child)
+  expect(tasks.settled()).toBe(true)
+})
+
+test("legacy launch part dedupes while pending and a delivery before its first observation stays settled", () => {
+  const tasks = BackgroundTasks.make(root)
+  const first = { ...launch(root, child), launchID: "prt_first" }
+  expect(tasks.launch(first)).toBe(true)
+  expect(tasks.launch(first)).toBe(false)
+  expect(tasks.pending()).toEqual([child])
+  tasks.resolve(child)
+  expect(tasks.launch(first)).toBe(false)
+  const early = BackgroundTasks.make(root)
+  early.resolve(child)
+  expect(early.launch(first)).toBe(false)
+  expect(early.settled()).toBe(true)
+  expect(early.launch(first)).toBe(false)
+})

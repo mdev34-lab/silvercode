@@ -26,6 +26,7 @@ import { Filesystem } from "@/util/filesystem"
 import { createOpencodeClient, type OpencodeClient, type ToolPart } from "@opencode-ai/sdk/v2"
 import { FormatError, FormatUnknownError } from "../error"
 import { INTERACTIVE_INPUT_ERROR, resolveInteractiveStdin } from "./run/runtime.stdin"
+import { win32InstallCtrlCGuard } from "@opencode-ai/tui/terminal-win32"
 
 type ModelInput = Parameters<OpencodeClient["session"]["prompt"]>[0]["model"]
 
@@ -755,7 +756,7 @@ export const RunCommand = effectCmd({
                     "metadata" in part.state && typeof part.state.metadata?.runId === "string"
                       ? part.state.metadata.runId
                       : undefined
-                  background.launch({ sessionID: taskID!, parentSessionID: part.sessionID, run })
+                  background.launch({ sessionID: taskID!, parentSessionID: part.sessionID, run, launchID: part.id })
                 }
               }
               if (part.type === "text") {
@@ -1032,36 +1033,48 @@ type MiniCommandInput = {
 
 export async function runMini(input: MiniCommandInput) {
   if (!RunCommand.handler) throw new Error("Mini command handler is unavailable")
-  await RunCommand.handler({
-    $0: "silvercode",
-    _: ["mini"],
-    message: input.prompt ? [input.prompt] : [],
-    command: undefined,
-    continue: input.continue,
-    session: input.session,
-    fork: input.fork,
-    share: undefined,
-    model: input.model,
-    agent: input.agent,
-    format: "default",
-    file: undefined,
-    title: undefined,
-    attach: input.attach,
-    password: input.password,
-    username: input.username,
-    dir: input.directory,
-    port: undefined,
-    variant: undefined,
-    thinking: undefined,
-    mini: true,
-    interactive: false,
-    replay: input.replay ?? true,
-    "replay-limit": input.replayLimit,
-    replayLimit: input.replayLimit,
-    auto: false,
-    yolo: false,
-    "dangerously-skip-permissions": false,
-    dangerouslySkipPermissions: false,
-    demo: input.demo ?? false,
-  })
+  // Mini owns the console exactly like the full TUI: the split-footer renderer
+  // toggles raw mode, including across external-editor suspends. Keep the
+  // Windows Ctrl+C guard installed for the whole runtime so those toggles
+  // cannot turn Ctrl+C into a console event that kills the launcher's child
+  // abruptly (#441).
+  const unguard = win32InstallCtrlCGuard()
+  try {
+    await RunCommand.handler({
+      $0: "silvercode",
+      _: ["mini"],
+      message: input.prompt ? [input.prompt] : [],
+      command: undefined,
+      continue: input.continue,
+      session: input.session,
+      fork: input.fork,
+      share: undefined,
+      model: input.model,
+      agent: input.agent,
+      format: "default",
+      file: undefined,
+      title: undefined,
+      attach: input.attach,
+      password: input.password,
+      username: input.username,
+      dir: input.directory,
+      port: undefined,
+      variant: undefined,
+      thinking: undefined,
+      mini: true,
+      interactive: false,
+      replay: input.replay ?? true,
+      "replay-limit": input.replayLimit,
+      replayLimit: input.replayLimit,
+      auto: false,
+      yolo: false,
+      "dangerously-skip-permissions": false,
+      dangerouslySkipPermissions: false,
+      demo: input.demo ?? false,
+    })
+  } finally {
+    try {
+      unguard?.()
+    } catch {}
+  }
 }

@@ -77,6 +77,7 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | Path.Path | HttpClient
         (skill) =>
           Effect.gen(function* () {
             const root = path.join(cache, skill.name)
+            let availableRoot = root
             const versionFile = path.join(root, ".opencode-version")
             const version = skill.version
             const current =
@@ -110,7 +111,21 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | Path.Path | HttpClient
                     yield* fs.rename(staging, root).pipe(
                       Effect.catch((error) =>
                         Effect.gen(function* () {
-                          if (cached) yield* fs.rename(backup, root).pipe(Effect.ignore)
+                          if (cached) {
+                            yield* fs.rename(backup, root).pipe(
+                              Effect.catch((rollbackError) =>
+                                Effect.gen(function* () {
+                                  // Keep the only previous copy usable when restoration
+                                  // fails. Never remove it or silently hide that failure.
+                                  availableRoot = backup
+                                  yield* Effect.logError("failed to restore skill backup", {
+                                    skill: skill.name,
+                                    restorationFailed: true,
+                                  })
+                                }),
+                              ),
+                            )
+                          }
                           return yield* Effect.fail(error)
                         }),
                       ),
@@ -123,7 +138,7 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | Path.Path | HttpClient
                 Effect.ensuring(fs.remove(staging, { recursive: true, force: true }).pipe(Effect.ignore)),
               )
             }
-            return (yield* fs.exists(path.join(root, "SKILL.md")).pipe(Effect.orDie)) ? root : null
+            return (yield* fs.exists(path.join(availableRoot, "SKILL.md")).pipe(Effect.orDie)) ? availableRoot : null
           }),
         { concurrency: skillConcurrency },
       )

@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import { BackgroundJob } from "@opencode-ai/core/background-job"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
-import { Deferred, Effect, Exit, Scope } from "effect"
+import { Deferred, Effect, Exit, Ref, Scope } from "effect"
 import { it } from "./lib/effect"
 
 const jobsLayer = LayerNode.compile(BackgroundJob.node)
@@ -27,6 +27,35 @@ describe("BackgroundJob", () => {
       expect(yield* jobs.wait({ id: job.id })).toMatchObject({
         timedOut: false,
         info: { status: "completed", output: "done" },
+      })
+    }).pipe(Effect.provide(jobsLayer)),
+  )
+
+  it.live("promotion retains producer metadata while observation results stay shallow copies", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const latch = yield* Deferred.make<void>()
+      const metadata: Record<string, unknown> = { background: false, before: "initial" }
+      const started = yield* jobs.start({ type: "task", metadata, run: Deferred.await(latch).pipe(Effect.as("done")) })
+      metadata.before = "updated"
+      const promoted = yield* jobs.promote(started.id)
+      expect(metadata.background).toBe(true)
+      expect(promoted?.metadata).toMatchObject({ before: "updated", background: true })
+      metadata.reviewLoop = { writesFiles: true }
+      expect(promoted?.metadata).not.toHaveProperty("reviewLoop")
+      if (promoted?.metadata) promoted.metadata.before = "not the registry"
+      expect((yield* jobs.get(started.id))?.metadata).toMatchObject({
+        before: "updated",
+        reviewLoop: { writesFiles: true },
+      })
+      expect((yield* jobs.list()).find((job) => job.id === started.id)?.metadata).toMatchObject({
+        reviewLoop: { writesFiles: true },
+      })
+      expect(started.metadata).toEqual({ background: false, before: "initial" })
+      yield* Deferred.succeed(latch, undefined)
+      expect((yield* jobs.wait({ id: started.id })).info?.metadata).toMatchObject({
+        background: true,
+        reviewLoop: { writesFiles: true },
       })
     }).pipe(Effect.provide(jobsLayer)),
   )
@@ -58,6 +87,38 @@ describe("BackgroundJob", () => {
           })
         })
       })
+    }).pipe(Effect.provide(jobsLayer)),
+  )
+
+  it.effect("keeps same-session run keys distinct when the clock has not advanced", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const starts: number[] = []
+      for (let index = 0; index < 3; index++) {
+        const job = yield* jobs.start({ id: "ses_same_millisecond", type: "task", run: Effect.succeed("done") })
+        starts.push(job.started_at)
+        yield* jobs.wait({ id: job.id })
+      }
+      expect(new Set(starts).size).toBe(3)
+      expect(starts).toEqual([0, 1, 2])
+    }).pipe(Effect.provide(jobsLayer)),
+  )
+
+  it.effect("starting the same explicit id twice returns the running job and does not rerun it", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const latch = yield* Deferred.make<void>()
+      const reruns = yield* Ref.make(0)
+      const first = yield* jobs.start({
+        id: "ses_duplicate_start",
+        type: "task",
+        run: Deferred.succeed(latch, undefined).pipe(Effect.andThen(Effect.never)),
+      })
+      yield* Deferred.await(latch)
+      const second = yield* jobs.start({ id: "ses_duplicate_start", type: "task", run: Ref.update(reruns, (n) => n + 1).pipe(Effect.as("rerun")) })
+      expect(second).toMatchObject({ id: first.id, status: "running", started_at: first.started_at })
+      yield* Effect.yieldNow
+      expect(yield* Ref.get(reruns)).toBe(0)
     }).pipe(Effect.provide(jobsLayer)),
   )
 

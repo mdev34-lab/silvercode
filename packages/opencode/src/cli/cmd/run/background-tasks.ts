@@ -13,6 +13,9 @@ export const make = (rootSessionID: string) => {
   // Latest launch attribution per session, for the reachability walk.
   const parents = new Map<string, string>()
   const resolved = new Set<string>()
+  // Task part IDs are stable across event replay, even on older servers that
+  // do not emit run IDs. A real task_id resume has its own task part.
+  const launchParts = new Set<string>()
 
   const known = (sessionID: string): boolean => {
     const seen = new Set<string>()
@@ -31,15 +34,21 @@ export const make = (rootSessionID: string) => {
       .map(([, entry]) => entry.sessionID)
 
   return {
-    launch(input: { sessionID: string; parentSessionID: string; run?: string }) {
+    launch(input: { sessionID: string; parentSessionID: string; run?: string; launchID?: string }) {
       if (input.sessionID === rootSessionID) return false
+      if (input.launchID !== undefined) {
+        if (launchParts.has(input.launchID)) return false
+        launchParts.add(input.launchID)
+      }
       parents.set(input.sessionID, input.parentSessionID)
       const key = input.run ?? input.sessionID
-      // A launch re-emitted for a run still pending is the same run. One whose
-      // delivery already arrived was resumed (task_id): a new run, so it is
-      // pending again.
+      // Explicit execution keys stay idempotent after delivery. Legacy keys
+      // cannot distinguish a completed-launch replay from task_id resume.
       if (launched.has(key)) {
-        if (!resolved.has(key)) return false
+        // An explicit run identifies one execution forever. Replaying its
+        // launch after delivery cannot resurrect completed work. Only legacy
+        // session-only launches lack enough identity to distinguish resume.
+        if (input.run !== undefined || !resolved.has(key)) return false
         resolved.delete(key)
       }
       launched.set(key, { sessionID: input.sessionID, parentSessionID: input.parentSessionID })

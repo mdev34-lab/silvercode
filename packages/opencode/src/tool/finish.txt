@@ -7,3 +7,5 @@ Review: at medium and thorough effort, finish requires an explicit Approved revi
 Optional `validation.checks` records evidence only; finish runs nothing. Open todos are cancelled on success, but still mark items completed as you go.
 
 A waiting_for_subagent finish preserves todos, review requirements, and terminal result metadata. It is accepted only while one of your own background subagents is running. Once none remain, deliver success or failure.
+
+Every subagent must deliver its required result envelope before calling finish, including yields and failure outcomes. Review keeps its specialized <silvercode-review> JSON contract. Other subagents use <silvercode-result>final result text</silvercode-result> with non-empty text, not JSON. Put it in visible assistant text in the same execution (same or earlier turn), or in result. Missing envelopes reject finish as recoverable feedback. Main sessions do not need a result envelope.

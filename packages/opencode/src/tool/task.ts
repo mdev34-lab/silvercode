@@ -1,5 +1,8 @@
+import { ownerOf as workflowOwner, route as workRoute } from "@/session/work-flow"
+import { WorkFlow } from "@opencode-ai/core/work-flow"
 import { sessionAgent } from "../session/session-agent"
 import * as Tool from "./tool"
+import { resultChunks, textResult, renderTextResult } from "@/session/subagent-result"
 import { FinishTool, deliveredReason, readTermination, type Reason, type TerminationReason } from "@/tool/finish"
 import DESCRIPTION from "./task.txt"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
@@ -13,7 +16,7 @@ import { SessionID, MessageID } from "../session/schema"
 import { MessageV2 } from "../session/message-v2"
 import { Agent } from "../agent/agent"
 import { isReviewAgent, LEGACY_REVIEW_AGENTS, resolveReviewer } from "../agent/review-agents"
-import { deriveSubagentSessionPermission } from "../agent/subagent-permissions"
+import { deriveSubagentSessionPermission, deriveSubagentToolDenies } from "../agent/subagent-permissions"
 import type { SessionPrompt } from "../session/prompt"
 import { Config } from "@/config/config"
 import { Cause, Effect, Exit, Option, Ref, Schema, Scope } from "effect"
@@ -165,7 +168,7 @@ const TERMINATION_NOTE: Record<TerminationReason, string> = {
   success: "",
   subagent_wait: "Subagent stopped on a dependency and is not in flight; it will not report back on its own.",
   failure: "Subagent stopped because the task could not be completed.",
-  cancelled: "Subagent stopped because the user cancelled it; it did not complete and its result was not delivered.",
+  cancelled: "Subagent was cancelled before completion; its result was not delivered.",
 }
 
 /**
@@ -173,7 +176,7 @@ const TERMINATION_NOTE: Record<TerminationReason, string> = {
  * call, so there is usually no output at all; the envelope must still say what
  * became of the task instead of delivering an empty result.
  */
-const CANCELLED_TEXT = "The subagent was cancelled by the user before it delivered a result."
+const CANCELLED_TEXT = "The subagent was cancelled before it delivered a result."
 
 /**
  * Renders the parent-facing `<task>` envelope. The termination reason is part of
@@ -314,7 +317,90 @@ export const TaskTool = Tool.define(
       // aliases included; the fallback is skipped entirely when resolution
       // left the name alone, which is every other dispatch.
       const requested = subagentType === params.subagent_type ? undefined : yield* agent.get(params.subagent_type)
-      const runInBackground = (next.background ?? requested?.background ?? true) || params.background === true
+      const callerName = yield* parentAgentOf
+      const workIdentity = yield* agent.get("work")
+      const thinkIdentity = yield* agent.get("think")
+      const codeIdentity = yield* agent.get("code")
+      const allRoles = yield* agent.list()
+      const coordinator = WorkFlow.ownsRole(allRoles, workIdentity, callerName)
+      const session = params.task_id
+        ? yield* sessions
+            .get(SessionID.make(params.task_id))
+            .pipe(Effect.catchIf(NotFoundError.isInstance, () => Effect.succeed(undefined)))
+        : undefined
+      const admission = yield* workRoute(ctx.sessionID).pipe(Effect.provideService(Session.Service, sessions))
+      const rootOwner = yield* workflowOwner(ctx.sessionID).pipe(Effect.provideService(Session.Service, sessions))
+      const rootRole = yield* sessionAgent(sessions, rootOwner)
+      const inheritedWorkflow = WorkFlow.ownsRole(allRoles, workIdentity, rootRole)
+      const programming = coordinator && admission.kind === "programming"
+      if (inheritedWorkflow && admission.kind === "programming" && !coordinator)
+        return yield* Effect.fail(
+          new Error(
+            "Programming stage children cannot delegate implementation or substitute workflow stages. Return the result to Work.",
+          ),
+        )
+      if (inheritedWorkflow && admission.kind === "uncertain")
+        return yield* Effect.fail(
+          new Error(
+            "Clarify programming or non-programming intent with the user before dispatching any child. Inspection may use the native read-only tools.",
+          ),
+        )
+      const planner = WorkFlow.ownsRole(allRoles, thinkIdentity, callerName) && admission.kind === "programming"
+      if (planner)
+        return yield* Effect.fail(
+          new Error("Programming Think must return a read-only plan, not delegate implementation."),
+        )
+      if (
+        coordinator &&
+        admission.kind !== "nonprogramming" &&
+        ![thinkIdentity, codeIdentity, yield* agent.get("review")].some(
+          (item) => item?.native === true && item === next,
+        )
+      )
+        return yield* Effect.fail(
+          new Error(
+            "Programming or uncertain Work cannot bypass routing through an alternate child. Use Think/Code for programming or ask the user to clarify non-programming intent.",
+          ),
+        )
+      if (admission.kind !== "programming" && next === codeIdentity)
+        return yield* Effect.fail(
+          new Error(
+            "Code is only for a programming request. Non-programming work stays manual or with General; clarify uncertain intent first.",
+          ),
+        )
+      const workflow = coordinator
+        ? WorkFlow.state(yield* sessions.messages({ sessionID: ctx.sessionID }), ctx.sessionID)
+        : undefined
+      const reviewIdentity = yield* agent.get("review")
+      if (programming && next === reviewIdentity && !workflow?.implemented)
+        return yield* Effect.fail(
+          new Error("Programming Review follows successful Code implementation; it cannot replace Think or Code."),
+        )
+      if (programming && codeIdentity?.native === true && next === codeIdentity && !workflow?.planned)
+        return yield* Effect.fail(
+          new Error(
+            "Work must complete a successful Think planning task in this request before dispatching Code. Delegate Think first; a pending, cancelled or failed plan is not sufficient.",
+          ),
+        )
+      const generalIdentity = yield* agent.get("general")
+      const requiredGeneral =
+        admission.kind === "nonprogramming" &&
+        (AgentEffort.resolve(
+          readAgentEffort(parent.metadata),
+          AgentEffort.resolve(typeof cfg.agent?.effort === "string" ? cfg.agent.effort : undefined),
+        ) === "thorough" ||
+          WorkFlow.complex(
+            WorkFlow.request(yield* sessions.messages({ sessionID: ctx.sessionID }))
+              ?.parts.flatMap((part) => (part.type === "text" ? [(part as { text: string }).text] : []))
+              .join("\n") ?? "",
+          ))
+      const noncodingGeneral =
+        coordinator && admission.kind === "nonprogramming" && next.native === true && next === generalIdentity
+      const requiredStage = programming && next.native === true && (next === thinkIdentity || next === codeIdentity)
+      const runInBackground =
+        requiredStage || (noncodingGeneral && requiredGeneral)
+          ? false
+          : (next.background ?? requested?.background ?? true) || params.background === true
 
       if (!ctx.extra?.bypassAgentCheck) {
         yield* ctx.ask({
@@ -333,9 +419,7 @@ export const TaskTool = Tool.define(
           // skipped, and the common case - a request routing did not rewrite -
           // still prompts under exactly one name.
           patterns: [
-            ...(subagentType === params.subagent_type
-              ? [params.subagent_type]
-              : [params.subagent_type, subagentType]),
+            ...(subagentType === params.subagent_type ? [params.subagent_type] : [params.subagent_type, subagentType]),
             // The retired specialist names stay valid rule targets: a deny or
             // grant written against `work-review`/`code-review` gated the
             // reviewer before the consolidation, and there is exactly one
@@ -352,28 +436,20 @@ export const TaskTool = Tool.define(
         })
       }
 
-      const session = params.task_id
-        ? yield* sessions
-            .get(SessionID.make(params.task_id))
-            .pipe(Effect.catchIf(NotFoundError.isInstance, () => Effect.succeed(undefined)))
-        : undefined
+      if (
+        (requiredStage || (noncodingGeneral && requiredGeneral)) &&
+        session &&
+        (session.parentID !== ctx.sessionID || session.agent !== next.name)
+      )
+        return yield* Effect.fail(new Error("Workflow stages cannot reuse a child owned by another session."))
       const childPermission = deriveSubagentSessionPermission({
         parentSessionPermission: parent.permission ?? [],
         subagent: next,
       })
-      const childToolDenies = [
-        ...(next.permission.some((rule) => rule.permission === "todowrite")
-          ? []
-          : [{ permission: "todowrite" as const, pattern: "*" as const, action: "deny" as const }]),
-        ...(next.permission.some((rule) => rule.permission === id)
-          ? []
-          : [{ permission: id, pattern: "*" as const, action: "deny" as const }]),
-        ...(cfg.experimental?.primary_tools?.map((permission) => ({
-          permission,
-          pattern: "*" as const,
-          action: "deny" as const,
-        })) ?? []),
-      ]
+      const childToolDenies = deriveSubagentToolDenies({
+        subagent: next,
+        primaryTools: cfg.experimental?.primary_tools,
+      })
       const nextSession =
         session ??
         (yield* sessions.create({
@@ -465,6 +541,7 @@ export const TaskTool = Tool.define(
       // nested yield is never delivered, but it is what decides whether this
       // dispatch keeps the child's job alive and resumes it (#222).
       const declaredReason = yield* Ref.make<Reason | undefined>(undefined)
+      const explicitSuccess = yield* Ref.make(false)
       const projectWrites = Effect.fn("TaskTool.projectChildWrites")(function* (parts: readonly SessionV1.Part[]) {
         if (!parts.some(hasFileWrites)) return
         const evidence = { writesFiles: true, handoff: "pending", sessionId: nextSession.id }
@@ -558,8 +635,9 @@ export const TaskTool = Tool.define(
       // resumed turn after a nested wait (#222) deliver the same contract, so
       // they read the reply with the same extraction and record the same refs.
       const promptChild = Effect.fn("TaskTool.promptChild")(function* (parts: SessionPrompt.PromptInput["parts"]) {
+        const promptID = MessageID.ascending()
         const result = yield* ops.prompt({
-          messageID: MessageID.ascending(),
+          messageID: promptID,
           sessionID: nextSession.id,
           model: {
             modelID: model.modelID,
@@ -567,14 +645,39 @@ export const TaskTool = Tool.define(
           },
           variant: next.model ? undefined : variant,
           agent: next.name,
-          parts,
+          parts: [
+            ...parts,
+            {
+              type: "text",
+              text: isReviewAgent(next.name)
+                ? "Deliver your final review in the required <silvercode-review> envelope before finish, in this execution."
+                : "Before every finish call, deliver a non-empty <silvercode-result>final result text</silvercode-result> envelope. It may be in the same assistant turn, an earlier assistant turn of this execution, or finish.result. Do not put progress in the result envelope.",
+            },
+          ],
         })
 
+        const transcript = yield* sessions.messages({ sessionID: nextSession.id })
+        const chunks = resultChunks(transcript, result)
         yield* projectWrites(result.parts)
         yield* Ref.update(wroteFiles, (prev) => prev || result.parts.some((part) => declaresFileWrites(part)))
+        if (result.info.role === "assistant" && result.info.error) {
+          const error = result.info.error
+          const message = error.data && "message" in error.data ? error.data.message : error.name
+          return yield* Effect.fail(new Error(`Subagent failed: ${message}`))
+        }
+
         const finish = result.parts.findLast(
           (item): item is SessionV1.ToolPart =>
             item.type === "tool" && item.tool === FinishTool.id && item.state.status === "completed",
+        )
+        yield* Ref.set(
+          explicitSuccess,
+          finish?.state.status === "completed" &&
+            finish.state.input.reason === "success" &&
+            result.info.role === "assistant" &&
+            result.info.parentID === promptID &&
+            result.info.agent === next.name &&
+            result.info.sessionID === nextSession.id,
         )
         yield* Ref.set(declaredReason, finish ? readTermination(finish) : undefined)
         yield* Ref.set(termination, finish ? deliveredReason(readTermination(finish)) : undefined)
@@ -606,10 +709,7 @@ export const TaskTool = Tool.define(
             )
           }
           const summary = finish.state.input.result
-          const delivery = ReviewReport.extract([
-            ...result.parts.flatMap((part) => (part.type === "text" ? [part.text] : [])),
-            typeof summary === "string" ? summary : undefined,
-          ])
+          const delivery = ReviewReport.extract([...chunks, typeof summary === "string" ? summary : undefined])
           if (!delivery.ok)
             return yield* Effect.fail(
               new Error(
@@ -623,12 +723,15 @@ export const TaskTool = Tool.define(
           return ReviewReport.render(delivery)
         }
 
-        const text = result.parts.findLast((item) => item.type === "text")?.text
-        if (text !== undefined) return text
-        // Subagents end their turn with the finish tool; its result argument is
-        // the task summary.
         const summary = finish?.state.status === "completed" ? finish.state.input.result : undefined
-        return typeof summary === "string" ? summary : ""
+        const delivery = textResult([...chunks, typeof summary === "string" ? summary : undefined])
+        if (!delivery.ok)
+          return yield* Effect.fail(
+            new Error(
+              "Subagent result delivery failed: missing non-empty <silvercode-result> envelope in this execution.",
+            ),
+          )
+        return renderTextResult(delivery.text)
       })
 
       const runTask = Effect.fn("TaskTool.runTask")(function* () {
@@ -754,7 +857,8 @@ export const TaskTool = Tool.define(
       const childJobs = Effect.fn("TaskTool.childJobs")(function* () {
         const jobs = yield* background.list()
         return jobs.filter(
-          (job) => job.type === id && BackgroundJob.isSubagentOf(job, nextSession.id) && job.metadata?.background !== false,
+          (job) =>
+            job.type === id && BackgroundJob.isSubagentOf(job, nextSession.id) && job.metadata?.background !== false,
         )
       })
 
@@ -1025,6 +1129,22 @@ export const TaskTool = Tool.define(
               title: params.description,
               metadata: {
                 ...metadata,
+                ...((requiredStage || noncodingGeneral) &&
+                reason === "success" &&
+                result?.status === "completed" &&
+                result.metadata?.background !== true &&
+                result.metadata?.truncated !== true &&
+                (yield* Ref.get(explicitSuccess))
+                  ? {
+                      [WorkFlow.METADATA]: {
+                        agent: noncodingGeneral ? "general" : next === thinkIdentity ? "think" : "code",
+                        terminal: "success",
+                        planned: workflow?.planned === true,
+                        requestID: workflow?.requestID,
+                        parentID: ctx.sessionID,
+                      },
+                    }
+                  : {}),
                 ...(reviewed ? { review: reviewed } : {}),
                 ...(reason !== undefined ? { termination: { reason } } : {}),
                 // A handoff reports the child's writes as unreviewed. It keeps

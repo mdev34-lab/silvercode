@@ -1659,6 +1659,8 @@ const layer = Layer.effect(
               messages: msgs,
               promptOps,
             }).pipe(
+              Effect.provideService(Session.Service, sessions),
+              Effect.provideService(Agent.Service, agents),
               Effect.provideService(Plugin.Service, plugin),
               Effect.provideService(Permission.Service, permission),
               Effect.provideService(ToolRegistry.Service, registry),
@@ -1706,7 +1708,8 @@ const layer = Layer.effect(
               (msg) =>
                 (msg.info.role === "assistant" && msg.info.summary === true) ||
                 msg.parts.some(
-                  (part) => part.type === "compaction" || declaresFileWrites(part as Parameters<typeof declaresFileWrites>[0]),
+                  (part) =>
+                    part.type === "compaction" || declaresFileWrites(part as Parameters<typeof declaresFileWrites>[0]),
                 ),
             )
             const system = [
@@ -1900,9 +1903,7 @@ const layer = Layer.effect(
         const ours = msgs.findIndex((msg) => msg.info.id === input.messageID)
         const newerUser = msgs.slice(ours + 1).find((msg) => msg.info.role === "user")
         if (!newerUser) continue
-        const superseded = msgs.some(
-          (msg) => msg.info.role === "assistant" && msg.info.parentID === newerUser.info.id,
-        )
+        const superseded = msgs.some((msg) => msg.info.role === "assistant" && msg.info.parentID === newerUser.info.id)
         if (superseded) return result
       }
     })
@@ -1965,8 +1966,13 @@ const layer = Layer.effect(
               async ([, cmd]) =>
                 // A `!` block that hangs would wedge command expansion forever;
                 // kill it instead and let nothrow surface the failure as text.
-                (await Process.text([cmd], { shell: sh, nothrow: true, abort: AbortSignal.timeout(SHELL_BLOCK_TIMEOUT_MS) }))
-                  .text,
+                (
+                  await Process.text([cmd], {
+                    shell: sh,
+                    nothrow: true,
+                    abort: AbortSignal.timeout(SHELL_BLOCK_TIMEOUT_MS),
+                  })
+                ).text,
             ),
           ),
         )

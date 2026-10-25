@@ -44,6 +44,8 @@ const npmMock = Layer.mock(Npm.Service)({
 
 const it = testEffect(LayerNode.compile(LayerNode.group([FSUtil.node]), [[Npm.node, npmMock]]))
 
+let callsBeforeRetry = 0
+let afterReenabledRetry: readonly string[] = ["unset"]
 let reported: readonly string[] = []
 let afterRetry: readonly string[] = ["unset"]
 const logs: string[] = []
@@ -80,7 +82,7 @@ const clean = Effect.gen(function* () {
 })
 
 // A TUI config with a plugin makes the loader schedule the background install.
-const run = (mode: "ok" | "fail" | "stall", timeoutMs: string, retry = false) =>
+const run = (mode: "ok" | "fail" | "stall", timeoutMs: string, retry = false, disableRetry = false, reenableRetry = false) =>
   withEnv(
     TIMEOUT_KEY,
     timeoutMs,
@@ -103,8 +105,15 @@ const run = (mode: "ok" | "fail" | "stall", timeoutMs: string, retry = false) =>
               reported = TuiConfig.installFailures()
               if (retry) {
                 install.mode = "ok"
-                yield* svc.retryDependencies()
+                callsBeforeRetry = install.calls
+                yield* (disableRetry
+                  ? withEnv("OPENCODE_DISABLE_CONFIG_DEP_INSTALL", "1", svc.retryDependencies())
+                  : svc.retryDependencies())
                 afterRetry = TuiConfig.installFailures()
+                if (reenableRetry) {
+                  yield* svc.retryDependencies()
+                  afterReenabledRetry = TuiConfig.installFailures()
+                }
               }
             }),
           ).pipe(
@@ -186,3 +195,33 @@ it.instance(
     ),
   30_000,
 )
+
+
+it.instance("does not install TUI config dependencies while disabled", () =>
+  withEnv("OPENCODE_DISABLE_CONFIG_DEP_INSTALL", "1", run("ok", "5000")).pipe(
+    Effect.tap(() => Effect.sync(() => {
+      expect(install.calls).toBe(0)
+      expect(reported).toEqual([])
+      expect(warned("background dependency install")).toBe(false)
+    })),
+  ), 30_000)
+
+it.instance("disabled retry preserves failure evidence without starting another install", () =>
+  run("fail", "5000", true, true).pipe(
+    Effect.tap(() => Effect.sync(() => {
+      expect(callsBeforeRetry).toBeGreaterThan(0)
+      expect(install.calls).toBe(callsBeforeRetry)
+      expect(afterRetry).toEqual(reported)
+      expect(afterRetry).toEqual(["Could not install @opencode-ai/plugin"])
+    })),
+  ), 30_000)
+
+it.instance("re-enabled retry installs preserved failed directories", () =>
+  run("fail", "5000", true, true, true).pipe(
+    Effect.tap(() => Effect.sync(() => {
+      expect(callsBeforeRetry).toBeGreaterThan(0)
+      expect(afterRetry).toEqual(["Could not install @opencode-ai/plugin"])
+      expect(install.calls).toBe(callsBeforeRetry * 2)
+      expect(afterReenabledRetry).toEqual([])
+    })),
+  ), 30_000)

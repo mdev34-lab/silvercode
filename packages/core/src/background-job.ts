@@ -73,6 +73,11 @@ export type StartInput = {
   id?: string
   type: string
   title?: string
+  /**
+   * Producer-owned live metadata for this run. The registry retains this object
+   * through promotion, so late evidence remains visible. Observation results
+   * shallow-copy it; nested values are not isolated snapshots.
+   */
   metadata?: Record<string, unknown>
   onPromote?: Effect.Effect<void>
   run: Effect.Effect<string, unknown>
@@ -264,7 +269,9 @@ export const make = Effect.gen(function* () {
                 type: input.type,
                 title: input.title,
                 status: "running" as const,
-                started_at,
+                // started_at also identifies a run on the wire. A completed
+                // session can restart before the millisecond clock advances.
+                started_at: Math.max(started_at, (existing?.info.started_at ?? -Infinity) + 1),
                 metadata: input.metadata,
               },
               done,
@@ -362,7 +369,9 @@ export const make = Effect.gen(function* () {
           onPromote: undefined,
           info: {
             ...job.info,
-            metadata: { ...job.info.metadata, background: true },
+            // start retains producer-owned metadata. Keep that ownership
+            // through promotion so later evidence reaches registry consumers.
+            metadata: Object.assign(job.info.metadata ?? {}, { background: true }),
           },
         }
         return [

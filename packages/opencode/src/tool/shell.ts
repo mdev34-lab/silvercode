@@ -13,6 +13,7 @@ import { fileURLToPath } from "url"
 import { Config } from "@/config/config"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Shell } from "@opencode-ai/core/shell"
+import { windowsPowerShellCommand } from "@opencode-ai/core/shell-encoding"
 import { ShellID } from "./shell/id"
 import { ToolFailure } from "@opencode-ai/llm"
 
@@ -294,15 +295,19 @@ const ask = Effect.fn("ShellTool.ask")(function* (ctx: Tool.Context, scan: Scan,
 
 function cmd(shell: string, command: string, cwd: string, env: NodeJS.ProcessEnv) {
   if (process.platform === "win32" && Shell.ps(shell)) {
-    return ChildProcess.make(shell, ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command], {
-      cwd,
-      env,
-      stdin: "ignore",
-      detached: false,
-      // Bound scope-teardown kills: without this, a child that ignores SIGTERM
-      // hangs the finalizer forever and the session never leaves "running".
-      forceKillAfter: "3 seconds",
-    })
+    return ChildProcess.make(
+      shell,
+      ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", windowsPowerShellCommand(shell, command)],
+      {
+        cwd,
+        env,
+        stdin: "ignore",
+        detached: false,
+        // Bound scope-teardown kills: without this, a child that ignores SIGTERM
+        // hangs the finalizer forever and the session never leaves "running".
+        forceKillAfter: "3 seconds",
+      },
+    )
   }
 
   return ChildProcess.make(command, [], {
@@ -645,7 +650,9 @@ export const ShellTool = Tool.define(
       }
       if (aborted) meta.push("User aborted the command")
       if (spillError) {
-        meta.push(`Could not save the full output to a file (${spillError.message}). The output below may be incomplete.`)
+        meta.push(
+          `Could not save the full output to a file (${spillError.message}). The output below may be incomplete.`,
+        )
         file = ""
       }
       if (signaled) meta.push(`Command was terminated by signal ${signaled}`)

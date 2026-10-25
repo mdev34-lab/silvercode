@@ -198,6 +198,27 @@ const mustTruncate = (result: {
 }
 
 describe("tool.shell", () => {
+  for (const item of ps) {
+    it.live(`preserves non-ASCII PowerShell stdout/stderr and nonzero exit (#543) [${item.label}]`, () =>
+      withShell(
+        item,
+        runIn(
+          projectRoot,
+          Effect.gen(function* () {
+            const result = yield* run({
+              command:
+                "[Console]::Write('Área de Trabalho ação 日本語 😀'); [Console]::Error.Write('saída de erro'); exit 7",
+            })
+            expect(result.metadata.exit).toBe(7)
+            expect(result.output).toContain("Área de Trabalho ação 日本語 😀")
+            expect(result.output).toContain("saída de erro")
+            expect(result.output).not.toContain("\ufffd")
+          }),
+        ),
+      ),
+    )
+  }
+
   each("basic", () =>
     runIn(
       projectRoot,

@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test"
 import { createThreadWorker, createTuiWorker, createWorkerProcess, isWorkerCrash, type WorkerExit } from "../../src/cli/tui/worker-process"
 
 type FakeProcess = {
+  pid: number
   exitCode: number | null
   signalCode: string | null
   killed: boolean
@@ -14,9 +15,12 @@ type FakeProcess = {
   resolveExit(code: number, signal?: string): void
 }
 
+let nextPid = 1000
+
 function fakeProcess(): FakeProcess {
   let resolveExit!: (code: number) => void
   return {
+    pid: nextPid++,
     exitCode: null,
     signalCode: null,
     killed: false,
@@ -386,5 +390,36 @@ describe("TUI thread worker", () => {
     expect(fake.terminated).toBe(false)
     await worker.terminate()
     await expect(worker.closed).resolves.toEqual({ code: 0, signal: null })
+  })
+})
+
+describe("TUI worker owner-death wiring", () => {
+  test("hands every spawned worker, restarts included, to the owner-death hook (#442)", async () => {
+    const children: FakeProcess[] = []
+    const adopted: Array<number | undefined> = []
+    const spawn = () => {
+      const child = fakeProcess()
+      children.push(child)
+      return child
+    }
+
+    const worker = createWorkerProcess("worker.ts", {
+      spawn,
+      log: () => {},
+      maxRestarts: 2,
+      adoptWorker: (pid) => adopted.push(pid),
+    })
+
+    // The initial child is adopted as soon as it exists: a replacement that
+    // only gets adopted on the first spawn would outlive the owner after a
+    // crash restart.
+    expect(adopted).toEqual([children[0].pid])
+
+    children[0].resolveExit(1, "SIGSEGV")
+    await worker.waitForRestart()
+
+    expect(children).toHaveLength(2)
+    expect(adopted).toEqual([children[0].pid, children[1].pid])
+    await worker.terminate()
   })
 })
