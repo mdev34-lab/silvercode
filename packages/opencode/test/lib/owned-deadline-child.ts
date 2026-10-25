@@ -1,6 +1,6 @@
 /** Own the spawned process even if collection or a child fixture fails. */
-export async function collectDeadlineChild(argv: string[], cwd: string, timeoutMs: number) {
-  const child = Bun.spawn(argv, { cwd, stdout: "pipe", stderr: "pipe" })
+export async function collectDeadlineChild(argv: string[], cwd: string, timeoutMs: number, env?: Record<string, string>) {
+  const child = Bun.spawn(argv, { cwd, env: env ? { ...process.env, ...env } : process.env, stdout: "pipe", stderr: "pipe" })
   let timedOut = false
   const timer = setTimeout(() => { timedOut = true; child.kill() }, timeoutMs)
   try {

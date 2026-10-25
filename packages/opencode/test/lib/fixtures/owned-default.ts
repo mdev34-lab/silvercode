@@ -21,7 +21,7 @@ const layer = Layer.effect(
       }),
   ),
 )
-// Default testEffect path: no per-test timeout, only the host default (--timeout 1000 from the runner).
+// Default testEffect path: no per-test timeout, only the host default (OPENCODE_TEST_HOST_TIMEOUT_MS=1000 from the runner, applied by preload).
 const it = testEffect(layer)
 it.live(
   "default path times out after layer acquisition",

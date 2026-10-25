@@ -9,8 +9,8 @@ test("opt-in runner interrupts full provided execution and finalizes before the 
   ["owned-default.ts","next Bun test sees default-path layer finalized"],
  ]){
   const {stdout,stderr,code,timedOut}=await collectDeadlineChild([
-   process.execPath,"test",...(fixture==="owned-default.ts"?["--timeout","1000"]:[]),path.join(import.meta.dir,"fixtures",fixture),
-  ],cwd,5000)
+   process.execPath,"test",path.join(import.meta.dir,"fixtures",fixture),
+  ],cwd,5000,fixture==="owned-default.ts"?{OPENCODE_TEST_HOST_TIMEOUT_MS:"1000"}:undefined)
   const output=stdout+stderr
   expect(timedOut).toBe(false)
   expect(code).toBe(1)
