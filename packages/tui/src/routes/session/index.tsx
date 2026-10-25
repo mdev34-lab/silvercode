@@ -3183,6 +3183,10 @@ function Task(props: ToolProps) {
     return assistant - first
   })
 
+  const delivered = createMemo(() =>
+    props.part.state.status === "completed" ? subagentDeliveredState(props.part.state.output) : undefined,
+  )
+
   const content = createMemo(() => {
     const description = stringValue(props.input.description)
     if (!description) return ""
@@ -3206,7 +3210,9 @@ function Task(props: ToolProps) {
     }
 
     if (!isRunning() && props.part.state.status === "completed") {
-      content.push(`↳ ${formatCompletedSubagentDetail(tools().length, Locale.duration(duration()))}`)
+      const outcome = delivered()
+      if (outcome === "cancelled" || outcome === "error") content.push(`↳ ${formatUndeliveredSubagentDetail(outcome)}`)
+      else content.push(`↳ ${formatCompletedSubagentDetail(tools().length, Locale.duration(duration()))}`)
     }
 
     return content.join("\n")
@@ -3214,7 +3220,15 @@ function Task(props: ToolProps) {
 
   return (
     <InlineTool
-      icon={props.part.state.status === "completed" ? "✓" : "│"}
+      icon={
+        props.part.state.status !== "completed"
+          ? "│"
+          : delivered() === "cancelled"
+            ? "○"
+            : delivered() === "error"
+              ? "✗"
+              : "✓"
+      }
       separate={true}
       color={retry() ? theme.error : undefined}
       spinner={isRunning()}
@@ -3244,6 +3258,16 @@ export function formatSubagentTitle(agent: string, description: string, backgrou
 
 export function formatSubagentRetry(attempt: number, message: string) {
   return `Retrying (attempt ${attempt}) · ${message}`
+}
+
+/** The child's own outcome. A completed Task tool call is not a delivered result. */
+export function subagentDeliveredState(output: string): "completed" | "cancelled" | "error" | undefined {
+  const match = output.match(/^<task\b[^>\n]*\sstate="(completed|cancelled|error)"/m)
+  return match?.[1] as "completed" | "cancelled" | "error" | undefined
+}
+
+export function formatUndeliveredSubagentDetail(state: "cancelled" | "error") {
+  return state === "cancelled" ? "Cancelled before delivering a result" : "Failed before delivering a result"
 }
 
 export function formatCompletedSubagentDetail(toolcalls: number, duration: string) {
