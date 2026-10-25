@@ -2,6 +2,10 @@ import { expect, test } from "bun:test"
 import path from "node:path"
 import { collectDeadlineChild } from "./owned-deadline-child"
 const cwd=path.resolve(import.meta.dir,"../..")
+// Hang guard for a spawned fixture, not a performance budget. Measured on a 2-core host with Bun 1.3.14:
+// each fixture takes 1.6-2.7s unloaded, 4.3-5.1s with 4 CPU-bound competitors, 8.2-8.9s with 10.
+// The previous 5000ms guard was exceeded under 4+ competitors (timedOut assertion, not an ownership failure).
+const CHILD_GUARD_MS=15000
 test("opt-in runner interrupts full provided execution and finalizes before the next Bun test",async()=>{
  for(const [fixture,next] of [
   ["owned-cooperative.ts","next Bun test sees provided layer finalized"],
@@ -10,7 +14,7 @@ test("opt-in runner interrupts full provided execution and finalizes before the 
  ]){
   const {stdout,stderr,code,timedOut}=await collectDeadlineChild([
    process.execPath,"test",path.join(import.meta.dir,"fixtures",fixture),
-  ],cwd,5000)
+  ],cwd,CHILD_GUARD_MS)
   const output=stdout+stderr
   expect(timedOut).toBe(false)
   expect(code).toBe(1)
@@ -20,7 +24,7 @@ test("opt-in runner interrupts full provided execution and finalizes before the 
   expect(output).not.toContain("timed out after")
   expect(output).not.toContain("positive finite")
  }
-},15000)
+},CHILD_GUARD_MS*4+10000)
 test("a hanging child is killed and joined before collection settles",async()=>{
  const result=await collectDeadlineChild([process.execPath,"-e","setInterval(()=>{},1000)"],cwd,80)
  expect(result.timedOut).toBe(true)
