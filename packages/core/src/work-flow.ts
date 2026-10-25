@@ -84,7 +84,11 @@ export function classify(requestID: string, raw: string): Route {
   // Asking for a software artifact is programming only when the verb's direct object is the
   // artifact. Office deliverables ("a report comparing apps") and explanations about how to
   // build something stay out of this rule.
-  const primary = positive.split(/\b(?:about|how to|explain\w*|describ\w*|regarding|on how|sobre|como)\b/)[0]
+  const verbs = "create|write|make|generate|add|crie|criar|escreva|escrever|faca|fazer|gere|gerar|adicione"
+  const primary = clauses
+    .flatMap((clause) => clause.split(new RegExp("\\b(?:and|then|also|e|depois)\\b(?=\\s+(?:" + verbs + ")\\b)")))
+    .map((part) => part.split(/\b(?:about|how to|explain\w*|describ\w*|regarding|on how|sobre|como)\b/)[0])
+    .join(" ; ")
   const modifier =
     "(?!(?:report|email|e-mail|summary|presentation|slides?|pdf|spreadsheet|memo|note|notes|essay|letter|relatorio|resumo|planilha|apresentacao|about|for|of|on|in|with|to|comparing|sobre|para|de)\\b)[a-z0-9+#.-]+"
   const artifactMatch = new RegExp(

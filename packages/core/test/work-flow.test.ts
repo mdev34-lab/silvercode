@@ -146,3 +146,13 @@ test("office deliverables mentioning software words are not forced to Code", () 
   expect(WorkFlow.classify("r", "Create a small bash script").kind).toBe("programming")
   expect(WorkFlow.classify("r", "Create a Python script to save this attachment").kind).toBe("programming")
 })
+
+test("a later independent artifact request survives an earlier about-clause", () => {
+  for (const text of [
+    "Write a report about mobile apps; create a Python script",
+    "Write a report about mobile apps and create a Python script",
+    "Escreva um relatorio sobre aplicativos e crie um script Python",
+  ])
+    expect(WorkFlow.classify("r", text).kind).toBe("programming")
+  expect(WorkFlow.classify("r", "Write a report about how to create a Python script").kind).toBe("nonprogramming")
+})
