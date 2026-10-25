@@ -434,7 +434,8 @@ describe("tool.task", () => {
         const description = schema.properties.subagent_type.description
         // Generated from the agent registry, same permission-filtered list the
         // tool description appends: no primary agents, no denied names.
-        expect(description).toContain("think - Planning specialist.")
+        expect(description).not.toContain("think - Planning specialist.")
+        expect(description).toContain("code - Software-engineering specialist.")
         expect(description).toContain("zebra - Zebra agent")
         expect(description).not.toContain("work - General-purpose workhorse")
       }),

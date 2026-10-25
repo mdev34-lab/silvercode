@@ -206,6 +206,13 @@ const layer = Layer.effect(
         const delegatable = (list: Agent.Info[]) => list.filter((item) => item.name !== agent.name)
         const plannersToAdvertise = delegatable(planners)
         const implementersToAdvertise = delegatable(implementers)
+        // Planning lives in the built-in skill when no planner subagent is
+        // delegatable: same context window, loaded once at the start.
+        const canPlan =
+          plannersToAdvertise.length === 0 &&
+          !Permission.disabled(["skill"], agent.permission).has("skill") &&
+          (yield* skill.available(agent)).some((item) => item.name === Skill.DEEP_THINK_SKILL_NAME)
+        const planLine = `For anything beyond a small task, first load the \`${Skill.DEEP_THINK_SKILL_NAME}\` skill with the skill tool, once, at the start, then work its plan step by step instead of re-planning at every tool call.`
         if (plannersToAdvertise.length === 0 && implementersToAdvertise.length === 0) return
 
         // Accurate guidance: when session rules restrict subagent edits to
@@ -226,6 +233,7 @@ const layer = Layer.effect(
         if (plannersToAdvertise.length === 0) {
           return [
             `Delegate by default: you coordinate and ${names(implementersToAdvertise)} implements.`,
+            ...(canPlan ? [planLine] : []),
             `For anything beyond a small task, delegate each implementation step to ${names(implementersToAdvertise)} with the task tool.`,
             ...(scopeNote ? [scopeNote] : []),
             "Direct work is the exception, reserved for small tasks - a quick lookup, a tiny edit, a short answer.",

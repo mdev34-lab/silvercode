@@ -94,13 +94,13 @@ describe("Work/Code agent split", () => {
     }),
   )
 
-  it.instance("work cannot delegate to itself, and think is advertised for delegation", () =>
+  it.instance("work cannot delegate to itself or to think, planning is the deep-think skill", () =>
     Effect.gen(function* () {
       const agent = yield* Agent.Service
       const work = yield* agent.get("work")
       expect(work).toBeDefined()
       expect(Permission.evaluate("task", "work", work!.permission).action).toBe("deny")
-      expect(Permission.evaluate("task", "think", work!.permission).action).toBe("allow")
+      expect(Permission.evaluate("task", "think", work!.permission).action).toBe("deny")
       const registry = yield* ToolRegistry.Service
       const tools = yield* registry.tools({
         providerID: ProviderV2.ID.make("test"),
@@ -110,7 +110,7 @@ describe("Work/Code agent split", () => {
       const taskTool = tools.find((t) => t.id === "task")
       expect(taskTool).toBeDefined()
       expect(taskTool?.description).not.toContain("- work:")
-      expect(taskTool?.description).toContain("- think:")
+      expect(taskTool?.description).not.toContain("- think:")
     }),
   )
 
