@@ -1,3 +1,4 @@
+import { refreshDiagnostic } from "./refresh-diagnostic"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { httpClient, path } from "@opencode-ai/core/effect/app-node-platform"
 import { NodePath } from "@effect/platform-node"
@@ -76,6 +77,7 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | Path.Path | HttpClient
         list,
         (skill) =>
           Effect.gen(function* () {
+            const trace = refreshDiagnostic()
             const root = path.join(cache, skill.name)
             const versionFile = path.join(root, ".opencode-version")
             const version = skill.version
@@ -95,32 +97,32 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | Path.Path | HttpClient
               const staging = `${root}.tmp-${token}`
               const backup = `${root}.old-${token}`
               yield* Effect.gen(function* () {
-                const downloaded = yield* Effect.forEach(
+                const downloaded = yield* trace("download", Effect.forEach(
                   skill.files,
                   (file) => download(new URL(file, `${host}/${skill.name}/`).href, path.join(staging, file)),
                   { concurrency: fileConcurrency },
-                )
+                ))
                 if (!downloaded.every(Boolean)) return
-                if (!(yield* fs.exists(path.join(staging, "SKILL.md")).pipe(Effect.orDie))) return
-                yield* fs.writeFileString(path.join(staging, ".opencode-version"), version)
+                if (!(yield* trace("staging-check", fs.exists(path.join(staging, "SKILL.md")).pipe(Effect.orDie)))) return
+                yield* trace("version-write", fs.writeFileString(path.join(staging, ".opencode-version"), version))
                 yield* Effect.uninterruptible(
                   Effect.gen(function* () {
                     const cached = yield* fs.exists(root).pipe(Effect.orDie)
-                    if (cached) yield* fs.rename(root, backup)
-                    yield* fs.rename(staging, root).pipe(
+                    if (cached) yield* trace("backup", fs.rename(root, backup))
+                    yield* trace("promote", fs.rename(staging, root)).pipe(
                       Effect.catch((error) =>
                         Effect.gen(function* () {
-                          if (cached) yield* fs.rename(backup, root).pipe(Effect.ignore)
+                          if (cached) yield* trace("rollback", fs.rename(backup, root)).pipe(Effect.ignore)
                           return yield* Effect.fail(error)
                         }),
                       ),
                     )
-                    if (cached) yield* fs.remove(backup, { recursive: true, force: true }).pipe(Effect.ignore)
+                    if (cached) yield* trace("backup-remove", fs.remove(backup, { recursive: true, force: true })).pipe(Effect.ignore)
                   }),
                 )
               }).pipe(
                 Effect.catch((error) => Effect.logError("failed to refresh skill", { skill: skill.name, error })),
-                Effect.ensuring(fs.remove(staging, { recursive: true, force: true }).pipe(Effect.ignore)),
+                Effect.ensuring(trace("staging-remove", fs.remove(staging, { recursive: true, force: true })).pipe(Effect.ignore)),
               )
             }
             return (yield* fs.exists(path.join(root, "SKILL.md")).pipe(Effect.orDie)) ? root : null

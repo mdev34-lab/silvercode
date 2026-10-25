@@ -1,13 +1,21 @@
+import { PlatformError, SystemError } from "effect/PlatformError"
 import { describe, expect, beforeAll, afterAll } from "bun:test"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { FSUtil } from "@opencode-ai/core/fs-util"
-import { Effect } from "effect"
+import { Effect, Layer } from "effect"
 import { Discovery } from "../../src/skill/discovery"
 import { Global } from "@opencode-ai/core/global"
 import { Filesystem } from "@/util/filesystem"
 import { rm } from "fs/promises"
 import path from "path"
 import { testEffect } from "../lib/effect"
+
+const priorRefreshDiagnostics=process.env.OPENCODE_TEST_SKILL_REFRESH_DIAGNOSTICS
+beforeAll(()=>{process.env.OPENCODE_TEST_SKILL_REFRESH_DIAGNOSTICS="1"})
+afterAll(()=>{
+ if(priorRefreshDiagnostics===undefined)delete process.env.OPENCODE_TEST_SKILL_REFRESH_DIAGNOSTICS
+ else process.env.OPENCODE_TEST_SKILL_REFRESH_DIAGNOSTICS=priorRefreshDiagnostics
+})
 
 let CLOUDFLARE_SKILLS_URL: string
 let server: ReturnType<typeof Bun.serve>
@@ -19,7 +27,23 @@ let mutableFiles = ["SKILL.md"]
 
 const fixturePath = path.join(import.meta.dir, "../fixture/skills")
 const cacheDir = path.join(Global.Path.cache, "skills")
-const it = testEffect(LayerNode.compile(LayerNode.group([Discovery.node, FSUtil.node])))
+let forcePromotion=false
+let forceRollback=false
+const observedFs=Layer.effect(FSUtil.Service,Effect.gen(function*(){
+ const fs=yield* FSUtil.Service
+ return {...fs,rename:(source:string,destination:string)=>{
+  if(forcePromotion&&source.includes(".tmp-")&&destination.endsWith("mutable")){
+   forcePromotion=false
+   return Effect.fail(new PlatformError(new SystemError({_tag:"Busy",module:"FileSystem",method:"rename",cause:{code:"EBUSY"}})))
+  }
+  if(forceRollback&&source.includes(".old-")&&destination.endsWith("mutable")){
+   forceRollback=false
+   return Effect.fail(new PlatformError(new SystemError({_tag:"PermissionDenied",module:"FileSystem",method:"rename",cause:{code:"EPERM"}})))
+  }
+  return fs.rename(source,destination)
+ }}
+})).pipe(Layer.provide(LayerNode.compile(FSUtil.node)))
+const it = testEffect(LayerNode.compile(LayerNode.group([Discovery.node, FSUtil.node]),[[FSUtil.node,observedFs]]))
 
 beforeAll(async () => {
   await rm(cacheDir, { recursive: true, force: true })
@@ -183,4 +207,23 @@ describe("Discovery.pull", () => {
       expect(mutableDownloadCount).toBe(3)
     }),
   )
+  it.live("diagnostic phases retain distinct promotion and rollback failures",()=>Effect.gen(function*(){
+    yield* Effect.promise(()=>rm(cacheDir,{recursive:true,force:true}))
+    mutableVersion="phase-1";mutableContent="# Old";mutableFiles=["SKILL.md"]
+    const discovery=yield* Discovery.Service
+    const url=`http://localhost:${server.port}/mutable/`
+    yield* discovery.pull(url)
+    mutableVersion="phase-2";mutableContent="# New"
+    const original=console.log
+    const events:{phase:string;state:string;code?:string}[]=[]
+    console.log=(...args:unknown[])=>{if(args[0]==="SKILL_REFRESH")events.push(JSON.parse(String(args[1])))}
+    forcePromotion=true;forceRollback=true
+    try {
+      const result=yield* discovery.pull(url)
+      expect(result).toEqual([])
+      expect(events).toContainEqual(expect.objectContaining({phase:"promote",state:"failure",code:"EBUSY"}))
+      expect(events).toContainEqual(expect.objectContaining({phase:"rollback",state:"failure",code:"EPERM"}))
+    }finally{console.log=original;forcePromotion=false;forceRollback=false}
+  }))
+
 })
