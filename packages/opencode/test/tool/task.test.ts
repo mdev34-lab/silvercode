@@ -100,6 +100,8 @@ const seed = Effect.fn("TaskToolTest.seed")(function* (title = "Pinned") {
     model: ref,
     time: { created: Date.now() },
   })
+  // Existing task-mechanics fixtures model non-programming research; routing tests append their explicit intent below.
+  yield* session.updatePart({id:PartID.ascending(),sessionID:chat.id,messageID:user.id,type:"text",text:"Research the requested information"})
   const assistant: SessionV1.Assistant = {
     id: MessageID.ascending(),
     role: "assistant",
@@ -207,7 +209,7 @@ function reviewOps(chunks: string[]): TaskPromptOps {
   }
 }
 
-function reviewRunOps(chunks: string[], summary = "done"): TaskPromptOps {
+function reviewRunOps(chunks: string[], summary = "done", reason?: string): TaskPromptOps {
   return {
     cancel: () => Effect.void,
     resolvePromptParts: (template) => Effect.succeed([{ type: "text" as const, text: template }]),
@@ -224,7 +226,7 @@ function reviewRunOps(chunks: string[], summary = "done"): TaskPromptOps {
           callID: "finish-call",
           state: {
             status: "completed",
-            input: { result: summary },
+            input: { result: summary, ...(reason ? { reason } : {}) },
             output: summary,
             title: "finish",
             metadata: {},
@@ -1112,6 +1114,19 @@ describe("tool.task", () => {
   )
 
   it.instance(
+    "literal tag prose survives rendered review metadata association",
+    () =>
+      Effect.gen(function* () {
+        const result = yield* runReview(reviewRunOps([reviewEnvelope(), "Mention <silvercode-review> in prose."]))
+        expect(result.metadata.review.report).toEqual(REVIEW_REPORT)
+        expect(result.metadata.review.revision).toBe("uncommitted")
+        expect(result.metadata.review.sessionId).toBe(result.metadata.sessionId)
+        expect(result.output).toContain("Mention <silvercode-review> in prose.")
+      }),
+    { config: FOREGROUND },
+  )
+
+  it.instance(
     "a missing review report envelope fails delivery explicitly",
     () =>
       Effect.gen(function* () {
@@ -1931,7 +1946,8 @@ describe("tool.task", () => {
         expect(result.metadata.termination.reason).toBe("cancelled")
         expect(result.output).toContain(`<task id="${child}" state="cancelled">`)
         expect(result.output).toContain('<termination reason="cancelled">')
-        expect(result.output).toContain("cancelled by the user")
+        expect(result.output).toContain("cancelled before it delivered a result")
+        expect(result.output).not.toMatch(/the user|user cancelled/i)
         // The cancel reached the child's execution handle itself, not only the
         // envelope handed back to the parent.
         expect((yield* jobs.get(child))?.status).toBe("cancelled")
@@ -1992,7 +2008,8 @@ describe("tool.task", () => {
       expect(text).toMatch(new RegExp(`<task id="${child}" run="${child}@\\d+" state="cancelled">`))
       expect(text).toContain("<summary>Background task cancelled: inspect bug</summary>")
       expect(text).toContain('<termination reason="cancelled">')
-      expect(text).toContain("cancelled by the user")
+      expect(text).toContain("cancelled before it delivered a result")
+      expect(text).not.toMatch(/the user|user cancelled/i)
     }),
   )
 
@@ -2069,6 +2086,9 @@ describe("tool.task", () => {
       expect(silent).toHaveLength(1)
       const receipt = silent[0]?.parts[0]
       expect(receipt?.type === "text" && receipt.text).toContain('state="cancelled"')
+      // Parent teardown is not evidence that a person explicitly cancelled this child.
+      expect(receipt?.type === "text" && receipt.text).toContain("cancelled before it delivered a result")
+      expect(receipt?.type === "text" && receipt.text).not.toMatch(/the user|user cancelled/i)
       expect(receipt?.type === "text" && receipt.metadata?.backgroundNoReply).toBe(true)
     }),
   )
@@ -4137,3 +4157,326 @@ it.instance("keeps the error name if an upstream child error has no data", () =>
   }),
   { config: FOREGROUND },
 )
+
+it.instance("programming cannot dispatch Code or Review before successful Think and Code", () =>
+  Effect.gen(function* () {
+    const { chat, assistant } = yield* seed()
+    const sessions = yield* Session.Service
+    const history = yield* sessions.messages({ sessionID: chat.id })
+    const user = history.find((message) => message.info.role === "user")!
+    yield* sessions.updatePart({
+      id: PartID.ascending(),
+      messageID: user.info.id,
+      sessionID: chat.id,
+      type: "text",
+      text: "Fix the Python software bug",
+    })
+    const def = yield* (yield* TaskTool).init()
+    for (const name of ["code", "review", "general"]) {
+      let executed = false
+      const exit = yield* def
+        .execute(
+          { description: "blocked stage", prompt: "implement", subagent_type: name, background: false },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "work",
+            abort: new AbortController().signal,
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+            extra: {
+              promptOps: stubOps({
+                onPrompt: () => {
+                  executed = true
+                },
+              }),
+            },
+          },
+        )
+        .pipe(Effect.exit)
+      if (process.env.WORK_FLOW_CAPTURE && name === "code" && Exit.isFailure(exit)) yield* Effect.promise(()=>Bun.write("/tmp/wf-runtime-refusal.json",JSON.stringify({error:Cause.pretty(exit.cause), input:{subagent_type:name,description:"Implement requested fix",prompt:"Fix software"}})))
+    expect(Exit.isFailure(exit)).toBe(true)
+      expect(executed).toBe(false)
+    }
+  }),
+)
+
+it.instance("programming persists a fresh successful Think delivery before permitting Code", () => Effect.gen(function* () {
+  const {chat,assistant}=yield* seed()
+  const sessions=yield* Session.Service
+  const history=yield* sessions.messages({sessionID:chat.id})
+  const user=history.find((message)=>message.info.role === "user")!
+  yield* sessions.updatePart({id:PartID.ascending(),messageID:user.info.id,sessionID:chat.id,type:"text",text:"Fix the Python software bug"})
+  const def=yield* (yield* TaskTool).init()
+  const ctx={sessionID:chat.id,messageID:assistant.id,agent:"work",abort:new AbortController().signal,messages:[],metadata:()=>Effect.void,ask:()=>Effect.void,extra:{promptOps:reviewRunOps(["<silvercode-result>Plan the implementation and tests.</silvercode-result>"], "done", "success")}}
+  const planned=yield* def.execute({description:"plan",prompt:"plan",subagent_type:"think",background:false},ctx)
+  expect(planned.metadata.background).toBe(false)
+  expect(planned.metadata.workFlow?.agent).toBe("think")
+  yield* sessions.updatePart({id:PartID.ascending(),sessionID:chat.id,messageID:assistant.id,type:"tool",tool:"task",callID:"planning",state:{status:"completed",input:{subagent_type:"think"},output:planned.output,title:"plan",metadata:planned.metadata,time:{start:Date.now(),end:Date.now()}}})
+  const implemented=yield* def.execute({description:"implement",prompt:"implement plan",subagent_type:"code",background:false},ctx)
+  expect(implemented.metadata.workFlow?.agent).toBe("code")
+  expect(implemented.metadata.workFlow?.planned).toBe(true)
+}))
+
+it.instance("uncertain root blocks every child including Review and permission-overridden Explore", () => Effect.gen(function* () {
+  const {chat,assistant}=yield* seed()
+  const sessions=yield* Session.Service
+  const history=yield* sessions.messages({sessionID:chat.id})
+  const user=history.find((message)=>message.info.role === "user")!
+  yield* sessions.updatePart({id:PartID.ascending(),messageID:user.info.id,sessionID:chat.id,type:"text",text:"Fix this"})
+  const def=yield* (yield* TaskTool).init()
+  for (const name of ["think","code","review","explore","general"]) {
+    let ran=false
+    const exit=yield* def.execute({description:"cannot bypass question",prompt:"implement",subagent_type:name,background:false},{sessionID:chat.id,messageID:assistant.id,agent:"work",abort:new AbortController().signal,messages:[],metadata:()=>Effect.void,ask:()=>Effect.void,extra:{promptOps:stubOps({onPrompt:()=>{ran=true}})}}).pipe(Effect.exit)
+    expect(Exit.isFailure(exit)).toBe(true)
+    expect(ran).toBe(false)
+  }
+}))
+
+it.instance("non-programming root survives nested model prompts and cannot reach Code via General", () => Effect.gen(function* () {
+  const {chat,assistant}=yield* seed()
+  const sessions=yield* Session.Service
+  const history=yield* sessions.messages({sessionID:chat.id})
+  const user=history.find((message)=>message.info.role === "user")!
+  yield* sessions.updatePart({id:PartID.ascending(),messageID:user.info.id,sessionID:chat.id,type:"text",text:"Research hotels and write a report"})
+  const child=yield* sessions.create({parentID:chat.id,agent:"general",title:"research"})
+  const nested=yield* sessions.create({parentID:child.id,agent:"general",title:"nested"})
+  const synthetic=yield* sessions.updateMessage({id:MessageID.ascending(),sessionID:nested.id,role:"user",agent:"general",model:ref,time:{created:Date.now()}})
+  yield* sessions.updatePart({id:PartID.ascending(),sessionID:nested.id,messageID:synthetic.id,type:"text",text:"Implement a Python application"})
+  const reply={...assistant,id:MessageID.ascending(),sessionID:nested.id,parentID:synthetic.id,agent:"general",mode:"general"}
+  yield* sessions.updateMessage(reply)
+  const def=yield* (yield* TaskTool).init()
+  let ran=false
+  const exit=yield* def.execute({description:"bypass",prompt:"implement",subagent_type:"code",background:false},{sessionID:nested.id,messageID:reply.id,agent:"general",abort:new AbortController().signal,messages:[],metadata:()=>Effect.void,ask:()=>Effect.void,extra:{promptOps:stubOps({onPrompt:()=>{ran=true}})}}).pipe(Effect.exit)
+  expect(Exit.isFailure(exit)).toBe(true)
+  expect(ran).toBe(false)
+}))
+
+it.instance("a stale successful child finish cannot authorize Code", () => Effect.gen(function* () {
+  const {chat,assistant}=yield* seed()
+  const sessions=yield* Session.Service
+  const history=yield* sessions.messages({sessionID:chat.id})
+  const user=history.find((message)=>message.info.role === "user")!
+  yield* sessions.updatePart({id:PartID.ascending(),messageID:user.info.id,sessionID:chat.id,type:"text",text:"Fix Python software"})
+  const ops=reviewRunOps(["<silvercode-result>Old plan.</silvercode-result>"],"done","success")
+  const stale={...ops,prompt:(input:SessionPrompt.PromptInput)=>ops.prompt(input).pipe(Effect.map(result=>({...result,info:{...result.info,parentID:MessageID.ascending()}})))}
+  const def=yield* (yield* TaskTool).init()
+  const planned=yield* def.execute({description:"stale plan",prompt:"plan",subagent_type:"think",background:false},{sessionID:chat.id,messageID:assistant.id,agent:"work",abort:new AbortController().signal,messages:[],metadata:()=>Effect.void,ask:()=>Effect.void,extra:{promptOps:stale}})
+  expect(planned.metadata.workFlow).toBeUndefined()
+}))
+
+it.instance("thorough non-programming General forces foreground and stamps successful delivery", () => Effect.gen(function* () {
+  const {chat,assistant}=yield* seed()
+  const sessions=yield* Session.Service
+  yield* sessions.setMetadata({sessionID:chat.id,metadata:{agentEffort:"thorough"}})
+  const def=yield* (yield* TaskTool).init()
+  const ops=reviewRunOps(["<silvercode-result>Research report.</silvercode-result>"],"done","success")
+  const result=yield* def.execute({description:"research",prompt:"research",subagent_type:"general",background:true},{sessionID:chat.id,messageID:assistant.id,agent:"work",abort:new AbortController().signal,messages:[],metadata:()=>Effect.void,ask:()=>Effect.void,extra:{promptOps:ops}})
+  expect(result.metadata.background).toBe(false)
+  expect(result.metadata.workFlow?.agent).toBe("general")
+}))
+
+it.instance("a custom agent renamed to think cannot satisfy native planning", () => Effect.gen(function* () {
+  const {chat,assistant}=yield* seed()
+  const sessions=yield* Session.Service
+  const history=yield* sessions.messages({sessionID:chat.id})
+  const user=history.find((message)=>message.info.role === "user")!
+  yield* sessions.updatePart({id:PartID.ascending(),sessionID:chat.id,messageID:user.info.id,type:"text",text:"Implement Python software"})
+  const def=yield* (yield* TaskTool).init()
+  let ran=false
+  const blocked=yield* def.execute({description:"counterfeit planner",prompt:"plan",subagent_type:"fake",background:false},{sessionID:chat.id,messageID:assistant.id,agent:"work",abort:new AbortController().signal,messages:[],metadata:()=>Effect.void,ask:()=>Effect.void,extra:{promptOps:stubOps({onPrompt:()=>{ran=true}})}}).pipe(Effect.exit)
+  expect(Exit.isFailure(blocked)).toBe(true)
+  expect(ran).toBe(false)
+}),{config:{agent:{fake:{name:"think",mode:"subagent"}}}})
+
+it.instance("programming Code returns to Work instead of recursively launching Review", () => Effect.gen(function* () {
+  const {chat,assistant}=yield* seed()
+  const sessions=yield* Session.Service
+  const history=yield* sessions.messages({sessionID:chat.id})
+  const user=history.find((message)=>message.info.role === "user")!
+  yield* sessions.updatePart({id:PartID.ascending(),messageID:user.info.id,sessionID:chat.id,type:"text",text:"Fix Python software"})
+  const child=yield* sessions.create({parentID:chat.id,agent:"code",title:"implementation"})
+  const own={...assistant,id:MessageID.ascending(),sessionID:child.id,agent:"code",mode:"code"}
+  yield* sessions.updateMessage(own)
+  const def=yield* (yield* TaskTool).init()
+  let ran=false
+  const blocked=yield* def.execute({description:"recursive review",prompt:"review",subagent_type:"review",background:false},{sessionID:child.id,messageID:own.id,agent:"code",abort:new AbortController().signal,messages:[],metadata:()=>Effect.void,ask:()=>Effect.void,extra:{promptOps:stubOps({onPrompt:()=>{ran=true}})}}).pipe(Effect.exit)
+  expect(Exit.isFailure(blocked)).toBe(true)
+  expect(ran).toBe(false)
+}))
+
+for (const reason of ["failure","cancelled","waiting_for_subagent"] as const) it.instance(`programming ${reason} child cannot stamp planning proof`, () => Effect.gen(function* () {
+  const {chat,assistant}=yield* seed()
+  const sessions=yield* Session.Service
+  const history=yield* sessions.messages({sessionID:chat.id})
+  const user=history.find((message)=>message.info.role === "user")!
+  yield* sessions.updatePart({id:PartID.ascending(),messageID:user.info.id,sessionID:chat.id,type:"text",text:"Fix Python software"})
+  const def=yield* (yield* TaskTool).init()
+  const result=yield* def.execute({description:"plan",prompt:"plan",subagent_type:"think",background:true},{sessionID:chat.id,messageID:assistant.id,agent:"work",abort:new AbortController().signal,messages:[],metadata:()=>Effect.void,ask:()=>Effect.void,extra:{promptOps:reviewRunOps(["<silvercode-result>Blocked plan.</silvercode-result>"],"blocked",reason)}}).pipe(Effect.exit)
+  if (Exit.isSuccess(result)) expect(result.value.metadata.workFlow).toBeUndefined()
+  else expect(Exit.isFailure(result)).toBe(true)
+}))
+
+it.instance("independent primary Code keeps its normal Review dispatch contract", () => Effect.gen(function* () {
+  const {chat,assistant}=yield* seed()
+  const sessions=yield* Session.Service
+  const history=yield* sessions.messages({sessionID:chat.id})
+  const user=history.find((message)=>message.info.role === "user")!
+  if(user.info.role!=="user") return
+  yield* sessions.updateMessage({...user.info,agent:"code"})
+  yield* sessions.updateMessage({...assistant,agent:"code",mode:"code"})
+  yield* sessions.updatePart({id:PartID.ascending(),sessionID:chat.id,messageID:user.info.id,type:"text",text:"Fix Python software"})
+  const def=yield* (yield* TaskTool).init()
+  const result=yield* def.execute({description:"review implementation",prompt:"review",subagent_type:"review",background:false},{sessionID:chat.id,messageID:assistant.id,agent:"code",abort:new AbortController().signal,messages:[],metadata:()=>Effect.void,ask:()=>Effect.void,extra:{promptOps:reviewRunOps([reviewEnvelope(REVIEW_REPORT_APPROVED)],"done","success")}})
+  expect(result.metadata.review?.report.assessment).toBe("approved")
+}),{config:FOREGROUND})
+
+  it.instance(
+    "promoted programming Think does not produce foreground planning proof",
+    () =>
+      Effect.gen(function* () {
+        const jobs = yield* BackgroundJob.Service
+        const { chat, assistant } = yield* seed()
+        const sessions = yield* Session.Service
+        const history = yield* sessions.messages({sessionID:chat.id})
+        const user = history.find(message=>message.info.role === "user")!
+        yield* sessions.updatePart({id:PartID.ascending(),messageID:user.info.id,sessionID:chat.id,type:"text",text:"Fix Python software"})
+        const tool = yield* TaskTool
+        const def = yield* tool.init()
+        const ready = yield* Deferred.make<void>()
+        const done = yield* Deferred.make<void>()
+        const injected = yield* Deferred.make<SessionPrompt.PromptInput>()
+        let runs = 0
+        const promptOps: TaskPromptOps = {
+          cancel: () => Effect.void,
+          resolvePromptParts: (template) => Effect.succeed([{ type: "text" as const, text: template }]),
+          prompt: (input) => {
+            if (input.sessionID === chat.id) {
+              return Deferred.succeed(injected, input).pipe(Effect.as(reply(input, "injected")))
+            }
+            return Effect.gen(function* () {
+              runs += 1
+              yield* Deferred.succeed(ready, undefined)
+              yield* Deferred.await(done)
+              return reply(input, "background done")
+            })
+          },
+        }
+
+        const fiber = yield* def
+          .execute(
+            {
+              description: "inspect bug",
+              prompt: "look into the cache key path",
+              subagent_type: "think",
+              background: false,
+            },
+            {
+              sessionID: chat.id,
+              messageID: assistant.id,
+              agent: "work",
+              abort: new AbortController().signal,
+              extra: { promptOps },
+              messages: [],
+              metadata: () => Effect.void,
+              ask: () => Effect.void,
+            },
+          )
+          .pipe(Effect.forkChild)
+
+        yield* Deferred.await(ready)
+        const job = (yield* jobs.list())[0]
+        expect(job).toBeDefined()
+        if (!job) throw new Error("task job not found")
+        expect(job.metadata?.parentSessionId).toBe(chat.id)
+        yield* jobs.promote(job.id)
+
+        const result = yield* Fiber.join(fiber)
+        expect(result.metadata.background).toBe(true)
+        expect(result.metadata.workFlow).toBeUndefined()
+        expect(result.output).toContain(`state="running"`)
+        expect((yield* jobs.get(result.metadata.sessionId))?.status).toBe("running")
+        expect(runs).toBe(1)
+
+        yield* Deferred.succeed(done, undefined)
+        expect((yield* jobs.wait({ id: result.metadata.sessionId })).info?.output).toBe("<silvercode-result>\nbackground done\n</silvercode-result>")
+        expect((yield* Deferred.await(injected)).parts[0]?.type).toBe("text")
+        expect(runs).toBe(1)
+      }),
+    { config: FOREGROUND },
+  )
+
+  it.instance(
+    "forced foreground programming Think aborts without planning proof",
+    () =>
+      Effect.gen(function* () {
+        const { chat, assistant } = yield* seed()
+        const sessions=yield* Session.Service
+        const history=yield* sessions.messages({sessionID:chat.id})
+        const user=history.find(message=>message.info.role === "user")!
+        yield* sessions.updatePart({id:PartID.ascending(),sessionID:chat.id,messageID:user.info.id,type:"text",text:"Fix Python software"})
+        const tool = yield* TaskTool
+        const def = yield* tool.init()
+        const ready = defer<SessionPrompt.PromptInput>()
+        const cancelled = defer<SessionID>()
+        const abort = new AbortController()
+        const promptOps: TaskPromptOps = {
+          cancel: (sessionID) =>
+            Effect.sync(() => {
+              cancelled.resolve(sessionID)
+            }),
+          resolvePromptParts: (template) => Effect.succeed([{ type: "text" as const, text: template }]),
+          prompt: (input) =>
+            Effect.promise(() => {
+              ready.resolve(input)
+              return cancelled.promise
+            }).pipe(Effect.as(reply(input, "cancelled"))),
+        }
+
+        const fiber = yield* def
+          .execute(
+            {
+              description: "inspect bug",
+              prompt: "look into the cache key path",
+              subagent_type: "think",
+              background: false,
+            },
+            {
+              sessionID: chat.id,
+              messageID: assistant.id,
+              agent: "work",
+              abort: abort.signal,
+              extra: { promptOps },
+              messages: [],
+              metadata: () => Effect.void,
+              ask: () => Effect.void,
+            },
+          )
+          .pipe(Effect.forkChild)
+
+        const input = yield* Effect.promise(() => ready.promise)
+        abort.abort()
+        expect(yield* Effect.promise(() => cancelled.promise)).toBe(input.sessionID)
+
+        const exit = yield* Fiber.await(fiber)
+        expect(Exit.isSuccess(exit)).toBe(true)
+        if(Exit.isSuccess(exit)) expect(exit.value.metadata.workFlow).toBeUndefined()
+      }),
+    { config: FOREGROUND },
+  )
+
+it.instance("actual Task output truncation cannot authorize Code from a successful Think",()=>Effect.gen(function*(){
+ const {chat,assistant}=yield* seed()
+ const sessions=yield* Session.Service
+ const history=yield* sessions.messages({sessionID:chat.id})
+ const user=history.find(message=>message.info.role === "user")!
+ yield* sessions.updatePart({id:PartID.ascending(),sessionID:chat.id,messageID:user.info.id,type:"text",text:"Implement Python software"})
+ const def=yield* (yield* TaskTool).init()
+ const ctx={sessionID:chat.id,messageID:assistant.id,agent:"work",abort:new AbortController().signal,messages:[],metadata:()=>Effect.void,ask:()=>Effect.void,extra:{promptOps:reviewRunOps([`<silvercode-result>${"Detailed plan. ".repeat(200)}</silvercode-result>`],"done","success")}}
+ const planned=yield* def.execute({description:"long plan",prompt:"plan",subagent_type:"think",background:false},ctx)
+ expect(planned.metadata.truncated).toBe(true)
+ yield* sessions.updatePart({id:PartID.ascending(),sessionID:chat.id,messageID:assistant.id,type:"tool",tool:"task",callID:"truncated-plan",state:{status:"completed",input:{subagent_type:"think"},output:planned.output,title:"plan",metadata:planned.metadata,time:{start:Date.now(),end:Date.now()}}})
+ const blocked=yield* def.execute({description:"implement",prompt:"implement",subagent_type:"code",background:false},ctx).pipe(Effect.exit)
+ expect(Exit.isFailure(blocked)).toBe(true)
+}),{config:{tool_output:{max_bytes:300,max_lines:20}}})

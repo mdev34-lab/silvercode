@@ -1,3 +1,4 @@
+import { scriptWorkStages, stageMatch } from "../fixture/work-flow"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { expect } from "bun:test"
@@ -308,7 +309,7 @@ const REPORT = [
   "</silvercode-review>",
 ].join("\n")
 
-const USER_REQUEST = "fix the off-by-one in the cache key and add a test"
+const USER_REQUEST = "Fix the software bug in the cache key and add a test"
 
 const TASK_PROMPT = [
   "What was requested: fix the off-by-one in the cache key and add a test.",
@@ -360,6 +361,17 @@ const runReview = Effect.fn("test.runReview")(function* (parentAgents: string | 
     title: "Pinned",
     permission: [{ permission: "*", pattern: "*", action: "allow" }],
   })
+  if ((Array.isArray(parentAgents) ? parentAgents.at(-1) : parentAgents) === "work") {
+    const fs=yield* FSUtil.Service
+    const {directory}=yield* TestInstance
+    const file=path.join(directory,"opencode.json")
+    const config=JSON.parse(yield* Effect.promise(()=>Bun.file(file).text()))
+    config.agent.think={finishTool:true}
+    config.agent.code={finishTool:true}
+    delete config.agent.plan
+    yield* fs.writeWithDirs(file,JSON.stringify(config))
+  }
+  if ((Array.isArray(parentAgents) ? parentAgents.at(-1) : parentAgents) === "work") yield* scriptWorkStages(parentMatch)
   yield* script({ subagent_type: subagentType })
   for (const agent of typeof parentAgents === "string" ? [parentAgents] : parentAgents)
     yield* user(chat.id, USER_REQUEST, agent)
@@ -369,7 +381,7 @@ const runReview = Effect.fn("test.runReview")(function* (parentAgents: string | 
 
   const msgs = yield* MessageV2.filterCompactedEffect(chat.id)
   const toolParts = msgs.flatMap((msg) => msg.parts).filter((part): part is SessionV1.ToolPart => part.type === "tool")
-  const taskPart = toolParts.find((part) => part.tool === "task")
+  const taskPart = toolParts.find((part) => part.tool === "task" && resolveReviewer(String(part.state.input.subagent_type)) === "review")
   if (!taskPart || taskPart.state.status !== "completed")
     expect(
       JSON.stringify(

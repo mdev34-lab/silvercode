@@ -1195,6 +1195,138 @@ describe("activity group TUI", () => {
     }
   })
 
+  for (const scenario of [
+    "success",
+    "synthetic",
+    "new-request",
+    "missing-parts",
+    "ignored-parent",
+    "unknown-part",
+    "file-request",
+    "waiting",
+    "error",
+    "ordinary",
+  ] as const) {
+    test(`last Work footer duration after ${scenario} tool call`, async () => {
+      const { app, sync } = await mountActivity({
+        render: (store) => {
+          const message = store.data.message[SESSION]?.find((m) => m.role === "assistant") as AssistantMessage
+          return message ? (
+            <AssistantMessageRow message={message} parts={store.data.part[message.id] ?? []} last={true} />
+          ) : (
+            <text />
+          )
+        },
+      })
+      try {
+        const message = {
+          ...assistant("duration-final", at(9)),
+          parentID: [
+            "synthetic",
+            "new-request",
+            "missing-parts",
+            "ignored-parent",
+            "unknown-part",
+            "file-request",
+          ].includes(scenario)
+            ? "synthetic-parent"
+            : "msg_user",
+          time: { created: at(9), completed: at(12) },
+        }
+        const user = {
+          id: "msg_user",
+          sessionID: SESSION,
+          role: "user" as const,
+          time: { created: at(0) },
+          agent: "work",
+          model: { providerID: "test", modelID: "model" },
+        }
+        const input = { reason: scenario === "waiting" ? "waiting_for_subagent" : "success", result: "Done" }
+        let tool = completed(
+          running(message.id, scenario === "ordinary" ? "read" : "finish", input, at(10)),
+          at(10),
+          at(12),
+        )
+        if (scenario === "waiting" && tool.state.status === "completed")
+          tool = { ...tool, state: { ...tool.state, metadata: { waiting: true } } }
+        if (scenario === "error")
+          tool = {
+            ...tool,
+            state: { status: "error", input, error: "invalid finish", time: { start: at(10), end: at(12) } },
+          }
+        seed(sync, [
+          { message: user, parts: [textPart(user.id, "Build tasklog")] },
+          ...(scenario === "new-request"
+            ? [
+                {
+                  message: { ...user, id: "new-request", time: { created: at(5) } },
+                  parts: [textPart("new-request", "Now change the output")],
+                },
+              ]
+            : []),
+          ...(scenario === "synthetic"
+            ? [
+                {
+                  message: { ...user, id: "background-delivery", time: { created: at(4) } },
+                  parts: [{ ...textPart("background-delivery", "Code completed"), synthetic: true }],
+                },
+              ]
+            : []),
+          ...(["synthetic", "new-request", "missing-parts", "ignored-parent", "unknown-part", "file-request"].includes(
+            scenario,
+          )
+            ? [
+                {
+                  message: { ...user, id: "synthetic-parent", time: { created: at(10) } },
+                  parts:
+                    scenario === "missing-parts"
+                      ? []
+                      : scenario === "ignored-parent"
+                        ? [{ ...textPart("synthetic-parent", "ignored"), ignored: true }]
+                        : scenario === "unknown-part"
+                          ? [
+                              {
+                                id: nextPartID(),
+                                sessionID: SESSION,
+                                messageID: "synthetic-parent",
+                                type: "step-start" as const,
+                              },
+                            ]
+                          : scenario === "file-request"
+                            ? [
+                                {
+                                  id: nextPartID(),
+                                  sessionID: SESSION,
+                                  messageID: "synthetic-parent",
+                                  type: "file" as const,
+                                  mime: "text/plain",
+                                  url: "file:///fixture/request.txt",
+                                },
+                              ]
+                            : [{ ...textPart("synthetic-parent", "Continue after finish error"), synthetic: true }],
+                },
+              ]
+            : []),
+          { message, parts: [reasoningPart(message.id, "Ready to finish"), tool] },
+          // A later human message must not change a historical row's boundary.
+          {
+            message: { ...user, id: "later-user", time: { created: at(20) } },
+            parts: [textPart("later-user", "Unrelated next request")],
+          },
+        ])
+        await waitFrame(app, (frame: string) => frame.includes("Work · model"))
+        const frame = await frameOf(app)
+        const footer = frame.split("\n").find((line: string) => line.includes("Work · model")) ?? ""
+        if (scenario === "success" || scenario === "synthetic") expect(footer).toContain("12.0s")
+        else if (scenario === "new-request") expect(footer).toContain("7.0s")
+        else if (scenario === "file-request") expect(footer).toContain("2.0s")
+        else expect(footer).not.toMatch(/ · [0-9.]+s/)
+      } finally {
+        app.renderer.destroy()
+      }
+    })
+  }
+
   test("does not render a second model footer for a finish-only turn", async () => {
     const { app, sync } = await mountActivity({
       render: (storeSync) => {

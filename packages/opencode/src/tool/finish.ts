@@ -1,3 +1,5 @@
+import { route as workRoute } from "@/session/work-flow"
+import { WorkFlow } from "@opencode-ai/core/work-flow"
 import * as Tool from "./tool"
 import { ToolFailure } from "@opencode-ai/llm"
 import { ReviewReport } from "@opencode-ai/core/review-report"
@@ -302,6 +304,53 @@ export const FinishTool = Tool.define(
           const configEffort = typeof cfg.agent?.effort === "string" ? cfg.agent.effort : undefined
           const effort = AgentEffort.resolve(readAgentEffort(session?.metadata), AgentEffort.resolve(configEffort))
           const reviewState = reviewLoopState(messages, { effort })
+          const workIdentity = yield* agents.get("work")
+          if (
+            session !== undefined &&
+            WorkFlow.ownsRole(yield* agents.list(), workIdentity, ctx.agent) &&
+            params.reason === "success"
+          ) {
+            const workflow = WorkFlow.state(messages, ctx.sessionID)
+            const admission = yield* workRoute(ctx.sessionID).pipe(
+              Effect.provideService(Session.Service, sessions),
+              Effect.mapError((error) => new ToolFailure({ message: error.message })),
+            )
+            const original = WorkFlow.request(messages)
+            const requestText =
+              original?.parts
+                .flatMap((part) => (part.type === "text" ? [(part as { text: string }).text] : []))
+                .join("\n") ?? ""
+            if (
+              admission.kind === "nonprogramming" &&
+              (effort === "thorough" || WorkFlow.complex(requestText)) &&
+              !workflow.delegated
+            )
+              return yield* Effect.fail(
+                new ToolFailure({
+                  message:
+                    "Complex or thorough non-programming work requires a successful General delivery before success. Do not send it to Code.",
+                }),
+              )
+            if (admission.kind === "programming" && !workflow.implemented)
+              return yield* Effect.fail(
+                new ToolFailure({
+                  message:
+                    "Programming success requires successful Think planning followed by successful Code implementation in this request.",
+                }),
+              )
+            if (
+              (admission.kind === "programming" || reviewState.blockingFindings > 0) &&
+              (reviewState.blockingFindings > 0 ||
+                reviewState.workSinceReview ||
+                reviewState.lastReviewVerdict !== "approved")
+            )
+              return yield* Effect.fail(
+                new ToolFailure({
+                  message:
+                    "Work cannot report implementation success while Review is missing, stale or has blocking findings. Fix through the appropriate executor and obtain a clean Review; a review budget is not approval. Report failure honestly if blocked.",
+                }),
+              )
+          }
 
           // Reviewer availability is dispatch evidence taken from the same
           // context a real `task` dispatch would use: the reviewer's

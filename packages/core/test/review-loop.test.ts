@@ -13,6 +13,7 @@
  */
 
 import { describe, expect, test } from "bun:test"
+import { ReviewReport } from "@opencode-ai/core/review-report"
 import { REVIEW_LOOP_METADATA, finishGateError, reviewLoopState } from "@opencode-ai/core/review-loop"
 
 type Part = {
@@ -358,4 +359,24 @@ describe("review loop - conservative task evidence", () => {
     expect(state.verdict).toBe("pending")
     expect(finishGateError(state)).toBeInstanceOf(Error)
   })
+})
+
+test("rendered review tag mentions retain blocking findings in completed task accounting", () => {
+  const report: ReviewReport.Info = {
+    version: 1,
+    revision: "uncommitted",
+    assessment: "needs-fixes",
+    summary: "One defect",
+    findings: [{ severity: "critical", title: "Real defect" }],
+  }
+  const delivery = ReviewReport.extract([ReviewReport.envelope(report), "Mention <silvercode-review> in prose."])
+  expect(delivery.ok).toBe(true)
+  if (!delivery.ok) return
+  const task = reviewMessage({ termination: "success" })
+  task.parts[0].state!.output = ReviewReport.render(delivery)
+  const state = reviewLoopState([userMessage, editMessage, task], { effort: "medium" })
+  expect(state.verdict).toBe("needs-fixes")
+  expect(state.reviews).toBe(1)
+  expect(state.openFindings).toBe(1)
+  expect(state.blockingFindings).toBe(1)
 })

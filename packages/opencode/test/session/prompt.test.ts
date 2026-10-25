@@ -1,3 +1,4 @@
+import { ToolCatalog } from "@/tool/catalog"
 import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Database } from "@opencode-ai/core/database/database"
@@ -222,6 +223,7 @@ const promptRoot = LayerNode.group([
   Question.node,
   Todo.node,
   ToolRegistry.node,
+  ToolCatalog.node,
   Skill.node,
   Git.node,
   Ripgrep.node,
@@ -860,8 +862,8 @@ it.instance(
 
       const hits = yield* llm.hits
       const body = JSON.stringify(hits[0]?.body)
-      expect(body).toContain("delegate planning to `think` once, at the start")
-      expect(body).toContain("delegate each implementation step to `code`")
+      expect(body).toContain("completed Think planning before Code implementation")
+      expect(body).toContain("Work cannot implement programming directly")
       yield* Fiber.interrupt(fiber)
     }),
   15_000,
@@ -894,7 +896,7 @@ it.instance("legacy prompt emits message events without session.next events", ()
       sessionID: chat.id,
       agent: "work",
       noReply: true,
-      parts: [{ type: "text", text: "again" }],
+      parts: [{ type: "text", text: "Generate the report again" }],
     })
     yield* off
 
@@ -1547,6 +1549,7 @@ it.instance(
         filename: "historical.txt",
         url: "data:text/plain;base64,aGlzdG9yaWNhbCBjb250ZW50",
       })
+      yield* sessions.updatePart({id:PartID.ascending(),messageID,sessionID:session.id,type:"text",text:"Save this attachment"})
       const target = path.join(dir, "historical.txt")
 
       yield* llm.tool("attachment", { action: "list" })
@@ -2531,7 +2534,7 @@ it.instance("failed background subtask preserves metadata and surfaces the error
       subagent_type: "general",
     })
     yield* llm.text("done")
-    const msg = yield* user(chat.id, "hello")
+    const msg = yield* user(chat.id, "Research the requested information")
     yield* addSubtask(chat.id, msg.id)
 
     const result = yield* prompt.loop({ sessionID: chat.id })
@@ -2588,7 +2591,7 @@ it.instance("subtask child inherits parent session external_directory allow", ()
       permission: [{ permission: "external_directory", pattern: "/tmp/allowed/*", action: "allow" }],
     })
     yield* llm.text("done")
-    const msg = yield* user(chat.id, "hello")
+    const msg = yield* user(chat.id, "Research the requested information")
     yield* addSubtask(chat.id, msg.id)
 
     yield* prompt.loop({ sessionID: chat.id })
@@ -2641,7 +2644,7 @@ it.instance(
       const sessions = yield* Session.Service
       const chat = yield* sessions.create({ title: "Pinned" })
       yield* llm.hang
-      const msg = yield* user(chat.id, "hello")
+      const msg = yield* user(chat.id, "Research the requested information")
       yield* addSubtask(chat.id, msg.id)
 
       const fiber = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
@@ -2684,7 +2687,7 @@ it.instance(
       const background = yield* BackgroundJob.Service
       const chat = yield* sessions.create({ title: "Pinned" })
       yield* llm.hang
-      const msg = yield* user(chat.id, "hello")
+      const msg = yield* user(chat.id, "Research the requested information")
       yield* addSubtask(chat.id, msg.id)
 
       const fiber = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
@@ -2743,7 +2746,7 @@ it.instance(
         subagent_type: "general",
       })
       yield* llm.hang
-      yield* user(chat.id, "hello")
+      yield* user(chat.id, "Research the requested information")
 
       const fiber = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
 
@@ -2999,7 +3002,7 @@ it.instance(
       const status = yield* SessionStatus.Service
       const chat = yield* sessions.create({ title: "Pinned" })
       yield* llm.hang
-      const msg = yield* user(chat.id, "hello")
+      const msg = yield* user(chat.id, "Research the requested information")
       yield* addSubtask(chat.id, msg.id)
 
       const fiber = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
@@ -4364,7 +4367,7 @@ unix(
         sessionID: chat.id,
         agent: "work",
         noReply: true,
-        parts: [{ type: "text", text: "run bash" }],
+        parts: [{ type: "text", text: "Generate a report using the shell" }],
       })
 
       yield* llm.tool("bash", {
@@ -4987,7 +4990,7 @@ it.instance(
         sessionID: chat.id,
         agent: "work",
         noReply: true,
-        parts: [{ type: "text", text: "run bash" }],
+        parts: [{ type: "text", text: "Generate a report using the shell" }],
       })
       yield* llm.tool("bash", { command: "sleep 30", timeout: 30_000, workdir: path.resolve(dir) })
       const run = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
@@ -5010,7 +5013,7 @@ it.instance(
       const result = yield* prompt.prompt({
         sessionID: chat.id,
         agent: "work",
-        parts: [{ type: "text", text: "again" }],
+        parts: [{ type: "text", text: "Generate the report again" }],
       })
       yield* expectFreshRun(chat.id, result, interrupted)
     }),
@@ -5149,7 +5152,7 @@ it.instance(
       yield* llm.tool("bash", { command: `printf 'once\\n' >> ${JSON.stringify(target)}` })
       yield* llm.cut()
       yield* llm.text("recovered after retry")
-      yield* user(chat.id, "hello")
+      yield* user(chat.id, "Research the requested information")
 
       const result = yield* prompt.loop({ sessionID: chat.id })
       expect(yield* llm.calls).toBe(3)
@@ -5303,6 +5306,94 @@ it.instance(
   { timeout: 30_000 },
 )
 
+it.instance("cancel while edit permission is pending removes the request and prevents a late write", () =>
+  Effect.gen(function* () {
+    const { dir, llm } = yield* useServerConfig((url) => ({ ...providerCfg(url), permission: { "*": "allow", edit: "ask" }, permission_timeout: { enabled: false } }))
+    const file = path.join(dir, "abort-locked.txt")
+    yield* Effect.promise(() => Bun.write(file, "ORIGINAL_CONTENT\n"))
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const permission = yield* Permission.Service
+    const chat = yield* sessions.create({ title: "Pinned" })
+    yield* llm.push(reply().tool("read", { filePath: file }))
+    yield* llm.push(reply().tool("edit", { filePath: file, oldString: "ORIGINAL_CONTENT", newString: "ABORTED_TURN_OVERWRITE" }))
+    yield* user(chat.id, "Read and revise the report")
+    const first = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+    const request = yield* pollWithTimeout(permission.list().pipe(Effect.map((items) => items.find((r) => r.sessionID === chat.id))), "edit permission did not arrive")
+    yield* prompt.cancel(chat.id)
+    yield* Fiber.await(first)
+    const remaining = yield* permission.list()
+    // Probe the stale UI reply even if it should now be rejected.
+    yield* permission.reply({ requestID: request.id, reply: "once" }).pipe(Effect.ignore)
+    yield* Effect.sleep("100 millis")
+    expect(yield* Effect.promise(() => Bun.file(file).text())).toBe("ORIGINAL_CONTENT\n")
+    expect(remaining.some((r) => r.id === request.id)).toBe(false)
+    // A fresh edit of the same path must acquire the prior turn's semaphore.
+    yield* llm.push(reply().tool("edit", { filePath: file, oldString: "ORIGINAL_CONTENT", newString: "FRESH_TURN_WRITE" }))
+    yield* llm.text("fresh done")
+    yield* user(chat.id, "Revise the report")
+    const fresh = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+    const next = yield* pollWithTimeout(permission.list().pipe(Effect.map((items) => items.find((r) => r.sessionID === chat.id))), "fresh edit remained locked")
+    yield* permission.reply({ requestID: next.id, reply: "once" })
+    yield* Fiber.join(fresh).pipe(Effect.timeout("5 seconds"))
+    expect(yield* Effect.promise(() => Bun.file(file).text())).toBe("FRESH_TURN_WRITE\n")
+  }), { timeout: 20000 })
+
+it.instance("cancel while a question is pending removes it before a stale answer can complete the tool", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const questions = yield* Question.Service
+    const chat = yield* sessions.create({ title: "Pinned" })
+    yield* llm.push(reply().tool("question", { questions: [{ question: "Continue?", header: "Choice", options: [{ label: "Yes", description: "Continue" }] }] }))
+    yield* user(chat.id, "ask a question")
+    const first = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+    const request = yield* pollWithTimeout(questions.list().pipe(Effect.map((items) => items.find((r) => r.sessionID === chat.id))), "question did not arrive")
+    yield* prompt.cancel(chat.id)
+    yield* Fiber.await(first)
+    expect((yield* questions.list()).some((r) => r.id === request.id)).toBe(false)
+    const late = yield* questions.reply({ requestID: request.id, answers: [["Yes"]] }).pipe(Effect.exit)
+    expect(Exit.isFailure(late)).toBe(true)
+  }), { timeout: 20000 })
+
+const itAbortMcp = testEffect(makeHttp({ mcpTools: { probe_lookup: mcpTool("lookup", "Look up a note") } }))
+itAbortMcp.instance("cancel while an MCP permission is pending removes it before late approval", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig((url) => ({ ...providerCfg(url), permission: { "*": "allow", probe_lookup: "ask" }, permission_timeout: { enabled: false }, tool_search: { enabled: false } }))
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const permissions = yield* Permission.Service
+    const chat = yield* sessions.create({ title: "Pinned" })
+    yield* llm.push(reply().tool("probe_lookup", { query: "milk" }))
+    yield* user(chat.id, "look up note")
+    const first = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+    const request = yield* pollWithTimeout(permissions.list().pipe(Effect.map((items) => items.find((r) => r.sessionID === chat.id))), "MCP permission did not arrive")
+    yield* prompt.cancel(chat.id)
+    yield* Fiber.await(first)
+    expect((yield* permissions.list()).some((r) => r.id === request.id)).toBe(false)
+    const late = yield* permissions.reply({ requestID: request.id, reply: "once" }).pipe(Effect.exit)
+    expect(Exit.isFailure(late)).toBe(true)
+  }), { timeout: 20000 })
+
+it.instance("cancel while bash permission is pending cannot run the command on late approval", () =>
+  Effect.gen(function* () {
+    const { dir, llm } = yield* useServerConfig((url) => ({ ...providerCfg(url), permission: { "*": "allow", bash: "ask" }, permission_timeout: { enabled: false } }))
+    const file = path.join(dir, "aborted-command.txt")
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const permissions = yield* Permission.Service
+    const chat = yield* sessions.create({ title: "Pinned" })
+    yield* llm.push(reply().tool("bash", { command: "echo SHOULD_NOT_RUN > aborted-command.txt", description: "write marker", workdir: dir }))
+    yield* user(chat.id, "Write a report marker")
+    const first = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+    const request = yield* pollWithTimeout(permissions.list().pipe(Effect.map((items) => items.find((r) => r.sessionID === chat.id))), "bash permission did not arrive")
+    yield* prompt.cancel(chat.id)
+    yield* Fiber.await(first)
+    const late = yield* permissions.reply({ requestID: request.id, reply: "once" }).pipe(Effect.exit)
+    expect(Exit.isFailure(late)).toBe(true)
+    expect(yield* Effect.promise(() => Bun.file(file).exists())).toBe(false)
+  }), { timeout: 20000 })
 it.instance("a child can finish on the next generation after writing its result envelope", () =>
   Effect.gen(function* () {
     const { llm } = yield* useServerConfig((url) => ({
@@ -5332,3 +5423,74 @@ it.instance("a child can finish on the next generation after writing its result 
     expectNoFinishNudge(history)
   }),
 )
+
+
+it.instance("cancel registered custom tool permission prevents a late side effect", () =>
+  Effect.acquireUseRelease(
+    Effect.sync(() => {
+      const previous = process.env.OPENCODE_DISABLE_CONFIG_DEP_INSTALL
+      process.env.OPENCODE_DISABLE_CONFIG_DEP_INSTALL = "1"
+      return previous
+    }),
+    () => Effect.gen(function* () {
+    const dir = (yield* TestInstance).directory
+    const tools = path.join(dir, ".opencode", "tools")
+    const marker = path.join(dir, "plugin-late-write.txt")
+    yield* Effect.promise(() => Bun.write(path.join(tools, "plugin_write.ts"), `export default {
+      description: "Request permission then write a marker", args: {},
+      async execute(args, ctx) {
+        await ctx.ask({ permission: "plugin_write", patterns: ["*"], always: ["*"], metadata: {} })
+        await Bun.write(${JSON.stringify(marker)}, "LATE_SIDE_EFFECT")
+        return "written"
+      }
+    }`))
+    const { llm } = yield* useServerConfig((url) => ({ ...providerCfg(url), permission: { "*": "allow", plugin_write: "ask" }, permission_timeout: { enabled: false }, tool_search: { enabled: false } }))
+    expect((yield* (yield* ToolRegistry.Service).all()).some((t) => t.id === "plugin_write")).toBe(true)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const permissions = yield* Permission.Service
+    const chat = yield* sessions.create({ title: "Pinned" })
+    yield* llm.push(reply().tool("plugin_write", {}))
+    yield* user(chat.id, "Generate a report with the custom tool")
+    const first = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+    const request = yield* pollWithTimeout(permissions.list().pipe(Effect.map((items) => items.find((r) => r.sessionID === chat.id))), "custom tool permission did not arrive")
+    yield* prompt.cancel(chat.id)
+    yield* Fiber.await(first)
+    const remaining = yield* permissions.list()
+    yield* permissions.reply({ requestID: request.id, reply: "once" }).pipe(Effect.ignore)
+    yield* Effect.sleep("100 millis")
+    expect(yield* Effect.promise(() => Bun.file(marker).exists())).toBe(false)
+    expect(remaining.some((r) => r.id === request.id)).toBe(false)
+    // Cancellation must not poison the next legitimate plugin invocation.
+    yield* llm.push(reply().tool("plugin_write", {}))
+    yield* llm.text("approved plugin invocation completed")
+    yield* user(chat.id, "Generate the report again with approval")
+    const fresh = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+    const next = yield* pollWithTimeout(permissions.list().pipe(Effect.map((items) => items.find((r) => r.sessionID === chat.id))), "fresh custom tool permission did not arrive")
+    yield* permissions.reply({ requestID: next.id, reply: "once" })
+    yield* Fiber.join(fresh).pipe(Effect.timeout("5 seconds"))
+    expect(yield* Effect.promise(() => Bun.file(marker).text())).toBe("LATE_SIDE_EFFECT")
+    }),
+    (previous) => Effect.sync(() => {
+      if (previous === undefined) delete process.env.OPENCODE_DISABLE_CONFIG_DEP_INSTALL
+      else process.env.OPENCODE_DISABLE_CONFIG_DEP_INSTALL = previous
+    }),
+  ), { timeout: 20000 })
+
+withMcpTools.instance("captured noncoding MCP executor rechecks a newer programming root before executing",()=>Effect.gen(function*(){
+ yield* useServerConfig(url=>({...providerCfg(url),tool_search:{enabled:false},permission:{"*":"allow"}}))
+ const sessions=yield* Session.Service
+ const agents=yield* AgentSvc.Service
+ const provider=yield* ProviderSvc.Service
+ const chat=yield* sessions.create({title:"overlap"})
+ const seeded=yield* seed(chat.id)
+ yield* user(chat.id,"Research notes and write a report")
+ const {SessionTools}=yield* Effect.promise(()=>import("../../src/session/tools"))
+ const tools=yield* SessionTools.resolve({agent:yield* agents.get("work"),model:yield* provider.getModel(ref.providerID,ref.modelID),session:chat,processor:{message:seeded.assistant,updateToolCall:()=>Effect.succeed(undefined),completeToolCall:()=>Effect.void,waitForOtherTools:()=>Effect.void},bypassAgentCheck:false,messages:yield* sessions.messages({sessionID:chat.id}),promptOps:{resolvePromptParts:()=>Effect.succeed([]),cancel:()=>Effect.void,prompt:()=>Effect.die("No child expected")}})
+ const execute=tools.notes_search_notes?.execute
+ expect(execute).toBeDefined()
+ yield* user(chat.id,"Implement API endpoint")
+ const exit=yield* Effect.tryPromise(()=>execute!({query:"private"},{toolCallId:"old",messages:[],abortSignal:new AbortController().signal})).pipe(Effect.exit)
+ expect(Exit.isFailure(exit)).toBe(true)
+ if(Exit.isFailure(exit)) expect(Cause.pretty(exit.cause)).toContain("Task scope changed")
+}))
