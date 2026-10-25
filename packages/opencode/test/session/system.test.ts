@@ -169,6 +169,31 @@ const it = testEffect(
   ]),
 )
 
+const deepThinkSkills: Skill.Info[] = [
+  ...skills,
+  { name: Skill.DEEP_THINK_SKILL_NAME, description: "Plan once.", location: "<built-in>", content: "# deep-think" },
+]
+const itDeepThink = testEffect(
+  LayerNode.compile(SystemPrompt.node, [
+    [Global.node, Global.layerWith({ desktop: desktopDirectory })],
+    [MCP.node, Layer.mock(MCP.Service, { instructions: () => Effect.succeed([]) })],
+    [Agent.node, Layer.mock(Agent.Service, { list: () => Effect.succeed([build, code, scout]) })],
+    [
+      Skill.node,
+      Layer.succeed(
+        Skill.Service,
+        Skill.Service.of({
+          get: (name) => Effect.succeed(deepThinkSkills.find((skill) => skill.name === name)),
+          require: (name) => Effect.fail(new Skill.NotFoundError({ name, available: [] })),
+          all: () => Effect.succeed(deepThinkSkills),
+          dirs: () => Effect.succeed([]),
+          available: () => Effect.succeed(deepThinkSkills),
+        }),
+      ),
+    ],
+  ]),
+)
+
 const itPrimaryTools = testEffect(
   LayerNode.compile(SystemPrompt.node, [
     [Global.node, Global.layerWith({ desktop: desktopDirectory })],
@@ -879,4 +904,17 @@ describe("session.system", () => {
     expect(text).toContain("independently verifiable")
     expect(text).toContain("acceptance criteria")
   })
+})
+
+describe("deep-think planning skill", () => {
+  itDeepThink.effect("work is told to load deep-think once instead of delegating to a planner", () =>
+    Effect.gen(function* () {
+      const prompt = yield* SystemPrompt.Service
+      const output = (yield* delegation(prompt, build)) ?? (yield* Effect.fail(new NamedError.Unknown({ message: "missing delegation output" })))
+
+      expect(output).toContain("`deep-think` skill")
+      expect(output).toContain("`code`")
+      expect(output).not.toContain("`think`")
+    }),
+  )
 })
