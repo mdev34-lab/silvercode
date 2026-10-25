@@ -797,7 +797,7 @@ for (const [parent, reviewer] of [
             expect(implementation?.state.status).toBe("completed")
             if(implementation?.state.status === "completed") {
               const childHistory=yield* sessions.messages({sessionID:SessionID.make(implementation.state.metadata.sessionId)})
-              expect(childHistory.flatMap(message=>message.parts).find(part=>part.type === "tool" && part.tool === "write")?.state.status).toBe("completed")
+              expect(childHistory.flatMap(message=>message.parts).find((part):part is SessionV1.ToolPart=>part.type === "tool" && part.tool === "write")?.state.status).toBe("completed")
             }
           } else expect(tools.find((part) => part.tool === "write")?.state.status).toBe("completed")
           const finishes = tools.filter((part) => part.tool === "finish")

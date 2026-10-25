@@ -390,7 +390,7 @@ const layer = Layer.effect(
             parameters: taskParameters ?? output.parameters,
             jsonSchema: taskParameters ? ToolJsonSchema.fromSchema(taskParameters) : jsonSchema,
             metadata: tool.metadata,
-            execute: (args, ctx) =>
+            execute: (args: unknown, ctx: Tool.Context) =>
               Effect.gen(function* () {
                 const current = ownedRole
                   ? yield* workRoute(ctx.sessionID).pipe(Effect.provideService(Session.Service, sessions), Effect.orDie)

@@ -423,7 +423,9 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
   const controlled =
     input.agent.native === true &&
     [yield* agents.get("work"), yield* agents.get("think")].some((agent) => agent === input.agent)
-  const admission = controlled ? yield* workRoute(input.session.id) : undefined
+  const admission = controlled
+    ? yield* workRoute(input.session.id).pipe(Effect.provideService(Session.Service, sessions), Effect.orDie)
+    : undefined
   if ((controlled && admission?.kind !== "nonprogramming") || flags.experimentalCodeMode) {
     yield* catalog.sync(entries, toolSearch)
     return tools
