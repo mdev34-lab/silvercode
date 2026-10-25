@@ -11,7 +11,7 @@ expect(http.request).toBe(before)
 const calls: {self:unknown,args:unknown[]}[]=[]
 const result={host:"127.0.0.1",path:"/@opencode-ai/plugin"}
 const sentinel=new Error("original failure")
-http.request=function(...args:any[]){calls.push({self:this,args});if(args[0]==="throw")throw sentinel;return result} as any
+http.request=function(this:unknown,...args:any[]){calls.push({self:this,args});if(args[0]==="throw")throw sentinel;return result} as any
 const original=http.request
 const events:unknown[]=[]
 const observer=observe({enabled:true,owner:()=>"alpha",report:e=>events.push(e)})
