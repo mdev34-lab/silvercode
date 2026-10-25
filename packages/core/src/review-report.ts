@@ -98,6 +98,7 @@ export function extract(chunks: readonly (string | undefined)[]): Delivery {
   const tokens = new RegExp(`<(/?)(${TAGS.join("|")})>`, "g")
   let pending: { tag: string; start: number; body: number } | undefined
   let last: { index: number; end: number; inner: string } | undefined
+  let quotedClose: { index: number; end: number; inner: string } | undefined
   let quoted = false
   let escaped = false
   let json: boolean | undefined
@@ -120,20 +121,29 @@ export function extract(chunks: readonly (string | undefined)[]): Delivery {
         }
         if (char === '"') quoted = !quoted
       }
-      if (quoted) continue
+      if (quoted) {
+        if (token[1] && pending.tag === token[2])
+          quotedClose = { index: pending.start, end: start + token[0].length, inner: text.slice(pending.body, start) }
+        continue
+      }
     }
     if (!token[1]) {
       // An unmatched prose opening must not consume a later real envelope.
       pending = { tag: token[2], start, body: start + token[0].length }
+      quotedClose = undefined
       quoted = false
       escaped = false
       json = undefined
     } else if (pending?.tag === token[2]) {
       last = { index: pending.start, end: start + token[0].length, inner: text.slice(pending.body, start) }
       pending = undefined
+      quotedClose = undefined
     }
     cursor = start + token[0].length
   }
+  // A closing tag under an unterminated JSON quote still marks a malformed
+  // latest report. Never silently revive an older approval in that case.
+  if (pending && quotedClose) last = quotedClose
   if (!last) {
     const analysis = text.trim()
     const opened = TAGS.find((tag) => text.includes(`<${tag}>`))
