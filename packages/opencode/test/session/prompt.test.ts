@@ -862,7 +862,7 @@ it.instance(
 
       const hits = yield* llm.hits
       const body = JSON.stringify(hits[0]?.body)
-      expect(body).toContain("completed Think planning before Code implementation")
+      expect(body).toContain("completed deep-think planning (load the deep-think skill once, at the start) before Code implementation")
       expect(body).toContain("Work cannot implement programming directly")
       yield* Fiber.interrupt(fiber)
     }),

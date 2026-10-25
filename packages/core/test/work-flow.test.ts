@@ -176,3 +176,20 @@ test("explicit macro or VBA creation is programming, reports about macros are no
   for (const text of ["Create an Excel report", "Write a report about macros", "Faca um relatorio sobre macros"])
     expect(WorkFlow.classify("r", text).kind).toBe("nonprogramming")
 })
+const skill = (name: string, status = "completed") => ({
+  info: { role: "assistant" },
+  parts: [{ type: "tool", tool: "skill", state: { status, metadata: { name, dir: "<built-in>" } } }],
+})
+test("a completed deep-think skill load in this request satisfies planning for Code", () => {
+  expect(WorkFlow.state([user, skill("deep-think"), task("code", "success", true)])).toEqual({
+    planned: true,
+    implemented: true,
+    delegated: false,
+    requestID: "request",
+  })
+})
+test("other skills, running loads and loads from an earlier request are not planning proof", () => {
+  expect(WorkFlow.state([user, skill("alpha-skill")]).planned).toBe(false)
+  expect(WorkFlow.state([user, skill("deep-think", "running")]).planned).toBe(false)
+  expect(WorkFlow.state([user, skill("deep-think"), user]).planned).toBe(false)
+})

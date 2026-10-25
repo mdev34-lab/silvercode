@@ -177,7 +177,7 @@ const itDeepThink = testEffect(
   LayerNode.compile(SystemPrompt.node, [
     [Global.node, Global.layerWith({ desktop: desktopDirectory })],
     [MCP.node, Layer.mock(MCP.Service, { instructions: () => Effect.succeed([]) })],
-    [Agent.node, Layer.mock(Agent.Service, { list: () => Effect.succeed([build, code, scout]) })],
+    [Agent.node, Layer.mock(Agent.Service, { get: () => Effect.succeed(undefined), list: () => Effect.succeed([build, code, scout]) })],
     [
       Skill.node,
       Layer.succeed(

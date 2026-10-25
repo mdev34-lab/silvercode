@@ -379,7 +379,7 @@ export const TaskTool = Tool.define(
       if (programming && codeIdentity?.native === true && next === codeIdentity && !workflow?.planned)
         return yield* Effect.fail(
           new Error(
-            "Work must complete a successful Think planning task in this request before dispatching Code. Delegate Think first; a pending, cancelled or failed plan is not sufficient.",
+            "Work must load the deep-think skill and write its plan in this request before dispatching Code. Load deep-think first; a Think task also counts when Think is delegatable.",
           ),
         )
       const generalIdentity = yield* agent.get("general")
