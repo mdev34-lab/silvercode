@@ -1,3 +1,4 @@
+import { ownedDeadlineTest, validateOwnedDeadline, type OwnedDeadline } from "./owned-deadline"
 import { test, type TestOptions } from "bun:test"
 import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import { Cause, Duration, Effect, Exit, Layer } from "effect"
@@ -33,10 +34,10 @@ function instanceArgs<E, R>(
 
 const body = <A, E, R>(value: Body<A, E, R>) => Effect.suspend(() => (typeof value === "function" ? value() : value))
 
-type Runner = <A, E, R, E2>(value: Body<A, E, R | Scope.Scope>, layer: Layer.Layer<R, E2>) => Promise<A>
+type Runner = <A, E, R, E2>(value: Body<A, E, R | Scope.Scope>, layer: Layer.Layer<R, E2>, deadline?: OwnedDeadline) => Promise<A>
 
-const isolatedRun: Runner = (value, layer) =>
-  Effect.gen(function* () {
+const isolatedRun: Runner = (value, layer, deadline) => {
+  const execution = Effect.gen(function* () {
     const exit = yield* body(value).pipe(Effect.scoped, Effect.provide(layer), Effect.exit)
     if (Exit.isFailure(exit)) {
       for (const err of Cause.prettyErrors(exit.cause)) {
@@ -44,7 +45,9 @@ const isolatedRun: Runner = (value, layer) =>
       }
     }
     return yield* exit
-  }).pipe(Effect.runPromise)
+  })
+  return deadline ? ownedDeadlineTest(() => execution, deadline)() : Effect.runPromise(execution)
+}
 
 // Builds the test layer through the shared process-wide memoMap so cached
 // services (Bus, Session, …) match Server.Default's instances. Use for tests
@@ -175,3 +178,15 @@ export const pollWithTimeout = <A, E, R>(
       orElse: () => Effect.fail(new Error(message)),
     }),
   )
+
+// Deliberately separate from sharedRun: opt in only for cooperative Effect work.
+// Bun hooks and signal-less Promise work are outside this ownership contract.
+export function testEffectOwned<R, E>(layer: Layer.Layer<R, E>, deadline: OwnedDeadline) {
+  validateOwnedDeadline(deadline)
+  const budget = Object.freeze({ ...deadline })
+  const provided = Layer.provideMerge(layer, liveEnv)
+  return {
+    live: <A, E2>(name: string, value: Body<A, E2, R | Scope.Scope>) =>
+      test(name, () => isolatedRun(value, provided, budget), budget.hostTimeoutMs),
+  }
+}
