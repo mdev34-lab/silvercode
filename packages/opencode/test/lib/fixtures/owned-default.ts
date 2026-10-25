@@ -21,7 +21,7 @@ const layer = Layer.effect(
       }),
   ),
 )
-// Default testEffect path: no explicit deadline, only the host timeout (1000ms here).
+// Default testEffect path: no per-test timeout, only the host default (--timeout 1000 from the runner).
 const it = testEffect(layer)
 it.live(
   "default path times out after layer acquisition",
@@ -30,7 +30,6 @@ it.live(
       yield* Resource
       yield* Effect.never
     }),
-  1000,
 )
 test("next Bun test sees default-path layer finalized", () => {
   expect(flag).toBe("original")

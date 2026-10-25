@@ -67,11 +67,21 @@ const sharedRun: Runner = (value, layer) =>
     return yield* exit
   }).pipe(Effect.runPromise)
 
-// The package test script runs Bun with --timeout 30000. A Bun test-level timeout only
-// rejects the test promise; it does not interrupt the Effect fiber, so scoped finalizers
-// (for example restoring a process-wide flag) could run after the next test started.
-// Own cancellation a little before the host timeout so it is interrupted and joined first.
-const DEFAULT_HOST_TIMEOUT_MS = 30_000
+// A Bun test-level timeout only rejects the test promise; it does not interrupt the Effect
+// fiber, so scoped finalizers could run after the next test started. Own cancellation a
+// little before the host timeout so the fiber is interrupted and joined first.
+// Bun does not expose its configured default timeout, so read the CLI flag; plain
+// `bun test` uses 5000ms. Per-test options override it.
+function cliTimeoutMs() {
+  const argv = process.argv
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i]
+    const raw = arg === "--timeout" ? argv[i + 1] : arg.startsWith("--timeout=") ? arg.slice(10) : undefined
+    if (raw !== undefined && Number.isFinite(Number(raw)) && Number(raw) > 0) return Number(raw)
+  }
+  return 5000
+}
+const DEFAULT_HOST_TIMEOUT_MS = cliTimeoutMs()
 function ownedFor(opts?: number | TestOptions): OwnedDeadline | undefined {
   const hostTimeoutMs = typeof opts === "number" ? opts : (opts?.timeout ?? DEFAULT_HOST_TIMEOUT_MS)
   if (!Number.isFinite(hostTimeoutMs) || hostTimeoutMs <= 0) return undefined
