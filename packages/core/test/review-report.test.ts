@@ -390,3 +390,47 @@ for (const broken of [
     if (!parsed.ok) expect(parsed.failure.reason).toBe("malformed")
   })
 }
+
+for (const suffix of [' " prose <silvercode-review> mention', ' " prose <alphacode-review> mention']) {
+  test(`malformed completed candidate survives later unmatched prose: ${suffix}`, () => {
+    const parsed = ReviewReport.extract([
+      envelope({ assessment: "approved", findings: [] }),
+      '<silvercode-review>{"summary":"unterminated</silvercode-review>' + suffix,
+    ])
+    expect(parsed.ok).toBe(false)
+    if (!parsed.ok) expect(parsed.failure.reason).toBe("malformed")
+  })
+}
+test("a later valid report supersedes a malformed quoted completed candidate", () => {
+  const parsed = ReviewReport.extract([
+    '<silvercode-review>{"summary":"unterminated</silvercode-review> " prose <silvercode-review> mention',
+    envelope(),
+  ])
+  expect(parsed.ok).toBe(true)
+  if (parsed.ok) expect(parsed.report).toEqual(report)
+})
+
+for (const broken of [
+  '{"summary":"unterminated',
+  '{"summary":"bad\\',
+  '{"summary":"bad\\"',
+  '{"summary":"unterminated <silvercode-review>',
+]) {
+  for (const suffix of [
+    "",
+    ' " prose <silvercode-review> mention',
+    ' " prose <alphacode-review> mention',
+    ' " prose <silvercode-review>not json</silvercode-review>',
+    ' " trailing prose',
+    " </alphacode-review>",
+  ]) {
+    test(`latest malformed candidate invariant: ${broken} / ${suffix}`, () => {
+      const latest = `<silvercode-review>${broken}</silvercode-review>${suffix}`
+      const prior = envelope({ assessment: "approved", findings: [] })
+      expect(ReviewReport.extract([prior, latest]).ok).toBe(false)
+      const replaced = ReviewReport.extract([prior, latest, envelope()])
+      expect(replaced.ok).toBe(true)
+      if (replaced.ok) expect(replaced.report).toEqual(report)
+    })
+  }
+}

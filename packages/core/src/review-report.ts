@@ -95,55 +95,34 @@ export function extract(chunks: readonly (string | undefined)[]): Delivery {
   const text = chunks.filter((chunk): chunk is string => typeof chunk === "string").join("\n")
   // Pair only matching tag spellings while allowing an unmatched prose opening
   // before the real report. A tag inside a JSON string is ordinary report data.
-  const tokens = new RegExp(`<(/?)(${TAGS.join("|")})>`, "g")
+  const tokens = [...text.matchAll(new RegExp(`<(/?)(${TAGS.join("|")})>`, "g"))]
   let pending: { tag: string; start: number; body: number } | undefined
   let last: { index: number; end: number; inner: string } | undefined
-  let quotedClose: { index: number; end: number; inner: string } | undefined
-  let quoted = false
-  let escaped = false
-  let json: boolean | undefined
-  let cursor = 0
-  for (const token of text.matchAll(tokens)) {
+  for (let i = 0; i < tokens.length; i++) {
+    const token = tokens[i]
     const start = token.index
-    if (pending) {
-      // Tags inside JSON strings are data, not envelope boundaries.
-      for (; cursor < start; cursor++) {
-        const char = text[cursor]
-        if (json === undefined && !/\s/.test(char)) json = char === "{"
-        if (!json) continue
-        if (escaped) {
-          escaped = false
-          continue
-        }
-        if (quoted && char === "\\") {
-          escaped = true
-          continue
-        }
-        if (char === '"') quoted = !quoted
-      }
-      if (quoted) {
-        if (token[1] && pending.tag === token[2])
-          quotedClose = { index: pending.start, end: start + token[0].length, inner: text.slice(pending.body, start) }
-        continue
-      }
-    }
     if (!token[1]) {
-      // An unmatched prose opening must not consume a later real envelope.
       pending = { tag: token[2], start, body: start + token[0].length }
-      quotedClose = undefined
-      quoted = false
-      escaped = false
-      json = undefined
+      // A complete JSON object establishes its own string boundaries. A tag
+      // literal inside that object must not split the report. Invalid JSON
+      // gets no such shielding, so it cannot swallow a later valid envelope.
+      for (let j = i + 1; j < tokens.length; j++) {
+        const close = tokens[j]
+        if (!close[1] || close[2] !== pending.tag) continue
+        const inner = text.slice(pending.body, close.index)
+        if (!isRecord(Option.getOrUndefined(decodeJson(inner.trim())))) continue
+        last = { index: pending.start, end: close.index + close[0].length, inner }
+        pending = undefined
+        i = j
+        break
+      }
     } else if (pending?.tag === token[2]) {
+      // Even a malformed complete candidate supersedes an older approval.
+      // An unmatched later prose opening cannot erase this candidate.
       last = { index: pending.start, end: start + token[0].length, inner: text.slice(pending.body, start) }
       pending = undefined
-      quotedClose = undefined
     }
-    cursor = start + token[0].length
   }
-  // A closing tag under an unterminated JSON quote still marks a malformed
-  // latest report. Never silently revive an older approval in that case.
-  if (pending && quotedClose) last = quotedClose
   if (!last) {
     const analysis = text.trim()
     const opened = TAGS.find((tag) => text.includes(`<${tag}>`))
