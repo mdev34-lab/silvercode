@@ -154,7 +154,7 @@ const layer = Layer.effect(
         const cfg = yield* config.get()
 
         const work = yield* agents.get("work")
-        if (work?.native === true && agent.name === work.name)
+        if (work?.native === true && agent === work)
           return [
             "Programming requests require completed Think planning before Code implementation, then a clean Review. Work cannot implement programming directly, including tiny edits.",
             "Non-programming work must not go to Code. At fast effort, medium-sized work may be manual; complex or thorough work goes to General; medium effort balances direct work and General delegation.",

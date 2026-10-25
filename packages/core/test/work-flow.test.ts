@@ -115,3 +115,11 @@ test("truncated runtime delivery cannot satisfy either stage", () => {
   Object.assign(implementation.parts[0].state.metadata, { truncated: true })
   expect(WorkFlow.state([user, task("think"), implementation], "parent").implemented).toBe(false)
 })
+
+test("CLI-quoted single argument classifies the wrapped request", () => {
+  {
+    expect(WorkFlow.classify("r", '"fix the python API bug"').kind).toBe("programming")
+    expect(WorkFlow.classify("r", '"Research the nested report"').kind).toBe("nonprogramming")
+    expect(WorkFlow.classify("r", 'review "fix the python API bug" in my notes').kind).not.toBe("programming")
+  }
+})

@@ -52,7 +52,11 @@ export type Route = {
 }
 
 /** Bounded high-precision admission, not a universal semantic intent classifier. */
-export function classify(requestID: string, text: string): Route {
+export function classify(requestID: string, raw: string): Route {
+  // The CLI wraps a single spaced argument in quotes. A message that is wholly
+  // one quoted span is the user's request, not an example inside one.
+  const trimmed = raw.trim()
+  const text = /^"(?:[^"\\]|\\.)*"$/.test(trimmed) ? trimmed.slice(1, -1).replace(/\\"/g, '"') : raw
   // Quotes/examples are context, not by themselves the requested action.
   const active = text
     .replace(/```[\s\S]*?```/g, " ")
@@ -74,7 +78,7 @@ export function classify(requestID: string, text: string): Route {
     )
   const language = /\b(python|typescript|javascript)\b|\b[\w-]+\.(py|ts|tsx|js|jsx)\b/.test(positive)
   const office =
-    /\b(list the files|list attachments|report|pdf|spreadsheet|slides?|presentation|email|e-mail|research|summari[sz]e|organize|rename|relatorio|planilha|apresentacao|pesquis|resum|renome)\w*/.test(
+    /\b(list the files|list attachments|save this attachment|save the attachment|list my notes|in my notes|look up note|report|pdf|spreadsheet|slides?|presentation|email|e-mail|research|summari[sz]e|organize|rename|relatorio|planilha|apresentacao|pesquis|resum|renome)\w*/.test(
       positive,
     )
   if (

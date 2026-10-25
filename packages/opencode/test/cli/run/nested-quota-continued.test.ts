@@ -31,11 +31,11 @@ describe("continued nested session quota handling (#555)", () => {
         }),
       }
       yield* llm.push(reply().text("Initial session completed.").tool("finish", { reason: "success", result: "Initial done" }).stop())
-      const first = yield* opencode.run("initial session", { model: "opencode/local-quota-test", env, timeoutMs: 20_000 })
+      const first = yield* opencode.run("Research the initial session report", { model: "opencode/local-quota-test", env, timeoutMs: 20_000 })
       opencode.expectExit(first, 0)
       const opened = (body: Body, text: string) => body.messages?.at(-1)?.role === "user" && lastText(body).includes(text)
       const followed = (body: Body, text: string) => body.messages?.at(-1)?.role === "tool" && JSON.stringify(body).includes(text)
-      yield* llm.pushMatch((hit) => opened(hit.body as Body, "continue nested investigation"), reply().tool("task", {
+      yield* llm.pushMatch((hit) => opened(hit.body as Body, "Research the nested investigation report"), reply().tool("task", {
         description: "child quota investigation", prompt: "delegate quota grandchild", subagent_type: "general", background: true,
       }))
       yield* llm.pushMatch((hit) => opened(hit.body as Body, "delegate quota grandchild"), reply().tool("task", {
@@ -56,7 +56,7 @@ describe("continued nested session quota handling (#555)", () => {
         reply().tool("finish", { reason: "failure", result: envelope("Child failed: LOCAL_CHILD_QUOTA") }).stop())
       yield* llm.pushMatch((hit) => lastText(hit.body as Body).includes("LOCAL_CHILD_QUOTA"),
         reply().text("LOCAL_ROOT_QUOTA_SURFACED").tool("finish", { reason: "failure", result: "Nested provider quota surfaced" }).stop())
-      const result = yield* opencode.run("continue nested investigation", {
+      const result = yield* opencode.run("Research the nested investigation report", {
         model: "opencode/local-quota-test", extraArgs: ["--continue", "--dangerously-skip-permissions"], env, timeoutMs: 25_000,
       })
       // A parent can handle a child failure and finish its own turn. The CLI's
