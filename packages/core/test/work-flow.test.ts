@@ -156,3 +156,12 @@ test("a later independent artifact request survives an earlier about-clause", ()
     expect(WorkFlow.classify("r", text).kind).toBe("programming")
   expect(WorkFlow.classify("r", "Write a report about how to create a Python script").kind).toBe("nonprogramming")
 })
+
+test("a negated artifact cannot combine with incidental positive language", () => {
+  for (const text of [
+    "Do not create a Python script; write a report using Python to calculate totals.",
+    "Nao crie um script Python; escreva um relatorio usando Python para calcular totais.",
+  ])
+    expect(WorkFlow.classify("r", text).kind).toBe("nonprogramming")
+  expect(WorkFlow.classify("r", "Write a report using Python to calculate totals").kind).toBe("nonprogramming")
+})

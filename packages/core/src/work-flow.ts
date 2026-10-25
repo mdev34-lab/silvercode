@@ -86,6 +86,7 @@ export function classify(requestID: string, raw: string): Route {
   // build something stay out of this rule.
   const verbs = "create|write|make|generate|add|crie|criar|escreva|escrever|faca|fazer|gere|gerar|adicione"
   const primary = clauses
+    .map((clause) => clause.split(/\b(do not|don't|not asking|nao|sem|without)\b/)[0])
     .flatMap((clause) => clause.split(new RegExp("\\b(?:and|then|also|e|depois)\\b(?=\\s+(?:" + verbs + ")\\b)")))
     .map((part) => part.split(/\b(?:about|how to|explain\w*|describ\w*|regarding|on how|sobre|como)\b/)[0])
     .join(" ; ")
