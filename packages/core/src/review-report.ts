@@ -96,6 +96,10 @@ export function extract(chunks: readonly (string | undefined)[]): Delivery {
   // Pair only matching tag spellings while allowing an unmatched prose opening
   // before the real report. A tag inside a JSON string is ordinary report data.
   const tokens = [...text.matchAll(new RegExp(`<(/?)(${TAGS.join("|")})>`, "g"))]
+  // Combined lexical scan and JSON decode input is bounded by sixteen times the text length.
+  // Ordinary disjoint reports consume about two copies regardless of literal
+  // tags. Malformed overlapping candidates may retry; exhaustion never approves.
+  let candidateBudget = text.length * 16
   let pending: { tag: string; start: number; body: number } | undefined
   let last: { index: number; end: number; inner: string } | undefined
   for (let i = 0; i < tokens.length; i++) {
@@ -103,17 +107,65 @@ export function extract(chunks: readonly (string | undefined)[]): Delivery {
     const start = token.index
     if (!token[1]) {
       pending = { tag: token[2], start, body: start + token[0].length }
-      // A complete JSON object establishes its own string boundaries. A tag
-      // literal inside that object must not split the report. Invalid JSON
-      // gets no such shielding, so it cannot swallow a later valid envelope.
-      for (let j = i + 1; j < tokens.length; j++) {
-        const close = tokens[j]
-        if (!close[1] || close[2] !== pending.tag) continue
-        const inner = text.slice(pending.body, close.index)
-        if (!isRecord(Option.getOrUndefined(decodeJson(inner.trim())))) continue
-        last = { index: pending.start, end: close.index + close[0].length, inner }
+      // Locate one JSON object boundary lexically, without reparsing every
+      // literal closing tag inside its strings. Malformed input is not shielded.
+      let depth = 0
+      let quoted = false
+      let escaped = false
+      let began = false
+      for (let cursor = pending.body; cursor < text.length; cursor++) {
+        if (--candidateBudget < 0)
+          return {
+            ok: false,
+            analysis: text.trim(),
+            failure: { reason: "malformed", message: "review envelope candidate work limit exceeded" },
+          }
+        const char = text[cursor]
+        if (!began) {
+          if (/\s/.test(char)) continue
+          if (char !== "{") break
+          began = true
+        }
+        if (escaped) {
+          escaped = false
+          continue
+        }
+        if (quoted && char === "\\") {
+          escaped = true
+          continue
+        }
+        if (char === '"') {
+          quoted = !quoted
+          continue
+        }
+        if (quoted) continue
+        if (char === "{" || char === "[") depth++
+        if (char === "}" || char === "]") depth--
+        if (depth !== 0) continue
+        let end = cursor + 1
+        while (end < text.length && /\s/.test(text[end])) {
+          if (--candidateBudget < 0)
+            return {
+              ok: false,
+              analysis: text.trim(),
+              failure: { reason: "malformed", message: "review envelope candidate work limit exceeded" },
+            }
+          end++
+        }
+        const closing = `</${pending.tag}>`
+        if (!text.startsWith(closing, end)) break
+        const inner = text.slice(pending.body, cursor + 1)
+        candidateBudget -= inner.length
+        if (candidateBudget < 0)
+          return {
+            ok: false,
+            analysis: text.trim(),
+            failure: { reason: "malformed", message: "review envelope candidate work limit exceeded" },
+          }
+        if (!isRecord(Option.getOrUndefined(decodeJson(inner.trim())))) break
+        last = { index: pending.start, end: end + closing.length, inner }
         pending = undefined
-        i = j
+        while (i + 1 < tokens.length && tokens[i + 1].index < last.end) i++
         break
       }
     } else if (pending?.tag === token[2]) {

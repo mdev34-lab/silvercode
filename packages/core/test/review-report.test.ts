@@ -434,3 +434,29 @@ for (const broken of [
     })
   }
 }
+
+test("bounded malformed tag spam fails conservatively rather than reviving approval", () => {
+  const spam = "<silvercode-review>{bad</silvercode-review>".repeat(400)
+  const parsed = ReviewReport.extract([envelope({ assessment: "approved", findings: [] }), spam])
+  expect(parsed.ok).toBe(false)
+  if (!parsed.ok) expect(parsed.failure.message).toContain("work limit")
+})
+test("many disjoint valid report copies preserve last complete selection", () => {
+  const parsed = ReviewReport.extract(Array.from({ length: 100 }, (_, i) => envelope({ summary: `copy ${i}` })))
+  expect(parsed.ok).toBe(true)
+  if (parsed.ok) expect(parsed.report.summary).toBe("copy 99")
+})
+
+test("ordinary valid JSON with thirty literal closing tags is parsed once", () => {
+  const tagged = { ...report, summary: "Literal </silvercode-review> tag. ".repeat(30) }
+  const parsed = ReviewReport.extract([ReviewReport.envelope(tagged)])
+  expect(parsed.ok).toBe(true)
+  if (parsed.ok) expect(parsed.report).toEqual(tagged)
+})
+test("mismatched tag spam has bounded scan work and cannot revive approval", () => {
+  const parsed = ReviewReport.extract([
+    envelope({ assessment: "approved", findings: [] }),
+    "<silvercode-review>{bad</alphacode-review>".repeat(4000),
+  ])
+  expect(parsed.ok).toBe(false)
+})
