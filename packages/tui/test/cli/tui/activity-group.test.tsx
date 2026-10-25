@@ -1195,6 +1195,56 @@ describe("activity group TUI", () => {
     }
   })
 
+  for (const scenario of ["success", "waiting", "error", "ordinary"] as const) {
+    test(`last Work footer duration after ${scenario} tool call`, async () => {
+      const { app, sync } = await mountActivity({
+        render: (store) => {
+          const message = store.data.message[SESSION]?.find((m) => m.role === "assistant") as AssistantMessage
+          return message ? (
+            <AssistantMessageRow message={message} parts={store.data.part[message.id] ?? []} last={true} />
+          ) : (
+            <text />
+          )
+        },
+      })
+      try {
+        const message = { ...assistant("duration-final", at(9)), time: { created: at(9), completed: at(12) } }
+        const user = {
+          id: "msg_user",
+          sessionID: SESSION,
+          role: "user" as const,
+          time: { created: at(0) },
+          agent: "work",
+          model: { providerID: "test", modelID: "model" },
+        }
+        const input = { reason: scenario === "waiting" ? "waiting_for_subagent" : "success", result: "Done" }
+        let tool = completed(
+          running(message.id, scenario === "ordinary" ? "read" : "finish", input, at(10)),
+          at(10),
+          at(12),
+        )
+        if (scenario === "waiting" && tool.state.status === "completed")
+          tool = { ...tool, state: { ...tool.state, metadata: { waiting: true } } }
+        if (scenario === "error")
+          tool = {
+            ...tool,
+            state: { status: "error", input, error: "invalid finish", time: { start: at(10), end: at(12) } },
+          }
+        seed(sync, [
+          { message: user, parts: [] },
+          { message, parts: [reasoningPart(message.id, "Ready to finish"), tool] },
+        ])
+        await waitFrame(app, (frame: string) => frame.includes("Work · model"))
+        const frame = await frameOf(app)
+        const footer = frame.split("\n").find((line: string) => line.includes("Work · model")) ?? ""
+        if (scenario === "success") expect(footer).toContain("12.0s")
+        else expect(footer).not.toContain("12.0s")
+      } finally {
+        app.renderer.destroy()
+      }
+    })
+  }
+
   test("does not render a second model footer for a finish-only turn", async () => {
     const { app, sync } = await mountActivity({
       render: (storeSync) => {

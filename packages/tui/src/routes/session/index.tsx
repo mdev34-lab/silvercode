@@ -1661,8 +1661,18 @@ export function AssistantMessageRow(props: { message: AssistantMessage; parts: P
     return props.parts.length > 0 && !props.parts.some((p) => p.type === "text" || p.type === "reasoning")
   })
 
+  const completedFinish = createMemo(() =>
+    props.parts.some(
+      (part) =>
+        part.type === "tool" &&
+        part.tool === "finish" &&
+        part.state.status === "completed" &&
+        finishBlockView(part, part.state.input)?.tone === "success",
+    ),
+  )
+
   const duration = createMemo(() => {
-    if (!final()) return 0
+    if (!final() && !completedFinish()) return 0
     if (!props.message.time.completed) return 0
     const user = messages().find((x) => x.role === "user" && x.id === props.message.parentID)
     if (!user || !user.time) return 0
