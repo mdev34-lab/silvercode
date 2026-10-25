@@ -166,7 +166,7 @@ const TERMINATION_NOTE: Record<TerminationReason, string> = {
   success: "",
   subagent_wait: "Subagent stopped on a dependency and is not in flight; it will not report back on its own.",
   failure: "Subagent stopped because the task could not be completed.",
-  cancelled: "Subagent stopped because the user cancelled it; it did not complete and its result was not delivered.",
+  cancelled: "Subagent was cancelled before completion; its result was not delivered.",
 }
 
 /**
@@ -174,7 +174,7 @@ const TERMINATION_NOTE: Record<TerminationReason, string> = {
  * call, so there is usually no output at all; the envelope must still say what
  * became of the task instead of delivering an empty result.
  */
-const CANCELLED_TEXT = "The subagent was cancelled by the user before it delivered a result."
+const CANCELLED_TEXT = "The subagent was cancelled before it delivered a result."
 
 /**
  * Renders the parent-facing `<task>` envelope. The termination reason is part of
