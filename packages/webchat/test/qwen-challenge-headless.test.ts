@@ -5,7 +5,7 @@ import path from "path"
 import { QwenWebBrowser, type QwenWebContext, type QwenWebLauncher, type QwenWebPage } from "../src/adapters/qwen/browser"
 
 // A window revealed for a challenge is shown once; the retry and later requests must run headless again.
-function fakeLauncher() {
+function fakeLauncher(closeGate?: { promise: Promise<void> }) {
   const launches: boolean[] = []
   const launcher: QwenWebLauncher = async (_dir, options) => {
     launches.push(options.headless)
@@ -29,6 +29,7 @@ function fakeLauncher() {
       newPage: async () => page,
       cookies: async () => [],
       close: async () => {
+        if (closeGate && launches.length === 2) await closeGate.promise
         closed = true
         closers.forEach((fn) => fn())
       },
@@ -86,6 +87,39 @@ describe("Qwen challenge window", () => {
     await browser.ensureForRequest(undefined, { canRestore: () => false })
     expect(launches).toEqual([true, false])
     await browser.ensureForRequest(undefined, { canRestore: () => true })
+    expect(launches).toEqual([true, false, true])
+    await browser.close()
+  })
+
+  test("the restore is decided again right before the close", async () => {
+    const { launches, launcher } = fakeLauncher()
+    const browser = new QwenWebBrowser({ launcher, profileDir: dir })
+    await browser.ensureForRequest()
+    await browser.revealForChallenge()
+    let calls = 0
+    // free at entry, busy by the time the close would start
+    await browser.ensureForRequest(undefined, { canRestore: () => ++calls === 1 })
+    expect(calls).toBeGreaterThan(1)
+    expect(launches).toEqual([true, false])
+    await browser.close()
+  })
+
+  test("a request that may not start the restore still waits for one already under way", async () => {
+    let release!: () => void
+    const closeGate = { promise: new Promise<void>((resolve) => (release = resolve)) }
+    const { launches, launcher } = fakeLauncher(closeGate)
+    const browser = new QwenWebBrowser({ launcher, profileDir: dir })
+    await browser.ensureForRequest()
+    await browser.revealForChallenge()
+    let first = false
+    let second = false
+    const a = browser.ensureForRequest(undefined, { canRestore: () => true }).then(() => (first = true))
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    const b = browser.ensureForRequest(undefined, { canRestore: () => false }).then(() => (second = true))
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    expect([first, second]).toEqual([false, false])
+    release()
+    await Promise.all([a, b])
     expect(launches).toEqual([true, false, true])
     await browser.close()
   })

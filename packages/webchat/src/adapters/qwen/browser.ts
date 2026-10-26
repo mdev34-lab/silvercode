@@ -513,16 +513,20 @@ export class QwenWebBrowser {
     signal?: AbortSignal,
     opts?: { steer?: boolean; canRestore?: () => boolean },
   ): Promise<QwenWebPage> {
-    // Closing the headed window drops every page on it: only do it while no other request is
-    // mid-flight, otherwise the restore waits for a later request.
-    if (opts?.canRestore?.() !== false) await this.restoreHeadlessAfterChallenge()
+    // Closing the headed window drops every page on it: only start that while no other request
+    // is mid-flight (checked again right before the close). A restore already under way is
+    // joined by everyone, so nobody keeps using the page that is being closed.
+    await this.restoreHeadlessAfterChallenge(opts?.canRestore)
     return this.ensureOnOrigin(signal, { steer: opts?.steer })
   }
 
-  private async restoreHeadlessAfterChallenge(): Promise<void> {
+  private async restoreHeadlessAfterChallenge(canRestore?: () => boolean): Promise<void> {
+    if (this.headlessRestore) return this.headlessRestore
+    if (!this.challengeHeaded || canRestore?.() === false) return
     if (this.challengeReveal) await this.challengeReveal.catch(() => false)
     if (this.headlessRestore) return this.headlessRestore
-    if (!this.challengeHeaded) return
+    // The await above let other requests start: decide again, with no await before the close.
+    if (!this.challengeHeaded || canRestore?.() === false) return
     this.headlessRestore = (async () => {
       debug("browser", "returning to headless after a challenge window")
       this.challengeHeaded = false
