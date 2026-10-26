@@ -1,7 +1,9 @@
 import { test, expect, describe, afterEach, beforeEach } from "bun:test"
 import path from "path"
 import fs from "fs/promises"
-import { Effect, Layer, Logger } from "effect"
+import { writeSync } from "node:fs"
+import http from "node:http"
+import { Cause, Deferred, Effect, Exit, Fiber, Layer, Logger } from "effect"
 import { HttpClient } from "effect/unstable/http"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { FSUtil } from "@opencode-ai/core/fs-util"
@@ -21,6 +23,10 @@ import { AuthTest } from "../fake/auth"
 import { AccountTest } from "../fake/account"
 import { tmpdir } from "../fixture/fixture"
 import { MockRegistry } from "../fixture/mock-registry"
+
+// Diagnostic-only: keep process identity and phase visible if Windows exits before Bun reports (#590).
+const installPhase = (phase: string) =>
+  writeSync(2, `[dependency-install-phase] ${JSON.stringify({ phase, pid: process.pid, ppid: process.ppid, at: Date.now() })}\n`)
 
 const unexpectedHttp = HttpClient.make((request) =>
   Effect.die(`unexpected http request: ${request.method} ${request.url}`),
@@ -286,6 +292,7 @@ describe("Config Dependency Install Integration with MockRegistry", () => {
   })
 
   test("config get returns immediately on registry stall and waitForDependencies respects timeout", async () => {
+    installPhase("caller-timeout:enter")
     const previousTimeout = process.env.OPENCODE_CONFIG_DEP_INSTALL_TIMEOUT_MS
     process.env.OPENCODE_CONFIG_DEP_INSTALL_TIMEOUT_MS = "1000"
     try {
@@ -329,12 +336,14 @@ describe("Config Dependency Install Integration with MockRegistry", () => {
         expect(result.value.waitResult._tag).toBe("Failure")
       }
     } finally {
+      installPhase("caller-timeout:finally")
       if (previousTimeout === undefined) delete process.env.OPENCODE_CONFIG_DEP_INSTALL_TIMEOUT_MS
       else process.env.OPENCODE_CONFIG_DEP_INSTALL_TIMEOUT_MS = previousTimeout
     }
   })
 
-  test("stalled install is cut by OPENCODE_CONFIG_DEP_INSTALL_TIMEOUT_MS and waitForDependencies joins at the bound", async () => {
+  test("total install budget interrupts slow startup before HTTP and waitForDependencies joins", async () => {
+    installPhase("startup:enter")
     const previousTimeout = process.env.OPENCODE_CONFIG_DEP_INSTALL_TIMEOUT_MS
     process.env.OPENCODE_CONFIG_DEP_INSTALL_TIMEOUT_MS = "250"
     const logs: string[] = []
@@ -357,7 +366,47 @@ describe("Config Dependency Install Integration with MockRegistry", () => {
       await fs.mkdir(cacheDir, { recursive: true })
 
       const { ctx } = await createProjectFixture(tmp.path, registry.url, npmCacheDir)
-      const layer = makeIntegrationLayer(cacheDir)
+      const started: string[] = []
+      const startedAtMs: number[] = []
+      // Owner-local phase evidence: when this wrapper's own 300ms pre-install
+      // delay finished and the actual install was entered, and when each
+      // interrupt arrived. A request with no reachedActualInstallAtMs before it
+      // cannot have come from this wrapper's actual install.
+      const reachedActualInstallAtMs: number[] = []
+      const interruptedAtMs: number[] = []
+      const interrupted: string[] = []
+      const slowStart = Layer.effect(
+        Npm.Service,
+        Effect.gen(function* () {
+          const actual = yield* Npm.Service
+          return Npm.Service.of({
+            ...actual,
+            install: (dir, input) =>
+              Effect.sync(() => {
+                started.push(dir)
+                startedAtMs.push(Date.now())
+              }).pipe(
+                // The total budget also covers work before the first HTTP request.
+                Effect.andThen(Effect.sleep("300 millis")),
+                Effect.andThen(Effect.sync(() => reachedActualInstallAtMs.push(Date.now()))),
+                Effect.andThen(actual.install(dir, input)),
+                Effect.onInterrupt(() =>
+                  Effect.sync(() => {
+                    interrupted.push(dir)
+                    interruptedAtMs.push(Date.now())
+                  }),
+                ),
+              ),
+          })
+        }),
+      ).pipe(Layer.provide(LayerNode.compile(Npm.node)))
+      const layer = LayerNode.compile(Config.node, [
+        [Auth.node, AuthTest.empty],
+        [Account.node, AccountTest.empty],
+        [Npm.node, slowStart],
+        [Global.node, Global.layerWith({ cache: cacheDir, state: path.join(cacheDir, "state") })],
+        [httpClient, Layer.succeed(HttpClient.HttpClient, unexpectedHttp)],
+      ])
 
       const startedAt = Date.now()
       const result = await Effect.gen(function* () {
@@ -370,6 +419,7 @@ describe("Config Dependency Install Integration with MockRegistry", () => {
       })
         .pipe(Effect.provide(Logger.layer([captureLog])))
         .pipe(Effect.provideService(InstanceRef, ctx), Effect.scoped, Effect.provide(layer), Effect.runPromiseExit)
+      installPhase("startup:joined")
       const elapsed = Date.now() - startedAt
 
       expect(result._tag).toBe("Success")
@@ -379,14 +429,100 @@ describe("Config Dependency Install Integration with MockRegistry", () => {
       // The 10s wall bound needs headroom on the loaded windows runner, where
       // the same join crossed it under load (#485).
       expect(elapsed).toBeLessThan(process.platform === "win32" ? 30_000 : 10_000)
-      // The install really started against the mock registry before stalling.
-      expect(registry.requests.length).toBeGreaterThan(0)
+      expect(started.length).toBeGreaterThan(0)
+      expect(interrupted.sort()).toEqual(started.sort())
+      // Same assertion, but a failure carries attribution data: each stray
+      // request's method, URL path, query key names, selected client headers and
+      // time relative to this test's install starts and end, plus this
+      // registry's port. No local filesystem paths, query values or credential
+      // headers are deliberately included; the registry is controlled loopback,
+      // and header values are untrusted input, not proof of which install owned
+      // the request.
+      const endedAt = Date.now()
+      expect(
+        registry.requests.map((request) => ({
+          port: registry.port,
+          method: request.method,
+          path: request.url.split("?")[0],
+          queryKeys: [...new URLSearchParams(request.url.split("?")[1] ?? "").keys()],
+          userAgent: request.headers["user-agent"],
+          npmCommand: request.headers["npm-command"],
+          npmSession: request.headers["npm-session"],
+          msAfterFirstInstallStart: request.timestamp - (startedAtMs[0] ?? startedAt),
+          msBeforeTestEnd: endedAt - request.timestamp,
+          installStartsSeen: startedAtMs.length,
+          reachedActualInstallCount: reachedActualInstallAtMs.length,
+          msAfterFirstReachedActualInstall:
+            reachedActualInstallAtMs.length > 0 ? request.timestamp - reachedActualInstallAtMs[0]! : null,
+          interruptCount: interruptedAtMs.length,
+          msAfterFirstInterrupt: interruptedAtMs.length > 0 ? request.timestamp - interruptedAtMs[0]! : null,
+        })),
+      ).toEqual([])
       // The bound expiry is reported as a timeout, not as an install failure.
       expect(logs.some((message) => message.includes("background dependency install timed out"))).toBe(true)
       expect(logs.some((message) => message.includes("background dependency install failed"))).toBe(false)
     } finally {
+      installPhase("startup:finally")
       if (previousTimeout === undefined) delete process.env.OPENCODE_CONFIG_DEP_INSTALL_TIMEOUT_MS
       else process.env.OPENCODE_CONFIG_DEP_INSTALL_TIMEOUT_MS = previousTimeout
     }
   })
+
+  test("interrupting a real stalled registry request closes its TCP socket and releases locks", async () => {
+    installPhase("tcp:enter")
+    await using tmp = await tmpdir()
+    const entered = Deferred.makeUnsafe<void>()
+    const closed = Deferred.makeUnsafe<void>()
+    const server = http.createServer((request) => {
+      installPhase("tcp:request")
+      // Observe the socket carrying this exact stalled request, not an unrelated close.
+      request.socket.once("close", () => {
+        installPhase("tcp:socket-closed")
+        Deferred.doneUnsafe(closed, Effect.void)
+      })
+      Deferred.doneUnsafe(entered, Effect.void)
+    })
+    const sockets = new Set<import("node:net").Socket>()
+    server.on("connection", (socket) => {
+      sockets.add(socket)
+      socket.once("close", () => {
+        sockets.delete(socket)
+      })
+    })
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve))
+    installPhase("tcp:listening")
+    try {
+      const address = server.address()
+      if (!address || typeof address === "string") throw new Error("missing registry address")
+      const cacheDir = path.join(tmp.path, "cache")
+      const fixture = await createProjectFixture(
+        tmp.path,
+        `http://127.0.0.1:${address.port}`,
+        path.join(tmp.path, "npm-cache"),
+      )
+      const result = await Effect.gen(function* () {
+        const npm = yield* Npm.Service
+        const fiber = yield* npm
+          .install(fixture.opencodeDir, {
+            add: [{ name: "@opencode-ai/plugin", version: "1.0.0" }],
+          })
+          .pipe(Effect.forkChild)
+        yield* Deferred.await(entered).pipe(Effect.timeout("5 seconds"))
+        yield* Effect.sync(() => installPhase("tcp:interrupting"))
+        yield* Fiber.interrupt(fiber)
+        yield* Effect.sync(() => installPhase("tcp:interrupted"))
+        yield* Deferred.await(closed).pipe(Effect.timeout("5 seconds"))
+        return yield* Fiber.await(fiber)
+      }).pipe(Effect.scoped, Effect.provide(makeIntegrationLayer(cacheDir)), Effect.runPromise)
+      installPhase("tcp:joined")
+      expect(Exit.isFailure(result)).toBe(true)
+      if (Exit.isFailure(result)) expect(Cause.hasInterrupts(result.cause)).toBe(true)
+      expect(await fs.readdir(path.join(cacheDir, "state", "locks"))).toEqual([])
+    } finally {
+      installPhase("tcp:finally")
+      for (const socket of sockets) socket.destroy()
+      await new Promise<void>((resolve) => server.close(() => resolve()))
+      installPhase("tcp:cleanup-complete")
+    }
+  }, 15000)
 })
