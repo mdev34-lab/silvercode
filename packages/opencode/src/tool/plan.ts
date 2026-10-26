@@ -26,6 +26,14 @@ export const PlanExitTool = Tool.define(
         Effect.gen(function* () {
           const instance = yield* InstanceState.context
           const info = yield* session.get(ctx.sessionID)
+          // The approval and the switch to Work belong to the root session that owns the
+          // plan. A delegated child would ask and switch itself, not the root (#637).
+          if (info.parentID)
+            return yield* Effect.fail(
+              new Error(
+                "plan_exit only runs in the session that owns the plan. Return the finished plan to the parent session instead of switching this delegated session.",
+              ),
+            )
           const plan = path.relative(instance.worktree, Session.plan(info, instance))
           const answers = yield* question.ask({
             sessionID: ctx.sessionID,
