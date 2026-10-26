@@ -7,13 +7,14 @@ const cwd=path.resolve(import.meta.dir,"../..")
 // The previous 5000ms guard was exceeded under 4+ competitors (timedOut assertion, not an ownership failure).
 const CHILD_GUARD_MS=15000
 test("opt-in runner interrupts full provided execution and finalizes before the next Bun test",async()=>{
- for(const [fixture,next] of [
+ for(const [fixture,next,extra=[]] of [
   ["owned-cooperative.ts","next Bun test sees provided layer finalized"],
   ["owned-acquisition.ts","next Bun test sees acquisition scope finalized"],
-  ["owned-default.ts","next Bun test sees default-path layer finalized"],
- ]){
+  ["owned-default.ts","next Bun test sees default-path layer finalized",[]],
+  ["owned-implicit.ts","next Bun test sees the implicitly timed out layer finalized",["--timeout","800"]],
+ ] as [string,string,string[]?][]){
   const {stdout,stderr,code,timedOut}=await collectDeadlineChild([
-   process.execPath,"test",path.join(import.meta.dir,"fixtures",fixture),
+   process.execPath,"test",...extra,path.join(import.meta.dir,"fixtures",fixture),
   ],cwd,CHILD_GUARD_MS)
   const output=stdout+stderr
   expect(timedOut).toBe(false)
@@ -21,7 +22,8 @@ test("opt-in runner interrupts full provided execution and finalizes before the 
   expect(output).toContain("All fibers interrupted without error")
   expect(output).toContain(`(pass) ${next}`)
   expect(output).toContain("1 fail")
-  expect(output).not.toContain("timed out after")
+  // A fixture without its own deadline is stopped by the host timeout, which says so.
+  if (extra.length === 0) expect(output).not.toContain("timed out after")
   expect(output).not.toContain("positive finite")
  }
 },CHILD_GUARD_MS*4+10000)

@@ -1,3 +1,4 @@
+import { track } from "./abandoned"
 import { ownedDeadlineTest, validateOwnedDeadline, type OwnedDeadline } from "./owned-deadline"
 import { test, type TestOptions } from "bun:test"
 import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
@@ -36,6 +37,13 @@ const body = <A, E, R>(value: Body<A, E, R>) => Effect.suspend(() => (typeof val
 
 type Runner = <A, E, R, E2>(value: Body<A, E, R | Scope.Scope>, layer: Layer.Layer<R, E2>, deadline?: OwnedDeadline) => Promise<A>
 
+function runTracked<A, E>(effect: Effect.Effect<A, E, never>): Promise<A> {
+  const controller = new AbortController()
+  const promise = Effect.runPromise(effect, { signal: controller.signal })
+  track(controller, promise)
+  return promise
+}
+
 const isolatedRun: Runner = (value, layer, deadline) => {
   const execution = Effect.gen(function* () {
     const exit = yield* body(value).pipe(Effect.scoped, Effect.provide(layer), Effect.exit)
@@ -46,7 +54,7 @@ const isolatedRun: Runner = (value, layer, deadline) => {
     }
     return yield* exit
   })
-  return deadline ? ownedDeadlineTest(() => execution, deadline)() : Effect.runPromise(execution)
+  return deadline ? ownedDeadlineTest(() => execution, deadline)() : runTracked(execution)
 }
 
 // Builds the test layer through the shared process-wide memoMap so cached
@@ -54,18 +62,20 @@ const isolatedRun: Runner = (value, layer, deadline) => {
 // that publish to an in-process HTTP server and need pub/sub identity with
 // the server's handlers.
 const sharedRun: Runner = (value, layer) =>
-  Effect.gen(function* () {
-    const scope = yield* Scope.make()
-    const ctx = yield* Layer.buildWithMemoMap(layer, memoMap, scope)
-    const exit = yield* body(value).pipe(Effect.scoped, Effect.provide(ctx), Effect.exit)
-    yield* Scope.close(scope, Exit.void)
-    if (Exit.isFailure(exit)) {
-      for (const err of Cause.prettyErrors(exit.cause)) {
-        yield* Effect.logError(err)
+  runTracked(
+    Effect.gen(function* () {
+      const scope = yield* Scope.make()
+      const ctx = yield* Layer.buildWithMemoMap(layer, memoMap, scope)
+      const exit = yield* body(value).pipe(Effect.scoped, Effect.provide(ctx), Effect.exit)
+      yield* Scope.close(scope, Exit.void)
+      if (Exit.isFailure(exit)) {
+        for (const err of Cause.prettyErrors(exit.cause)) {
+          yield* Effect.logError(err)
+        }
       }
-    }
-    return yield* exit
-  }).pipe(Effect.runPromise)
+      return yield* exit
+    }),
+  )
 
 // A Bun test-level timeout only rejects the test promise; it does not interrupt the Effect
 // fiber, so scoped finalizers could run after the next test started. When the test declares

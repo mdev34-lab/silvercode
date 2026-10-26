@@ -4,7 +4,14 @@ import os from "os"
 import path from "path"
 import fs from "fs/promises"
 import { setTimeout as sleep } from "node:timers/promises"
-import { afterAll } from "bun:test"
+import { afterAll, afterEach } from "bun:test"
+
+// A host-level Bun timeout abandons the test promise without interrupting its Effect: stop it
+// and wait for its finalizers before the next test starts (#609).
+afterEach(async () => {
+  const { settleAbandonedEffects } = await import("./lib/abandoned")
+  await settleAbandonedEffects()
+})
 
 // Set XDG env vars FIRST, before any src/ imports
 const dir = path.join(os.tmpdir(), "opencode-test-data-" + process.pid)
