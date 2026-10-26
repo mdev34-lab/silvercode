@@ -411,6 +411,9 @@ export class QwenWebBrowser {
   private launching: Promise<QwenWebContext> | undefined
   private challengeReveal: Promise<boolean> | undefined
   private loginRelaunch: Promise<void> | undefined
+  private headlessRestore: Promise<void> | undefined
+  /** A headed window was opened only to show a challenge; later requests go back to headless. */
+  private challengeHeaded = false
   private contextDead = false
   private pageDead = false
   private lockHeldFor: string | undefined
@@ -487,6 +490,7 @@ export class QwenWebBrowser {
     const operation = this.restartWithHeadless(signal, false)
       .then(() => {
         this.headless = false
+        this.challengeHeaded = true
         return true
       })
       .catch(async (error) => {
@@ -498,6 +502,40 @@ export class QwenWebBrowser {
       this.challengeReveal = undefined
     })
     return this.challengeReveal
+  }
+
+  /**
+   * Entry point for chat requests. A window revealed for a challenge is for the person to
+   * solve it once: the retry and every later request run headless again (the persistent
+   * profile keeps whatever the person solved). No solved-detection is involved.
+   */
+  async ensureForRequest(
+    signal?: AbortSignal,
+    opts?: { steer?: boolean; canRestore?: () => boolean },
+  ): Promise<QwenWebPage> {
+    // Closing the headed window drops every page on it: only start that while no other request
+    // is mid-flight (checked again right before the close). A restore already under way is
+    // joined by everyone, so nobody keeps using the page that is being closed.
+    await this.restoreHeadlessAfterChallenge(opts?.canRestore)
+    return this.ensureOnOrigin(signal, { steer: opts?.steer })
+  }
+
+  private async restoreHeadlessAfterChallenge(canRestore?: () => boolean): Promise<void> {
+    if (this.headlessRestore) return this.headlessRestore
+    if (!this.challengeHeaded || canRestore?.() === false) return
+    if (this.challengeReveal) await this.challengeReveal.catch(() => false)
+    if (this.headlessRestore) return this.headlessRestore
+    // The await above let other requests start: decide again, with no await before the close.
+    if (!this.challengeHeaded || canRestore?.() === false) return
+    this.headlessRestore = (async () => {
+      debug("browser", "returning to headless after a challenge window")
+      this.challengeHeaded = false
+      this.headless = true
+      await this.close()
+    })().finally(() => {
+      this.headlessRestore = undefined
+    })
+    return this.headlessRestore
   }
 
   /**
