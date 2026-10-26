@@ -136,6 +136,9 @@ async function toolError(part: ToolPart) {
   }
 }
 
+/** Retry delays longer than this are announced by a non-interactive run; shorter ones stay silent. */
+const RUN_RETRY_NOTICE_MS = 10_000
+
 export const RunCommand = effectCmd({
   command: "run [message..]",
   describe: "run silvercode with a message",
@@ -718,6 +721,7 @@ export const RunCommand = effectCmd({
           let rootIdle = false
           let lastText = ""
           let error: string | undefined
+          let retryNoticed = 0
 
           for await (const event of events.stream) {
             if (
@@ -846,6 +850,28 @@ export const RunCommand = effectCmd({
 
             if (event.type === "session.status" && event.properties.sessionID === sessionID) {
               rootIdle = event.properties.status.type === "idle"
+              const status = event.properties.status
+              // Visibility only: a long provider-requested retry delay used to leave a
+              // headless run silent until killed (#555). Say that it is waiting, without
+              // changing the retry policy. Short retries stay silent.
+              // A later non-retry status (busy again after a successful step) ends the
+              // wait, so the next wait in the same run is announced too.
+              if (status.type !== "retry") retryNoticed = 0
+              if (status.type === "retry" && args.format !== "json") {
+                const wait = status.next - Date.now()
+                if (wait > RUN_RETRY_NOTICE_MS && status.attempt !== retryNoticed) {
+                  retryNoticed = status.attempt
+                  // A fixed category, never the provider's retry message: that text can carry raw
+                  // response bodies, URLs or control characters.
+                  const reason =
+                    status.action?.reason === "free_tier_limit"
+                      ? "free usage limit reached"
+                      : status.action?.reason === "account_rate_limit"
+                        ? "account rate limit"
+                        : "retrying after a provider error"
+                  UI.println(`waiting about ${Math.ceil(wait / 1000)}s before retrying (attempt ${status.attempt}): ${reason}`)
+                }
+              }
             }
             // A deferred/silent descendant delivery can arrive after the root's
             // last idle event. Recheck on every event, not only another root
