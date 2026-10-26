@@ -374,34 +374,42 @@ describe("Npm with MockRegistry - Stall, Interruption, and Cleanup", () => {
 
     const layer = npmLayer(cacheDir)
 
+    // The cut is owned by the install operation, not by a join observer: the
+    // install is raced against a bound that starts only once the registry holds
+    // the stalled request, so a pre-HTTP startup is not charged against it (that
+    // is a different contract, #581/#586). raceFirst interrupts the install and
+    // waits for its interruption to finish, so `elapsed` covers the cut AND the
+    // install's cleanup. An install that ends first (for example a failure before
+    // any HTTP request) wins the race and is reported as its own cause instead
+    // of being masked by a generic rendezvous timeout.
     const result = await Effect.gen(function* () {
       const npm = yield* Npm.Service
-      const fiber = yield* npm
-        .install(projectDir, {
-          add: [{ name: "@opencode-ai/plugin", version: "1.0.0" }],
-        })
-        .pipe(Effect.forkChild)
-
-      // Rendezvous on the registry actually receiving the install request. The
-      // total install budget would also cover startup before any HTTP request
-      // (filesystem, lock, module import, npm config), which is slow on loaded
-      // Windows runners; that is a different contract (#581, #586).
-      yield* Effect.gen(function* () {
+      let cutStart = 0
+      const cut = Effect.gen(function* () {
         while (registry.requests.length === 0) yield* Effect.sleep("5 millis")
-      }).pipe(Effect.timeout("10 seconds"))
+        cutStart = Date.now()
+        yield* Effect.sleep("200 millis")
+        return yield* Effect.fail("cut" as const)
+      })
+      const exit = yield* Effect.raceFirst(
+        npm.install(projectDir, {
+          add: [{ name: "@opencode-ai/plugin", version: "1.0.0" }],
+        }),
+        cut,
+      ).pipe(Effect.match({ onFailure: (error) => ({ ok: false as const, error }), onSuccess: () => ({ ok: true as const, error: undefined }) }))
+      return { exit, elapsed: Date.now() - cutStart, cutStart }
+      // Owned host budget: below the 15s test timeout and the 20s parent kill, so
+      // an overrun interrupts this program (and the scope cleanup) instead of
+      // being abandoned by the test runner.
+    }).pipe(Effect.timeout("12 seconds"), Effect.scoped, Effect.provide(layer), Effect.runPromise)
 
-      // The stalled request must now be cut by an Effect timeout.
-      const startTime = Date.now()
-      const joined = yield* Fiber.join(fiber).pipe(Effect.timeout("200 millis"), Effect.exit)
-      const elapsed = Date.now() - startTime
-      yield* Fiber.interrupt(fiber)
-      return { joined, elapsed }
-    }).pipe(Effect.scoped, Effect.provide(layer), Effect.runPromise)
-
-    expect(result.joined._tag).toBe("Failure")
+    expect(result.exit.ok).toBe(false)
+    // The failure must be the bound firing, not the install failing on its own.
+    expect(result.exit.error).toBe("cut")
+    expect(result.cutStart).toBeGreaterThan(0)
     expect(result.elapsed).toBeLessThan(4000)
     expect(registry.requests.length).toBeGreaterThan(0)
-  })
+  }, 15_000)
 
   test("fiber interruption aborts pending install without leaking resources", async () => {
     await using tmp = await tmpdir()
