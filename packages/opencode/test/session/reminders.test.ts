@@ -8,7 +8,7 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 
 import { Session as SessionNs } from "@/session/session"
-import { SessionReminders, rootSession } from "../../src/session/reminders"
+import { SessionReminders, rootSession, walkToRoot } from "../../src/session/reminders"
 import { PlanExitTool } from "../../src/tool/plan"
 import * as Tool from "../../src/tool/tool"
 import { Truncate } from "../../src/tool/truncate"
@@ -109,6 +109,20 @@ describe("rootSession", () => {
 })
 
 describe("SessionReminders.apply plan-mode", () => {
+  it.instance("resolves to none on a parent cycle instead of looping", () =>
+    Effect.gen(function* () {
+      const sessions = yield* SessionNs.Service
+      const a = yield* sessions.create({})
+      const b = yield* sessions.create({})
+      const looped = { ...a, parentID: b.id } as typeof a
+      const sessionsView = {
+        get: (id: typeof a.id) => Effect.succeed(id === b.id ? ({ ...b, parentID: a.id } as typeof b) : looped),
+      } as unknown as SessionNs.Interface
+      const resolved = yield* walkToRoot(sessionsView, looped)
+      expect(Option.isNone(resolved)).toBe(true)
+    }),
+  )
+
   it.instance("names the root session plan file for a delegated think", () =>
     Effect.gen(function* () {
       const sessions = yield* SessionNs.Service
@@ -240,6 +254,56 @@ describe("plan_exit root resolution", () => {
       expect(result.title).toBe("Cannot switch to work agent")
       expect(result.output).toContain("missing from storage")
       expect(calls.count).toBe(0)
+    }),
+  )
+})
+
+describe("living plan handoff for programming sessions", () => {
+  const taskResult = (sessionID: SessionID, subagent: string) =>
+    ({
+      info: {
+        id: MessageID.ascending(),
+        sessionID,
+        role: "assistant",
+        agent: "work",
+        time: { created: Date.now() },
+      },
+      parts: [
+        {
+          type: "tool",
+          tool: "task",
+          callID: "call_1",
+          state: { status: "completed", input: { subagent_type: subagent }, output: "plan", title: "", metadata: {}, time: { start: 0, end: 1 } },
+        },
+      ],
+    }) as unknown as SessionV1.WithParts
+
+  itOff.instance("tells Work to have Code create the plan file after a delegated think when none exists", () =>
+    Effect.gen(function* () {
+      const sessions = yield* SessionNs.Service
+      const root = yield* sessions.create({})
+      const result = yield* SessionReminders.apply({
+        messages: [taskResult(root.id, "think"), yield* user(root.id)],
+        agent: work,
+        session: root,
+      })
+      const body = texts(result).join("\n")
+      expect(body).toContain(root.slug)
+      expect(body).toContain("first Code step create it")
+      expect(body).not.toContain("you must write")
+    }),
+  )
+
+  itOff.instance("stays silent for Work when no think was delegated and no plan file exists", () =>
+    Effect.gen(function* () {
+      const sessions = yield* SessionNs.Service
+      const root = yield* sessions.create({})
+      const result = yield* SessionReminders.apply({
+        messages: [taskResult(root.id, "code"), yield* user(root.id)],
+        agent: work,
+        session: root,
+      })
+      expect(texts(result).join("\n")).not.toContain(root.slug)
     }),
   )
 })

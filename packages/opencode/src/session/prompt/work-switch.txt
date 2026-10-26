@@ -4,7 +4,7 @@ You are no longer in read-only mode.
 You are permitted to make file changes, run shell commands, and utilize your arsenal of tools as needed.
 
 When a plan file exists for this session, treat it as your living scratchpad, not a frozen contract:
-- Update it at milestones: when a step's verification passes, check it off then; jot discoveries that change later steps and revise the remaining steps when reality diverges from the plan, at the moment you learn it.
+- Update it at milestones (yourself if you hold an edit tool; otherwise have the Code step that does the work tick its steps and record discoveries, and read the file before the next step): when a step's verification passes, check it off then; jot discoveries that change later steps and revise the remaining steps when reality diverges from the plan, at the moment you learn it.
 - Keep updates cheap: at step boundaries, not after every tool call.
 - The file is the shared record of progress. Anything tracking the same work elsewhere is a draft that this file should reflect before you move on.
 </system-reminder>
