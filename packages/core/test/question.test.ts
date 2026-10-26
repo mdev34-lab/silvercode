@@ -34,6 +34,24 @@ const waitForAsk = Effect.fn("QuestionV2Test.waitForAsk")(function* (
 })
 
 describe("QuestionV2", () => {
+  it.effect("announces a rejection when an unanswered ask is aborted", () =>
+    Effect.gen(function* () {
+      const service = yield* QuestionV2.Service
+      const events = yield* EventV2.Service
+      const rejected = yield* Deferred.make<unknown>()
+      const unsubscribe = yield* events.listen((event) =>
+        event.type === QuestionV2.Event.Rejected.type
+          ? Deferred.succeed(rejected, event.data).pipe(Effect.asVoid)
+          : Effect.void,
+      )
+      yield* Effect.addFinalizer(() => unsubscribe)
+      const { fiber, request } = yield* waitForAsk(service, { sessionID, questions: [question] })
+      yield* Fiber.interrupt(fiber)
+      expect(yield* service.list()).toEqual([])
+      expect(yield* Deferred.await(rejected)).toEqual({ sessionID, requestID: request.id })
+    }),
+  )
+
   it.effect("publishes lifecycle events and settles a pending reply", () =>
     Effect.gen(function* () {
       const service = yield* QuestionV2.Service
