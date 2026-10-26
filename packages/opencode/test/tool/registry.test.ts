@@ -714,3 +714,25 @@ it.instance("programming Work and Think expose only native inspection tools, non
     }
   }
 }))
+
+it.instance("an uncertain or programming Work route keeps the invalid-call reporter but not execution tools", () => Effect.gen(function* () {
+  const sessions=yield* Session.Service
+  const agents=yield* Agent.Service
+  const registry=yield* ToolRegistry.Service
+  for (const text of ["run ls and echo hello","Fix Python software"]) {
+    const chat=yield* sessions.create({title:"admission"})
+    const user=yield* sessions.updateMessage({id:MessageID.ascending(),role:"user",sessionID:chat.id,agent:"work",model:{providerID:ProviderV2.ID.make("test"),modelID:ModelV2.ID.make("test")},time:{created:Date.now()}})
+    yield* sessions.updatePart({id:PartID.ascending(),messageID:user.id,sessionID:chat.id,type:"text",text})
+    for (const role of ["work","think"]) {
+      const found=yield* registry.tools({sessionID:chat.id,agent:yield* agents.get(role),providerID:ProviderV2.ID.make("test"),modelID:ModelV2.ID.make("test")})
+      const ids=found.map(tool=>tool.id)
+      expect(ids.includes("invalid")).toBe(true)
+      expect(ids.includes("bash")).toBe(false)
+      expect(ids.includes("edit")).toBe(false)
+      const invalid=found.find(tool=>tool.id==="invalid")
+      const ctx={sessionID:chat.id,messageID:user.id,agent:role,abort:new AbortController().signal,messages:[],metadata:()=>Effect.void,ask:()=>Effect.void} as never
+      const out=yield* invalid!.execute({tool:"bash",error:"Model tried to call unavailable tool 'bash'."},ctx)
+      expect(out.output).toContain("unavailable tool 'bash'")
+    }
+  }
+}))

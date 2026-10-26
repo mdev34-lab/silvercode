@@ -316,8 +316,11 @@ const layer = Layer.effect(
           ? yield* workRoute(input.sessionID).pipe(Effect.provideService(Session.Service, sessions), Effect.orDie)
           : undefined
       const restricted = ownedRole && input.sessionID !== undefined && admission?.kind !== "nonprogramming"
+      // `invalid` only reports a failed call back to the model (it runs nothing), so a restricted
+      // route keeps it: the repair path of a call to an unavailable tool lands on it.
+      const reportsInvalidCall = (tool: Tool.Def) => tool.id === InvalidTool.id && known.builtin.includes(tool)
       const allowed = (tool: Tool.Def) =>
-        !restricted || (known.builtin.includes(tool) && WorkFlow.inspectionTool(tool.id))
+        !restricted || reportsInvalidCall(tool) || (known.builtin.includes(tool) && WorkFlow.inspectionTool(tool.id))
       const filtered = (yield* all()).filter((tool) => {
         if (!allowed(tool)) return false
         // Agents that opt out of the finish tool end turns on end-of-stream,
@@ -398,6 +401,7 @@ const layer = Layer.effect(
                 if (
                   ownedRole &&
                   current?.kind !== "nonprogramming" &&
+                  !reportsInvalidCall(tool) &&
                   (!known.builtin.includes(tool) || !WorkFlow.inspectionTool(tool.id))
                 )
                   return yield* Effect.fail(
