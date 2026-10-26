@@ -93,6 +93,7 @@ function makeFake(): Fake {
   }
   fake.browser = {
     ensureOnOrigin: (...args: unknown[]) => (fake.ensureOnOrigin as (...a: unknown[]) => Promise<QwenWebPage>)(...args),
+    ensureForRequest: (...args: unknown[]) => (fake.ensureOnOrigin as (...a: unknown[]) => Promise<QwenWebPage>)(...args),
     invalidatePage: () => {
       invalidated = true
     },
