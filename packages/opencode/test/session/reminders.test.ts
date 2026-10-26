@@ -294,6 +294,21 @@ describe("living plan handoff for programming sessions", () => {
     }),
   )
 
+  it.instance("experimental plan mode: Work gets the same handoff after a delegated think", () =>
+    Effect.gen(function* () {
+      const sessions = yield* SessionNs.Service
+      const root = yield* sessions.create({})
+      const result = yield* SessionReminders.apply({
+        messages: [taskResult(root.id, "think"), yield* user(root.id)],
+        agent: work,
+        session: root,
+      })
+      const body = texts(result).join("\n")
+      expect(body).toContain(root.slug)
+      expect(body).toContain("first Code step create it")
+    }),
+  )
+
   itOff.instance("stays silent for Work when no think was delegated and no plan file exists", () =>
     Effect.gen(function* () {
       const sessions = yield* SessionNs.Service
