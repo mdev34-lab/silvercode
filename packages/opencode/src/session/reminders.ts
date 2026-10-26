@@ -13,25 +13,21 @@ import PROMPT_PLAN from "./prompt/plan.txt"
 import WORK_SWITCH from "./prompt/work-switch.txt"
 import PLAN_MODE from "./prompt/plan-mode.txt"
 import { NotFoundError } from "@/storage/storage"
+import { WorkFlow } from "@opencode-ai/core/work-flow"
 
 const scratchpad = (plan: string) =>
-  `A plan file exists at ${plan}. Execute on the plan defined within it, and keep the file current as the run's scratchpad: a step is checked off when its verification passes, not in a batch later, and remaining steps are revised when reality diverges from the plan. If you hold an edit tool, do that yourself. If you cannot edit files (programming sessions), have each Code step tick its own steps and record discoveries there, and read the file before the next step to check progress.`
+  `A plan file exists at ${plan}. Execute on the plan defined within it, and keep the file current as the run's scratchpad: a step is checked off when its verification passes, not in a batch later, and remaining steps are revised when reality diverges from the plan. If you hold a file-editing tool (edit, write or apply_patch), do that yourself. If you do not (programming sessions, where the Code step makes the edits), have each Code step tick its own steps and record discoveries there, and read the file before the next step to check progress.`
 
 const planHandoff = (plan: string) =>
-  `The session plan file belongs at ${plan} and does not exist yet. Have the first Code step create it from the planner's checklist (one verifiable \`- [ ]\` step per line), then keep it current as described: each Code step ticks its own steps and records discoveries, and you read it before the next step.`
+  `The session plan file belongs at ${plan} and does not exist yet. Create it from the planner's checklist (one verifiable \`- [ ]\` step per line): yourself if you hold a file-editing tool (edit, write or apply_patch), otherwise (programming sessions) have the first Code step create it. Then keep it current as described: the step that edits ticks its own steps and records discoveries, and you read the file before the next step.`
 
 // A delegated Think runs as a child session, so the planner's reply is a task
 // tool result in this session rather than an assistant message from think.
-const delegatedThink = (messages: SessionV1.WithParts[]) =>
-  messages.some((msg) =>
-    msg.parts.some(
-      (part) =>
-        part.type === "tool" &&
-        part.tool === "task" &&
-        part.state.status === "completed" &&
-        AgentSchema.canonicalID(String((part.state.input as { subagent_type?: unknown } | undefined)?.subagent_type ?? "")) === "think",
-    ),
-  )
+// Only a runtime-stamped successful foreground Think delivered in this real
+// request counts: a failed, cancelled, background or earlier-request Think
+// does not mean a plan exists.
+const delegatedThink = (messages: SessionV1.WithParts[], sessionID: string) =>
+  WorkFlow.state(messages, sessionID).planned
 
 // Plan files belong to the root session: a Think running as a delegated
 // subagent writes the same plan file its caller's session later reads.
@@ -70,6 +66,13 @@ const rootPlan = Effect.fn("SessionReminders.rootPlan")(function* (session: Sess
   return Option.map(root, (root) => Session.plan(root, ctx))
 })
 
+// A primary Think->Work switch: Think may hold no write tool, so a missing
+// plan file is handed to Work to create rather than assumed to exist.
+const switchText = (plan: Option.Option<string>, exists: boolean) =>
+  Option.isNone(plan)
+    ? WORK_SWITCH
+    : `${WORK_SWITCH}\n\n${exists ? scratchpad(plan.value) : planHandoff(plan.value)}`
+
 export const apply = Effect.fn("SessionReminders.apply")(function* (input: {
   messages: SessionV1.WithParts[]
   agent: Agent.Info
@@ -98,7 +101,7 @@ export const apply = Effect.fn("SessionReminders.apply")(function* (input: {
           messageID: userMessage.info.id,
           sessionID: userMessage.info.sessionID,
           type: "text",
-          text: `Write your plan at ${plan.value} with the write tool if you have it - create it if it does not exist, extend it if it does. If you have no write tool, put the full plan in your reply instead and the implementer saves it to that path. Either way, structure it as a checklist of one verifiable step per line (markdown \`- [ ]\` items) so the executor can check steps off as it works, and end your reply with that exact path.`,
+          text: `Write your plan at ${plan.value} with your file-writing tool (write or apply_patch) if you have one - create it if it does not exist, extend it if it does. If you have no file-writing tool, put the full plan in your reply instead and the implementer saves it to that path. Either way, structure it as a checklist of one verifiable step per line (markdown \`- [ ]\` items) so the executor can check steps off as it works, and end your reply with that exact path.`,
           synthetic: true,
         })
     }
@@ -114,10 +117,10 @@ export const apply = Effect.fn("SessionReminders.apply")(function* (input: {
           messageID: userMessage.info.id,
           sessionID: userMessage.info.sessionID,
           type: "text",
-          text: exists && Option.isSome(plan) ? `${WORK_SWITCH}\n\n${scratchpad(plan.value)}` : WORK_SWITCH,
+          text: switchText(plan, exists),
           synthetic: true,
         })
-      } else if (!exists && Option.isSome(plan) && delegatedThink(input.messages)) {
+      } else if (!exists && Option.isSome(plan) && delegatedThink(input.messages, input.session.id)) {
         userMessage.parts.push({
           id: PartID.ascending(),
           messageID: userMessage.info.id,
@@ -142,10 +145,28 @@ export const apply = Effect.fn("SessionReminders.apply")(function* (input: {
     return input.messages
   }
 
-  // Delegation flow in experimental plan mode: a delegated Think ran as a child
-  // session, so the last assistant message here is not Think's. Work still gets
+  const assistantMessage = input.messages.findLast((msg) => msg.info.role === "assistant")
+  if (input.agent.name !== "think" && AgentSchema.canonicalID(assistantMessage?.info.agent ?? "") === "think") {
+    const plan = yield* rootPlan(input.session)
+    const exists = Option.isSome(plan) && (yield* fsys.existsSafe(plan.value))
+    const part = yield* sessions.updatePart({
+      id: PartID.ascending(),
+      messageID: userMessage.info.id,
+      sessionID: userMessage.info.sessionID,
+      type: "text",
+      text: switchText(plan, exists),
+      synthetic: true,
+    })
+    userMessage.parts.push(part)
+    return input.messages
+  }
+
+  // Delegation flow in experimental plan mode (after the primary switch check,
+  // so a later primary Think->Work switch is never shadowed by an earlier
+  // delegation): a delegated Think ran as a child session, so the last
+  // assistant message here is not Think's. Work still gets
   // the living-plan guidance, same as outside experimental plan mode.
-  if (input.agent.name === "work" && delegatedThink(input.messages)) {
+  if (input.agent.name === "work" && delegatedThink(input.messages, input.session.id)) {
     const plan = yield* rootPlan(input.session)
     if (Option.isSome(plan)) {
       const exists = yield* fsys.existsSafe(plan.value)
@@ -159,22 +180,6 @@ export const apply = Effect.fn("SessionReminders.apply")(function* (input: {
       })
       return input.messages
     }
-  }
-
-  const assistantMessage = input.messages.findLast((msg) => msg.info.role === "assistant")
-  if (input.agent.name !== "think" && AgentSchema.canonicalID(assistantMessage?.info.agent ?? "") === "think") {
-    const plan = yield* rootPlan(input.session)
-    const exists = Option.isSome(plan) && (yield* fsys.existsSafe(plan.value))
-    const part = yield* sessions.updatePart({
-      id: PartID.ascending(),
-      messageID: userMessage.info.id,
-      sessionID: userMessage.info.sessionID,
-      type: "text",
-      text: exists && Option.isSome(plan) ? `${WORK_SWITCH}\n\n${scratchpad(plan.value)}` : WORK_SWITCH,
-      synthetic: true,
-    })
-    userMessage.parts.push(part)
-    return input.messages
   }
 
   if (input.agent.name !== "think" || AgentSchema.canonicalID(assistantMessage?.info.agent ?? "") === "think") return input.messages
@@ -192,8 +197,8 @@ export const apply = Effect.fn("SessionReminders.apply")(function* (input: {
       Option.isNone(plan)
         ? "A plan file path could not be resolved because an ancestor session is missing from storage. Do not create or edit any plan file."
         : exists
-          ? `A plan file already exists at ${plan.value}. If you hold the edit tool, read it and make incremental edits; otherwise put the updated plan in your reply.`
-          : `No plan file exists yet. If you hold the write tool, create your plan at ${plan.value}; otherwise put the full plan in your reply and the implementer saves it there.`,
+          ? `A plan file already exists at ${plan.value}. If you hold a file-editing tool (edit or apply_patch), read it and make incremental edits; otherwise put the updated plan in your reply.`
+          : `No plan file exists yet. If you hold a file-writing tool (write or apply_patch), create your plan at ${plan.value}; otherwise put the full plan in your reply and the implementer saves it there.`,
     ),
     synthetic: true,
   })

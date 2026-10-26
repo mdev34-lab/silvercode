@@ -148,6 +148,11 @@ const layer = Layer.effect(
 
         const user = Permission.fromConfig(cfg.permission ?? {})
 
+        // Non-VCS sessions keep the living plan file under the global data dir,
+        // outside the worktree. Code (writes it) and Work (reads it) get exactly
+        // that directory, not a broad external-directory grant.
+        const sessionPlans = { [path.join(Global.Path.data, "plans", "*")]: "allow" } as const
+
         const planPermissions = Permission.fromConfig({
           question: "allow",
           plan_exit: "allow",
@@ -199,6 +204,7 @@ const layer = Layer.effect(
                 task: {
                   work: "deny",
                 },
+                external_directory: sessionPlans,
               }),
               user,
             ),
@@ -224,6 +230,7 @@ const layer = Layer.effect(
                   work: "deny",
                   code: "deny",
                 },
+                external_directory: sessionPlans,
               }),
               user,
             ),

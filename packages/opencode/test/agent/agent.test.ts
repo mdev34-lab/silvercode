@@ -555,6 +555,20 @@ it.instance("default permission includes doom_loop and external_directory as ask
   }),
 )
 
+it.instance("Code and Work reach the session plan directory only, not other external paths", () =>
+  Effect.gen(function* () {
+    const plan = path.join(Global.Path.data, "plans", "1-slug.md")
+    for (const name of ["code", "work"]) {
+      const agent = yield* load((svc) => svc.get(name))
+      expect(Permission.evaluate("external_directory", plan, agent!.permission).action).toBe("allow")
+      expect(Permission.evaluate("external_directory", path.join(Global.Path.data, "other", "x.md"), agent!.permission).action).toBe("ask")
+      expect(Permission.evaluate("external_directory", "/some/other/path", agent!.permission).action).toBe("ask")
+    }
+    const general = yield* load((svc) => svc.get("general"))
+    expect(Permission.evaluate("external_directory", plan, general!.permission).action).toBe("ask")
+  }),
+)
+
 it.instance("webfetch is allowed by default", () =>
   Effect.gen(function* () {
     const work = yield* load((svc) => svc.get("work"))
