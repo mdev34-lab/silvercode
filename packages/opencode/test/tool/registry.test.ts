@@ -691,3 +691,22 @@ it.instance("programming Work and Think expose only native inspection tools, non
     }
   }
 }))
+
+it.instance("programming session living-plan handoff: Work and Think cannot write the plan file, Code can", () => Effect.gen(function* () {
+  const sessions=yield* Session.Service
+  const agents=yield* Agent.Service
+  const registry=yield* ToolRegistry.Service
+  const chat=yield* sessions.create({title:"admission"})
+  const user=yield* sessions.updateMessage({id:MessageID.ascending(),role:"user",sessionID:chat.id,agent:"work",model:{providerID:ProviderV2.ID.make("test"),modelID:ModelV2.ID.make("test")},time:{created:Date.now()}})
+  yield* sessions.updatePart({id:PartID.ascending(),messageID:user.id,sessionID:chat.id,type:"text",text:"Fix Python software"})
+  const toolIDs=(role:string)=>Effect.gen(function* () {
+    const found=yield* registry.tools({sessionID:chat.id,agent:yield* agents.get(role),providerID:ProviderV2.ID.make("test"),modelID:ModelV2.ID.make("test")})
+    return found.map(tool=>tool.id)
+  })
+  for (const role of ["work","think"]) {
+    const ids=yield* toolIDs(role)
+    for (const writer of ["write","edit","apply_patch","plan_exit"]) expect(ids.includes(writer)).toBe(false)
+  }
+  const code=yield* toolIDs("code")
+  expect(code.includes("write")||code.includes("apply_patch")).toBe(true)
+}))
