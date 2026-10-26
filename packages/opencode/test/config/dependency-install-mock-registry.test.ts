@@ -419,16 +419,20 @@ describe("Config Dependency Install Integration with MockRegistry", () => {
       expect(elapsed).toBeLessThan(process.platform === "win32" ? 30_000 : 10_000)
       expect(started.length).toBeGreaterThan(0)
       expect(interrupted.sort()).toEqual(started.sort())
-      // Same assertion, but a failure carries attribution data (no paths or
-      // secrets): each stray request's method, URL, selected client headers and
+      // Same assertion, but a failure carries attribution data: each stray
+      // request's method, URL path, query key names, selected client headers and
       // time relative to this test's install starts and end, plus this
-      // registry's port. Attribution needs this, not just a count.
+      // registry's port. No local filesystem paths, query values or credential
+      // headers are deliberately included; the registry is controlled loopback,
+      // and header values are untrusted input, not proof of which install owned
+      // the request.
       const endedAt = Date.now()
       expect(
         registry.requests.map((request) => ({
           port: registry.port,
           method: request.method,
-          url: request.url,
+          path: request.url.split("?")[0],
+          queryKeys: [...new URLSearchParams(request.url.split("?")[1] ?? "").keys()],
           userAgent: request.headers["user-agent"],
           npmCommand: request.headers["npm-command"],
           npmSession: request.headers["npm-session"],
