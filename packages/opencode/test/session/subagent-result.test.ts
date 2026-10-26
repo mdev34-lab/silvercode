@@ -1,9 +1,11 @@
 import { describe, expect, test } from "bun:test"
 import type { SessionV1 } from "@opencode-ai/core/v1/session"
-import { resultChunks, textResult, renderTextResult } from "../../src/session/subagent-result"
+import { continuesPrompt, resultChunks, textResult, renderTextResult } from "../../src/session/subagent-result"
 
 // Only the fields consumed by the collector are relevant to this pure boundary test.
 const user = (id: string) => ({ info: { id, role: "user" }, parts: [] }) as unknown as SessionV1.WithParts
+const nudge = (id: string) =>
+  ({ info: { id, role: "user" }, parts: [{ type: "text", text: "call finish now", synthetic: true }] }) as unknown as SessionV1.WithParts
 const assistant = (id: string, parentID: string, parts: unknown[]) =>
   ({ info: { id, role: "assistant", parentID }, parts }) as unknown as SessionV1.WithParts
 const text = (text: string) => ({ type: "text", text })
@@ -34,6 +36,21 @@ describe("subagent result execution boundary", () => {
     const last = assistant("03", "01", [text("Finished")])
     expect(textResult(resultChunks([user("01"), old, last], last))).toEqual({ ok: false })
   })
+  test("a finish nudge keeps the envelope written before it", () => {
+    const first = assistant("02", "01", [text(envelope)])
+    const last = assistant("04", "03", [text("")])
+    expect(textResult(resultChunks([user("01"), first, nudge("03"), last], last))).toEqual({ ok: true, text: plan })
+  })
+  test("a nudge chain stops at the original prompt, never an earlier one", () => {
+    const old = assistant("02", "01", [text(envelope)])
+    const last = assistant("06", "05", [text("")])
+    expect(textResult(resultChunks([user("01"), old, user("03"), nudge("05"), last], last))).toEqual({ ok: false })
+  })
+  test("a nudge after a completed finish does not resurrect the earlier result", () => {
+    const old = assistant("02", "01", [text(envelope), { type: "tool", tool: "finish", state: { status: "completed" } }])
+    const last = assistant("04", "03", [text("")])
+    expect(textResult(resultChunks([user("01"), old, nudge("03"), last], last))).toEqual({ ok: false })
+  })
   test("never promotes reasoning or tool output to a result", () => {
     const last = assistant("02", "01", [
       { type: "reasoning", text: envelope },
@@ -53,6 +70,21 @@ describe("subagent result execution boundary", () => {
     const first = assistant("02", "01", [text(envelope)])
     const last = assistant("03", "01", [text("")])
     expect(resultChunks([last, first, user("01")], last)).toEqual([envelope, ""])
+  })
+})
+
+describe("prompt continuation through finish nudges", () => {
+  test("a direct answer and a nudged answer both continue the prompt", () => {
+    const direct = assistant("02", "01", [text("a")])
+    expect(continuesPrompt([user("01"), direct], direct, "01")).toBe(true)
+    const nudged = assistant("04", "03", [text("b")])
+    expect(continuesPrompt([user("01"), assistant("02", "01", []), nudge("03"), nudged], nudged, "01")).toBe(true)
+  })
+  test("a real later prompt or an unrelated id is not a continuation", () => {
+    const last = assistant("04", "03", [text("b")])
+    expect(continuesPrompt([user("01"), user("03"), last], last, "01")).toBe(false)
+    expect(continuesPrompt([user("01"), nudge("03"), last], last, "99")).toBe(false)
+    expect(continuesPrompt([nudge("03"), last], last, "01")).toBe(false)
   })
 })
 
