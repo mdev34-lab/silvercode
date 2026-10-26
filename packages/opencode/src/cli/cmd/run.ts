@@ -858,8 +858,15 @@ export const RunCommand = effectCmd({
                 const wait = status.next - Date.now()
                 if (wait > RUN_RETRY_NOTICE_MS && status.attempt !== retryNoticed) {
                   retryNoticed = status.attempt
-                  const detail = status.message.length > 200 ? status.message.slice(0, 200) + "..." : status.message
-                  UI.println(`waiting about ${Math.ceil(wait / 1000)}s before retrying (attempt ${status.attempt}): ${detail}`)
+                  // A fixed category, never the provider's retry message: that text can carry raw
+                  // response bodies, URLs or control characters.
+                  const reason =
+                    status.action?.reason === "free_tier_limit"
+                      ? "free usage limit reached"
+                      : status.action?.reason === "account_rate_limit"
+                        ? "account rate limit"
+                        : "provider asked to retry later"
+                  UI.println(`waiting about ${Math.ceil(wait / 1000)}s before retrying (attempt ${status.attempt}): ${reason}`)
                 }
               }
             }

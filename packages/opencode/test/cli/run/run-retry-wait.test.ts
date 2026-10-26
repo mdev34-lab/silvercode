@@ -37,7 +37,8 @@ describe("headless run provider retry delay (#555)", () => {
       expect(result.exitCode).toBe(0)
       expect(result.stdout).toContain("recovered after the long wait")
       expect(result.stderr).toMatch(/waiting about \d+s before retrying \(attempt 1\)/)
-      expect(result.stderr).toContain("Free usage")
+      expect(result.stderr).toContain("free usage limit reached")
+      expect(result.stderr).not.toContain("quota_exceeded")
     }), 60_000)
 
   cliIt.live("announces a long retry-after that is not a free-tier quota too", ({ llm, opencode }) =>
@@ -52,7 +53,8 @@ describe("headless run provider retry delay (#555)", () => {
         timeoutMs: 40_000, extraArgs: ["--continue"], model: "opencode/local-quota-test", env,
       })
       expect(result.exitCode).toBe(0)
-      expect(result.stderr).toMatch(/waiting about \d+s before retrying/)
+      expect(result.stderr).toMatch(/waiting about \d+s before retrying \(attempt 1\): provider asked to retry later/)
+      expect(result.stderr).not.toContain("Too many requests")
     }), 60_000)
 
   cliIt.live("stays silent and still retries through a short provider delay", ({ llm, opencode }) =>
