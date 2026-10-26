@@ -1887,6 +1887,9 @@ const layer = Layer.effect(
       // a run has actually answered this caller's message; if a newer user
       // message overtook it and got answered instead, return the latest state
       // rather than spinning on a superseded prompt.
+      // A cancel that ends the run this caller joined must not be followed by a
+      // fresh run for the caller's queued message: cancel releases queued callers.
+      const epoch = yield* state.cancelEpoch(input.sessionID)
       while (true) {
         const result = yield* state.ensureRunning(
           input.sessionID,
@@ -1902,7 +1905,10 @@ const layer = Layer.effect(
         if (!msgs) return result
         const ours = msgs.findIndex((msg) => msg.info.id === input.messageID)
         const newerUser = msgs.slice(ours + 1).find((msg) => msg.info.role === "user")
-        if (!newerUser) continue
+        if (!newerUser) {
+          if ((yield* state.cancelEpoch(input.sessionID)) !== epoch) return result
+          continue
+        }
         const superseded = msgs.some((msg) => msg.info.role === "assistant" && msg.info.parentID === newerUser.info.id)
         if (superseded) return result
       }

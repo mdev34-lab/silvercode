@@ -5022,6 +5022,34 @@ it.instance(
 )
 
 it.instance(
+  "a prompt queued behind a run is not restarted after cancel (F2)",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Pinned" })
+      yield* llm.hang
+      const a = yield* prompt
+        .prompt({ sessionID: chat.id, agent: "work", model: ref, parts: [{ type: "text", text: "first" }] })
+        .pipe(Effect.forkChild)
+      yield* llm.wait(1)
+      const b = yield* prompt
+        .prompt({ sessionID: chat.id, agent: "work", model: ref, parts: [{ type: "text", text: "second" }] })
+        .pipe(Effect.forkChild)
+      yield* Effect.sleep(100)
+      yield* prompt.cancel(chat.id)
+      const [exitA, exitB] = yield* Effect.all([Fiber.await(a), Fiber.await(b)])
+      expect(Exit.isSuccess(exitA)).toBe(true)
+      expect(Exit.isSuccess(exitB)).toBe(true)
+      yield* Effect.sleep(300)
+      // Cancel must not be followed by a fresh provider call for the queued prompt.
+      expect(yield* llm.hits).toHaveLength(1)
+    }),
+  10_000,
+)
+
+it.instance(
   "queued prompts are released by cancel and the next prompt runs once",
   () =>
     Effect.gen(function* () {
