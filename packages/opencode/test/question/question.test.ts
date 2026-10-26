@@ -457,3 +457,29 @@ lifecycle.live("pending question rejects on instance reload", () =>
     if (Exit.isFailure(exit)) expect(Cause.squash(exit.cause)).toBeInstanceOf(Question.RejectedError)
   }),
 )
+
+// An ask abandoned by an abort never got an answer, but clients only drop a prompt on
+// `question.replied` or `question.rejected`; without the event the modal outlives the request.
+it.instance(
+  "ask - an aborted question is announced as rejected so clients drop the prompt",
+  () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2Bridge.Service
+      const rejected: string[] = []
+      const unsub = yield* events.listen((event) => {
+        if (event.type === Question.Event.Rejected.type) rejected.push((event.data as { requestID: string }).requestID)
+        return Effect.void
+      })
+      yield* Effect.addFinalizer(() => unsub)
+      const fiber = yield* askEffect({
+        sessionID: SessionID.make("ses_abort_announced"),
+        questions: [{ question: "Q?", header: "Q", options: [{ label: "a", description: "a" }] }],
+      }).pipe(Effect.forkScoped)
+      while ((yield* listEffect).length === 0) yield* Effect.sleep("10 millis")
+      const [pending] = yield* listEffect
+      yield* Fiber.interrupt(fiber)
+      while (rejected.length === 0) yield* Effect.sleep("10 millis")
+      expect(rejected).toEqual([pending.id])
+      expect(yield* listEffect).toHaveLength(0)
+    }).pipe(Effect.timeout("2 seconds")),
+)
