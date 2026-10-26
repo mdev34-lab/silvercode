@@ -2,7 +2,7 @@ import { ownerOrNone as workflowOwner, ancestry as workflowAncestry, route as wo
 import { WorkFlow } from "@opencode-ai/core/work-flow"
 import { sessionAgent } from "../session/session-agent"
 import * as Tool from "./tool"
-import { resultChunks, textResult, renderTextResult } from "@/session/subagent-result"
+import { continuesPrompt, resultChunks, textResult, renderTextResult } from "@/session/subagent-result"
 import { FinishTool, deliveredReason, readTermination, type Reason, type TerminationReason } from "@/tool/finish"
 import DESCRIPTION from "./task.txt"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
@@ -684,7 +684,7 @@ export const TaskTool = Tool.define(
           finish?.state.status === "completed" &&
             finish.state.input.reason === "success" &&
             result.info.role === "assistant" &&
-            result.info.parentID === promptID &&
+            continuesPrompt(transcript, result, promptID) &&
             result.info.agent === next.name &&
             result.info.sessionID === nextSession.id,
         )

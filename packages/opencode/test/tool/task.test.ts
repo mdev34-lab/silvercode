@@ -40,6 +40,7 @@ import { disposeAllInstances } from "../fixture/fixture"
 import { pollWithTimeout, testEffect } from "../lib/effect"
 import { ProjectV2 } from "@opencode-ai/core/project"
 import { ProviderV2 } from "@opencode-ai/core/provider"
+import FINISH_NUDGE from "../../src/session/prompt/finish-nudge.txt"
 import { ModelV2 } from "@opencode-ai/core/model"
 
 afterEach(async () => {
@@ -4249,6 +4250,27 @@ it.instance("programming persists a fresh successful Think delivery before permi
   const implemented=yield* def.execute({description:"implement",prompt:"implement plan",subagent_type:"code",background:false},ctx)
   expect(implemented.metadata.workFlow?.agent).toBe("code")
   expect(implemented.metadata.workFlow?.planned).toBe(true)
+}))
+
+it.instance("a Think delivery finished after a runner finish nudge still records the workflow stage", () => Effect.gen(function* () {
+  const {chat,assistant}=yield* seed()
+  const sessions=yield* Session.Service
+  const history=yield* sessions.messages({sessionID:chat.id})
+  const user=history.find((message)=>message.info.role === "user")!
+  yield* sessions.updatePart({id:PartID.ascending(),messageID:user.info.id,sessionID:chat.id,type:"text",text:"Fix the Python software bug"})
+  const ops=reviewRunOps(["<silvercode-result>Plan the implementation and tests.</silvercode-result>"], "done", "success")
+  // The child stopped without finish once, so the runner appended a synthetic nudge and the
+  // finishing assistant answers the nudge, not the prompt the task tool issued.
+  const nudged={...ops,prompt:(input:SessionPrompt.PromptInput)=>ops.prompt(input).pipe(Effect.flatMap((result)=>Effect.gen(function* () {
+    yield* sessions.updateMessage({id:input.messageID!,sessionID:input.sessionID,role:"user",agent:"think",model:ref,time:{created:Date.now()}})
+    yield* sessions.updatePart({id:PartID.ascending(),messageID:input.messageID!,sessionID:input.sessionID,type:"text",text:"plan"})
+    const nudge=yield* sessions.updateMessage({id:MessageID.ascending(),sessionID:input.sessionID,role:"user",agent:"think",model:ref,time:{created:Date.now()}})
+    yield* sessions.updatePart({id:PartID.ascending(),messageID:nudge.id,sessionID:input.sessionID,type:"text",text:FINISH_NUDGE,synthetic:true})
+    return {...result,info:{...result.info,id:MessageID.ascending(),parentID:nudge.id}}
+  })))}
+  const def=yield* (yield* TaskTool).init()
+  const planned=yield* def.execute({description:"plan",prompt:"plan",subagent_type:"think",background:false},{sessionID:chat.id,messageID:assistant.id,agent:"work",abort:new AbortController().signal,messages:[],metadata:()=>Effect.void,ask:()=>Effect.void,extra:{promptOps:nudged}})
+  expect(planned.metadata.workFlow?.agent).toBe("think")
 }))
 
 it.instance("uncertain root blocks every child including Review and permission-overridden Explore", () => Effect.gen(function* () {
