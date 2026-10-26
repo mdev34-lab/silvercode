@@ -2,7 +2,7 @@ End your turn by reporting the outcome. You MUST call this tool exactly once at 
 
 `reason`: `success` (work done, even if a background subagent is still running), `waiting_for_subagent` (nothing left to do while a background subagent you launched runs; a yielding subagent stays in flight until its own children report and it finishes), `subagent_wait` (progress depends on another subagent), or `failure`. `result`: concise summary. Silent protocol signal; do not announce it.
 
-Review: at medium and thorough effort, finish requires an explicit Approved review of that work from the Review subagent (dispatch it with `subagent_type: "review"` and `background: false`); at fast no review is required and the result is labelled unreviewed. Retrying finish does not skip review. Medium allows two passes, then the result is delivered as `budget-exhausted`, never as approval. Dispatches that cannot run end as `review-blocked`; a child's unreviewed handoff ends as `review-pending`.
+Review: at medium and thorough effort, an explicit Approved review of that work from the Review subagent is expected before finish (dispatch it with `subagent_type: "review"` and `background: false`); at fast no review is required and the result is labelled unreviewed. Without a clean current review finish still delivers, labelled UNREVIEWED and never approved; blocking findings from a Review that ran hold it back. Medium allows two passes, then the result is delivered as `budget-exhausted`, never as approval. Dispatches that cannot run end as `review-blocked`; a child's unreviewed handoff ends as `review-pending`.
 
 Optional `validation.checks` records evidence only; finish runs nothing. Open todos are cancelled on success, but still mark items completed as you go.
 

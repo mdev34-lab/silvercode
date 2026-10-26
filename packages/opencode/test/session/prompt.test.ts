@@ -5564,9 +5564,10 @@ withMcpTools.instance("an explicit permission deny still removes the MCP tool wh
  const tools=yield* SessionTools.resolve({agent:yield* agents.get("work"),model:yield* provider.getModel(ref.providerID,ref.modelID),session:chat,processor:{message:seeded.assistant,updateToolCall:()=>Effect.succeed(undefined),completeToolCall:()=>Effect.void,waitForOtherTools:()=>Effect.void},bypassAgentCheck:false,messages:yield* sessions.messages({sessionID:chat.id}),promptOps:{resolvePromptParts:()=>Effect.succeed([]),cancel:()=>Effect.void,prompt:()=>Effect.die("No child expected")}})
  const execute=tools.notes_search_notes?.execute
  yield* user(chat.id,"Implement API endpoint")
- if(execute){
-  const exit=yield* Effect.tryPromise(()=>execute({query:"private"},{toolCallId:"deny",messages:[],abortSignal:new AbortController().signal})).pipe(Effect.exit)
-  expect(Exit.isFailure(exit)).toBe(true)
- }
+ // The tool is offered; the deny is enforced at execution, whatever the classification.
+ expect(execute).toBeDefined()
+ const exit=yield* Effect.tryPromise(()=>execute!({query:"private"},{toolCallId:"deny",messages:[],abortSignal:new AbortController().signal})).pipe(Effect.exit)
+ expect(Exit.isFailure(exit)).toBe(true)
+ if(Exit.isFailure(exit)) expect(Cause.pretty(exit.cause).toLowerCase()).toMatch(/denied|deny|permission/)
 }))
 

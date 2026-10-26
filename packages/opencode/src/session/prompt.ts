@@ -121,11 +121,11 @@ const EFFORT_PROCESS: Record<AgentEffort.Level, string> = {
   ].join("\n\n"),
   medium: [
     "## Agent effort: medium (review passes: at most 2, validation gate: standard)",
-    'For work that changes files, finish requires at least one independent synchronous review (`subagent_type: "review"`, `background: false`) when a reviewer can run. Only blocking findings (Critical/Important, or a Needs-fixes report with no findings) or work landed after the last review need another pass, bounded by two; minor findings are logged. After the budget, finish delivers with an honest exhausted/findings-open status and repeated finish calls never skip a required review. Declare standard validation evidence (relevant tests) on finish.',
+    'For work that changes files, an independent synchronous review is expected before finish (without one, finish delivers the result labelled UNREVIEWED, never approved) (`subagent_type: "review"`, `background: false`) when a reviewer can run. Only blocking findings (Critical/Important, or a Needs-fixes report with no findings) or work landed after the last review need another pass, bounded by two; minor findings are logged. After the budget, finish delivers with an honest exhausted/findings-open status. A Review with blocking findings holds finish back until fixed. Declare standard validation evidence (relevant tests) on finish.',
   ].join("\n\n"),
   thorough: [
     "## Agent effort: thorough (review passes: until clean, validation gate: full)",
-    "Finish keeps declining until a clean, current independent review exists: fix blocking findings and re-review; any write after an approval needs a fresh pass. No pass cap. If the reviewer cannot run, only a declared failure delivers as review-blocked (a depth-limited child hands unreviewed writes to its parent as review-pending); neither is approval. Declare full validation evidence (tests, typecheck, parity as applicable) on finish.",
+    "Aim for a clean, current independent review: fix blocking findings and re-review; any write after an approval needs a fresh pass. No pass cap. Without one (or if the reviewer cannot run), finish delivers the result labelled UNREVIEWED, never approved; known blocking findings hold finish back until fixed. Declare full validation evidence (tests, typecheck, parity as applicable) on finish.",
   ].join("\n\n"),
 }
 

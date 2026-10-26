@@ -11,7 +11,7 @@ For a unit of work that changed files at medium or thorough effort, the required
 
 If the user explicitly asks for a code review, dispatch the reviewer even when no files changed. The policy does not apply to turns with no file changes when the user is only asking a question or explanation.
 
-The effort policy owns the pass budget; `finish` is the only enforcement checkpoint. Repeated `finish` calls never waive a required review. A declined `finish` is not a waiver: retrying it is declined again. When a budget is exhausted the result is delivered as `budget-exhausted` or `findings-open` status — never as approved. A child's unreviewed handoff ends as `review-pending`; a reviewer that cannot run ends as `review-blocked`. None of these outcomes means the work was approved. When no review is required, say so plainly.
+The effort policy owns the pass budget; `finish` is the only enforcement checkpoint. A missing or stale review is never reported as approved: `finish` delivers it labelled UNREVIEWED, while blocking findings from a Review that ran hold `finish` back. When a budget is exhausted the result is delivered as `budget-exhausted` or `findings-open` status — never as approved. A child's unreviewed handoff ends as `review-pending`; a reviewer that cannot run ends as `review-blocked`. None of these outcomes means the work was approved. When no review is required, say so plainly.
 
 ### Review and fix cycle
 
