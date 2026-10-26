@@ -21,6 +21,9 @@ import { InstanceStore } from "@/project/instance-store"
 import { InstanceBootstrap } from "@/project/bootstrap"
 import { MessageID, SessionID } from "../../src/session/schema"
 import { testEffect } from "../lib/effect"
+import { InstanceState } from "@/effect/instance-state"
+import fsp from "fs/promises"
+import nodePath from "path"
 
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
@@ -386,4 +389,33 @@ describe("living plan handoff for programming sessions", () => {
       expect(body).toContain(root.slug)
     }),
   )
+
+  const writePlan = (root: SessionNs.Info) =>
+    Effect.gen(function* () {
+      const ctx = yield* InstanceState.context
+      const file = SessionNs.plan(root, ctx)
+      yield* Effect.promise(async () => {
+        await fsp.mkdir(nodePath.dirname(file), { recursive: true })
+        await fsp.writeFile(file, "- [ ] step one\n")
+      })
+      return file
+    })
+
+  for (const [label, harnessIt] of [
+    ["default", itOff],
+    ["experimental", it],
+  ] as const)
+    harnessIt.instance(`${label}: an existing plan file gets the scratchpad guidance without a planning stamp`, () =>
+      Effect.gen(function* () {
+        const sessions = yield* SessionNs.Service
+        const root = yield* sessions.create({})
+        const file = yield* writePlan(root)
+        const request = yield* user(root.id)
+        // A non-programming delegated Think may write the file while the task
+        // result carries no workflow stamp; the file itself is the evidence.
+        const body = yield* run([request, assistantBy(root.id, "work")], work, root)
+        expect(body).toContain(`A plan file exists at ${file}`)
+        expect(body).not.toContain("does not exist yet")
+      }),
+    )
 })

@@ -166,19 +166,29 @@ export const apply = Effect.fn("SessionReminders.apply")(function* (input: {
   // delegation): a delegated Think ran as a child session, so the last
   // assistant message here is not Think's. Work still gets
   // the living-plan guidance, same as outside experimental plan mode.
-  if (input.agent.name === "work" && delegatedThink(input.messages, input.session.id)) {
+  if (input.agent.name === "work") {
     const plan = yield* rootPlan(input.session)
     if (Option.isSome(plan)) {
+      // An existing plan file is the run's scratchpad whoever wrote it, so its
+      // guidance does not depend on this request's planning proof; only the
+      // handoff (a plan that should exist) needs a stamped successful Think.
       const exists = yield* fsys.existsSafe(plan.value)
-      userMessage.parts.push({
-        id: PartID.ascending(),
-        messageID: userMessage.info.id,
-        sessionID: userMessage.info.sessionID,
-        type: "text",
-        text: exists ? scratchpad(plan.value) : planHandoff(plan.value),
-        synthetic: true,
-      })
-      return input.messages
+      const text = exists
+        ? scratchpad(plan.value)
+        : delegatedThink(input.messages, input.session.id)
+          ? planHandoff(plan.value)
+          : undefined
+      if (text !== undefined) {
+        userMessage.parts.push({
+          id: PartID.ascending(),
+          messageID: userMessage.info.id,
+          sessionID: userMessage.info.sessionID,
+          type: "text",
+          text,
+          synthetic: true,
+        })
+        return input.messages
+      }
     }
   }
 
