@@ -136,7 +136,7 @@ async function toolError(part: ToolPart) {
   }
 }
 
-/** Longest provider-requested retry delay a non-interactive run will wait for. */
+/** Longest retry delay a non-interactive run waits through after a free-tier quota rejection. */
 const RUN_MAX_RETRY_WAIT_MS = 120_000
 
 export const RunCommand = effectCmd({
@@ -851,11 +851,12 @@ export const RunCommand = effectCmd({
               rootIdle = event.properties.status.type === "idle"
               const status = event.properties.status
               if (status.type === "retry") {
-                // A headless run has no one to wait for a provider that asks for a long
-                // retry delay (for example a quota reset): fail fast with the provider
-                // message instead of sitting silent until killed (#555).
+                // A free-tier quota rejection is not a transient rate limit: waiting for its
+                // reset in a headless run only leaves it silent until killed (#555). Fail
+                // fast with the provider message. Other retryable errors, including
+                // account rate limits with a long retry-after, keep the normal retry wait.
                 const wait = status.next - Date.now()
-                if (wait > RUN_MAX_RETRY_WAIT_MS) {
+                if (status.action?.reason === "free_tier_limit" && wait > RUN_MAX_RETRY_WAIT_MS) {
                   const message = `${status.message} (provider asked to retry in ${Math.ceil(wait / 1000)}s; not waiting)`
                   error = error ? error + EOL + message : message
                   if (!emit("error", { error: { name: "RetryDelayTooLong", data: { message } } })) UI.error(message)

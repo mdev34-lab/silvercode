@@ -51,4 +51,19 @@ describe("headless run provider retry delay (#555)", () => {
       expect(result.stdout).toContain("recovered after retry")
       expect(result.stderr).not.toContain("not waiting")
     }), 60_000)
+
+  cliIt.live("keeps waiting on a long retry-after that is not a free-tier quota", ({ llm, opencode }) =>
+    Effect.gen(function* () {
+      const env = config(llm.url)
+      yield* llm.text("initial session response")
+      const first = yield* opencode.run("initial request", { timeoutMs: 20_000, model: "opencode/local-quota-test", env })
+      expect(first.exitCode).toBe(0)
+      yield* llm.error(429, { error: { message: "Too many requests, try again later", type: "rate_limit_error" } }, { "retry-after": "3600" })
+      const result = yield* opencode.run("rate limited", {
+        timeoutMs: 8_000, extraArgs: ["--continue"], model: "opencode/local-quota-test", env,
+      })
+      // Still inside the provider's requested wait when the harness stops it: not aborted by run.
+      expect(result.exitCode).not.toBe(1)
+      expect(result.stderr).not.toContain("not waiting")
+    }), 60_000)
 })
