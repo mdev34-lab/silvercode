@@ -367,6 +367,7 @@ describe("Config Dependency Install Integration with MockRegistry", () => {
 
       const { ctx } = await createProjectFixture(tmp.path, registry.url, npmCacheDir)
       const started: string[] = []
+      const startedAtMs: number[] = []
       const interrupted: string[] = []
       const slowStart = Layer.effect(
         Npm.Service,
@@ -375,7 +376,10 @@ describe("Config Dependency Install Integration with MockRegistry", () => {
           return Npm.Service.of({
             ...actual,
             install: (dir, input) =>
-              Effect.sync(() => started.push(dir)).pipe(
+              Effect.sync(() => {
+                started.push(dir)
+                startedAtMs.push(Date.now())
+              }).pipe(
                 // The total budget also covers work before the first HTTP request.
                 Effect.andThen(Effect.sleep("300 millis")),
                 Effect.andThen(actual.install(dir, input)),
@@ -415,7 +419,24 @@ describe("Config Dependency Install Integration with MockRegistry", () => {
       expect(elapsed).toBeLessThan(process.platform === "win32" ? 30_000 : 10_000)
       expect(started.length).toBeGreaterThan(0)
       expect(interrupted.sort()).toEqual(started.sort())
-      expect(registry.requests).toHaveLength(0)
+      // Same assertion, but a failure carries attribution data (no paths or
+      // secrets): each stray request's method, URL, selected client headers and
+      // time relative to this test's install starts and end, plus this
+      // registry's port. Attribution needs this, not just a count.
+      const endedAt = Date.now()
+      expect(
+        registry.requests.map((request) => ({
+          port: registry.port,
+          method: request.method,
+          url: request.url,
+          userAgent: request.headers["user-agent"],
+          npmCommand: request.headers["npm-command"],
+          npmSession: request.headers["npm-session"],
+          msAfterFirstInstallStart: request.timestamp - (startedAtMs[0] ?? startedAt),
+          msBeforeTestEnd: endedAt - request.timestamp,
+          installStartsSeen: startedAtMs.length,
+        })),
+      ).toEqual([])
       // The bound expiry is reported as a timeout, not as an install failure.
       expect(logs.some((message) => message.includes("background dependency install timed out"))).toBe(true)
       expect(logs.some((message) => message.includes("background dependency install failed"))).toBe(false)
