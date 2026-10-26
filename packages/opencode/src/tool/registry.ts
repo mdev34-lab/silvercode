@@ -398,21 +398,22 @@ const layer = Layer.effect(
                 const current = ownedRole
                   ? yield* workRoute(ctx.sessionID).pipe(Effect.provideService(Session.Service, sessions), Effect.orDie)
                   : undefined
+                const routeRestricted = ownedRole && current?.kind !== "nonprogramming"
+                const routeGuidance =
+                  current?.kind === "programming"
+                    ? "Programming is coordinator-only for Work and read-only for Think. Complete Think planning, then delegate implementation and commands to Code."
+                    : "Task intent is uncertain. Inspect read-only or ask whether this is programming or non-programming before execution; only the user's request can select the route."
                 if (
-                  ownedRole &&
-                  current?.kind !== "nonprogramming" &&
+                  routeRestricted &&
                   !reportsInvalidCall(tool) &&
                   (!known.builtin.includes(tool) || !WorkFlow.inspectionTool(tool.id))
                 )
-                  return yield* Effect.fail(
-                    new ToolFailure({
-                      message:
-                        current?.kind === "programming"
-                          ? "Programming is coordinator-only for Work and read-only for Think. Complete Think planning, then delegate implementation and commands to Code."
-                          : "Task intent is uncertain. Inspect read-only or ask whether this is programming or non-programming before execution; only the user's request can select the route.",
-                    }),
-                  )
-                return yield* tool.execute(args, ctx)
+                  return yield* Effect.fail(new ToolFailure({ message: routeGuidance }))
+                const result = yield* tool.execute(args, ctx)
+                // A call the route does not offer lands here: say why, so the model can recover.
+                if (routeRestricted && reportsInvalidCall(tool))
+                  return { ...result, output: `${result.output}\n\n${routeGuidance}` }
+                return result
               }),
             formatValidationError: tool.formatValidationError,
           }

@@ -733,6 +733,7 @@ it.instance("an uncertain or programming Work route keeps the invalid-call repor
       const ctx={sessionID:chat.id,messageID:user.id,agent:role,abort:new AbortController().signal,messages:[],metadata:()=>Effect.void,ask:()=>Effect.void} as never
       const out=yield* invalid!.execute({tool:"bash",error:"Model tried to call unavailable tool 'bash'."},ctx)
       expect(out.output).toContain("unavailable tool 'bash'")
+      expect(out.output).toContain(text === "Fix Python software" ? "delegate implementation and commands to Code" : "ask whether this is programming or non-programming")
     }
   }
 }))
