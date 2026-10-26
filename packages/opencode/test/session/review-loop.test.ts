@@ -168,7 +168,7 @@ describe("review loop prompt contract", () => {
     const prompt = await readPrompt("review-loop.txt")
 
     expect(prompt).toContain("`finish` is the only enforcement checkpoint")
-    expect(prompt).toContain("Repeated `finish` calls never waive a required review")
+    expect(prompt).toContain("A missing or stale review is never reported as approved")
     expect(prompt).not.toContain("Review is guidance, not an enforcement gate")
     expect(prompt).not.toContain("explicitly skip review")
     expect(prompt).not.toContain("Mandatory Review Loop")
@@ -180,7 +180,7 @@ describe("review loop prompt contract", () => {
     expect(nudge).toContain("explicit Approved review from the Review subagent")
     expect(nudge).toContain('`subagent_type: "review"` and `background: false`')
     expect(nudge).toContain("latest review returned `Needs fixes`")
-    expect(nudge).toContain("repeating `finish` does not skip it")
+    expect(nudge).toContain("labelled UNREVIEWED and is never approval")
     expect(nudge).not.toContain("review-cap")
   })
 
@@ -188,7 +188,7 @@ describe("review loop prompt contract", () => {
     const prompt = (await readPrompt("review-loop.txt")).replace(/\s+/g, " ")
 
     expect(prompt).toContain("Review is required before finishing file-writing work.")
-    expect(prompt).toContain("A declined `finish` is not a waiver: retrying it is declined again")
+    expect(prompt).toContain("`finish` delivers it labelled UNREVIEWED")
     // #233 replaced the runtime waiver with three outcomes, none of which is a
     // skip: the attempt cap, a child's unreviewed handoff, and a blocked
     // dispatch that only an honest failure may report.
@@ -207,7 +207,7 @@ describe("review loop prompt contract", () => {
     expect(nudge).toContain("explicit Approved review from the Review subagent")
     expect(nudge).toContain('`subagent_type: "review"` and `background: false`')
     expect(nudge).toContain("latest review returned `Needs fixes`")
-    expect(nudge).toContain("calling `finish` again without running the Review subagent is declined again")
+    expect(nudge).toContain("a Review that returned blocking findings holds `finish` back")
     expect(nudge).toContain("budget-exhausted")
     expect(nudge).not.toMatch(/explicitly skip review|strongly recommended/)
   })
@@ -215,9 +215,9 @@ describe("review loop prompt contract", () => {
   test("the finish tool description states the requirement and offers no skip path", async () => {
     const description = (await readTool("finish.txt")).replace(/\s+/g, " ")
 
-    expect(description).toContain("finish requires an explicit Approved review of that work from the Review subagent")
+    expect(description).toContain("an explicit Approved review of that work from the Review subagent is expected before finish")
     expect(description).toContain('`subagent_type: "review"` and `background: false`')
-    expect(description).toContain("Retrying finish does not skip review")
+    expect(description).toContain("labelled UNREVIEWED and never approved")
     expect(description).toContain("`budget-exhausted`")
     // #233: the waiver is gone from the tool description too. A dispatch that
     // cannot run blocks success and only an honest failure may report it.

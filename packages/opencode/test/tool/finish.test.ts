@@ -146,17 +146,18 @@ const declineOf = Effect.fn("FinishTest.declineOf")(function* (
   const tool = yield* FinishTool
   const def = yield* tool.init()
   const recorded: Record<string, unknown>[] = []
-  const failure = reviewFailure(
-    yield* def
-      .execute(
-        input,
-        workCtx(sessionID, messageID, (value) => {
-          recorded.push(value.metadata ?? {})
-          return Effect.void
-        }),
-      )
-      .pipe(Effect.exit),
-  )
+  const exit = yield* def
+    .execute(
+      input,
+      workCtx(sessionID, messageID, (value) => {
+        recorded.push(value.metadata ?? {})
+        return Effect.void
+      }),
+    )
+    .pipe(Effect.exit)
+  // A softened (UNREVIEWED) delivery carries its review metadata on the result.
+  if (Exit.isSuccess(exit)) recorded.push((exit.value as { metadata?: Record<string, unknown> }).metadata ?? {})
+  const failure = reviewFailure(exit)
   return { message: failure?.message ?? "", metadata: recorded.at(-1) ?? {}, recorded }
 })
 
@@ -169,7 +170,7 @@ const addReview = (sessionID: SessionID, messageID: MessageID, assessment: "Appr
 // waiver: a retried finish - whatever its result says about the work - is
 // declined again until a review approves the current work.
 describe("tool.finish – review requirement", () => {
-  it.instance("declines a finish for unreviewed file writes and names the Review subagent", () =>
+  it.instance("delivers a finish for unreviewed file writes as UNREVIEWED and names the Review subagent", () =>
     Effect.gen(function* () {
       const { chat, assistant } = yield* seedSession()
       yield* addToolPart(chat.id, assistant.id, "edit")
@@ -187,34 +188,21 @@ describe("tool.finish – review requirement", () => {
           )
           .pipe(Effect.exit)
 
-      expect(Exit.isFailure(exit)).toBe(true)
-      if (!Exit.isFailure(exit)) return
-      const failure = exit.cause.reasons.find(Cause.isFailReason)?.error
-      expect(failure).toBeInstanceOf(ToolFailure)
-      if (!(failure instanceof ToolFailure)) return
+      expect(Exit.isSuccess(exit)).toBe(true)
+      if (!Exit.isSuccess(exit)) return
+      const failure = { message: exit.value.output }
+      expect(failure.message).toContain("UNREVIEWED")
       expect(failure.message).toContain("requires at least one independent review")
       expect(failure.message).toContain('subagent_type: "review"')
       // The old skip-on-repeat hint is gone: repeating finish is never the way out.
       expect(failure.message).not.toContain("skip")
-      expect(recorded).toEqual([
-        {
-          review: {
-            nudged: true,
-            effort: "medium",
-            disposition: "unreviewed",
-            verdict: "pending",
-            reviews: 0,
-            maxIterations: 2,
-            openFindings: 0,
-            blockingFindings: 0,
-            workSinceReview: true,
-          },
-        },
-      ])
+      expect(recorded).toEqual([])
+      expect(exit.value.metadata.review).toMatchObject({ disposition: "unreviewed" })
+      expect(exit.value.metadata.review).not.toMatchObject({ termination: "approved" })
     }),
   )
 
-  it.instance("declines a repeated finish call too: the persisted nudge is not a skip path", () =>
+  it.instance("a repeated finish call is delivered UNREVIEWED again, never approved", () =>
     Effect.gen(function* () {
       const { chat, assistant } = yield* seedSession()
       yield* addToolPart(chat.id, assistant.id, "edit")
@@ -264,11 +252,11 @@ describe("tool.finish – review requirement", () => {
         )
         .pipe(Effect.exit)
 
-      expect(Exit.isFailure(exit)).toBe(true)
-      if (!Exit.isFailure(exit)) return
-      const failure = exit.cause.reasons.find(Cause.isFailReason)?.error
-      expect(failure).toBeInstanceOf(ToolFailure)
-      if (!(failure instanceof ToolFailure)) return
+      expect(Exit.isSuccess(exit)).toBe(true)
+      if (!Exit.isSuccess(exit)) return
+      const failure = { message: exit.value.output }
+      expect(failure.message).toContain("UNREVIEWED")
+      expect(exit.value.metadata.review).not.toMatchObject({ termination: "approved" })
       expect(failure.message).toContain("requires at least one independent review")
       expect(failure.message).not.toContain("skip")
     }),
@@ -313,7 +301,7 @@ describe("tool.finish – review requirement", () => {
 
   // Every reason except a yield is a delivery, and a failed attempt still
   // leaves its writes behind, so a failure cannot be used to step around review.
-  it.instance("declines a failure finish for unreviewed file writes too", () =>
+  it.instance("a failure finish for unreviewed file writes is delivered too, labelled UNREVIEWED", () =>
     Effect.gen(function* () {
       const { chat, assistant } = yield* seedSession()
       yield* addToolPart(chat.id, assistant.id, "edit")
@@ -1217,7 +1205,14 @@ const reviewCtx = (sessionID: SessionID, messageID: MessageID) => ({
   ask: () => Effect.void,
 })
 
+// A missing, stale or unavailable review no longer declines: it delivers with an UNREVIEWED note
+// carrying the same guidance. This returns that note in `message` so the guidance stays asserted.
 const reviewFailure = (exit: Exit.Exit<unknown, unknown>) => {
+  if (Exit.isSuccess(exit)) {
+    const output = (exit.value as { output: string }).output
+    expect(output).toContain("UNREVIEWED")
+    return { message: output } as unknown as ToolFailure
+  }
   expect(Exit.isFailure(exit)).toBe(true)
   if (!Exit.isFailure(exit)) return undefined
   const failure = exit.cause.reasons.find(Cause.isFailReason)?.error
@@ -1756,7 +1751,7 @@ describe("tool.finish – stale approval after later work and an errored attempt
   )
 
   it.instance(
-    "thorough: declines again, never delivered as approved",
+    "thorough: delivered UNREVIEWED again, never as approved",
     () =>
       Effect.gen(function* () {
         const { chat, assistant } = yield* seedSession()
@@ -1870,7 +1865,7 @@ it.instance("a subagent can correct a rejected malformed result through finish.r
   }),
 )
 
-it.instance("programming Work cannot claim success without delivered Think then Code, but may report failure", () =>
+it.instance("programming Work success without Think and Code is allowed, with a truthful workflow note", () =>
   Effect.gen(function* () {
     const { chat, assistant } = yield* seedSession()
     const sessions = yield* Session.Service
@@ -1887,7 +1882,8 @@ it.instance("programming Work cannot claim success without delivered Think then 
     const blocked = yield* def
       .execute({ reason: "success", result: "done" }, workCtx(chat.id, assistant.id))
       .pipe(Effect.exit)
-    expect(Exit.isFailure(blocked)).toBe(true)
+    expect(Exit.isSuccess(blocked)).toBe(true)
+    if (Exit.isSuccess(blocked)) expect(blocked.value.output).toContain("Workflow status (not blocking)")
     const failed = yield* def.execute(
       { reason: "failure", result: "Could not implement" },
       workCtx(chat.id, assistant.id),
@@ -1896,7 +1892,7 @@ it.instance("programming Work cannot claim success without delivered Think then 
   }),
 )
 
-it.instance("non-programming fast work stays manual while thorough requires General", () => Effect.gen(function* () {
+it.instance("non-programming thorough work without General finishes with a workflow note", () => Effect.gen(function* () {
   const {chat,assistant}=yield* seedSession()
   const sessions=yield* Session.Service
   const messages=yield* sessions.messages({sessionID:chat.id})
@@ -1908,14 +1904,15 @@ it.instance("non-programming fast work stays manual while thorough requires Gene
   const cfg=yield* Config.Service
   yield* cfg.update({agent:{effort:"thorough"}})
   const blocked=yield* def.execute({reason:"success",result:"done"},workCtx(chat.id,assistant.id)).pipe(Effect.exit)
-  expect(Exit.isFailure(blocked)).toBe(true)
+  expect(Exit.isSuccess(blocked)).toBe(true)
+  if (Exit.isSuccess(blocked)) expect(blocked.value.output).toContain("no successful General delivery")
   yield* sessions.setMetadata({sessionID:chat.id,metadata:withAgentEffort({},"fast")})
   yield* cfg.update({agent:{effort:"fast"}})
   const manual=yield* def.execute({reason:"success",result:"Hotels researched"},workCtx(chat.id,assistant.id))
   expect(manual.metadata.termination?.reason).toBe("success")
 }))
 
-it.instance("programming fast cannot bypass missing, blocking or stale Review after valid stages", () => Effect.gen(function* () {
+it.instance("programming fast: missing or stale Review is a note, blocking findings still refuse", () => Effect.gen(function* () {
   const {chat,assistant}=yield* seedSession()
   const sessions=yield* Session.Service
   const messages=yield* sessions.messages({sessionID:chat.id})
@@ -1925,13 +1922,17 @@ it.instance("programming fast cannot bypass missing, blocking or stale Review af
   for (const agent of ["think","code"]) yield* sessions.updatePart({id:PartID.ascending(),messageID:assistant.id,sessionID:chat.id,type:"tool",tool:"task",callID:agent,state:{status:"completed",input:{subagent_type:agent},output:"delivered",title:agent,time:{start:Date.now(),end:Date.now()},metadata:{background:false,workFlow:{agent,terminal:"success",planned:agent==="code",requestID:user.info.id,parentID:chat.id}}}})
   const def=yield* (yield* FinishTool).init()
   const finish=()=>def.execute({reason:"success",result:"done"},workCtx(chat.id,assistant.id)).pipe(Effect.exit)
-  expect(Exit.isFailure(yield* finish())).toBe(true)
+  const unreviewed=yield* finish()
+  expect(Exit.isSuccess(unreviewed)).toBe(true)
+  if (Exit.isSuccess(unreviewed)) expect(unreviewed.value.output).toContain("treat it as unreviewed")
   yield* addReview(chat.id,assistant.id,"Needs fixes")
   expect(Exit.isFailure(yield* finish())).toBe(true)
   yield* addReview(chat.id,assistant.id,"Approved")
   expect(Exit.isSuccess(yield* finish())).toBe(true)
   yield* addToolPart(chat.id,assistant.id,"edit")
-  expect(Exit.isFailure(yield* finish())).toBe(true)
+  const stale=yield* finish()
+  expect(Exit.isSuccess(stale)).toBe(true)
+  if (Exit.isSuccess(stale)) expect(stale.value.output).toContain("work after the last review")
 }))
 
 it.instance("uncertain read-only Work can finish without forcing a scope question", () => Effect.gen(function* () {

@@ -423,10 +423,10 @@ it.instance(
       expect(body).toContain("the required next step is review, not completion")
       expect(body).toContain("explicitly asks for a code review")
 
-      // Review is a requirement (#231): a declined finish is not a waiver, and
-      // the policy no longer offers a second finish as a way to skip it.
+      // Review is expected before finishing file-writing work; without one the result is delivered
+      // labelled UNREVIEWED, never approved.
       expect(body).toContain("Review is required before finishing file-writing work.")
-      expect(body).toContain("A declined `finish` is not a waiver")
+      expect(body).toContain("`finish` delivers it labelled UNREVIEWED")
       expect(body).not.toContain("explicitly skip review")
 
       // The carve-out: trivial turns with no file changes must not be reviewed.
@@ -746,7 +746,7 @@ it.instance(
 )
 
 // No reviewer opt-in in these configs. Exercise the real model/tool pipeline,
-// including a failed premature finish, routing, report delivery, and approval.
+// routing, report delivery, and approval.
 for (const [parent, reviewer] of [
   ["work", "review"],
   ["code", "review"],
@@ -772,7 +772,6 @@ for (const [parent, reviewer] of [
             parentMatch,
             reply().tool("write", { filePath: path.join(dir, "result.txt"), content: "verified work" }),
           )
-          yield* llm.pushMatch(parentMatch, reply().tool("finish", { reason: "success", result: "premature" }))
           yield* llm.pushMatch(
             parentMatch,
             reply().tool("task", { description: "Review file", subagent_type: "review", prompt: "Review result.txt" }),
@@ -801,7 +800,7 @@ for (const [parent, reviewer] of [
             }
           } else expect(tools.find((part) => part.tool === "write")?.state.status).toBe("completed")
           const finishes = tools.filter((part) => part.tool === "finish")
-          expect(finishes.map((part) => part.state.status)).toEqual(["error", "completed"])
+          expect(finishes.map((part) => part.state.status)).toEqual(["completed"])
           const task = tools.find((part) => part.tool === "task" && part.state.input.subagent_type === "review")
           expect(task?.state.status).toBe("completed")
           if (task?.state.status !== "completed") return
