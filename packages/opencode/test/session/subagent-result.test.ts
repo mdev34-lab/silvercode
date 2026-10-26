@@ -121,6 +121,14 @@ describe("prompt continuation boundaries", () => {
     const fresh = assistant("02", "01", [text("a")])
     expect(continuesPrompt([user("01"), fresh], fresh, "01")).toBe(true)
   })
+  test("a missing prompt with a known completed finish after it is not a continuation", () => {
+    const old = assistant("02", "01", [text(envelope), done])
+    const last = assistant("03", "01", [text("b"), done])
+    expect(continuesPrompt([old, last], last, "01")).toBe(false)
+    expect(continuesPrompt([last], last, "01")).toBe(true)
+    // a finish before the (absent) prompt's id is not after it
+    expect(continuesPrompt([assistant("00", "x", [done]), last], last, "01")).toBe(true)
+  })
   test("a parent that sorts after the assistant is not a continuation", () => {
     const last = assistant("02", "03", [text("b")])
     expect(continuesPrompt([user("01"), last, nudge("03")], last, "01")).toBe(false)

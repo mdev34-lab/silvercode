@@ -49,26 +49,27 @@ const order = (messages: readonly SessionV1.WithParts[], current: SessionV1.With
     a.info.id.localeCompare(b.info.id),
   )
 
-/** True when the current assistant answers `promptID` directly or through runner nudges that continue it. */
+/**
+ * True when the current assistant answers `promptID` directly or through runner nudges that continue it.
+ * The messages between the prompt and the assistant must hold no real user message and no completed
+ * finish. When the transcript lacks the prompt (minimal fixture), the same two rules apply to every
+ * message after `promptID`; an empty history is a direct match.
+ */
 export function continuesPrompt(messages: readonly SessionV1.WithParts[], current: SessionV1.WithParts, promptID: string) {
   if (current.info.role !== "assistant") return false
   const ordered = order(messages, current)
-  const parentID = current.info.parentID
-  if (parentID === promptID && !ordered.some((message) => message.info.id === promptID)) {
-    // The prompt itself is missing from the transcript (minimal fixture): it is a direct match only
-    // while no real user message after it is present.
-    const end = ordered.findIndex((message) => message.info.id === current.info.id)
-    return !ordered
-      .slice(0, end)
-      .some((message) => message.info.role === "user" && !isNudge(message) && message.info.id > promptID)
-  }
-  const anchors = anchorsOf(ordered, current)
-  if (!anchors) return false
-  const start = anchors[anchors.length - 1]!
   const end = ordered.findIndex((message) => message.info.id === current.info.id)
-  // A completed finish ended the execution: nothing after it, nudged or not, continues the prompt.
-  if (ordered.slice(start + 1, end).some(finished)) return false
-  return anchors.some((at) => ordered[at]!.info.id === promptID)
+  let between: readonly SessionV1.WithParts[]
+  if (ordered.some((message) => message.info.id === promptID)) {
+    const anchors = anchorsOf(ordered, current)
+    const found = anchors?.find((at) => ordered[at]!.info.id === promptID)
+    if (!anchors || found === undefined) return false
+    between = ordered.slice(anchors[anchors.length - 1]! + 1, end)
+  } else {
+    if (current.info.parentID !== promptID) return false
+    between = ordered.slice(0, end).filter((message) => message.info.id > promptID)
+  }
+  return !between.some((message) => (message.info.role === "user" && !isNudge(message)) || finished(message))
 }
 
 /** Visible assistant text from this prompt execution, never reasoning or tool output. */
