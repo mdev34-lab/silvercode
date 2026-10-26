@@ -10,11 +10,12 @@ const isNudge = (message: SessionV1.WithParts) =>
 /** True when the current assistant answers `promptID` directly or through runner nudges that continue it. */
 export function continuesPrompt(messages: readonly SessionV1.WithParts[], current: SessionV1.WithParts, promptID: string) {
   if (current.info.role !== "assistant") return false
-  if (current.info.parentID === promptID) return true
+  const parentID = current.info.parentID
+  if (parentID === promptID) return true
   const ordered = [...messages.filter((message) => message.info.id !== current.info.id), current].sort((a, b) =>
     a.info.id.localeCompare(b.info.id),
   )
-  let at = ordered.findIndex((message) => message.info.id === current.info.parentID && message.info.role === "user")
+  let at = ordered.findIndex((message) => message.info.id === parentID && message.info.role === "user")
   while (at >= 0) {
     if (ordered[at]!.info.id === promptID) return true
     if (!isNudge(ordered[at]!)) return false
@@ -33,7 +34,8 @@ export function resultChunks(messages: readonly SessionV1.WithParts[], current: 
   // A runner nudge (finish reminder) is a synthetic-only user message, so a nudged turn's parent is
   // the nudge, not the prompt it continues. Treat the nudge chain as one execution anchored at the
   // original prompt, otherwise the envelope written before the nudge is dropped.
-  let start = ordered.findIndex((message) => message.info.id === current.info.parentID && message.info.role === "user")
+  const parentID = current.info.parentID
+  let start = ordered.findIndex((message) => message.info.id === parentID && message.info.role === "user")
   if (start < 0) return current.parts.flatMap((part) => (part.type === "text" && !part.ignored && !part.synthetic ? [part.text] : []))
   const anchors = new Set<string>([ordered[start]!.info.id])
   while (isNudge(ordered[start]!)) {
