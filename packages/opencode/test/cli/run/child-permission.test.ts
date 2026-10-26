@@ -12,10 +12,10 @@ import { testProviderConfig } from "../../lib/test-provider"
 // way as the root's, or the child waits forever.
 // Responses are keyed on the session (its first user message) and on how many tool results it has seen, so
 // each session gets its own script whatever the interleaving.
+const first = (body: any): string => JSON.stringify((body.messages ?? []).find((m: any) => m.role === "user") ?? "")
+const tools = (body: any): number => (body.messages ?? []).filter((m: any) => m.role === "tool").length
 const flow = (llm: any, envFile: string) =>
   Effect.gen(function* () {
-    const first = (body: any) => JSON.stringify((body.messages ?? []).find((m: any) => m.role === "user") ?? "")
-    const tools = (body: any) => (body.messages ?? []).filter((m: any) => m.role === "tool").length
     const session = (text: string, seen: number) => (hit: any) => first(hit.body).includes(text) && tools(hit.body) === seen
     yield* llm.pushMatch((hit: any) => JSON.stringify(hit.body).includes("Generate a title"), reply().text("Update calc").stop())
     yield* llm.pushMatch(
@@ -59,7 +59,10 @@ describe("headless run child permission requests", () => {
       const hits = (yield* llm.hits) as any[]
       if (Option.isNone(exited)) {
         run.interrupt()
-        yield* run.result
+        const killed = yield* run.result
+        // Evidence for a timeout: which scripted turns the model server saw, and what the process printed.
+        const turns = hits.map((hit: any) => `${first(hit.body).slice(0, 40)}|tools=${tools(hit.body)}`)
+        console.log("child-permission timeout evidence", JSON.stringify({ turns, stderr: String((killed as { stderr?: string }).stderr ?? "").slice(-1500) }))
       }
       const stderr = Option.isSome(exited) ? String((exited.value as { stderr?: string }).stderr ?? "") : ""
       return {
