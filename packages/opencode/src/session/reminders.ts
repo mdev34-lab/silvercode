@@ -15,7 +15,23 @@ import PLAN_MODE from "./prompt/plan-mode.txt"
 import { NotFoundError } from "@/storage/storage"
 
 const scratchpad = (plan: string) =>
-  `A plan file exists at ${plan}. Execute on the plan defined within it, and keep the file current as your scratchpad: check off each step when its verification passes, not in a batch later, and revise the remaining steps when reality diverges from the plan.`
+  `A plan file exists at ${plan}. Execute on the plan defined within it, and keep the file current as the run's scratchpad: a step is checked off when its verification passes, not in a batch later, and remaining steps are revised when reality diverges from the plan. If you hold an edit tool, do that yourself. If you cannot edit files (programming sessions), have each Code step tick its own steps and record discoveries there, and read the file before the next step to check progress.`
+
+const planHandoff = (plan: string) =>
+  `The session plan file belongs at ${plan} and does not exist yet. Have the first Code step create it from the planner's checklist (one verifiable \`- [ ]\` step per line), then keep it current as described: each Code step ticks its own steps and records discoveries, and you read it before the next step.`
+
+// A delegated Think runs as a child session, so the planner's reply is a task
+// tool result in this session rather than an assistant message from think.
+const delegatedThink = (messages: SessionV1.WithParts[]) =>
+  messages.some((msg) =>
+    msg.parts.some(
+      (part) =>
+        part.type === "tool" &&
+        part.tool === "task" &&
+        part.state.status === "completed" &&
+        AgentSchema.canonicalID(String((part.state.input as { subagent_type?: unknown } | undefined)?.subagent_type ?? "")) === "think",
+    ),
+  )
 
 // Plan files belong to the root session: a Think running as a delegated
 // subagent writes the same plan file its caller's session later reads.
@@ -29,7 +45,11 @@ export const walkToRoot = Effect.fn("SessionReminders.walkToRoot")(function* (
   session: Session.Info,
 ) {
   let root = session
+  const seen = new Set<string>([session.id])
   while (root.parentID) {
+    // A corrupt parent cycle has no true root: resolve to none instead of looping.
+    if (seen.has(root.parentID)) return Option.none<Session.Info>()
+    seen.add(root.parentID)
     const parent = yield* sessions
       .get(root.parentID)
       .pipe(Effect.catchIf(NotFoundError.isInstance, () => Effect.succeed(undefined)))
@@ -78,7 +98,7 @@ export const apply = Effect.fn("SessionReminders.apply")(function* (input: {
           messageID: userMessage.info.id,
           sessionID: userMessage.info.sessionID,
           type: "text",
-          text: `Write your plan at ${plan.value} with the write tool - create it if it does not exist, extend it if it does. Structure it as a checklist of one verifiable step per line (markdown \`- [ ]\` items) so the executor can check steps off as it works. End your reply with that exact path so the executor can find the file.`,
+          text: `Write your plan at ${plan.value} with the write tool if you have it - create it if it does not exist, extend it if it does. If you have no write tool, put the full plan in your reply instead and the implementer saves it to that path. Either way, structure it as a checklist of one verifiable step per line (markdown \`- [ ]\` items) so the executor can check steps off as it works, and end your reply with that exact path.`,
           synthetic: true,
         })
     }
@@ -95,6 +115,15 @@ export const apply = Effect.fn("SessionReminders.apply")(function* (input: {
           sessionID: userMessage.info.sessionID,
           type: "text",
           text: exists && Option.isSome(plan) ? `${WORK_SWITCH}\n\n${scratchpad(plan.value)}` : WORK_SWITCH,
+          synthetic: true,
+        })
+      } else if (!exists && Option.isSome(plan) && delegatedThink(input.messages)) {
+        userMessage.parts.push({
+          id: PartID.ascending(),
+          messageID: userMessage.info.id,
+          sessionID: userMessage.info.sessionID,
+          type: "text",
+          text: planHandoff(plan.value),
           synthetic: true,
         })
       } else if (exists && Option.isSome(plan)) {

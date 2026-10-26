@@ -78,6 +78,9 @@ export interface Interface {
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/SystemPrompt") {}
 
+const LIVING_PLAN =
+  "If a plan file exists for this session (the planner's reply names it, or a reminder gives its path), it is the run's living scratchpad: it is updated at milestones (completed steps, discoveries, revised remaining steps), never after every tool call, and never in a way that blocks the work itself. If you cannot edit files yourself, have the Code step that does the work tick its steps there and read the file before the next step."
+
 const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
