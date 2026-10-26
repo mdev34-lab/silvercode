@@ -156,9 +156,9 @@ const layer = Layer.effect(
         const work = yield* agents.get("work")
         if (work?.native === true && agent === work)
           return [
-            "Programming requests require completed Think planning before Code implementation, then a clean Review. Work cannot implement programming directly, including tiny edits.",
-            "Non-programming work must not go to Code. At fast effort, medium-sized work may be manual; complex or thorough work goes to General; medium effort balances direct work and General delegation.",
-            "When it is unclear whether a request changes software, carry on with the work (inspect, run commands, delegate to General); use the question tool only if the answer would change what you do. If it turns out to be programming, follow the Think, Code, Review workflow. Do not relabel programming to evade its workflow.",
+            "Programming requests are best done as Think planning, then Code implementation, then a clean Review. Prefer that route for programming, including small edits; you may do the work yourself when the route is not available or would not help, and say so.",
+            "Non-programming work should not go to Code. At fast effort, medium-sized work may be manual; complex or thorough work goes to General; medium effort balances direct work and General delegation.",
+            "When it is unclear whether a request changes software, carry on with the work (inspect, run commands, delegate); use the question tool only if the answer would change what you do. Do not relabel programming work to avoid its workflow.",
             "Failed, cancelled or pending children are not successful stage completion. A pass budget cannot excuse reporting success with blocking findings.",
           ].join("\n")
 

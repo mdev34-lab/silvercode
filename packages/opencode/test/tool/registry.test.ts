@@ -194,10 +194,8 @@ describe("tool.registry", () => {
         sessionID: orphan.id,
       })
       const ids = tools.map((tool) => tool.id)
-      // Unknown root is treated as uncertain: native Work stays inspection-only.
+      // Unknown root is not a permission boundary: tools stay available.
       expect(ids).toContain("read")
-      expect(ids).not.toContain("edit")
-      expect(ids).not.toContain("write")
       expect(ids).not.toContain("apply_patch")
     }),
   )
@@ -698,11 +696,11 @@ describe("tool.registry", () => {
   )
 })
 
-it.instance("programming Work and Think expose only native inspection tools, noncoding Work keeps commands", () => Effect.gen(function* () {
+it.instance("programming and non-programming Work keep the same tools (workflow is advisory)", () => Effect.gen(function* () {
   const sessions=yield* Session.Service
   const agents=yield* Agent.Service
   const registry=yield* ToolRegistry.Service
-  for (const [text,restricted] of [["Fix Python software",true],["Research hotels",false]] as const) {
+  for (const [text,restricted] of [["Fix Python software",false],["Research hotels",false]] as const) {
     const chat=yield* sessions.create({title:"admission"})
     const user=yield* sessions.updateMessage({id:MessageID.ascending(),role:"user",sessionID:chat.id,agent:"work",model:{providerID:ProviderV2.ID.make("test"),modelID:ModelV2.ID.make("test")},time:{created:Date.now()}})
     yield* sessions.updatePart({id:PartID.ascending(),messageID:user.id,sessionID:chat.id,type:"text",text})
@@ -716,7 +714,7 @@ it.instance("programming Work and Think expose only native inspection tools, non
   }
 }))
 
-it.instance("a programming Work route keeps the invalid-call reporter, with guidance, but no execution tools", () => Effect.gen(function* () {
+it.instance("a programming Work route keeps execution tools and the invalid-call reporter", () => Effect.gen(function* () {
   const sessions=yield* Session.Service
   const agents=yield* Agent.Service
   const registry=yield* ToolRegistry.Service
@@ -727,12 +725,10 @@ it.instance("a programming Work route keeps the invalid-call reporter, with guid
     const found=yield* registry.tools({sessionID:chat.id,agent:yield* agents.get(role),providerID:ProviderV2.ID.make("test"),modelID:ModelV2.ID.make("test")})
     const ids=found.map(tool=>tool.id)
     expect(ids.includes("invalid")).toBe(true)
-    expect(ids.includes("bash")).toBe(false)
-    expect(ids.includes("edit")).toBe(false)
+    expect(ids.includes("bash")).toBe(true)
     const ctx={sessionID:chat.id,messageID:user.id,agent:role,abort:new AbortController().signal,messages:[],metadata:()=>Effect.void,ask:()=>Effect.void} as never
     const out=yield* found.find(tool=>tool.id==="invalid")!.execute({tool:"bash",error:"Model tried to call unavailable tool 'bash'."},ctx)
     expect(out.output).toContain("unavailable tool 'bash'")
-    expect(out.output).toContain("delegate implementation and commands to Code")
   }
 }))
 

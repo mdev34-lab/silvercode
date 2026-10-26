@@ -4191,7 +4191,7 @@ it.instance("keeps the error name if an upstream child error has no data", () =>
   { config: FOREGROUND },
 )
 
-it.instance("programming cannot dispatch Code or Review before successful Think and Code", () =>
+it.instance("programming Code and Review before Think run with guidance, not a block", () =>
   Effect.gen(function* () {
     const { chat, assistant } = yield* seed()
     const sessions = yield* Session.Service
@@ -4229,8 +4229,10 @@ it.instance("programming cannot dispatch Code or Review before successful Think 
         )
         .pipe(Effect.exit)
       if (process.env.WORK_FLOW_CAPTURE && name === "code" && Exit.isFailure(exit)) yield* Effect.promise(()=>Bun.write("/tmp/wf-runtime-refusal.json",JSON.stringify({error:Cause.pretty(exit.cause), input:{subagent_type:name,description:"Implement requested fix",prompt:"Fix software"}})))
-    expect(Exit.isFailure(exit)).toBe(true)
-      expect(executed).toBe(false)
+    // Workflow order is guidance: the child runs and the model is advised.
+    if (name !== "review") expect(Exit.isSuccess(exit)).toBe(true)
+      expect(executed).toBe(true)
+      if (Exit.isSuccess(exit) && name !== "general") expect(exit.value.output).toContain("Workflow guidance (not blocking)")
     }
   }),
 )
@@ -4332,7 +4334,7 @@ it.instance("thorough non-programming General forces foreground and stamps succe
   expect(result.metadata.workFlow?.agent).toBe("general")
 }))
 
-it.instance("a custom agent renamed to think cannot satisfy native planning", () => Effect.gen(function* () {
+it.instance("a custom agent renamed to think runs with guidance", () => Effect.gen(function* () {
   const {chat,assistant}=yield* seed()
   const sessions=yield* Session.Service
   const history=yield* sessions.messages({sessionID:chat.id})
@@ -4341,8 +4343,8 @@ it.instance("a custom agent renamed to think cannot satisfy native planning", ()
   const def=yield* (yield* TaskTool).init()
   let ran=false
   const blocked=yield* def.execute({description:"counterfeit planner",prompt:"plan",subagent_type:"fake",background:false},{sessionID:chat.id,messageID:assistant.id,agent:"work",abort:new AbortController().signal,messages:[],metadata:()=>Effect.void,ask:()=>Effect.void,extra:{promptOps:stubOps({onPrompt:()=>{ran=true}})}}).pipe(Effect.exit)
-  expect(Exit.isFailure(blocked)).toBe(true)
-  expect(ran).toBe(false)
+  expect(Exit.isSuccess(blocked)).toBe(true)
+  expect(ran).toBe(true)
 }),{config:{agent:{fake:{name:"think",mode:"subagent"}}}})
 
 it.instance("programming Code returns to Work instead of recursively launching Review", () => Effect.gen(function* () {
@@ -4521,7 +4523,7 @@ it.instance("independent primary Code keeps its normal Review dispatch contract"
     { config: FOREGROUND },
   )
 
-it.instance("actual Task output truncation cannot authorize Code from a successful Think",()=>Effect.gen(function*(){
+it.instance("Code after a truncated Think output runs (guidance only)",()=>Effect.gen(function*(){
  const {chat,assistant}=yield* seed()
  const sessions=yield* Session.Service
  const history=yield* sessions.messages({sessionID:chat.id})
@@ -4533,5 +4535,5 @@ it.instance("actual Task output truncation cannot authorize Code from a successf
  expect(planned.metadata.truncated).toBe(true)
  yield* sessions.updatePart({id:PartID.ascending(),sessionID:chat.id,messageID:assistant.id,type:"tool",tool:"task",callID:"truncated-plan",state:{status:"completed",input:{subagent_type:"think"},output:planned.output,title:"plan",metadata:planned.metadata,time:{start:Date.now(),end:Date.now()}}})
  const blocked=yield* def.execute({description:"implement",prompt:"implement",subagent_type:"code",background:false},ctx).pipe(Effect.exit)
- expect(Exit.isFailure(blocked)).toBe(true)
+ expect(Exit.isSuccess(blocked)).toBe(true)
 }),{config:{tool_output:{max_bytes:300,max_lines:20}}})

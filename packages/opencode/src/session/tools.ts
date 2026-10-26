@@ -1,5 +1,3 @@
-import { WorkFlow } from "@opencode-ai/core/work-flow"
-import { route as workRoute } from "./work-flow"
 import { Agent } from "@/agent/agent"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Provider } from "@/provider/provider"
@@ -420,14 +418,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
     })
   }
 
-  const agents = yield* Agent.Service
-  const controlled =
-    input.agent.native === true &&
-    [yield* agents.get("work"), yield* agents.get("think")].some((agent) => agent === input.agent)
-  const admission = controlled
-    ? yield* workRoute(input.session.id).pipe(Effect.provideService(Session.Service, sessions), Effect.orDie)
-    : undefined
-  if ((controlled && admission !== undefined && WorkFlow.hardRoute(admission)) || flags.experimentalCodeMode) {
+  if (flags.experimentalCodeMode) {
     yield* catalog.sync(entries, toolSearch)
     return tools
   }
@@ -459,15 +450,6 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
       run.promise(
         Effect.gen(function* () {
           const ctx = context(args, opts)
-          if (
-            controlled &&
-            WorkFlow.hardRoute(yield* workRoute(input.session.id).pipe(Effect.provideService(Session.Service, sessions)))
-          )
-            return yield* Effect.die(
-              new Error(
-                "Task scope changed: Work and Think cannot execute MCP tools before programming routing or clarification.",
-              ),
-            )
           yield* plugin.trigger(
             "tool.execute.before",
             { tool: key, sessionID: ctx.sessionID, callID: opts.toolCallId },

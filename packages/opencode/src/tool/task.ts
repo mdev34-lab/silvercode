@@ -224,6 +224,9 @@ export const TaskTool = Tool.define(
     const run = Effect.fn("TaskTool.execute")(function* (
       params: Schema.Schema.Type<typeof Parameters>,
       ctx: Tool.Context,
+      // Workflow guidance for the model. It never stops the dispatch: only permissions and
+      // safety limits do. It is appended to the tool result.
+      advice: string[],
     ) {
       const cfg = yield* config.get()
 
@@ -332,64 +335,39 @@ export const TaskTool = Tool.define(
         : undefined
       const admission = yield* workRoute(ctx.sessionID).pipe(Effect.provideService(Session.Service, sessions))
       const foundOwner = yield* workflowOwner(ctx.sessionID).pipe(Effect.provideService(Session.Service, sessions))
+      // An unknown workflow root (a missing ancestor row) only means the workflow cannot be inherited.
+      const rootRole = Option.isSome(foundOwner) ? yield* sessionAgent(sessions, foundOwner.value) : undefined
+      const inheritedWorkflow = Option.isSome(foundOwner) && WorkFlow.ownsRole(allRoles, workIdentity, rootRole)
       if (Option.isNone(foundOwner))
-        return yield* Effect.fail(
-          new Error(
-            "Cannot dispatch a child: an ancestor session is missing from storage, so the workflow root is unknown.",
-          ),
-        )
-      const rootOwner = foundOwner.value
-      const rootRole = yield* sessionAgent(sessions, rootOwner)
-      const inheritedWorkflow = WorkFlow.ownsRole(allRoles, workIdentity, rootRole)
+        advice.push("The workflow root of this session is unknown (an ancestor session is missing), so workflow stages could not be checked.")
       const programming = coordinator && admission.kind === "programming"
       if (inheritedWorkflow && admission.kind === "programming" && !coordinator)
-        return yield* Effect.fail(
-          new Error(
-            "Programming stage children cannot delegate implementation or substitute workflow stages. Return the result to Work.",
-          ),
-        )
-      if (inheritedWorkflow && admission.kind === "uncertain" && admission.requestID === undefined)
-        return yield* Effect.fail(
-          new Error(
-            "Clarify programming or non-programming intent with the user before dispatching any child. Inspection may use the native read-only tools.",
-          ),
+        advice.push(
+          "Programming stage children should not delegate implementation or substitute workflow stages; return the result to Work.",
         )
       const planner = WorkFlow.ownsRole(allRoles, thinkIdentity, callerName) && admission.kind === "programming"
-      if (planner)
-        return yield* Effect.fail(
-          new Error("Programming Think must return a read-only plan, not delegate implementation."),
-        )
+      if (planner) advice.push("A programming Think should return a read-only plan rather than delegate implementation.")
       if (
         coordinator &&
-        WorkFlow.hardRoute(admission) &&
+        admission.kind === "programming" &&
         ![thinkIdentity, codeIdentity, yield* agent.get("review")].some(
           (item) => item?.native === true && item === next,
         )
       )
-        return yield* Effect.fail(
-          new Error(
-            "Programming or uncertain Work cannot bypass routing through an alternate child. Use Think/Code for programming or ask the user to clarify non-programming intent.",
-          ),
+        advice.push(
+          "For a programming request the preferred route is Think planning, then Code, then Review, rather than an alternate child.",
         )
-      if ((admission.kind === "nonprogramming" || WorkFlow.hardRoute(admission)) && admission.kind !== "programming" && next === codeIdentity)
-        return yield* Effect.fail(
-          new Error(
-            "Code is only for a programming request. Non-programming work stays manual or with General; clarify uncertain intent first.",
-          ),
-        )
+      if (admission.kind === "nonprogramming" && next === codeIdentity)
+        advice.push("Code is meant for programming requests; this request was classified as non-programming.")
       const workflow = coordinator
         ? WorkFlow.state(yield* sessions.messages({ sessionID: ctx.sessionID }), ctx.sessionID)
         : undefined
       const reviewIdentity = yield* agent.get("review")
       if (programming && next === reviewIdentity && !workflow?.implemented)
-        return yield* Effect.fail(
-          new Error("Programming Review follows successful Code implementation; it cannot replace Think or Code."),
-        )
+        advice.push("Programming Review is meant to follow a successful Code implementation; it does not replace Think or Code.")
       if (programming && codeIdentity?.native === true && next === codeIdentity && !workflow?.planned)
-        return yield* Effect.fail(
-          new Error(
-            "Work must complete a successful Think planning task in this request before dispatching Code. Delegate Think first; a pending, cancelled or failed plan is not sufficient.",
-          ),
+        advice.push(
+          "A successful Think planning task is expected in this request before Code. A pending, cancelled or failed plan does not count.",
         )
       const generalIdentity = yield* agent.get("general")
       const requiredGeneral =
@@ -1193,8 +1171,17 @@ export const TaskTool = Tool.define(
     return {
       description: [DESCRIPTION, BACKGROUND_DESCRIPTION].join("\n\n"),
       parameters: Parameters,
-      execute: (params: Schema.Schema.Type<typeof Parameters>, ctx: Tool.Context) =>
-        run(params, ctx).pipe(Effect.orDie),
+      execute: (params: Schema.Schema.Type<typeof Parameters>, ctx: Tool.Context) => {
+        const advice: string[] = []
+        return run(params, ctx, advice).pipe(
+          Effect.map((result) =>
+            advice.length === 0
+              ? result
+              : { ...result, output: `${result.output}\n\nWorkflow guidance (not blocking):\n- ${advice.join("\n- ")}` },
+          ),
+          Effect.orDie,
+        )
+      },
     }
   }),
 )
