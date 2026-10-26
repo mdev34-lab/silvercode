@@ -61,7 +61,7 @@ describe("headless run child permission requests", () => {
         run.interrupt()
         yield* run.result
       }
-      const stderr = Option.isSome(exited) ? exited.value.stderr : ""
+      const stderr = Option.isSome(exited) ? String((exited.value as { stderr?: string }).stderr ?? "") : ""
       return {
         exited: Option.isSome(exited),
         rejected: stderr.includes("permission requested: external_directory") && stderr.includes("auto-rejecting"),
