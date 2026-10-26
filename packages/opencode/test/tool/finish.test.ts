@@ -1870,7 +1870,7 @@ it.instance("a subagent can correct a rejected malformed result through finish.r
   }),
 )
 
-it.instance("programming Work cannot claim success without delivered Think then Code, but may report failure", () =>
+it.instance("programming Work success without Think and Code is allowed, with a truthful workflow note", () =>
   Effect.gen(function* () {
     const { chat, assistant } = yield* seedSession()
     const sessions = yield* Session.Service
@@ -1887,7 +1887,8 @@ it.instance("programming Work cannot claim success without delivered Think then 
     const blocked = yield* def
       .execute({ reason: "success", result: "done" }, workCtx(chat.id, assistant.id))
       .pipe(Effect.exit)
-    expect(Exit.isFailure(blocked)).toBe(true)
+    expect(Exit.isSuccess(blocked)).toBe(true)
+    if (Exit.isSuccess(blocked)) expect(blocked.value.output).toContain("Workflow status (not blocking)")
     const failed = yield* def.execute(
       { reason: "failure", result: "Could not implement" },
       workCtx(chat.id, assistant.id),
@@ -1896,7 +1897,7 @@ it.instance("programming Work cannot claim success without delivered Think then 
   }),
 )
 
-it.instance("non-programming fast work stays manual while thorough requires General", () => Effect.gen(function* () {
+it.instance("non-programming thorough work without General finishes with a workflow note", () => Effect.gen(function* () {
   const {chat,assistant}=yield* seedSession()
   const sessions=yield* Session.Service
   const messages=yield* sessions.messages({sessionID:chat.id})
@@ -1908,14 +1909,15 @@ it.instance("non-programming fast work stays manual while thorough requires Gene
   const cfg=yield* Config.Service
   yield* cfg.update({agent:{effort:"thorough"}})
   const blocked=yield* def.execute({reason:"success",result:"done"},workCtx(chat.id,assistant.id)).pipe(Effect.exit)
-  expect(Exit.isFailure(blocked)).toBe(true)
+  expect(Exit.isSuccess(blocked)).toBe(true)
+  if (Exit.isSuccess(blocked)) expect(blocked.value.output).toContain("no successful General delivery")
   yield* sessions.setMetadata({sessionID:chat.id,metadata:withAgentEffort({},"fast")})
   yield* cfg.update({agent:{effort:"fast"}})
   const manual=yield* def.execute({reason:"success",result:"Hotels researched"},workCtx(chat.id,assistant.id))
   expect(manual.metadata.termination?.reason).toBe("success")
 }))
 
-it.instance("programming fast cannot bypass missing, blocking or stale Review after valid stages", () => Effect.gen(function* () {
+it.instance("programming fast: missing or stale Review is a note, blocking findings still refuse", () => Effect.gen(function* () {
   const {chat,assistant}=yield* seedSession()
   const sessions=yield* Session.Service
   const messages=yield* sessions.messages({sessionID:chat.id})
@@ -1925,13 +1927,17 @@ it.instance("programming fast cannot bypass missing, blocking or stale Review af
   for (const agent of ["think","code"]) yield* sessions.updatePart({id:PartID.ascending(),messageID:assistant.id,sessionID:chat.id,type:"tool",tool:"task",callID:agent,state:{status:"completed",input:{subagent_type:agent},output:"delivered",title:agent,time:{start:Date.now(),end:Date.now()},metadata:{background:false,workFlow:{agent,terminal:"success",planned:agent==="code",requestID:user.info.id,parentID:chat.id}}}})
   const def=yield* (yield* FinishTool).init()
   const finish=()=>def.execute({reason:"success",result:"done"},workCtx(chat.id,assistant.id)).pipe(Effect.exit)
-  expect(Exit.isFailure(yield* finish())).toBe(true)
+  const unreviewed=yield* finish()
+  expect(Exit.isSuccess(unreviewed)).toBe(true)
+  if (Exit.isSuccess(unreviewed)) expect(unreviewed.value.output).toContain("treat it as unreviewed")
   yield* addReview(chat.id,assistant.id,"Needs fixes")
   expect(Exit.isFailure(yield* finish())).toBe(true)
   yield* addReview(chat.id,assistant.id,"Approved")
   expect(Exit.isSuccess(yield* finish())).toBe(true)
   yield* addToolPart(chat.id,assistant.id,"edit")
-  expect(Exit.isFailure(yield* finish())).toBe(true)
+  const stale=yield* finish()
+  expect(Exit.isSuccess(stale)).toBe(true)
+  if (Exit.isSuccess(stale)) expect(stale.value.output).toContain("work after the last review")
 }))
 
 it.instance("uncertain read-only Work can finish without forcing a scope question", () => Effect.gen(function* () {
