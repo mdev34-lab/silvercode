@@ -11,18 +11,24 @@ import type { SessionID } from "./schema"
  * dying, which would turn a storage gap into a ToolRegistry.tools defect.
  * A parent cycle is still a defect.
  */
-export const ownerOrNone = Effect.fn("WorkFlow.ownerOrNone")(function* (sessionID: SessionID) {
+export const ancestry = Effect.fn("WorkFlow.ancestry")(function* (sessionID: SessionID) {
   const sessions = yield* Session.Service
   const load = (id: SessionID) =>
     sessions.get(id).pipe(Effect.catchIf(NotFoundError.isInstance, () => Effect.succeed(undefined)))
   let owner = yield* load(sessionID)
+  let depth = 0
   const seen = new Set<string>()
   while (owner?.parentID) {
     if (seen.has(owner.id)) return yield* Effect.die(new Error("Cyclic workflow ancestry"))
     seen.add(owner.id)
+    depth++
     owner = yield* load(owner.parentID)
   }
-  return Option.fromNullishOr(owner)
+  return owner ? Option.some({ owner, depth }) : Option.none()
+})
+
+export const ownerOrNone = Effect.fn("WorkFlow.ownerOrNone")(function* (sessionID: SessionID) {
+  return Option.map(yield* ancestry(sessionID), (found) => found.owner)
 })
 
 /** Runtime-owned admission cache. Child arguments and model text never set it. */

@@ -1,8 +1,8 @@
 import { Session } from "@/session/session"
 import { WorkFlow } from "@opencode-ai/core/work-flow"
 import { Agent } from "@/agent/agent"
-import { route as workRoute, clarify as clarifyWorkRoute } from "@/session/work-flow"
-import { Effect, Schema } from "effect"
+import { route as workRoute, clarify as clarifyWorkRoute, ownerOrNone } from "@/session/work-flow"
+import { Effect, Option, Schema } from "effect"
 import * as Tool from "./tool"
 import { Question } from "../question"
 import DESCRIPTION from "./question.txt"
@@ -37,6 +37,14 @@ export const QuestionTool = Tool.define<
             ? yield* workRoute(ctx.sessionID).pipe(Effect.provideService(Session.Service, sessions))
             : undefined
           if (isWork && admission?.kind === "uncertain") {
+            // An unknown root cannot bind an answer: report it, never fake a clarification.
+            const root = yield* ownerOrNone(ctx.sessionID).pipe(Effect.provideService(Session.Service, sessions))
+            if (Option.isNone(root))
+              return yield* Effect.fail(
+                new Error(
+                  "Task scope cannot be clarified: an ancestor session is missing from storage, so the workflow root is unknown. Inspection only; report this to the user.",
+                ),
+              )
             const clarified = yield* clarifyWorkRoute(ctx.sessionID).pipe(
               Effect.provideService(Session.Service, sessions),
               Effect.provideService(Question.Service, question),

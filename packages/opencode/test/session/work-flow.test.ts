@@ -1,10 +1,10 @@
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { afterEach, expect } from "bun:test"
-import { Effect, Fiber } from "effect"
+import { Effect, Exit, Fiber } from "effect"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Session } from "@/session/session"
 import { Question } from "@/question"
-import { route, clarify } from "@/session/work-flow"
+import { route, clarify, ancestry } from "@/session/work-flow"
 import { MessageID, PartID, SessionID } from "@/session/schema"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { ProviderV2 } from "@opencode-ai/core/provider"
@@ -93,5 +93,19 @@ it.instance("a missing ancestor session stays uncertain instead of dying, and cl
     // Nothing can bind an answer without a known root, so no question is raised.
     expect((yield* clarify(child.id)).kind).toBe("uncertain")
     expect(yield* questions.list()).toEqual([])
+  }),
+)
+
+it.instance("an ancestry cycle is a defect, not a hang", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const a = yield* sessions.create({})
+    const b = yield* sessions.create({})
+    const view = {
+      ...sessions,
+      get: (id: typeof a.id) => Effect.succeed(id === b.id ? ({ ...b, parentID: a.id } as typeof b) : ({ ...a, parentID: b.id } as typeof a)),
+    } as unknown as Session.Interface
+    const exit = yield* ancestry(a.id).pipe(Effect.provideService(Session.Service, view), Effect.timeout("250 millis"), Effect.exit)
+    expect(Exit.isFailure(exit) && String(exit.cause)).toContain("Cyclic workflow ancestry")
   }),
 )

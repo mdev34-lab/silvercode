@@ -827,6 +827,38 @@ describe("tool.task", () => {
   )
 
   it.instance(
+    "an orphan session with a missing ancestor is refused with a clear error and creates no child",
+    () =>
+      Effect.gen(function* () {
+        const sessions = yield* Session.Service
+        const { assistant } = yield* seed()
+        const orphan = yield* sessions.create({ parentID: SessionID.make("ses_missing_ancestor") })
+        const before = (yield* sessions.children(orphan.id)).length
+        const tool = yield* TaskTool
+        const def = yield* tool.init()
+        const exit = yield* def
+          .execute(
+            { description: "inspect", prompt: "look", subagent_type: "reviewer" },
+            {
+              sessionID: orphan.id,
+              messageID: assistant.id,
+              agent: "work",
+              abort: new AbortController().signal,
+              extra: { promptOps: stubOps() },
+              messages: [],
+              metadata: () => Effect.void,
+              ask: () => Effect.void,
+            },
+          )
+          .pipe(Effect.exit)
+        expect(Exit.isFailure(exit)).toBe(true)
+        expect(Cause.pretty((exit as Exit.Failure<unknown, unknown>).cause)).toContain("ancestor session is missing")
+        expect((yield* sessions.children(orphan.id)).length).toBe(before)
+      }),
+    { config: { subagent_depth: 5 } },
+  )
+
+  it.instance(
     "execute shapes child permissions for task, todowrite, and primary tools",
     () =>
       Effect.gen(function* () {
