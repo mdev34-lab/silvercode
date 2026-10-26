@@ -13,6 +13,8 @@ export interface Interface {
   readonly cancel: (sessionID: SessionID) => Effect.Effect<void>
   readonly cancelForeground: (sessionID: SessionID) => Effect.Effect<void>
   readonly cancelBackground: (sessionID: SessionID) => Effect.Effect<void>
+  /** Counts foreground cancels of a session's active run; lets a queued caller tell it was cancelled. */
+  readonly cancelEpoch: (sessionID: SessionID) => Effect.Effect<number>
   readonly ensureRunning: (
     sessionID: SessionID,
     onInterrupt: Effect.Effect<SessionV1.WithParts>,
@@ -38,6 +40,7 @@ const layer = Layer.effect(
       Effect.fn("SessionRunState.state")(function* () {
         const scope = yield* Scope.Scope
         const runners = new Map<SessionID, Runner.Runner<SessionV1.WithParts>>()
+        const epochs = new Map<SessionID, number>()
         yield* Effect.addFinalizer(
           Effect.fnUntraced(function* () {
             yield* Effect.forEach(runners.values(), (runner) => runner.cancel, {
@@ -47,7 +50,7 @@ const layer = Layer.effect(
             runners.clear()
           }),
         )
-        return { runners, scope }
+        return { runners, epochs, scope }
       }),
     )
 
@@ -83,7 +86,13 @@ const layer = Layer.effect(
         yield* status.set(sessionID, { type: "idle" })
         return
       }
+      data.epochs.set(sessionID, (data.epochs.get(sessionID) ?? 0) + 1)
       yield* existing.cancel
+    })
+
+    const cancelEpoch = Effect.fn("SessionRunState.cancelEpoch")(function* (sessionID: SessionID) {
+      const data = yield* InstanceState.get(state)
+      return data.epochs.get(sessionID) ?? 0
     })
 
     const cancelBackground = Effect.fn("SessionRunState.cancelBackground")(function* (sessionID: SessionID) {
@@ -114,7 +123,7 @@ const layer = Layer.effect(
         .pipe(Effect.catchTag("RunnerBusy", () => Effect.fail(busyError(sessionID))))
     })
 
-    return Service.of({ assertNotBusy, cancel, cancelForeground, cancelBackground, ensureRunning, startShell })
+    return Service.of({ assertNotBusy, cancel, cancelForeground, cancelBackground, cancelEpoch, ensureRunning, startShell })
   }),
 )
 
