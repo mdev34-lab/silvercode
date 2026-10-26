@@ -26,9 +26,11 @@ const finished = (message: SessionV1.WithParts) =>
  * completed finish happened since: a nudge never follows a finish.
  */
 function anchorsOf(ordered: readonly SessionV1.WithParts[], current: SessionV1.WithParts) {
-  if (current.info.role !== "assistant") return undefined
-  const end = ordered.findIndex((message) => message.info.id === current.info.id)
-  let at = ordered.findIndex((message) => message.info.id === current.info.parentID && message.info.role === "user")
+  const info = current.info
+  if (info.role !== "assistant") return undefined
+  const parentID = info.parentID
+  const end = ordered.findIndex((message) => message.info.id === info.id)
+  let at = ordered.findIndex((message) => message.info.id === parentID && message.info.role === "user")
   if (at < 0 || at >= end) return undefined
   if (ordered.slice(at + 1, end).some((message) => message.info.role === "user")) return undefined
   const anchors: number[] = [at]
