@@ -169,6 +169,12 @@ const fillAssistantRows = Effect.fn("AgentEffortTest.fillAssistantRows")(functio
 // The medium/thorough block: a successful finish whose reviewer cannot run
 // fails the tool call with the typed `Review blocked (<code>)` message.
 const blockedMessage = (exit: Exit.Exit<unknown, unknown>) => {
+  // A missing or unavailable review delivers UNREVIEWED with the same guidance instead of declining.
+  if (Exit.isSuccess(exit)) {
+    const output = (exit.value as { output: string }).output
+    expect(output).toContain("UNREVIEWED")
+    return output
+  }
   expect(Exit.isFailure(exit)).toBe(true)
   if (!Exit.isFailure(exit)) return ""
   const failure = Cause.squash(exit.cause)
@@ -304,8 +310,11 @@ describe("tool.finish – effort-labelled delivery", () => {
       const gone = yield* missing
         .execute({ reason: "success", result: "done" }, finishContext(chat.id, assistant.id))
         .pipe(Effect.exit)
-      expect(Exit.isFailure(gone)).toBe(true)
-      if (Exit.isFailure(gone)) expect(String(Cause.squash(gone.cause))).toContain("session-unreadable")
+      expect(Exit.isSuccess(gone)).toBe(true)
+      if (Exit.isSuccess(gone)) {
+        expect(gone.value.output).toContain("UNREVIEWED")
+        expect(gone.value.output).toContain("session-unreadable")
+      }
 
       // A storage defect is not "no session": it must reach the caller intact.
       const sentinel = new Error("storage-defect-sentinel")
@@ -582,12 +591,12 @@ describe("tool.finish – availability uses the calling agent's dispatch ruleset
             },
           )
           .pipe(Effect.exit)
-        expect(Exit.isFailure(declined)).toBe(true)
-        if (!Exit.isFailure(declined)) return
-        expect(Cause.squash(declined.cause)).toBeInstanceOf(ToolFailure)
-        expect(attempts).toHaveLength(1)
-        expect(attempts[0]?.review).toMatchObject({ nudged: true, disposition: "unreviewed" })
-        expect("unavailableReason" in (attempts[0]?.review ?? {})).toBe(false)
+        // Delivered UNREVIEWED with the review guidance, never as approved.
+        expect(Exit.isSuccess(declined)).toBe(true)
+        if (!Exit.isSuccess(declined)) return
+        expect(declined.value.output).toContain("UNREVIEWED")
+        expect(declined.value.metadata.review).toMatchObject({ disposition: "unreviewed" })
+        expect(declined.value.metadata.review).not.toMatchObject({ termination: "approved" })
       }),
     { config: { agent: { review: { permission: { task: { "*": "deny" } } } } } },
   )
@@ -688,12 +697,12 @@ describe("tool.finish – availability uses the calling agent's dispatch ruleset
             },
           )
           .pipe(Effect.exit)
-        expect(Exit.isFailure(declined)).toBe(true)
-        if (!Exit.isFailure(declined)) return
-        expect(Cause.squash(declined.cause)).toBeInstanceOf(ToolFailure)
-        expect(attempts).toHaveLength(1)
-        expect(attempts[0]?.review).toMatchObject({ nudged: true, disposition: "unreviewed" })
-        expect("unavailableReason" in (attempts[0]?.review ?? {})).toBe(false)
+        // Delivered UNREVIEWED with the review guidance, never as approved.
+        expect(Exit.isSuccess(declined)).toBe(true)
+        if (!Exit.isSuccess(declined)) return
+        expect(declined.value.output).toContain("UNREVIEWED")
+        expect(declined.value.metadata.review).toMatchObject({ disposition: "unreviewed" })
+        expect(declined.value.metadata.review).not.toMatchObject({ termination: "approved" })
       }),
     30_000,
   )
@@ -828,12 +837,12 @@ describe("tool.finish – review dispatch permission parity with task dispatch",
             },
           )
           .pipe(Effect.exit)
-        expect(Exit.isFailure(declined)).toBe(true)
-        if (!Exit.isFailure(declined)) return
-        expect(Cause.squash(declined.cause)).toBeInstanceOf(ToolFailure)
-        expect(attempts).toHaveLength(1)
-        expect(attempts[0]?.review).toMatchObject({ nudged: true, disposition: "unreviewed" })
-        expect("unavailableReason" in (attempts[0]?.review ?? {})).toBe(false)
+        // Delivered UNREVIEWED with the review guidance, never as approved.
+        expect(Exit.isSuccess(declined)).toBe(true)
+        if (!Exit.isSuccess(declined)) return
+        expect(declined.value.output).toContain("UNREVIEWED")
+        expect(declined.value.metadata.review).toMatchObject({ disposition: "unreviewed" })
+        expect(declined.value.metadata.review).not.toMatchObject({ termination: "approved" })
       }),
     {
       config: {
@@ -967,10 +976,9 @@ describe("tool.finish – background child accounting", () => {
         const exit = yield* def
           .execute({ reason: "success", result: "done" }, finishContext(chat.id, assistant.id))
           .pipe(Effect.exit)
-        expect(Exit.isFailure(exit)).toBe(true)
-        if (!Exit.isFailure(exit)) return
-        const failure = exit.cause.reasons.find(Cause.isFailReason)?.error
-        expect(failure).toBeInstanceOf(ToolFailure)
+        expect(Exit.isSuccess(exit)).toBe(true)
+        if (!Exit.isSuccess(exit)) return
+        expect(exit.value.output).toContain("UNREVIEWED")
       }),
     { config: { agent: { effort: "medium" } } },
   )

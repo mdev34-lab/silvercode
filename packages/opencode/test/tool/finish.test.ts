@@ -146,17 +146,18 @@ const declineOf = Effect.fn("FinishTest.declineOf")(function* (
   const tool = yield* FinishTool
   const def = yield* tool.init()
   const recorded: Record<string, unknown>[] = []
-  const failure = reviewFailure(
-    yield* def
-      .execute(
-        input,
-        workCtx(sessionID, messageID, (value) => {
-          recorded.push(value.metadata ?? {})
-          return Effect.void
-        }),
-      )
-      .pipe(Effect.exit),
-  )
+  const exit = yield* def
+    .execute(
+      input,
+      workCtx(sessionID, messageID, (value) => {
+        recorded.push(value.metadata ?? {})
+        return Effect.void
+      }),
+    )
+    .pipe(Effect.exit)
+  // A softened (UNREVIEWED) delivery carries its review metadata on the result.
+  if (Exit.isSuccess(exit)) recorded.push((exit.value as { metadata?: Record<string, unknown> }).metadata ?? {})
+  const failure = reviewFailure(exit)
   return { message: failure?.message ?? "", metadata: recorded.at(-1) ?? {}, recorded }
 })
 
@@ -169,7 +170,7 @@ const addReview = (sessionID: SessionID, messageID: MessageID, assessment: "Appr
 // waiver: a retried finish - whatever its result says about the work - is
 // declined again until a review approves the current work.
 describe("tool.finish – review requirement", () => {
-  it.instance("declines a finish for unreviewed file writes and names the Review subagent", () =>
+  it.instance("delivers a finish for unreviewed file writes as UNREVIEWED and names the Review subagent", () =>
     Effect.gen(function* () {
       const { chat, assistant } = yield* seedSession()
       yield* addToolPart(chat.id, assistant.id, "edit")
@@ -187,34 +188,21 @@ describe("tool.finish – review requirement", () => {
           )
           .pipe(Effect.exit)
 
-      expect(Exit.isFailure(exit)).toBe(true)
-      if (!Exit.isFailure(exit)) return
-      const failure = exit.cause.reasons.find(Cause.isFailReason)?.error
-      expect(failure).toBeInstanceOf(ToolFailure)
-      if (!(failure instanceof ToolFailure)) return
+      expect(Exit.isSuccess(exit)).toBe(true)
+      if (!Exit.isSuccess(exit)) return
+      const failure = { message: exit.value.output }
+      expect(failure.message).toContain("UNREVIEWED")
       expect(failure.message).toContain("requires at least one independent review")
       expect(failure.message).toContain('subagent_type: "review"')
       // The old skip-on-repeat hint is gone: repeating finish is never the way out.
       expect(failure.message).not.toContain("skip")
-      expect(recorded).toEqual([
-        {
-          review: {
-            nudged: true,
-            effort: "medium",
-            disposition: "unreviewed",
-            verdict: "pending",
-            reviews: 0,
-            maxIterations: 2,
-            openFindings: 0,
-            blockingFindings: 0,
-            workSinceReview: true,
-          },
-        },
-      ])
+      expect(recorded).toEqual([])
+      expect(exit.value.metadata.review).toMatchObject({ disposition: "unreviewed" })
+      expect(exit.value.metadata.review).not.toMatchObject({ termination: "approved" })
     }),
   )
 
-  it.instance("declines a repeated finish call too: the persisted nudge is not a skip path", () =>
+  it.instance("a repeated finish call is delivered UNREVIEWED again, never approved", () =>
     Effect.gen(function* () {
       const { chat, assistant } = yield* seedSession()
       yield* addToolPart(chat.id, assistant.id, "edit")
@@ -264,11 +252,11 @@ describe("tool.finish – review requirement", () => {
         )
         .pipe(Effect.exit)
 
-      expect(Exit.isFailure(exit)).toBe(true)
-      if (!Exit.isFailure(exit)) return
-      const failure = exit.cause.reasons.find(Cause.isFailReason)?.error
-      expect(failure).toBeInstanceOf(ToolFailure)
-      if (!(failure instanceof ToolFailure)) return
+      expect(Exit.isSuccess(exit)).toBe(true)
+      if (!Exit.isSuccess(exit)) return
+      const failure = { message: exit.value.output }
+      expect(failure.message).toContain("UNREVIEWED")
+      expect(exit.value.metadata.review).not.toMatchObject({ termination: "approved" })
       expect(failure.message).toContain("requires at least one independent review")
       expect(failure.message).not.toContain("skip")
     }),
@@ -313,7 +301,7 @@ describe("tool.finish – review requirement", () => {
 
   // Every reason except a yield is a delivery, and a failed attempt still
   // leaves its writes behind, so a failure cannot be used to step around review.
-  it.instance("declines a failure finish for unreviewed file writes too", () =>
+  it.instance("a failure finish for unreviewed file writes is delivered too, labelled UNREVIEWED", () =>
     Effect.gen(function* () {
       const { chat, assistant } = yield* seedSession()
       yield* addToolPart(chat.id, assistant.id, "edit")
@@ -1217,7 +1205,14 @@ const reviewCtx = (sessionID: SessionID, messageID: MessageID) => ({
   ask: () => Effect.void,
 })
 
+// A missing, stale or unavailable review no longer declines: it delivers with an UNREVIEWED note
+// carrying the same guidance. This returns that note in `message` so the guidance stays asserted.
 const reviewFailure = (exit: Exit.Exit<unknown, unknown>) => {
+  if (Exit.isSuccess(exit)) {
+    const output = (exit.value as { output: string }).output
+    expect(output).toContain("UNREVIEWED")
+    return { message: output } as unknown as ToolFailure
+  }
   expect(Exit.isFailure(exit)).toBe(true)
   if (!Exit.isFailure(exit)) return undefined
   const failure = exit.cause.reasons.find(Cause.isFailReason)?.error
@@ -1756,7 +1751,7 @@ describe("tool.finish – stale approval after later work and an errored attempt
   )
 
   it.instance(
-    "thorough: declines again, never delivered as approved",
+    "thorough: delivered UNREVIEWED again, never as approved",
     () =>
       Effect.gen(function* () {
         const { chat, assistant } = yield* seedSession()

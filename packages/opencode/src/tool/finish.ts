@@ -466,7 +466,21 @@ export const FinishTool = Tool.define(
               !availability.available && session?.parentID !== undefined && availability.code === "subagent-depth",
           })
 
-          if (!outcome.deliver) {
+          // A missing, stale or unavailable review is not a completion gate: the result is delivered
+          // with an explicit UNREVIEWED label and never as approved. Known blocking findings from a
+          // Review that ran, and a review still in progress, keep declining.
+          const softened =
+            !outcome.deliver &&
+            params.reason !== "subagent_wait" &&
+            reviewState.blockingFindings === 0 &&
+            !reviewState.reviewInProgress
+          if (softened)
+            workflowNotes.push(
+              `UNREVIEWED: effort ${effort} asks for a clean current Review and none is in place; this is not an approval. ${
+                outcome.feedback ?? ""
+              }`.trim(),
+            )
+          if (!outcome.deliver && !softened) {
             yield* Effect.logWarning("finish declined by effort policy", {
               sessionID: ctx.sessionID,
               effort,

@@ -862,8 +862,8 @@ it.instance(
 
       const hits = yield* llm.hits
       const body = JSON.stringify(hits[0]?.body)
-      expect(body).toContain("completed Think planning before Code implementation")
-      expect(body).toContain("Work cannot implement programming directly")
+      expect(body).toContain("Think planning, then Code implementation, then a clean Review")
+      expect(body).toContain("Prefer that route for programming")
       yield* Fiber.interrupt(fiber)
     }),
   15_000,
@@ -5533,7 +5533,7 @@ it.instance("cancel registered custom tool permission prevents a late side effec
     }),
   ), { timeout: 20000 })
 
-withMcpTools.instance("captured noncoding MCP executor rechecks a newer programming root before executing",()=>Effect.gen(function*(){
+withMcpTools.instance("captured MCP executor still runs after the request becomes programming (advisory workflow)",()=>Effect.gen(function*(){
  yield* useServerConfig(url=>({...providerCfg(url),tool_search:{enabled:false},permission:{"*":"allow"}}))
  const sessions=yield* Session.Service
  const agents=yield* AgentSvc.Service
@@ -5547,6 +5547,26 @@ withMcpTools.instance("captured noncoding MCP executor rechecks a newer programm
  expect(execute).toBeDefined()
  yield* user(chat.id,"Implement API endpoint")
  const exit=yield* Effect.tryPromise(()=>execute!({query:"private"},{toolCallId:"old",messages:[],abortSignal:new AbortController().signal})).pipe(Effect.exit)
- expect(Exit.isFailure(exit)).toBe(true)
- if(Exit.isFailure(exit)) expect(Cause.pretty(exit.cause)).toContain("Task scope changed")
+ // Classification is guidance, not a gate: the captured MCP call runs after the request turns into programming.
+ expect(Exit.isSuccess(exit)).toBe(true)
+ if(Exit.isFailure(exit)) expect(Cause.pretty(exit.cause)).not.toContain("Task scope changed")
 }))
+
+withMcpTools.instance("an explicit permission deny still removes the MCP tool whatever the classification",()=>Effect.gen(function*(){
+ yield* useServerConfig(url=>({...providerCfg(url),tool_search:{enabled:false},permission:{"*":"allow","notes_search_notes":"deny"}}))
+ const sessions=yield* Session.Service
+ const agents=yield* AgentSvc.Service
+ const provider=yield* ProviderSvc.Service
+ const chat=yield* sessions.create({title:"overlap"})
+ const seeded=yield* seed(chat.id)
+ yield* user(chat.id,"Research notes and write a report")
+ const {SessionTools}=yield* Effect.promise(()=>import("../../src/session/tools"))
+ const tools=yield* SessionTools.resolve({agent:yield* agents.get("work"),model:yield* provider.getModel(ref.providerID,ref.modelID),session:chat,processor:{message:seeded.assistant,updateToolCall:()=>Effect.succeed(undefined),completeToolCall:()=>Effect.void,waitForOtherTools:()=>Effect.void},bypassAgentCheck:false,messages:yield* sessions.messages({sessionID:chat.id}),promptOps:{resolvePromptParts:()=>Effect.succeed([]),cancel:()=>Effect.void,prompt:()=>Effect.die("No child expected")}})
+ const execute=tools.notes_search_notes?.execute
+ yield* user(chat.id,"Implement API endpoint")
+ if(execute){
+  const exit=yield* Effect.tryPromise(()=>execute({query:"private"},{toolCallId:"deny",messages:[],abortSignal:new AbortController().signal})).pipe(Effect.exit)
+  expect(Exit.isFailure(exit)).toBe(true)
+ }
+}))
+
