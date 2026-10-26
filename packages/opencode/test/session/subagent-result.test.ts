@@ -108,6 +108,19 @@ describe("prompt continuation boundaries", () => {
     const last = assistant("04", "03", [text("b")])
     expect(continuesPrompt([user("01"), old, nudge("03"), last], last, "01")).toBe(false)
   })
+  test("an absent prompt is a direct match only while no later real user message is present", () => {
+    const last = assistant("04", "01", [text("b")])
+    expect(continuesPrompt([], last, "01")).toBe(true)
+    expect(continuesPrompt([last], last, "01")).toBe(true)
+    expect(continuesPrompt([user("03"), last], last, "01")).toBe(false)
+  })
+  test("an assistant after a completed finish does not continue the prompt", () => {
+    const old = assistant("02", "01", [text(envelope), done])
+    const later = assistant("03", "01", [text("b")])
+    expect(continuesPrompt([user("01"), old, later], later, "01")).toBe(false)
+    const fresh = assistant("02", "01", [text("a")])
+    expect(continuesPrompt([user("01"), fresh], fresh, "01")).toBe(true)
+  })
   test("a parent that sorts after the assistant is not a continuation", () => {
     const last = assistant("02", "03", [text("b")])
     expect(continuesPrompt([user("01"), last, nudge("03")], last, "01")).toBe(false)
