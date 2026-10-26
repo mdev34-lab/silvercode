@@ -721,7 +721,8 @@ export const RunCommand = effectCmd({
           let rootIdle = false
           let lastText = ""
           let error: string | undefined
-          let retryNoticed = 0
+          // Last announced retry attempt per session (root and owned background children).
+          const retryNoticed = new Map<string, number>()
 
           for await (const event of events.stream) {
             if (
@@ -848,19 +849,21 @@ export const RunCommand = effectCmd({
               UI.error(err)
             }
 
-            if (event.type === "session.status" && event.properties.sessionID === sessionID) {
-              rootIdle = event.properties.status.type === "idle"
+            if (event.type === "session.status" && background.owns(event.properties.sessionID)) {
+              const statusSession = event.properties.sessionID
+              const isRoot = statusSession === sessionID
+              if (isRoot) rootIdle = event.properties.status.type === "idle"
               const status = event.properties.status
               // Visibility only: a long provider-requested retry delay used to leave a
               // headless run silent until killed (#555). Say that it is waiting, without
               // changing the retry policy. Short retries stay silent.
               // A later non-retry status (busy again after a successful step) ends the
               // wait, so the next wait in the same run is announced too.
-              if (status.type !== "retry") retryNoticed = 0
+              if (status.type !== "retry") retryNoticed.delete(statusSession)
               if (status.type === "retry" && args.format !== "json") {
                 const wait = status.next - Date.now()
-                if (wait > RUN_RETRY_NOTICE_MS && status.attempt !== retryNoticed) {
-                  retryNoticed = status.attempt
+                if (wait > RUN_RETRY_NOTICE_MS && status.attempt !== retryNoticed.get(statusSession)) {
+                  retryNoticed.set(statusSession, status.attempt)
                   // A fixed category, never the provider's retry message: that text can carry raw
                   // response bodies, URLs or control characters.
                   const reason =
@@ -869,7 +872,9 @@ export const RunCommand = effectCmd({
                       : status.action?.reason === "account_rate_limit"
                         ? "account rate limit"
                         : "retrying after a provider error"
-                  UI.println(`waiting about ${Math.ceil(wait / 1000)}s before retrying (attempt ${status.attempt}): ${reason}`)
+                  UI.println(
+                    `${isRoot ? "" : "subagent "}waiting about ${Math.ceil(wait / 1000)}s before retrying (attempt ${status.attempt}): ${reason}`,
+                  )
                 }
               }
             }

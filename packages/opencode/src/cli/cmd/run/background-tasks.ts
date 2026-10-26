@@ -34,6 +34,8 @@ export const make = (rootSessionID: string) => {
       .map(([, entry]) => entry.sessionID)
 
   return {
+    /** True for the root and for sessions reachable from it through observed launches. */
+    owns: (sessionID: string) => sessionID === rootSessionID || known(sessionID),
     launch(input: { sessionID: string; parentSessionID: string; run?: string; launchID?: string }) {
       if (input.sessionID === rootSessionID) return false
       if (input.launchID !== undefined) {
