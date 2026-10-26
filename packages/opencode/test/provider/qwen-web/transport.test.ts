@@ -17,6 +17,7 @@ interface Fake {
   jsonHandler: (arg: Record<string, any>) => JsonResponse
   onBridge: (call: BridgeCall) => void
   ensureOnOrigin: () => Promise<QwenWebPage>
+  restoreChecks: Array<boolean | undefined>
   invalidated: () => boolean
   browser: QwenWebBrowser
   wafSignals: Record<string, string>
@@ -27,6 +28,7 @@ function makeFake(): Fake {
   const fake = {} as Fake
   fake.bindings = new Map()
   fake.evaluates = []
+  fake.restoreChecks = []
   fake.jsonHandler = () => ({ status: 200, statusText: "OK", contentType: "application/json", body: "{}" })
   fake.onBridge = () => {}
   fake.wafSignals = { "bx-v": "2.5.37", version: "0.2.91", "bx-ua": "bxua-fake", "bx-umidtoken": "tok-fake" }
@@ -93,6 +95,10 @@ function makeFake(): Fake {
   }
   fake.browser = {
     ensureOnOrigin: (...args: unknown[]) => (fake.ensureOnOrigin as (...a: unknown[]) => Promise<QwenWebPage>)(...args),
+    ensureForRequest: (...args: unknown[]) => {
+      fake.restoreChecks.push((args[1] as { canRestore?: () => boolean } | undefined)?.canRestore?.())
+      return (fake.ensureOnOrigin as (...a: unknown[]) => Promise<QwenWebPage>)(...args)
+    },
     invalidatePage: () => {
       invalidated = true
     },
@@ -341,6 +347,53 @@ describe("QwenWebTransport.requestStream", () => {
     await pending
     expect(calls).toHaveLength(2)
     second?.abort()
+  })
+})
+
+describe("QwenWebTransport headless restore gate", () => {
+  const stream = (fake: Fake) => {
+    fake.onBridge = (call) => emit(fake, call, { type: "headers", status: 200, contentType: "text/event-stream" })
+  }
+
+  test("a running stream blocks the restore for other requests and releases it when it ends", async () => {
+    const fake = makeFake()
+    stream(fake)
+    const transport = new QwenWebTransport({ browser: fake.browser, maxStreams: 2, idleTimeoutMs: 5000, metadataTimeoutMs: 1000 })
+    const running = await transport.requestStream("POST", "/a")
+    await transport.requestJson("GET", "/meta")
+    const second = await transport.requestStream("POST", "/b")
+    // stream a: alone; json meta: a stream is running; stream b: another stream is running
+    expect(fake.restoreChecks).toEqual([true, false, false])
+    running.abort()
+    second.abort()
+    await transport.requestJson("GET", "/meta")
+    expect(fake.restoreChecks.at(-1)).toBe(true)
+  })
+
+  test("an in-flight one-shot request blocks the restore and the counter is cleaned up after success and failure", async () => {
+    const fake = makeFake()
+    const transport = new QwenWebTransport({ browser: fake.browser, metadataTimeoutMs: 1000 })
+    const original = fake.page.evaluate.bind(fake.page)
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => (release = resolve))
+    fake.page.evaluate = (async (fn: unknown, arg: unknown) => {
+      await gate
+      return (original as (f: unknown, a: unknown) => unknown)(fn, arg)
+    }) as QwenWebPage["evaluate"]
+    const first = transport.requestJson("GET", "/one")
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    const second = transport.requestJson("GET", "/two")
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    release()
+    await Promise.all([first, second])
+    expect(fake.restoreChecks).toEqual([true, false])
+    fake.page.evaluate = (async () => {
+      throw new Error("page is closed")
+    }) as QwenWebPage["evaluate"]
+    await captureRejection(transport.requestJson("GET", "/three"))
+    fake.page.evaluate = original as QwenWebPage["evaluate"]
+    await transport.requestJson("GET", "/four")
+    expect(fake.restoreChecks.slice(-2)).toEqual([true, true])
   })
 })
 
