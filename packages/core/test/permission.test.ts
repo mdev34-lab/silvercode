@@ -272,6 +272,28 @@ describe("PermissionV2", () => {
     }),
   )
 
+  it.effect("announces a rejection when an unanswered assertion is aborted", () =>
+    Effect.gen(function* () {
+      yield* setup()
+      const events = yield* EventV2.Service
+      const replied = yield* Deferred.make<unknown>()
+      const unsubscribe = yield* events.listen((event) =>
+        event.type === PermissionV2.Event.Replied.type
+          ? Deferred.succeed(replied, event.data).pipe(Effect.asVoid)
+          : Effect.void,
+      )
+      yield* Effect.addFinalizer(() => unsubscribe)
+      const { service, fiber, request } = yield* waitForRequest()
+      yield* Fiber.interrupt(fiber)
+      expect(yield* service.list()).toEqual([])
+      expect(yield* Deferred.await(replied)).toEqual({
+        sessionID: request.sessionID,
+        requestID: request.id,
+        reply: "reject",
+      })
+    }),
+  )
+
   it.effect("resolves an asked permission once", () =>
     Effect.gen(function* () {
       yield* setup()

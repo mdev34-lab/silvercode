@@ -209,9 +209,21 @@ const layer = Layer.effect(
           const item = yield* create(request(input), input.agent)
           return yield* restore(Deferred.await(item.deferred)).pipe(
             EffectRuntime.catchTag("PermissionV2.DeclinedError", (error) => EffectRuntime.die(error)),
+            // Still pending here means the assertion was aborted unanswered. Clients only drop a
+            // prompt on a replied event, so announce it, detached because this runs while it ends.
             EffectRuntime.ensuring(
-              EffectRuntime.sync(() => {
-                pending.delete(item.request.id)
+              EffectRuntime.suspend(() => {
+                if (!pending.delete(item.request.id)) return EffectRuntime.void
+                return events
+                  .publish(Event.Replied, {
+                    sessionID: item.request.sessionID,
+                    requestID: item.request.id,
+                    reply: "reject",
+                  })
+                  .pipe(
+                    EffectRuntime.ignoreCause({ log: true, message: "failed to announce the abandoned permission" }),
+                    EffectRuntime.forkDetach,
+                  )
               }),
             ),
           )
