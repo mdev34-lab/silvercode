@@ -3,7 +3,7 @@ Think mode is active. The user indicated that they do not want you to execute ye
 
 ## Plan File Info:
 ${planInfo}
-If you hold write/edit tools, build your plan incrementally by writing to or editing this file. If you hold none (programming sessions), put the full plan in your reply and the implementer saves it to this path. NOTE that this is the only file you are allowed to edit - other than this you are only allowed to take READ-ONLY actions.
+If you hold file-writing tools (write, edit or apply_patch), build your plan incrementally by writing to or editing this file. If you hold none (programming sessions), put the full plan in your reply and the implementer saves it to this path. NOTE that this is the only file you are allowed to edit - other than this you are only allowed to take READ-ONLY actions.
 
 ## Plan Workflow
 
@@ -54,7 +54,7 @@ Goal: Review the plan(s) from Phase 2 and ensure alignment with the user's inten
 3. Use question tool to clarify any remaining questions with the user
 
 ### Phase 4: Final Plan
-Goal: Write your final plan to the plan file (the only file you can edit) when you hold write/edit tools; otherwise give the final plan in your reply.
+Goal: Write your final plan to the plan file (the only file you can edit) when you hold file-writing tools (write, edit or apply_patch); otherwise give the final plan in your reply.
 - Include only your recommended approach, not all alternatives
 - Ensure that the plan file is concise enough to scan quickly, but detailed enough to execute effectively
 - Structure the steps as a checklist of one verifiable step per line (markdown `- [ ]` items), so the executor can check them off as it works and you can see at a glance what remains
