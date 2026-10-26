@@ -77,6 +77,19 @@ describe("Qwen challenge window", () => {
     await browser.close()
   })
 
+  test("the restore waits while another request is mid-flight, then happens on a later request", async () => {
+    const { launches, launcher } = fakeLauncher()
+    const browser = new QwenWebBrowser({ launcher, profileDir: dir })
+    await browser.ensureForRequest()
+    await browser.revealForChallenge()
+    await browser.ensureForRequest(undefined, { canRestore: () => false })
+    await browser.ensureForRequest(undefined, { canRestore: () => false })
+    expect(launches).toEqual([true, false])
+    await browser.ensureForRequest(undefined, { canRestore: () => true })
+    expect(launches).toEqual([true, false, true])
+    await browser.close()
+  })
+
   test("explicit headless never opens a window", async () => {
     const { launches, launcher } = fakeLauncher()
     const browser = new QwenWebBrowser({ launcher, profileDir: dir, headless: true })

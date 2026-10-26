@@ -509,9 +509,14 @@ export class QwenWebBrowser {
    * solve it once: the retry and every later request run headless again (the persistent
    * profile keeps whatever the person solved). No solved-detection is involved.
    */
-  async ensureForRequest(signal?: AbortSignal, opts?: { steer?: boolean }): Promise<QwenWebPage> {
-    await this.restoreHeadlessAfterChallenge()
-    return this.ensureOnOrigin(signal, opts)
+  async ensureForRequest(
+    signal?: AbortSignal,
+    opts?: { steer?: boolean; canRestore?: () => boolean },
+  ): Promise<QwenWebPage> {
+    // Closing the headed window drops every page on it: only do it while no other request is
+    // mid-flight, otherwise the restore waits for a later request.
+    if (opts?.canRestore?.() !== false) await this.restoreHeadlessAfterChallenge()
+    return this.ensureOnOrigin(signal, { steer: opts?.steer })
   }
 
   private async restoreHeadlessAfterChallenge(): Promise<void> {
