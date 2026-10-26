@@ -136,6 +136,9 @@ async function toolError(part: ToolPart) {
   }
 }
 
+/** Longest provider-requested retry delay a non-interactive run will wait for. */
+const RUN_MAX_RETRY_WAIT_MS = 120_000
+
 export const RunCommand = effectCmd({
   command: "run [message..]",
   describe: "run silvercode with a message",
@@ -846,6 +849,19 @@ export const RunCommand = effectCmd({
 
             if (event.type === "session.status" && event.properties.sessionID === sessionID) {
               rootIdle = event.properties.status.type === "idle"
+              const status = event.properties.status
+              if (status.type === "retry") {
+                // A headless run has no one to wait for a provider that asks for a long
+                // retry delay (for example a quota reset): fail fast with the provider
+                // message instead of sitting silent until killed (#555).
+                const wait = status.next - Date.now()
+                if (wait > RUN_MAX_RETRY_WAIT_MS) {
+                  const message = `${status.message} (provider asked to retry in ${Math.ceil(wait / 1000)}s; not waiting)`
+                  error = error ? error + EOL + message : message
+                  if (!emit("error", { error: { name: "RetryDelayTooLong", data: { message } } })) UI.error(message)
+                  await client.session.abort({ sessionID }).catch(() => undefined)
+                }
+              }
             }
             // A deferred/silent descendant delivery can arrive after the root's
             // last idle event. Recheck on every event, not only another root
