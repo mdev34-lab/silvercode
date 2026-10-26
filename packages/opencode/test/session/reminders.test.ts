@@ -418,4 +418,29 @@ describe("living plan handoff for programming sessions", () => {
         expect(body).not.toContain("does not exist yet")
       }),
     )
+
+  it.instance("experimental: a primary switch persists only the marker; step 2 after the file is created has no stale handoff", () =>
+    Effect.gen(function* () {
+      const sessions = yield* SessionNs.Service
+      const root = yield* sessions.create({})
+      const request = yield* user(root.id)
+      // Step 1: Think was the last assistant, no plan file yet.
+      const step1 = yield* run([request, assistantBy(root.id, "think")], work, root)
+      expect(step1).toContain("operational mode has changed from plan to work")
+      expect(step1).toContain("does not exist yet")
+      // A Code step creates the file; Step 2 reloads the persisted user message.
+      const file = yield* writePlan(root)
+      const reloaded = (yield* sessions.messages({ sessionID: root.id })).filter((m) => m.info.role === "user")
+      expect(reloaded.length).toBe(1)
+      const persisted = texts(reloaded).join("\n")
+      // Only the base-behavior marker is persisted, not the live file guidance.
+      expect(persisted).toContain("operational mode has changed from plan to work")
+      expect(persisted).not.toContain("does not exist yet")
+      const step2 = yield* run([...reloaded, assistantBy(root.id, "work")], work, root)
+      expect(step2).toContain(`A plan file exists at ${file}`)
+      expect(step2).not.toContain("does not exist yet")
+      expect(step2.match(/operational mode has changed from plan to work/g)?.length).toBe(1)
+      expect(step2.match(/A plan file exists at/g)?.length).toBe(1)
+    }),
+  )
 })
