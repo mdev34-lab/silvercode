@@ -178,3 +178,11 @@ test("legacy launch part dedupes while pending and a delivery before its first o
   expect(early.settled()).toBe(true)
   expect(early.launch(first)).toBe(false)
 })
+
+test("owns reports the root and sessions reachable through observed launches only", () => {
+  const tasks = BackgroundTasks.make("root")
+  tasks.launch({ sessionID: "child", parentSessionID: "root" })
+  expect(tasks.owns("root")).toBe(true)
+  expect(tasks.owns("child")).toBe(true)
+  expect(tasks.owns("stranger")).toBe(false)
+})
