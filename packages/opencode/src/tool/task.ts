@@ -1,4 +1,4 @@
-import { ownerOf as workflowOwner, route as workRoute } from "@/session/work-flow"
+import { ownerOrNone as workflowOwner, ancestry as workflowAncestry, route as workRoute } from "@/session/work-flow"
 import { WorkFlow } from "@opencode-ai/core/work-flow"
 import { sessionAgent } from "../session/session-agent"
 import * as Tool from "./tool"
@@ -232,12 +232,14 @@ export const TaskTool = Tool.define(
       // reviewer, or a permission deny below. Keep `reviewUnavailable` in
       // finish.ts in step with these refusals.
       const parent = yield* sessions.get(ctx.sessionID)
-      let current = parent
-      let depth = 0
-      while (current.parentID) {
-        depth++
-        current = yield* sessions.get(current.parentID)
-      }
+      const lineage = yield* workflowAncestry(ctx.sessionID).pipe(Effect.provideService(Session.Service, sessions))
+      if (Option.isNone(lineage))
+        return yield* Effect.fail(
+          new Error(
+            "Cannot dispatch a child: an ancestor session is missing from storage, so the workflow root is unknown.",
+          ),
+        )
+      const depth = lineage.value.depth
       if (depth >= (cfg.subagent_depth ?? 1)) {
         return yield* Effect.fail(
           new Error(
@@ -329,7 +331,14 @@ export const TaskTool = Tool.define(
             .pipe(Effect.catchIf(NotFoundError.isInstance, () => Effect.succeed(undefined)))
         : undefined
       const admission = yield* workRoute(ctx.sessionID).pipe(Effect.provideService(Session.Service, sessions))
-      const rootOwner = yield* workflowOwner(ctx.sessionID).pipe(Effect.provideService(Session.Service, sessions))
+      const foundOwner = yield* workflowOwner(ctx.sessionID).pipe(Effect.provideService(Session.Service, sessions))
+      if (Option.isNone(foundOwner))
+        return yield* Effect.fail(
+          new Error(
+            "Cannot dispatch a child: an ancestor session is missing from storage, so the workflow root is unknown.",
+          ),
+        )
+      const rootOwner = foundOwner.value
       const rootRole = yield* sessionAgent(sessions, rootOwner)
       const inheritedWorkflow = WorkFlow.ownsRole(allRoles, workIdentity, rootRole)
       const programming = coordinator && admission.kind === "programming"
@@ -477,7 +486,7 @@ export const TaskTool = Tool.define(
       const persisted = owned ? readAgentEffort(nextSession.metadata) : undefined
       const configEffort = typeof cfg.agent?.effort === "string" ? cfg.agent.effort : undefined
       const effort = AgentEffort.resolve(
-        params.effort ?? persisted ?? readAgentEffort(parent.metadata) ?? readAgentEffort(current.metadata),
+        params.effort ?? persisted ?? readAgentEffort(parent.metadata) ?? readAgentEffort(lineage.value.owner.metadata),
         AgentEffort.resolve(configEffort),
       )
       // Persist the resolved level before execution so both foreground and

@@ -2,7 +2,7 @@ import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { Session } from "@/session/session"
 import { describe, expect } from "bun:test"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
-import { Effect, Fiber, Queue } from "effect"
+import { Effect, Exit, Fiber, Queue } from "effect"
 import { QuestionTool } from "../../src/tool/question"
 import { Question } from "../../src/question"
 import { SessionID, MessageID } from "../../src/session/schema"
@@ -44,6 +44,24 @@ const pending = Effect.fn("QuestionToolTest.pending")(function* (question: Quest
 })
 
 describe("tool.question", () => {
+  it.instance("a Work orphan with a missing ancestor reports unknown root instead of a fake clarification", () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const question = yield* Question.Service
+      const orphan = yield* sessions.create({ parentID: SessionID.make("ses_missing_ancestor") })
+      const tool = yield* (yield* QuestionTool).init()
+      const exit = yield* tool
+        .execute(
+          { questions: [{ question: "q", header: "h", options: [{ label: "a", description: "a" }], multiple: false }] },
+          { ...ctx, sessionID: orphan.id, agent: "work" },
+        )
+        .pipe(Effect.exit)
+      expect(Exit.isFailure(exit)).toBe(true)
+      expect(String((exit as Exit.Failure<unknown, unknown>).cause)).toContain("ancestor session is missing")
+      expect(yield* question.list()).toEqual([])
+    }),
+  )
+
   it.instance("should successfully execute with valid question parameters", () =>
     Effect.gen(function* () {
       const question = yield* Question.Service

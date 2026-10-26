@@ -178,6 +178,29 @@ describe("tool.registry", () => {
     }),
   )
 
+  it.instance("a missing ancestor session fails closed instead of dying in tools()", () =>
+    Effect.gen(function* () {
+      const registry = yield* ToolRegistry.Service
+      const agent = yield* Agent.Service
+      const sessions = yield* Session.Service
+      const work = yield* agent.get("work")
+      if (!work) throw new Error("work agent not found")
+      const orphan = yield* sessions.create({ parentID: SessionID.make("ses_missing_ancestor") })
+      const tools = yield* registry.tools({
+        providerID: ProviderV2.ID.opencode,
+        modelID: ModelV2.ID.make("test"),
+        agent: work,
+        sessionID: orphan.id,
+      })
+      const ids = tools.map((tool) => tool.id)
+      // Unknown root is treated as uncertain: native Work stays inspection-only.
+      expect(ids).toContain("read")
+      expect(ids).not.toContain("edit")
+      expect(ids).not.toContain("write")
+      expect(ids).not.toContain("apply_patch")
+    }),
+  )
+
   it.instance("exposes the task background parameter now that background subagents are stable", () =>
     Effect.gen(function* () {
       const registry = yield* ToolRegistry.Service
