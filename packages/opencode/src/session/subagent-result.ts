@@ -66,7 +66,8 @@ export function continuesPrompt(messages: readonly SessionV1.WithParts[], curren
     if (!anchors || found === undefined) return false
     between = ordered.slice(anchors[anchors.length - 1]! + 1, end)
   } else {
-    if (current.info.parentID !== promptID) return false
+    // The parent must exist chronologically before the assistant it answers.
+    if (current.info.parentID !== promptID || promptID > current.info.id) return false
     between = ordered.slice(0, end).filter((message) => message.info.id > promptID)
   }
   return !between.some((message) => (message.info.role === "user" && !isNudge(message)) || finished(message))

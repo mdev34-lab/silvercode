@@ -113,6 +113,8 @@ describe("prompt continuation boundaries", () => {
     expect(continuesPrompt([], last, "01")).toBe(true)
     expect(continuesPrompt([last], last, "01")).toBe(true)
     expect(continuesPrompt([user("03"), last], last, "01")).toBe(false)
+    const early = assistant("02", "03", [text("b")])
+    expect(continuesPrompt([early], early, "03")).toBe(false)
   })
   test("an assistant after a completed finish does not continue the prompt", () => {
     const old = assistant("02", "01", [text(envelope), done])
