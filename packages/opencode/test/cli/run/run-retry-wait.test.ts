@@ -1,6 +1,7 @@
 import { describe, expect } from "bun:test"
 import { Effect } from "effect"
 import { cliIt } from "../../lib/cli-process"
+import { reply } from "../../lib/llm-server"
 
 // #555: a provider quota rejection that asks for a long retry delay must not
 // leave a headless run silent until it is killed.
@@ -53,7 +54,7 @@ describe("headless run provider retry delay (#555)", () => {
         timeoutMs: 40_000, extraArgs: ["--continue"], model: "opencode/local-quota-test", env,
       })
       expect(result.exitCode).toBe(0)
-      expect(result.stderr).toMatch(/waiting about \d+s before retrying \(attempt 1\): provider asked to retry later/)
+      expect(result.stderr).toMatch(/waiting about \d+s before retrying \(attempt 1\): retrying after a provider error/)
       expect(result.stderr).not.toContain("Too many requests")
     }), 60_000)
 
@@ -72,4 +73,16 @@ describe("headless run provider retry delay (#555)", () => {
       expect(result.stdout).toContain("recovered after retry")
       expect(result.stderr).not.toContain("waiting about")
     }), 60_000)
+
+  cliIt.live("announces each long wait of a multi-step run, not only the first", ({ llm, opencode }) =>
+    Effect.gen(function* () {
+      yield* llm.error(429, quota, { "retry-after": "11" })
+      yield* llm.push(reply().text("first step").tool("bash", { command: "printf step", description: "First step" }))
+      yield* llm.error(429, quota, { "retry-after": "11" })
+      yield* llm.text("done after two waits")
+      const result = yield* opencode.run("two long waits", { timeoutMs: 50_000, extraArgs: ["--dangerously-skip-permissions"] })
+      expect(result.exitCode).toBe(0)
+      expect(result.stdout).toContain("done after two waits")
+      expect(result.stderr.match(/waiting about \d+s before retrying \(attempt 1\)/g)?.length).toBe(2)
+    }), 90_000)
 })

@@ -854,6 +854,9 @@ export const RunCommand = effectCmd({
               // Visibility only: a long provider-requested retry delay used to leave a
               // headless run silent until killed (#555). Say that it is waiting, without
               // changing the retry policy. Short retries stay silent.
+              // A later non-retry status (busy again after a successful step) ends the
+              // wait, so the next wait in the same run is announced too.
+              if (status.type !== "retry") retryNoticed = 0
               if (status.type === "retry" && args.format !== "json") {
                 const wait = status.next - Date.now()
                 if (wait > RUN_RETRY_NOTICE_MS && status.attempt !== retryNoticed) {
@@ -865,7 +868,7 @@ export const RunCommand = effectCmd({
                       ? "free usage limit reached"
                       : status.action?.reason === "account_rate_limit"
                         ? "account rate limit"
-                        : "provider asked to retry later"
+                        : "retrying after a provider error"
                   UI.println(`waiting about ${Math.ceil(wait / 1000)}s before retrying (attempt ${status.attempt}): ${reason}`)
                 }
               }
