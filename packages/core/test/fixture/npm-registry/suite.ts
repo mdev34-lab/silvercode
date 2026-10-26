@@ -373,22 +373,33 @@ describe("Npm with MockRegistry - Stall, Interruption, and Cleanup", () => {
     await writeProject(projectDir, registry.url, npmCache)
 
     const layer = npmLayer(cacheDir)
-    const startTime = Date.now()
 
     const result = await Effect.gen(function* () {
       const npm = yield* Npm.Service
-      return yield* npm
+      const fiber = yield* npm
         .install(projectDir, {
           add: [{ name: "@opencode-ai/plugin", version: "1.0.0" }],
         })
-        .pipe(Effect.timeout("200 millis"))
-    }).pipe(Effect.scoped, Effect.provide(layer), Effect.runPromiseExit)
+        .pipe(Effect.forkChild)
 
-    const elapsed = Date.now() - startTime
-    expect(elapsed).toBeLessThan(4000)
-    expect(result._tag).toBe("Failure")
+      // Rendezvous on the registry actually receiving the install request. The
+      // total install budget would also cover startup before any HTTP request
+      // (filesystem, lock, module import, npm config), which is slow on loaded
+      // Windows runners; that is a different contract (#581, #586).
+      yield* Effect.gen(function* () {
+        while (registry.requests.length === 0) yield* Effect.sleep("5 millis")
+      }).pipe(Effect.timeout("10 seconds"))
 
-    // Registry received request before stall
+      // The stalled request must now be cut by an Effect timeout.
+      const startTime = Date.now()
+      const joined = yield* Fiber.join(fiber).pipe(Effect.timeout("200 millis"), Effect.exit)
+      const elapsed = Date.now() - startTime
+      yield* Fiber.interrupt(fiber)
+      return { joined, elapsed }
+    }).pipe(Effect.scoped, Effect.provide(layer), Effect.runPromise)
+
+    expect(result.joined._tag).toBe("Failure")
+    expect(result.elapsed).toBeLessThan(4000)
     expect(registry.requests.length).toBeGreaterThan(0)
   })
 
