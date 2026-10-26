@@ -5022,6 +5022,62 @@ it.instance(
 )
 
 it.instance(
+  "a prompt queued behind a run is not restarted after cancel (F2)",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Pinned" })
+      yield* llm.hang
+      const a = yield* prompt
+        .prompt({ sessionID: chat.id, agent: "work", model: ref, parts: [{ type: "text", text: "first" }] })
+        .pipe(Effect.forkChild)
+      yield* llm.wait(1)
+      const b = yield* prompt
+        .prompt({ sessionID: chat.id, agent: "work", model: ref, parts: [{ type: "text", text: "second" }] })
+        .pipe(Effect.forkChild)
+      yield* Effect.sleep(100)
+      yield* prompt.cancel(chat.id)
+      const [exitA, exitB] = yield* Effect.all([Fiber.await(a), Fiber.await(b)])
+      expect(Exit.isSuccess(exitA)).toBe(true)
+      expect(Exit.isSuccess(exitB)).toBe(true)
+      yield* Effect.sleep(300)
+      // Cancel must not be followed by a fresh provider call for the queued prompt.
+      expect(yield* llm.hits).toHaveLength(1)
+    }),
+  10_000,
+)
+
+it.instance(
+  "several prompts queued behind a run are all released by cancel without a new run (F2)",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Pinned" })
+      yield* llm.hang
+      const send = (text: string) =>
+        prompt.prompt({ sessionID: chat.id, agent: "work", model: ref, parts: [{ type: "text", text }] })
+      const a = yield* send("first").pipe(Effect.forkChild)
+      yield* llm.wait(1)
+      const b = yield* send("second").pipe(Effect.forkChild)
+      const c = yield* send("third").pipe(Effect.forkChild)
+      // Both queued prompts are persisted, so each has joined or is about to join the run.
+      while ((yield* sessions.messages({ sessionID: chat.id })).filter((m) => m.info.role === "user").length < 3)
+        yield* Effect.yieldNow
+      for (let i = 0; i < 50; i++) yield* Effect.yieldNow
+      yield* prompt.cancel(chat.id)
+      const exits = yield* Effect.all([Fiber.await(a), Fiber.await(b), Fiber.await(c)])
+      for (const exit of exits) expect(Exit.isSuccess(exit)).toBe(true)
+      yield* Effect.sleep(300)
+      expect(yield* llm.hits).toHaveLength(1)
+    }),
+  10_000,
+)
+
+it.instance(
   "queued prompts are released by cancel and the next prompt runs once",
   () =>
     Effect.gen(function* () {
