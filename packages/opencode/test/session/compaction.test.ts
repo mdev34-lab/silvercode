@@ -7,6 +7,9 @@ import { APICallError } from "ai"
 import { Cause, Deferred, Effect, Exit, Fiber, Layer, Schema } from "effect"
 import * as Stream from "effect/Stream"
 import { Config } from "@/config/config"
+import { Snapshot } from "@/snapshot"
+import fs from "node:fs/promises"
+import path from "node:path"
 import { LLM } from "../../src/session/llm"
 import { SessionCompaction } from "../../src/session/compaction"
 import { Token } from "@/util/token"
@@ -250,6 +253,7 @@ type CompactionProcessOptions = {
   llm?: Layer.Layer<LLM.Service>
   plugin?: Layer.Layer<Plugin.Service>
   provider?: ReturnType<typeof wide>
+  snapshot?: Layer.Layer<Snapshot.Service>
   config?: Layer.Layer<Config.Service>
 }
 
@@ -262,6 +266,7 @@ function compactionProcessLayer(options?: CompactionProcessOptions) {
     [Provider.node, (options?.provider ?? wide()).layer],
     [RuntimeFlags.node, RuntimeFlags.layer({ experimentalEventSystem: true })],
     [SessionSummary.node, summary],
+    ...(options?.snapshot ? ([[Snapshot.node, options.snapshot]] as const) : []),
   ]
   if (!options?.llm) {
     return AppNodeBuilder.build(compactionTestNode, [
@@ -1260,6 +1265,111 @@ describe("session.compaction.process", () => {
           expect(Date.now() - start).toBeLessThan(250)
         }
       }).pipe(withCompaction({ llm: stub.llmLayer }))
+    },
+    // This latency contract covers the retry timer, not git snapshot teardown.
+    // The companion below retains snapshot-enabled finalization coverage.
+    { git: true, config: { snapshot: false } },
+    { timeout: 10_000 },
+  )
+
+  itCompaction.instance(
+    "aborting retry backoff waits for snapshot cleanup and persists its real patch",
+    () => {
+      const stub = llm()
+      const entered = Deferred.makeUnsafe<void>()
+      const release = Deferred.makeUnsafe<void>()
+      const premature: boolean[] = []
+      const snapshotLayer = Layer.effect(
+        Snapshot.Service,
+        Effect.gen(function* () {
+          const actual = yield* Snapshot.Service
+          return Snapshot.Service.of({
+            ...actual,
+            patch: (hash) =>
+              Effect.gen(function* () {
+                yield* Deferred.succeed(entered, undefined)
+                yield* Deferred.await(release)
+                // Observe entry to real cleanup, not its slow completion.
+                premature.push(!(yield* Deferred.isDone(release)))
+                return yield* actual.patch(hash)
+              }),
+          })
+        }),
+      ).pipe(Layer.provide(LayerNode.compile(Snapshot.node)))
+      let directory: string
+      stub.push(
+        Stream.fromAsyncIterable(
+          {
+            async *[Symbol.asyncIterator]() {
+              await fs.writeFile(path.join(directory, "during-retry.txt"), "changed during stream\n")
+              yield LLMEvent.stepStart({ index: 0 })
+              throw new APICallError({
+                message: "boom",
+                url: "https://example.com/v1/chat/completions",
+                requestBodyValues: {},
+                statusCode: 503,
+                responseHeaders: { "retry-after-ms": "10000" },
+                responseBody: '{"error":"boom"}',
+                isRetryable: true,
+              })
+            },
+          },
+          (err) => err,
+        ),
+      )
+
+      return Effect.gen(function* () {
+        directory = (yield* TestInstance).directory
+        const ssn = yield* SessionNs.Service
+        const events = yield* EventV2Bridge.Service
+        const ready = yield* Deferred.make<void>()
+        const session = yield* ssn.create({})
+        const msg = yield* createUserMessage(session.id, "hello")
+        const msgs = yield* ssn.messages({ sessionID: session.id })
+        const off = yield* events.listen((evt) => {
+          if (evt.type !== SessionStatus.Event.Status.type) return Effect.void
+          const data = evt.data as typeof SessionStatus.Event.Status.data.Type
+          if (data.sessionID !== session.id || data.status.type !== "retry") return Effect.void
+          Deferred.doneUnsafe(ready, Effect.void)
+          return Effect.void
+        })
+        yield* Effect.addFinalizer(() => off)
+
+        const fiber = yield* SessionCompaction.use
+          .process({
+            parentID: msg.id,
+            messages: msgs,
+            sessionID: session.id,
+            auto: false,
+          })
+          .pipe(Effect.forkChild)
+
+        yield* Deferred.await(ready).pipe(Effect.timeout("5 seconds"))
+        const interrupt = yield* Fiber.interrupt(fiber).pipe(Effect.forkChild)
+        const beforeRelease = yield* Effect.gen(function* () {
+          yield* Deferred.await(entered).pipe(Effect.timeout("5 seconds"))
+          // Let the wrapper progress past its entry signal if the gate is missing.
+          yield* Effect.yieldNow
+          expect(premature).toEqual([])
+          return interrupt.pollUnsafe()
+        })
+        yield* Deferred.succeed(release, undefined)
+        expect(beforeRelease).toBeUndefined()
+        yield* Fiber.join(interrupt).pipe(Effect.timeout("5 seconds"))
+        const exit = yield* Fiber.await(fiber)
+        expect(Exit.isFailure(exit)).toBe(true)
+        if (Exit.isFailure(exit)) expect(Cause.hasInterrupts(exit.cause)).toBe(true)
+        const parts = (yield* ssn.messages({ sessionID: session.id })).flatMap((message) => message.parts)
+        const patch = parts.find(
+          (part) => part.type === "patch" && part.files.some((file) => file.endsWith("during-retry.txt")),
+        )
+        expect(patch).toBeDefined()
+        expect(premature).toEqual([false])
+      }).pipe(
+        // Cover setup, readiness, interruption, and assertions before child teardown.
+        Effect.ensuring(Deferred.succeed(release, undefined)),
+        withCompaction({ llm: stub.llmLayer, snapshot: snapshotLayer }),
+      )
     },
     { git: true },
     { timeout: 10_000 },
