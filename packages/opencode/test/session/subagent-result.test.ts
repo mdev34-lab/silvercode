@@ -1,11 +1,13 @@
 import { describe, expect, test } from "bun:test"
 import type { SessionV1 } from "@opencode-ai/core/v1/session"
+import FINISH_NUDGE from "../../src/session/prompt/finish-nudge.txt"
 import { continuesPrompt, resultChunks, textResult, renderTextResult } from "../../src/session/subagent-result"
 
 // Only the fields consumed by the collector are relevant to this pure boundary test.
 const user = (id: string) => ({ info: { id, role: "user" }, parts: [] }) as unknown as SessionV1.WithParts
-const nudge = (id: string) =>
-  ({ info: { id, role: "user" }, parts: [{ type: "text", text: "call finish now", synthetic: true }] }) as unknown as SessionV1.WithParts
+const synthetic = (id: string, text: string) =>
+  ({ info: { id, role: "user" }, parts: [{ type: "text", text, synthetic: true }] }) as unknown as SessionV1.WithParts
+const nudge = (id: string) => synthetic(id, FINISH_NUDGE)
 const assistant = (id: string, parentID: string, parts: unknown[]) =>
   ({ info: { id, role: "assistant", parentID }, parts }) as unknown as SessionV1.WithParts
 const text = (text: string) => ({ type: "text", text })
@@ -85,6 +87,31 @@ describe("prompt continuation through finish nudges", () => {
     expect(continuesPrompt([user("01"), user("03"), last], last, "01")).toBe(false)
     expect(continuesPrompt([user("01"), nudge("03"), last], last, "99")).toBe(false)
     expect(continuesPrompt([nudge("03"), last], last, "01")).toBe(false)
+  })
+})
+
+describe("prompt continuation boundaries", () => {
+  const done = { type: "tool", tool: "finish", state: { status: "completed" } }
+  test("a later real user message makes an older parent stale", () => {
+    const stale = assistant("05", "01", [text("b")])
+    expect(continuesPrompt([user("01"), user("03"), stale], stale, "01")).toBe(false)
+    expect(resultChunks([user("01"), assistant("02", "01", [text(envelope)]), user("03"), stale], stale)).toEqual(["b"])
+  })
+  test("a synthetic user message that is not the runner nudge is a boundary", () => {
+    const last = assistant("04", "03", [text("b")])
+    const old = assistant("02", "01", [text(envelope)])
+    expect(continuesPrompt([user("01"), old, synthetic("03", "Background task finished"), last], last, "01")).toBe(false)
+    expect(resultChunks([user("01"), old, synthetic("03", "Background task finished"), last], last)).toEqual(["b"])
+  })
+  test("a nudge after a completed finish does not continue the earlier prompt", () => {
+    const old = assistant("02", "01", [text(envelope), done])
+    const last = assistant("04", "03", [text("b")])
+    expect(continuesPrompt([user("01"), old, nudge("03"), last], last, "01")).toBe(false)
+  })
+  test("a parent that sorts after the assistant is not a continuation", () => {
+    const last = assistant("02", "03", [text("b")])
+    expect(continuesPrompt([user("01"), last, nudge("03")], last, "01")).toBe(false)
+    expect(continuesPrompt([last, user("03")], last, "03")).toBe(false)
   })
 })
 
