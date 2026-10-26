@@ -146,39 +146,40 @@ export const apply = Effect.fn("SessionReminders.apply")(function* (input: {
   }
 
   const assistantMessage = input.messages.findLast((msg) => msg.info.role === "assistant")
-  if (input.agent.name !== "think" && AgentSchema.canonicalID(assistantMessage?.info.agent ?? "") === "think") {
-    const plan = yield* rootPlan(input.session)
-    const exists = Option.isSome(plan) && (yield* fsys.existsSafe(plan.value))
+  const switchedNow =
+    input.agent.name !== "think" && AgentSchema.canonicalID(assistantMessage?.info.agent ?? "") === "think"
+  // Only the base-behavior WORK_SWITCH marker is persisted in the user message.
+  // The file guidance below depends on live state (does the plan file exist
+  // now?) so it is recomputed ephemerally on every step: persisting it would
+  // replay a stale "does not exist yet" next to the live "exists" on reload.
+  if (switchedNow) {
     const part = yield* sessions.updatePart({
       id: PartID.ascending(),
       messageID: userMessage.info.id,
       sessionID: userMessage.info.sessionID,
       type: "text",
-      text: switchText(plan, exists),
+      text: WORK_SWITCH,
       synthetic: true,
     })
     userMessage.parts.push(part)
-    return input.messages
   }
-
-  // Delegation flow in experimental plan mode (after the primary switch check,
-  // so a later primary Think->Work switch is never shadowed by an earlier
-  // delegation): a delegated Think ran as a child session, so the last
-  // assistant message here is not Think's. Work still gets
-  // the living-plan guidance, same as outside experimental plan mode.
-  if (input.agent.name === "work") {
+  if (switchedNow || input.agent.name === "work") {
+    const switched =
+      switchedNow ||
+      userMessage.parts.some((part) => part.type === "text" && part.synthetic === true && part.text === WORK_SWITCH)
     const plan = yield* rootPlan(input.session)
     if (Option.isSome(plan)) {
       // An existing plan file is the run's scratchpad whoever wrote it, so its
-      // guidance does not depend on this request's planning proof; only the
-      // handoff (a plan that should exist) needs a stamped successful Think.
+      // guidance does not depend on this request's planning proof; the handoff
+      // (a plan that should exist) needs a primary switch or a stamped
+      // successful Think in this request.
       const exists = yield* fsys.existsSafe(plan.value)
       const text = exists
         ? scratchpad(plan.value)
-        : delegatedThink(input.messages, input.session.id)
+        : switched || delegatedThink(input.messages, input.session.id)
           ? planHandoff(plan.value)
           : undefined
-      if (text !== undefined) {
+      if (text !== undefined)
         userMessage.parts.push({
           id: PartID.ascending(),
           messageID: userMessage.info.id,
@@ -187,9 +188,8 @@ export const apply = Effect.fn("SessionReminders.apply")(function* (input: {
           text,
           synthetic: true,
         })
-        return input.messages
-      }
     }
+    return input.messages
   }
 
   if (input.agent.name !== "think" || AgentSchema.canonicalID(assistantMessage?.info.agent ?? "") === "think") return input.messages
