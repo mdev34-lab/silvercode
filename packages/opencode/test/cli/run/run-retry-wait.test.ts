@@ -20,25 +20,44 @@ const config = (url: string) => ({
 })
 
 describe("headless run provider retry delay (#555)", () => {
-  cliIt.live("fails fast with the provider message when the retry delay is far too long", ({ llm, opencode }) =>
+  const setup = (llm: { url: string }) => config(llm.url)
+
+  cliIt.live("announces a long provider retry wait and keeps the retry policy", ({ llm, opencode }) =>
     Effect.gen(function* () {
-      const env = config(llm.url)
+      const env = setup(llm)
       yield* llm.text("initial session response")
       const first = yield* opencode.run("initial request", { timeoutMs: 20_000, model: "opencode/local-quota-test", env })
       expect(first.exitCode).toBe(0)
-      yield* llm.error(429, quota, { "retry-after": "3600" })
+      yield* llm.error(429, quota, { "retry-after": "12" })
+      yield* llm.text("recovered after the long wait")
       const result = yield* opencode.run("quota rejection", {
-        timeoutMs: 20_000, extraArgs: ["--continue"], model: "opencode/local-quota-test", env,
+        timeoutMs: 40_000, extraArgs: ["--continue"], model: "opencode/local-quota-test", env,
       })
-      expect(result.exitCode).toBe(1)
-      expect(result.durationMs).toBeLessThan(15_000)
+      // The CLI keeps its retry policy: it waits out the delay and then succeeds.
+      expect(result.exitCode).toBe(0)
+      expect(result.stdout).toContain("recovered after the long wait")
+      expect(result.stderr).toMatch(/waiting about \d+s before retrying \(attempt 1\)/)
       expect(result.stderr).toContain("Free usage")
-      expect(result.stderr).toContain("not waiting")
     }), 60_000)
 
-  cliIt.live("still waits through a short provider retry delay", ({ llm, opencode }) =>
+  cliIt.live("announces a long retry-after that is not a free-tier quota too", ({ llm, opencode }) =>
     Effect.gen(function* () {
-      const env = config(llm.url)
+      const env = setup(llm)
+      yield* llm.text("initial session response")
+      const first = yield* opencode.run("initial request", { timeoutMs: 20_000, model: "opencode/local-quota-test", env })
+      expect(first.exitCode).toBe(0)
+      yield* llm.error(429, { error: { message: "Too many requests, try again later", type: "rate_limit_error" } }, { "retry-after": "12" })
+      yield* llm.text("recovered after the long wait")
+      const result = yield* opencode.run("rate limited", {
+        timeoutMs: 40_000, extraArgs: ["--continue"], model: "opencode/local-quota-test", env,
+      })
+      expect(result.exitCode).toBe(0)
+      expect(result.stderr).toMatch(/waiting about \d+s before retrying/)
+    }), 60_000)
+
+  cliIt.live("stays silent and still retries through a short provider delay", ({ llm, opencode }) =>
+    Effect.gen(function* () {
+      const env = setup(llm)
       yield* llm.text("initial session response")
       const first = yield* opencode.run("initial request", { timeoutMs: 20_000, model: "opencode/local-quota-test", env })
       expect(first.exitCode).toBe(0)
@@ -49,21 +68,6 @@ describe("headless run provider retry delay (#555)", () => {
       })
       expect(result.exitCode).toBe(0)
       expect(result.stdout).toContain("recovered after retry")
-      expect(result.stderr).not.toContain("not waiting")
-    }), 60_000)
-
-  cliIt.live("keeps waiting on a long retry-after that is not a free-tier quota", ({ llm, opencode }) =>
-    Effect.gen(function* () {
-      const env = config(llm.url)
-      yield* llm.text("initial session response")
-      const first = yield* opencode.run("initial request", { timeoutMs: 20_000, model: "opencode/local-quota-test", env })
-      expect(first.exitCode).toBe(0)
-      yield* llm.error(429, { error: { message: "Too many requests, try again later", type: "rate_limit_error" } }, { "retry-after": "3600" })
-      const result = yield* opencode.run("rate limited", {
-        timeoutMs: 8_000, extraArgs: ["--continue"], model: "opencode/local-quota-test", env,
-      })
-      // Still inside the provider's requested wait when the harness stops it: not aborted by run.
-      expect(result.exitCode).not.toBe(1)
-      expect(result.stderr).not.toContain("not waiting")
+      expect(result.stderr).not.toContain("waiting about")
     }), 60_000)
 })

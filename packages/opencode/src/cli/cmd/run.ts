@@ -136,8 +136,8 @@ async function toolError(part: ToolPart) {
   }
 }
 
-/** Longest retry delay a non-interactive run waits through after a free-tier quota rejection. */
-const RUN_MAX_RETRY_WAIT_MS = 120_000
+/** Retry delays longer than this are announced by a non-interactive run; shorter ones stay silent. */
+const RUN_RETRY_NOTICE_MS = 10_000
 
 export const RunCommand = effectCmd({
   command: "run [message..]",
@@ -721,6 +721,7 @@ export const RunCommand = effectCmd({
           let rootIdle = false
           let lastText = ""
           let error: string | undefined
+          let retryNoticed = 0
 
           for await (const event of events.stream) {
             if (
@@ -850,17 +851,15 @@ export const RunCommand = effectCmd({
             if (event.type === "session.status" && event.properties.sessionID === sessionID) {
               rootIdle = event.properties.status.type === "idle"
               const status = event.properties.status
-              if (status.type === "retry") {
-                // A free-tier quota rejection is not a transient rate limit: waiting for its
-                // reset in a headless run only leaves it silent until killed (#555). Fail
-                // fast with the provider message. Other retryable errors, including
-                // account rate limits with a long retry-after, keep the normal retry wait.
+              // Visibility only: a long provider-requested retry delay used to leave a
+              // headless run silent until killed (#555). Say that it is waiting, without
+              // changing the retry policy. Short retries stay silent.
+              if (status.type === "retry" && args.format !== "json") {
                 const wait = status.next - Date.now()
-                if (status.action?.reason === "free_tier_limit" && wait > RUN_MAX_RETRY_WAIT_MS) {
-                  const message = `${status.message} (provider asked to retry in ${Math.ceil(wait / 1000)}s; not waiting)`
-                  error = error ? error + EOL + message : message
-                  if (!emit("error", { error: { name: "RetryDelayTooLong", data: { message } } })) UI.error(message)
-                  await client.session.abort({ sessionID }).catch(() => undefined)
+                if (wait > RUN_RETRY_NOTICE_MS && status.attempt !== retryNoticed) {
+                  retryNoticed = status.attempt
+                  const detail = status.message.length > 200 ? status.message.slice(0, 200) + "..." : status.message
+                  UI.println(`waiting about ${Math.ceil(wait / 1000)}s before retrying (attempt ${status.attempt}): ${detail}`)
                 }
               }
             }
