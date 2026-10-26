@@ -27,6 +27,26 @@ export const ancestry = Effect.fn("WorkFlow.ancestry")(function* (sessionID: Ses
   return owner ? Option.some({ owner, depth }) : Option.none()
 })
 
+/**
+ * Depth of the reachable part of a session chain. A missing ancestor ends the walk, so
+ * the result is a lower bound; the depth limit still applies to it.
+ */
+export const knownDepth = Effect.fn("WorkFlow.knownDepth")(function* (sessionID: SessionID) {
+  const sessions = yield* Session.Service
+  const load = (id: SessionID) =>
+    sessions.get(id).pipe(Effect.catchIf(NotFoundError.isInstance, () => Effect.succeed(undefined)))
+  let owner = yield* load(sessionID)
+  let depth = 0
+  const seen = new Set<string>()
+  while (owner?.parentID) {
+    if (seen.has(owner.id)) return yield* Effect.die(new Error("Cyclic workflow ancestry"))
+    seen.add(owner.id)
+    depth++
+    owner = yield* load(owner.parentID)
+  }
+  return depth
+})
+
 export const ownerOrNone = Effect.fn("WorkFlow.ownerOrNone")(function* (sessionID: SessionID) {
   return Option.map(yield* ancestry(sessionID), (found) => found.owner)
 })

@@ -1,4 +1,4 @@
-import { ownerOrNone as workflowOwner, ancestry as workflowAncestry, route as workRoute } from "@/session/work-flow"
+import { ownerOrNone as workflowOwner, ancestry as workflowAncestry, knownDepth as workflowKnownDepth, route as workRoute } from "@/session/work-flow"
 import { WorkFlow } from "@opencode-ai/core/work-flow"
 import { sessionAgent } from "../session/session-agent"
 import * as Tool from "./tool"
@@ -236,13 +236,11 @@ export const TaskTool = Tool.define(
       // finish.ts in step with these refusals.
       const parent = yield* sessions.get(ctx.sessionID)
       const lineage = yield* workflowAncestry(ctx.sessionID).pipe(Effect.provideService(Session.Service, sessions))
-      if (Option.isNone(lineage))
-        return yield* Effect.fail(
-          new Error(
-            "Cannot dispatch a child: an ancestor session is missing from storage, so the workflow root is unknown.",
-          ),
-        )
-      const depth = lineage.value.depth
+      // Not a workflow gate: the subagent depth limit is a safety cap. A missing ancestor only
+      // makes the known depth a lower bound, which the limit still applies to.
+      const depth = Option.isSome(lineage)
+        ? lineage.value.depth
+        : yield* workflowKnownDepth(ctx.sessionID).pipe(Effect.provideService(Session.Service, sessions))
       if (depth >= (cfg.subagent_depth ?? 1)) {
         return yield* Effect.fail(
           new Error(
@@ -464,7 +462,7 @@ export const TaskTool = Tool.define(
       const persisted = owned ? readAgentEffort(nextSession.metadata) : undefined
       const configEffort = typeof cfg.agent?.effort === "string" ? cfg.agent.effort : undefined
       const effort = AgentEffort.resolve(
-        params.effort ?? persisted ?? readAgentEffort(parent.metadata) ?? readAgentEffort(lineage.value.owner.metadata),
+        params.effort ?? persisted ?? readAgentEffort(parent.metadata) ?? (Option.isSome(lineage) ? readAgentEffort(lineage.value.owner.metadata) : undefined),
         AgentEffort.resolve(configEffort),
       )
       // Persist the resolved level before execution so both foreground and

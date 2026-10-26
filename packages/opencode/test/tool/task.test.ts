@@ -828,7 +828,41 @@ describe("tool.task", () => {
   )
 
   it.instance(
-    "an orphan session with a missing ancestor is refused with a clear error and creates no child",
+    "an orphan session with a missing ancestor still dispatches (workflow root unknown is guidance, not a block)",
+    () =>
+      Effect.gen(function* () {
+        const sessions = yield* Session.Service
+        const { assistant } = yield* seed()
+        const orphan = yield* sessions.create({ parentID: SessionID.make("ses_missing_ancestor") })
+        yield* sessions.updateMessage({ ...assistant, id: MessageID.ascending(), sessionID: orphan.id })
+        const orphanAssistant = (yield* sessions.messages({ sessionID: orphan.id })).find((m) => m.info.role === "assistant")!.info
+        const before = (yield* sessions.children(orphan.id)).length
+        const tool = yield* TaskTool
+        const def = yield* tool.init()
+        const exit = yield* def
+          .execute(
+            { description: "inspect", prompt: "look", subagent_type: "general" },
+            {
+              sessionID: orphan.id,
+              messageID: orphanAssistant.id,
+              agent: "work",
+              abort: new AbortController().signal,
+              extra: { promptOps: stubOps() },
+              messages: [],
+              metadata: () => Effect.void,
+              ask: () => Effect.void,
+            },
+          )
+          .pipe(Effect.exit)
+        expect(Exit.isSuccess(exit)).toBe(true)
+        expect((yield* sessions.children(orphan.id)).length).toBe(before + 1)
+        if (Exit.isSuccess(exit)) expect(exit.value.output).toContain("workflow root of this session is unknown")
+      }),
+    { config: { subagent_depth: 5 } },
+  )
+
+  it.instance(
+    "an orphan session with a missing ancestor is still bound by the subagent depth limit",
     () =>
       Effect.gen(function* () {
         const sessions = yield* Session.Service
@@ -853,10 +887,10 @@ describe("tool.task", () => {
           )
           .pipe(Effect.exit)
         expect(Exit.isFailure(exit)).toBe(true)
-        expect(Cause.pretty((exit as Exit.Failure<unknown, unknown>).cause)).toContain("ancestor session is missing")
+        expect(Cause.pretty((exit as Exit.Failure<unknown, unknown>).cause)).toContain("Subagent depth limit reached")
         expect((yield* sessions.children(orphan.id)).length).toBe(before)
       }),
-    { config: { subagent_depth: 5 } },
+    { config: { subagent_depth: 1 } },
   )
 
   it.instance(
