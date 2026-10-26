@@ -22,10 +22,11 @@ const flow = (llm: any, envFile: string) =>
     )
   })
 
+type Outcome = { exited: boolean; seen: boolean }
 const SECRET = "APP_MODE=demo_child_perm_marker"
 
 describe("headless run child permission requests", () => {
-  const exec = (extraArgs: string[]) => ({ llm, home, opencode }: any) =>
+  const exec = (extraArgs: string[]) => ({ llm, home, opencode }: any): Effect.Effect<Outcome, unknown, any> =>
     Effect.gen(function* () {
       const envFile = path.join(home, ".env")
       yield* Effect.promise(() => writeFile(envFile, SECRET + "\n"))
