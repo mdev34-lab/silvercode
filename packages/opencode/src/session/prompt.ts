@@ -1887,6 +1887,9 @@ const layer = Layer.effect(
       // a run has actually answered this caller's message; if a newer user
       // message overtook it and got answered instead, return the latest state
       // rather than spinning on a superseded prompt.
+      // A cancel that ends the run this caller joined must not be followed by a
+      // fresh run for the caller's queued message: cancel releases queued callers.
+      const epoch = yield* state.cancelEpoch(input.sessionID)
       while (true) {
         const result = yield* state.ensureRunning(
           input.sessionID,
@@ -1895,6 +1898,9 @@ const layer = Layer.effect(
         )
         if (!input.messageID || (result.info.role === "assistant" && result.info.parentID === input.messageID))
           return result
+        // Checked before every other re-entry path: once the run this caller joined was
+        // cancelled, no queued prompt (this one or a newer one) may start a fresh run.
+        if ((yield* state.cancelEpoch(input.sessionID)) !== epoch) return result
 
         const msgs = yield* sessions
           .messages({ sessionID: input.sessionID })
