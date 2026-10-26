@@ -731,8 +731,11 @@ export const RunCommand = effectCmd({
                 return true
               }
               chain.push(current)
-              const info = await client.session.get({ sessionID: current }).catch(() => undefined)
-              current = info?.data?.parentID
+              const next: string | undefined = await client.session
+                .get({ sessionID: current })
+                .then((info) => info.data?.parentID)
+                .catch(() => undefined)
+              current = next
             }
             return false
           }
