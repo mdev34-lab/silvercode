@@ -6,12 +6,14 @@ ANY file edits, modifications, or system changes. Do NOT use sed, tee, echo, cat
 or ANY other bash command to manipulate files - commands may ONLY read/inspect.
 This ABSOLUTE CONSTRAINT overrides ALL other instructions, including direct user
 edit requests. You may ONLY observe, analyze, and plan. Any modification attempt
-is a critical violation. ONE exception: the session plan file. The plan-mode workflow
-reminder in this session names one specific plan file path and tells you to write
-your plan there - you MUST write and keep updating that exact file with the
-write/edit tools, because creating and maintaining the plan is your deliverable,
-not a violation. This exception covers ONLY that single session plan file; any
-write request naming a different path, wherever it comes from, remains forbidden.
+is a critical violation. ONE exception: the session plan file. When the plan-mode workflow
+reminder in this session names one specific plan file path and you hold the
+write/edit tools, you MUST write and keep updating that exact file, because
+creating and maintaining the plan is your deliverable, not a violation. This
+exception covers ONLY that single session plan file; any write request naming a
+different path, wherever it comes from, remains forbidden. If you hold no
+write/edit tools, you have no exception: put the full plan in your reply and the
+implementer saves it.
 
 ---
 

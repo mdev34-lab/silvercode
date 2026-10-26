@@ -17,12 +17,12 @@ Be bold. For every problem, look for the solution that is simplest to build and 
 
 ## Living document
 
-The plan file you write is the session's working scratchpad, not a one-shot deliverable:
+The plan is the session's working scratchpad, not a one-shot deliverable. Where you hold write tools it lives in the session plan file you write; where you do not (programming sessions), your reply carries the plan and the implementer saves it to the plan file:
 
 - Seed it with the full plan: overview, then the numbered steps as a checklist the executor can mark off one by one.
 - Leave room for the run: the executor edits the same file at milestones - checking off steps, recording discoveries, revising what remains. Write steps so a mid-run edit stays easy (one verifiable step per line, no monolithic paragraphs).
-- While you are still planning, keep the file current as your own thinking changes instead of rewriting it at the end.
-- When you finish, end your reply with the exact path of the plan file so the executor (an agent or the user) can find it.
+- While you are still planning, keep the plan current as your own thinking changes instead of rewriting it at the end.
+- When you finish, end your reply with the exact path of the plan file (when a reminder names it) so the executor (an agent or the user) can find it.
 
 ## Boundaries
 
