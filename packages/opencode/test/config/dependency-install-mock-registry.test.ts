@@ -368,6 +368,12 @@ describe("Config Dependency Install Integration with MockRegistry", () => {
       const { ctx } = await createProjectFixture(tmp.path, registry.url, npmCacheDir)
       const started: string[] = []
       const startedAtMs: number[] = []
+      // Owner-local phase evidence: when this wrapper's own 300ms pre-install
+      // delay finished and the actual install was entered, and when each
+      // interrupt arrived. A request with no reachedActualInstallAtMs before it
+      // cannot have come from this wrapper's actual install.
+      const reachedActualInstallAtMs: number[] = []
+      const interruptedAtMs: number[] = []
       const interrupted: string[] = []
       const slowStart = Layer.effect(
         Npm.Service,
@@ -382,8 +388,14 @@ describe("Config Dependency Install Integration with MockRegistry", () => {
               }).pipe(
                 // The total budget also covers work before the first HTTP request.
                 Effect.andThen(Effect.sleep("300 millis")),
+                Effect.andThen(Effect.sync(() => reachedActualInstallAtMs.push(Date.now()))),
                 Effect.andThen(actual.install(dir, input)),
-                Effect.onInterrupt(() => Effect.sync(() => interrupted.push(dir))),
+                Effect.onInterrupt(() =>
+                  Effect.sync(() => {
+                    interrupted.push(dir)
+                    interruptedAtMs.push(Date.now())
+                  }),
+                ),
               ),
           })
         }),
@@ -439,6 +451,11 @@ describe("Config Dependency Install Integration with MockRegistry", () => {
           msAfterFirstInstallStart: request.timestamp - (startedAtMs[0] ?? startedAt),
           msBeforeTestEnd: endedAt - request.timestamp,
           installStartsSeen: startedAtMs.length,
+          reachedActualInstallCount: reachedActualInstallAtMs.length,
+          msAfterFirstReachedActualInstall:
+            reachedActualInstallAtMs.length > 0 ? request.timestamp - reachedActualInstallAtMs[0]! : null,
+          interruptCount: interruptedAtMs.length,
+          msAfterFirstInterrupt: interruptedAtMs.length > 0 ? request.timestamp - interruptedAtMs[0]! : null,
         })),
       ).toEqual([])
       // The bound expiry is reported as a timeout, not as an install failure.
