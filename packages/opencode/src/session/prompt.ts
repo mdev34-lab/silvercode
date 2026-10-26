@@ -1898,6 +1898,9 @@ const layer = Layer.effect(
         )
         if (!input.messageID || (result.info.role === "assistant" && result.info.parentID === input.messageID))
           return result
+        // Checked before every other re-entry path: once the run this caller joined was
+        // cancelled, no queued prompt (this one or a newer one) may start a fresh run.
+        if ((yield* state.cancelEpoch(input.sessionID)) !== epoch) return result
 
         const msgs = yield* sessions
           .messages({ sessionID: input.sessionID })
@@ -1905,10 +1908,7 @@ const layer = Layer.effect(
         if (!msgs) return result
         const ours = msgs.findIndex((msg) => msg.info.id === input.messageID)
         const newerUser = msgs.slice(ours + 1).find((msg) => msg.info.role === "user")
-        if (!newerUser) {
-          if ((yield* state.cancelEpoch(input.sessionID)) !== epoch) return result
-          continue
-        }
+        if (!newerUser) continue
         const superseded = msgs.some((msg) => msg.info.role === "assistant" && msg.info.parentID === newerUser.info.id)
         if (superseded) return result
       }
