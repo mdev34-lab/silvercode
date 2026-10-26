@@ -1,4 +1,4 @@
-import { ownerOf as workflowOwner, route as workRoute } from "@/session/work-flow"
+import { ownerOrNone as workflowOwner, route as workRoute } from "@/session/work-flow"
 import { WorkFlow } from "@opencode-ai/core/work-flow"
 import { sessionAgent } from "../session/session-agent"
 import * as Tool from "./tool"
@@ -329,7 +329,14 @@ export const TaskTool = Tool.define(
             .pipe(Effect.catchIf(NotFoundError.isInstance, () => Effect.succeed(undefined)))
         : undefined
       const admission = yield* workRoute(ctx.sessionID).pipe(Effect.provideService(Session.Service, sessions))
-      const rootOwner = yield* workflowOwner(ctx.sessionID).pipe(Effect.provideService(Session.Service, sessions))
+      const foundOwner = yield* workflowOwner(ctx.sessionID).pipe(Effect.provideService(Session.Service, sessions))
+      if (Option.isNone(foundOwner))
+        return yield* Effect.fail(
+          new Error(
+            "Cannot dispatch a child: an ancestor session is missing from storage, so the workflow root is unknown.",
+          ),
+        )
+      const rootOwner = foundOwner.value
       const rootRole = yield* sessionAgent(sessions, rootOwner)
       const inheritedWorkflow = WorkFlow.ownsRole(allRoles, workIdentity, rootRole)
       const programming = coordinator && admission.kind === "programming"

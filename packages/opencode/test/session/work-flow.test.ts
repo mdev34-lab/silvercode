@@ -5,7 +5,7 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Session } from "@/session/session"
 import { Question } from "@/question"
 import { route, clarify } from "@/session/work-flow"
-import { MessageID, PartID } from "@/session/schema"
+import { MessageID, PartID, SessionID } from "@/session/schema"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { disposeAllInstances } from "../fixture/fixture"
@@ -79,5 +79,19 @@ it.instance("an answer to a stale clarification cannot overwrite a newer root re
     yield* questions.reply({ requestID: pending[0].id, answers: [["Non-programming"]] })
     expect((yield* Fiber.join(fiber)).kind).toBe("programming")
     expect((yield* route(root.id)).kind).toBe("programming")
+  }),
+)
+
+it.instance("a missing ancestor session stays uncertain instead of dying, and clarify does not ask", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const questions = yield* Question.Service
+    const child = yield* sessions.create({ parentID: SessionID.make("ses_missing_ancestor") })
+    const decision = yield* route(child.id)
+    expect(decision.kind).toBe("uncertain")
+    expect(decision.requestID).toBeUndefined()
+    // Nothing can bind an answer without a known root, so no question is raised.
+    expect((yield* clarify(child.id)).kind).toBe("uncertain")
+    expect(yield* questions.list()).toEqual([])
   }),
 )
