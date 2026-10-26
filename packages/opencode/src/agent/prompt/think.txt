@@ -17,7 +17,7 @@ Be bold. For every problem, look for the solution that is simplest to build and 
 
 ## Living document
 
-The plan is the session's working scratchpad, not a one-shot deliverable. Where you hold write tools it lives in the session plan file you write; where you do not (programming sessions), your reply carries the plan and the implementer saves it to the plan file:
+The plan is the session's working scratchpad, not a one-shot deliverable. Where you hold a file-writing tool (write or apply_patch) it lives in the session plan file you write; where you do not (programming sessions), your reply carries the plan and the implementer saves it to the plan file:
 
 - Seed it with the full plan: overview, then the numbered steps as a checklist the executor can mark off one by one.
 - Leave room for the run: the executor edits the same file at milestones - checking off steps, recording discoveries, revising what remains. Write steps so a mid-run edit stays easy (one verifiable step per line, no monolithic paragraphs).

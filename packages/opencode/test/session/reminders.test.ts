@@ -259,38 +259,57 @@ describe("plan_exit root resolution", () => {
 })
 
 describe("living plan handoff for programming sessions", () => {
-  const taskResult = (sessionID: SessionID, subagent: string) =>
+  // A runtime-stamped task delivery: only terminal-success foreground children
+  // of this session in the current real request count as planning evidence.
+  const taskResult = (
+    sessionID: SessionID,
+    requestID: string,
+    subagent: string,
+    overrides: { terminal?: string; background?: boolean } = {},
+  ) =>
     ({
-      info: {
-        id: MessageID.ascending(),
-        sessionID,
-        role: "assistant",
-        agent: "work",
-        time: { created: Date.now() },
-      },
+      info: { id: MessageID.ascending(), sessionID, role: "assistant", agent: "work", time: { created: Date.now() } },
       parts: [
         {
           type: "tool",
           tool: "task",
           callID: "call_1",
-          state: { status: "completed", input: { subagent_type: subagent }, output: "plan", title: "", metadata: {}, time: { start: 0, end: 1 } },
+          state: {
+            status: "completed",
+            input: { subagent_type: subagent },
+            output: "plan",
+            title: "",
+            metadata: {
+              background: overrides.background ?? false,
+              workFlow: { requestID, parentID: sessionID, agent: subagent, terminal: overrides.terminal ?? "success" },
+            },
+            time: { start: 0, end: 1 },
+          },
         },
       ],
     }) as unknown as SessionV1.WithParts
 
-  itOff.instance("tells Work to have Code create the plan file after a delegated think when none exists", () =>
+  const assistantBy = (sessionID: SessionID, agent: string) =>
+    ({
+      info: { id: MessageID.ascending(), sessionID, role: "assistant", agent, time: { created: Date.now() } },
+      parts: [],
+    }) as unknown as SessionV1.WithParts
+
+  const run = (
+    messages: SessionV1.WithParts[],
+    agent: Agent.Info,
+    session: SessionNs.Info,
+  ) => SessionReminders.apply({ messages, agent, session }).pipe(Effect.map(texts), Effect.map((t) => t.join("\n")))
+
+  itOff.instance("tells Work to create the plan file after a delegated think when none exists", () =>
     Effect.gen(function* () {
       const sessions = yield* SessionNs.Service
       const root = yield* sessions.create({})
-      const result = yield* SessionReminders.apply({
-        messages: [taskResult(root.id, "think"), yield* user(root.id)],
-        agent: work,
-        session: root,
-      })
-      const body = texts(result).join("\n")
+      const request = yield* user(root.id)
+      const body = yield* run([request, taskResult(root.id, request.info.id, "think")], work, root)
       expect(body).toContain(root.slug)
-      expect(body).toContain("first Code step create it")
-      expect(body).not.toContain("you must write")
+      expect(body).toContain("have the first Code step create it")
+      expect(body).toContain("yourself if you hold a file-editing tool (edit, write or apply_patch)")
     }),
   )
 
@@ -298,14 +317,10 @@ describe("living plan handoff for programming sessions", () => {
     Effect.gen(function* () {
       const sessions = yield* SessionNs.Service
       const root = yield* sessions.create({})
-      const result = yield* SessionReminders.apply({
-        messages: [taskResult(root.id, "think"), yield* user(root.id)],
-        agent: work,
-        session: root,
-      })
-      const body = texts(result).join("\n")
+      const request = yield* user(root.id)
+      const body = yield* run([request, taskResult(root.id, request.info.id, "think")], work, root)
       expect(body).toContain(root.slug)
-      expect(body).toContain("first Code step create it")
+      expect(body).toContain("have the first Code step create it")
     }),
   )
 
@@ -313,12 +328,62 @@ describe("living plan handoff for programming sessions", () => {
     Effect.gen(function* () {
       const sessions = yield* SessionNs.Service
       const root = yield* sessions.create({})
-      const result = yield* SessionReminders.apply({
-        messages: [taskResult(root.id, "code"), yield* user(root.id)],
-        agent: work,
-        session: root,
-      })
-      expect(texts(result).join("\n")).not.toContain(root.slug)
+      const request = yield* user(root.id)
+      expect(yield* run([request, taskResult(root.id, request.info.id, "code")], work, root)).not.toContain(root.slug)
+    }),
+  )
+
+  for (const [label, overrides] of [
+    ["failed", { terminal: "failure" }],
+    ["cancelled", { terminal: "cancelled" }],
+    ["background", { background: true }],
+  ] as const)
+    itOff.instance(`a ${label} delegated think is not planning evidence`, () =>
+      Effect.gen(function* () {
+        const sessions = yield* SessionNs.Service
+        const root = yield* sessions.create({})
+        const request = yield* user(root.id)
+        expect(yield* run([request, taskResult(root.id, request.info.id, "think", overrides)], work, root)).not.toContain(
+          root.slug,
+        )
+      }),
+    )
+
+  itOff.instance("a think delegated for an earlier request does not leak into the next request", () =>
+    Effect.gen(function* () {
+      const sessions = yield* SessionNs.Service
+      const root = yield* sessions.create({})
+      const first = yield* user(root.id)
+      const second = yield* user(root.id)
+      const body = yield* run([first, taskResult(root.id, first.info.id, "think"), second], work, root)
+      expect(body).not.toContain(root.slug)
+    }),
+  )
+
+  itOff.instance("a primary think to work switch with no plan file hands creation to Work", () =>
+    Effect.gen(function* () {
+      const sessions = yield* SessionNs.Service
+      const root = yield* sessions.create({})
+      const body = yield* run([assistantBy(root.id, "think"), yield* user(root.id)], work, root)
+      expect(body).toContain(root.slug)
+      expect(body).toContain("does not exist yet")
+      expect(body).toContain("have the first Code step create it")
+    }),
+  )
+
+  it.instance("experimental: a primary think to work switch in a request that also delegated think keeps the switch reminder", () =>
+    Effect.gen(function* () {
+      const sessions = yield* SessionNs.Service
+      const root = yield* sessions.create({})
+      const request = yield* user(root.id)
+      const body = yield* run(
+        [request, taskResult(root.id, request.info.id, "think"), assistantBy(root.id, "think")],
+        work,
+        root,
+      )
+      expect(body).toContain("operational mode has changed from plan to work")
+      expect(body).toContain("does not exist yet")
+      expect(body).toContain(root.slug)
     }),
   )
 })
