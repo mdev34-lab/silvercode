@@ -1,5 +1,3 @@
-import { WorkFlow } from "@opencode-ai/core/work-flow"
-import { route as workRoute } from "@/session/work-flow"
 import { ToolFailure } from "@opencode-ai/llm"
 import type { SessionID } from "@/session/schema"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
@@ -309,17 +307,7 @@ const layer = Layer.effect(
 
     const tools: Interface["tools"] = Effect.fn("ToolRegistry.tools")(function* (input) {
       const known = yield* InstanceState.get(state)
-      const identities = yield* Effect.all([agents.get("work"), agents.get("think")])
-      const ownedRole = input.agent.native === true && identities.some((item) => item === input.agent)
-      const admission =
-        input.sessionID && ownedRole
-          ? yield* workRoute(input.sessionID).pipe(Effect.provideService(Session.Service, sessions), Effect.orDie)
-          : undefined
-      const restricted = ownedRole && input.sessionID !== undefined && admission?.kind !== "nonprogramming"
-      const allowed = (tool: Tool.Def) =>
-        !restricted || (known.builtin.includes(tool) && WorkFlow.inspectionTool(tool.id))
       const filtered = (yield* all()).filter((tool) => {
-        if (!allowed(tool)) return false
         // Agents that opt out of the finish tool end turns on end-of-stream,
         // so the model is not offered finish at all (the loop gating in
         // prompt.ts already skips the requirement for them).
@@ -392,22 +380,6 @@ const layer = Layer.effect(
             metadata: tool.metadata,
             execute: (args: unknown, ctx: Tool.Context) =>
               Effect.gen(function* () {
-                const current = ownedRole
-                  ? yield* workRoute(ctx.sessionID).pipe(Effect.provideService(Session.Service, sessions), Effect.orDie)
-                  : undefined
-                if (
-                  ownedRole &&
-                  current?.kind !== "nonprogramming" &&
-                  (!known.builtin.includes(tool) || !WorkFlow.inspectionTool(tool.id))
-                )
-                  return yield* Effect.fail(
-                    new ToolFailure({
-                      message:
-                        current?.kind === "programming"
-                          ? "Programming is coordinator-only for Work and read-only for Think. Complete Think planning, then delegate implementation and commands to Code."
-                          : "Task intent is uncertain. Inspect read-only or ask whether this is programming or non-programming before execution; only the user's request can select the route.",
-                    }),
-                  )
                 return yield* tool.execute(args, ctx)
               }),
             formatValidationError: tool.formatValidationError,

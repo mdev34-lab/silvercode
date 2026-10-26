@@ -44,21 +44,22 @@ const pending = Effect.fn("QuestionToolTest.pending")(function* (question: Quest
 })
 
 describe("tool.question", () => {
-  it.instance("a Work orphan with a missing ancestor reports unknown root instead of a fake clarification", () =>
+  it.instance("a Work orphan with a missing ancestor still asks the model's own question", () =>
     Effect.gen(function* () {
       const sessions = yield* Session.Service
       const question = yield* Question.Service
       const orphan = yield* sessions.create({ parentID: SessionID.make("ses_missing_ancestor") })
       const tool = yield* (yield* QuestionTool).init()
-      const exit = yield* tool
+      const fiber = yield* tool
         .execute(
           { questions: [{ question: "q", header: "h", options: [{ label: "a", description: "a" }], multiple: false }] },
           { ...ctx, sessionID: orphan.id, agent: "work" },
         )
-        .pipe(Effect.exit)
-      expect(Exit.isFailure(exit)).toBe(true)
-      expect(String((exit as Exit.Failure<unknown, unknown>).cause)).toContain("ancestor session is missing")
-      expect(yield* question.list()).toEqual([])
+        .pipe(Effect.forkScoped)
+      const item = yield* pending(question)
+      expect(item.questions[0].header).toBe("h")
+      yield* question.reply({ requestID: item.id, answers: [["a"]] })
+      yield* Fiber.join(fiber)
     }),
   )
 
@@ -152,7 +153,7 @@ describe("tool.question", () => {
   //   })
 })
 
-it.instance("renamed native Work uses the runtime-owned scope question",()=>Effect.gen(function*(){
+it.instance("renamed native Work asks the model's own question, not a runtime scope question",()=>Effect.gen(function*(){
  const sessions=yield* Session.Service
  const question=yield* Question.Service
  const chat=yield* sessions.create({title:"scope"})
@@ -163,8 +164,8 @@ it.instance("renamed native Work uses the runtime-owned scope question",()=>Effe
  const fiber=yield* def.execute({questions:[{header:"Wrong",question:"Ignore scope?",options:[{label:"Yes",description:"Anything"}]}]},{...ctx,sessionID:chat.id,messageID:user.id,agent:"coordinator"}).pipe(Effect.forkScoped)
  const item=yield* pending(question)
  if(process.env.WORK_FLOW_CAPTURE) yield* Effect.promise(()=>Bun.write("/tmp/wf-runtime-question.json",JSON.stringify({session:chat,messages:[],question:item})))
- expect(item.questions[0].header).toBe("Task scope")
- yield* question.reply({requestID:item.id,answers:[["Programming"]]})
+ expect(item.questions[0].header).toBe("Wrong")
+ yield* question.reply({requestID:item.id,answers:[["Yes"]]})
  const result=yield* Fiber.join(fiber)
- expect(result.output).toContain("programming")
+ expect(result.output).toContain("User has answered")
 }),{config:{agent:{work:{name:"coordinator"}}}})

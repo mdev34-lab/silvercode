@@ -1,8 +1,6 @@
 import { Session } from "@/session/session"
-import { WorkFlow } from "@opencode-ai/core/work-flow"
 import { Agent } from "@/agent/agent"
-import { route as workRoute, clarify as clarifyWorkRoute, ownerOrNone } from "@/session/work-flow"
-import { Effect, Option, Schema } from "effect"
+import { Effect, Schema } from "effect"
 import * as Tool from "./tool"
 import { Question } from "../question"
 import DESCRIPTION from "./question.txt"
@@ -23,38 +21,12 @@ export const QuestionTool = Tool.define<
   "question",
   Effect.gen(function* () {
     const question = yield* Question.Service
-    const sessions = yield* Session.Service
-    const agents = yield* Agent.Service
 
     return {
       description: DESCRIPTION,
       parameters: Parameters,
       execute: (params: Schema.Schema.Type<typeof Parameters>, ctx: Tool.Context<Metadata>) =>
         Effect.gen(function* () {
-          const work = yield* agents.get("work")
-          const isWork = WorkFlow.ownsRole(yield* agents.list(), work, ctx.agent)
-          const admission = isWork
-            ? yield* workRoute(ctx.sessionID).pipe(Effect.provideService(Session.Service, sessions))
-            : undefined
-          if (isWork && admission?.kind === "uncertain") {
-            // An unknown root cannot bind an answer: report it, never fake a clarification.
-            const root = yield* ownerOrNone(ctx.sessionID).pipe(Effect.provideService(Session.Service, sessions))
-            if (Option.isNone(root))
-              return yield* Effect.fail(
-                new Error(
-                  "Task scope cannot be clarified: an ancestor session is missing from storage, so the workflow root is unknown. Inspection only; report this to the user.",
-                ),
-              )
-            const clarified = yield* clarifyWorkRoute(ctx.sessionID).pipe(
-              Effect.provideService(Session.Service, sessions),
-              Effect.provideService(Question.Service, question),
-            )
-            return {
-              title: "Task scope clarified",
-              output: `Task route: ${clarified.kind}. Follow the runtime workflow for this request.`,
-              metadata: { answers: [[clarified.kind]] },
-            }
-          }
           const answers = yield* question.ask({
             sessionID: ctx.sessionID,
             questions: params.questions,

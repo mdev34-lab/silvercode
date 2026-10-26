@@ -305,6 +305,7 @@ export const FinishTool = Tool.define(
           const effort = AgentEffort.resolve(readAgentEffort(session?.metadata), AgentEffort.resolve(configEffort))
           const reviewState = reviewLoopState(messages, { effort })
           const workIdentity = yield* agents.get("work")
+          const workflowNotes: string[] = []
           if (
             session !== undefined &&
             WorkFlow.ownsRole(yield* agents.list(), workIdentity, ctx.agent) &&
@@ -320,35 +321,31 @@ export const FinishTool = Tool.define(
               original?.parts
                 .flatMap((part) => (part.type === "text" ? [(part as { text: string }).text] : []))
                 .join("\n") ?? ""
+            // Workflow stages are not action or completion gates: a missing stage is reported
+            // truthfully in the result instead of blocking, and never claimed as done.
             if (
               admission.kind === "nonprogramming" &&
               (effort === "thorough" || WorkFlow.complex(requestText)) &&
               !workflow.delegated
             )
-              return yield* Effect.fail(
-                new ToolFailure({
-                  message:
-                    "Complex or thorough non-programming work requires a successful General delivery before success. Do not send it to Code.",
-                }),
-              )
+              workflowNotes.push("complex or thorough non-programming work had no successful General delivery")
             if (admission.kind === "programming" && !workflow.implemented)
+              workflowNotes.push("programming work was not delivered through successful Think planning and Code implementation")
+            // Blocking findings come from a Review that actually ran: reporting success over them
+            // would misstate the delivered work, so that one stays a delivery-integrity refusal.
+            if (reviewState.blockingFindings > 0)
               return yield* Effect.fail(
                 new ToolFailure({
                   message:
-                    "Programming success requires successful Think planning followed by successful Code implementation in this request.",
+                    "Work cannot report success while a Review has blocking findings. Fix them and obtain a clean Review, or report failure honestly; a review budget is not approval.",
                 }),
               )
             if (
-              (admission.kind === "programming" || reviewState.blockingFindings > 0) &&
-              (reviewState.blockingFindings > 0 ||
-                reviewState.workSinceReview ||
-                reviewState.lastReviewVerdict !== "approved")
+              admission.kind === "programming" &&
+              (reviewState.workSinceReview || reviewState.lastReviewVerdict !== "approved")
             )
-              return yield* Effect.fail(
-                new ToolFailure({
-                  message:
-                    "Work cannot report implementation success while Review is missing, stale or has blocking findings. Fix through the appropriate executor and obtain a clean Review; a review budget is not approval. Report failure honestly if blocked.",
-                }),
+              workflowNotes.push(
+                `no clean Review of the current work (blocking findings ${reviewState.blockingFindings}, ${reviewState.workSinceReview ? "work after the last review, " : ""}last verdict ${reviewState.lastReviewVerdict ?? "none"}); treat it as unreviewed`,
               )
           }
 
@@ -469,7 +466,21 @@ export const FinishTool = Tool.define(
               !availability.available && session?.parentID !== undefined && availability.code === "subagent-depth",
           })
 
-          if (!outcome.deliver) {
+          // A missing, stale or unavailable review is not a completion gate: the result is delivered
+          // with an explicit UNREVIEWED label and never as approved. Known blocking findings from a
+          // Review that ran, and a review still in progress, keep declining.
+          const softened =
+            !outcome.deliver &&
+            params.reason !== "subagent_wait" &&
+            reviewState.blockingFindings === 0 &&
+            !reviewState.reviewInProgress
+          if (softened)
+            workflowNotes.push(
+              `UNREVIEWED: effort ${effort} asks for a clean current Review and none is in place; this is not an approval. ${
+                outcome.feedback ?? ""
+              }`.trim(),
+            )
+          if (!outcome.deliver && !softened) {
             yield* Effect.logWarning("finish declined by effort policy", {
               sessionID: ctx.sessionID,
               effort,
@@ -556,7 +567,9 @@ export const FinishTool = Tool.define(
 
           return {
             title: "Task completed",
-            output: `${params.result}\n\n[${status}]`,
+            output: `${params.result}\n\n[${status}]${
+              workflowNotes.length > 0 ? `\n\nWorkflow status (not blocking): ${workflowNotes.join("; ")}.` : ""
+            }`,
             metadata: {
               termination: { reason: params.reason },
               review: {

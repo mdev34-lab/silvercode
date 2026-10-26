@@ -3,7 +3,7 @@ import { afterEach, describe, expect } from "bun:test"
 import path from "path"
 import fs from "fs/promises"
 import { fileURLToPath, pathToFileURL } from "url"
-import { Effect, Layer, Result, Schema } from "effect"
+import { Effect, Fiber, Layer, Result, Schema } from "effect"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { ToolRegistry } from "@/tool/registry"
 import { Tool } from "@/tool/tool"
@@ -23,6 +23,7 @@ import { RuntimeFlags } from "@/effect/runtime-flags"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { MCP } from "@/mcp"
+import { Question } from "@/question"
 import type { Tool as MCPToolDef } from "@modelcontextprotocol/sdk/types.js"
 
 const configLayer = TestConfig.layer({
@@ -53,7 +54,7 @@ const brokenPluginLayer = Layer.succeed(
   }),
 )
 
-const root = LayerNode.group([ToolRegistry.node, Agent.node, Session.node, SessionProjector.node])
+const root = LayerNode.group([ToolRegistry.node, Agent.node, Session.node, SessionProjector.node, Question.node])
 const replacements = [
   [Config.node, configLayer],
   [RuntimeFlags.node, RuntimeFlags.layer()],
@@ -193,10 +194,8 @@ describe("tool.registry", () => {
         sessionID: orphan.id,
       })
       const ids = tools.map((tool) => tool.id)
-      // Unknown root is treated as uncertain: native Work stays inspection-only.
+      // Unknown root is not a permission boundary: tools stay available.
       expect(ids).toContain("read")
-      expect(ids).not.toContain("edit")
-      expect(ids).not.toContain("write")
       expect(ids).not.toContain("apply_patch")
     }),
   )
@@ -697,11 +696,11 @@ describe("tool.registry", () => {
   )
 })
 
-it.instance("programming Work and Think expose only native inspection tools, noncoding Work keeps commands", () => Effect.gen(function* () {
+it.instance("programming and non-programming Work keep the same tools (workflow is advisory)", () => Effect.gen(function* () {
   const sessions=yield* Session.Service
   const agents=yield* Agent.Service
   const registry=yield* ToolRegistry.Service
-  for (const [text,restricted] of [["Fix Python software",true],["Research hotels",false]] as const) {
+  for (const [text,restricted] of [["Fix Python software",false],["Research hotels",false]] as const) {
     const chat=yield* sessions.create({title:"admission"})
     const user=yield* sessions.updateMessage({id:MessageID.ascending(),role:"user",sessionID:chat.id,agent:"work",model:{providerID:ProviderV2.ID.make("test"),modelID:ModelV2.ID.make("test")},time:{created:Date.now()}})
     yield* sessions.updatePart({id:PartID.ascending(),messageID:user.id,sessionID:chat.id,type:"text",text})
@@ -712,5 +711,37 @@ it.instance("programming Work and Think expose only native inspection tools, non
       expect(ids.includes("edit")).toBe(!restricted)
       expect(ids.includes("bash")).toBe(!restricted)
     }
+  }
+}))
+
+it.instance("a programming Work route keeps execution tools and the invalid-call reporter", () => Effect.gen(function* () {
+  const sessions=yield* Session.Service
+  const agents=yield* Agent.Service
+  const registry=yield* ToolRegistry.Service
+  const chat=yield* sessions.create({title:"admission"})
+  const user=yield* sessions.updateMessage({id:MessageID.ascending(),role:"user",sessionID:chat.id,agent:"work",model:{providerID:ProviderV2.ID.make("test"),modelID:ModelV2.ID.make("test")},time:{created:Date.now()}})
+  yield* sessions.updatePart({id:PartID.ascending(),messageID:user.id,sessionID:chat.id,type:"text",text:"Fix Python software"})
+  for (const role of ["work","think"]) {
+    const found=yield* registry.tools({sessionID:chat.id,agent:yield* agents.get(role),providerID:ProviderV2.ID.make("test"),modelID:ModelV2.ID.make("test")})
+    const ids=found.map(tool=>tool.id)
+    expect(ids.includes("invalid")).toBe(true)
+    expect(ids.includes("bash")).toBe(true)
+    const ctx={sessionID:chat.id,messageID:user.id,agent:role,abort:new AbortController().signal,messages:[],metadata:()=>Effect.void,ask:()=>Effect.void} as never
+    const out=yield* found.find(tool=>tool.id==="invalid")!.execute({tool:"bash",error:"Model tried to call unavailable tool 'bash'."},ctx)
+    expect(out.output).toContain("unavailable tool 'bash'")
+  }
+}))
+
+it.instance("a request the classifier is unsure about keeps Work's execution tools and Task; the model is advised, not blocked", () => Effect.gen(function* () {
+  const sessions=yield* Session.Service
+  const agents=yield* Agent.Service
+  const registry=yield* ToolRegistry.Service
+  for (const text of ["run echo hi","Fetch the pull request"]) {
+    const chat=yield* sessions.create({title:"admission"})
+    const user=yield* sessions.updateMessage({id:MessageID.ascending(),role:"user",sessionID:chat.id,agent:"work",model:{providerID:ProviderV2.ID.make("test"),modelID:ModelV2.ID.make("test")},time:{created:Date.now()}})
+    yield* sessions.updatePart({id:PartID.ascending(),messageID:user.id,sessionID:chat.id,type:"text",text})
+    const found=yield* registry.tools({sessionID:chat.id,agent:yield* agents.get("work"),providerID:ProviderV2.ID.make("test"),modelID:ModelV2.ID.make("test")})
+    const ids=found.map(tool=>tool.id)
+    for (const id of ["bash","edit","write","task","read"]) expect(ids.includes(id)).toBe(true)
   }
 }))
