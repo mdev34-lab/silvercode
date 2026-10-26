@@ -455,3 +455,36 @@ it.instance(
     }),
   { git: true, config: countdown },
 )
+
+// An ask abandoned by an abort never got an answer, but clients only drop a prompt on
+// `permission.replied`; without the event the modal outlives the request and every later
+// reply for it is a not-found error.
+it.instance(
+  "ask - an aborted request is announced as settled so clients drop the prompt",
+  () =>
+    Effect.gen(function* () {
+      const replies = yield* collectReplies()
+      const fiber = yield* ask(bash("per_abort_announced")).pipe(Effect.forkScoped)
+      yield* waitForPending(1)
+      yield* Fiber.interrupt(fiber)
+      yield* waitForReplies(replies, 1)
+      expect(replies).toEqual(["reject"])
+      expect(yield* list()).toHaveLength(0)
+    }),
+  { git: true },
+)
+
+it.instance(
+  "ask - an answered request is announced once, not again when the ask ends",
+  () =>
+    Effect.gen(function* () {
+      const replies = yield* collectReplies()
+      const fiber = yield* ask(bash("per_answered_once")).pipe(Effect.forkScoped)
+      yield* waitForPending(1)
+      yield* reply({ requestID: PermissionV1.ID.make("per_answered_once"), reply: "once" })
+      yield* Fiber.join(fiber)
+      yield* Effect.sleep("200 millis")
+      expect(replies).toEqual(["once"])
+    }),
+  { git: true },
+)
