@@ -142,6 +142,25 @@ export const apply = Effect.fn("SessionReminders.apply")(function* (input: {
     return input.messages
   }
 
+  // Delegation flow in experimental plan mode: a delegated Think ran as a child
+  // session, so the last assistant message here is not Think's. Work still gets
+  // the living-plan guidance, same as outside experimental plan mode.
+  if (input.agent.name === "work" && delegatedThink(input.messages)) {
+    const plan = yield* rootPlan(input.session)
+    if (Option.isSome(plan)) {
+      const exists = yield* fsys.existsSafe(plan.value)
+      userMessage.parts.push({
+        id: PartID.ascending(),
+        messageID: userMessage.info.id,
+        sessionID: userMessage.info.sessionID,
+        type: "text",
+        text: exists ? scratchpad(plan.value) : planHandoff(plan.value),
+        synthetic: true,
+      })
+      return input.messages
+    }
+  }
+
   const assistantMessage = input.messages.findLast((msg) => msg.info.role === "assistant")
   if (input.agent.name !== "think" && AgentSchema.canonicalID(assistantMessage?.info.agent ?? "") === "think") {
     const plan = yield* rootPlan(input.session)
@@ -173,8 +192,8 @@ export const apply = Effect.fn("SessionReminders.apply")(function* (input: {
       Option.isNone(plan)
         ? "A plan file path could not be resolved because an ancestor session is missing from storage. Do not create or edit any plan file."
         : exists
-          ? `A plan file already exists at ${plan.value}. You can read it and make incremental edits using the edit tool.`
-          : `No plan file exists yet. You should create your plan at ${plan.value} using the write tool.`,
+          ? `A plan file already exists at ${plan.value}. If you hold the edit tool, read it and make incremental edits; otherwise put the updated plan in your reply.`
+          : `No plan file exists yet. If you hold the write tool, create your plan at ${plan.value}; otherwise put the full plan in your reply and the implementer saves it there.`,
     ),
     synthetic: true,
   })
