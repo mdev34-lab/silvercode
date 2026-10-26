@@ -718,6 +718,24 @@ export const RunCommand = effectCmd({
           // exit, killing the in-process server and every job with it, before
           // all of their results are surfaced.
           const background = BackgroundTasks.make(sessionID)
+          // Sessions already known to descend from this run's root, so a request is checked once.
+          const ownedSessions = new Set<string>([sessionID])
+          const ownsPermissionSession = async (id: string) => {
+            if (ownedSessions.has(id)) return true
+            if (background.owns(id)) return true
+            const chain: string[] = []
+            let current: string | undefined = id
+            for (let depth = 0; current && depth < 16; depth++) {
+              if (ownedSessions.has(current)) {
+                for (const item of chain) ownedSessions.add(item)
+                return true
+              }
+              chain.push(current)
+              const info = await client.session.get({ sessionID: current }).catch(() => undefined)
+              current = info?.data?.parentID
+            }
+            return false
+          }
           let rootIdle = false
           let lastText = ""
           let error: string | undefined
@@ -885,7 +903,9 @@ export const RunCommand = effectCmd({
 
             if (event.type === "permission.asked") {
               const permission = event.properties
-              if (permission.sessionID !== sessionID) continue
+              // A delegated child (foreground or background) waits for the same answer the root would
+              // get; nobody else answers a headless run's requests, so ignoring it hangs the child.
+              if (!(await ownsPermissionSession(permission.sessionID))) continue
 
               if (auto) {
                 await client.permission.reply({
