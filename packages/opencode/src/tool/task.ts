@@ -348,7 +348,7 @@ export const TaskTool = Tool.define(
             "Programming stage children cannot delegate implementation or substitute workflow stages. Return the result to Work.",
           ),
         )
-      if (inheritedWorkflow && admission.kind === "uncertain")
+      if (inheritedWorkflow && admission.kind === "uncertain" && admission.requestID === undefined)
         return yield* Effect.fail(
           new Error(
             "Clarify programming or non-programming intent with the user before dispatching any child. Inspection may use the native read-only tools.",
@@ -361,7 +361,7 @@ export const TaskTool = Tool.define(
         )
       if (
         coordinator &&
-        admission.kind !== "nonprogramming" &&
+        WorkFlow.hardRoute(admission) &&
         ![thinkIdentity, codeIdentity, yield* agent.get("review")].some(
           (item) => item?.native === true && item === next,
         )
@@ -371,7 +371,7 @@ export const TaskTool = Tool.define(
             "Programming or uncertain Work cannot bypass routing through an alternate child. Use Think/Code for programming or ask the user to clarify non-programming intent.",
           ),
         )
-      if (admission.kind !== "programming" && next === codeIdentity)
+      if ((admission.kind === "nonprogramming" || WorkFlow.hardRoute(admission)) && admission.kind !== "programming" && next === codeIdentity)
         return yield* Effect.fail(
           new Error(
             "Code is only for a programming request. Non-programming work stays manual or with General; clarify uncertain intent first.",

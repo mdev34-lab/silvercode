@@ -4273,7 +4273,7 @@ it.instance("a Think delivery finished after a runner finish nudge still records
   expect(planned.metadata.workFlow?.agent).toBe("think")
 }))
 
-it.instance("uncertain root blocks every child including Review and permission-overridden Explore", () => Effect.gen(function* () {
+it.instance("an unclassified request does not block children: Work is advised, not stopped", () => Effect.gen(function* () {
   const {chat,assistant}=yield* seed()
   const sessions=yield* Session.Service
   const history=yield* sessions.messages({sessionID:chat.id})
@@ -4283,8 +4283,9 @@ it.instance("uncertain root blocks every child including Review and permission-o
   for (const name of ["think","code","review","explore","general"]) {
     let ran=false
     const exit=yield* def.execute({description:"cannot bypass question",prompt:"implement",subagent_type:name,background:false},{sessionID:chat.id,messageID:assistant.id,agent:"work",abort:new AbortController().signal,messages:[],metadata:()=>Effect.void,ask:()=>Effect.void,extra:{promptOps:stubOps({onPrompt:()=>{ran=true}})}}).pipe(Effect.exit)
-    expect(Exit.isFailure(exit)).toBe(true)
-    expect(ran).toBe(false)
+    // The child is dispatched (Review's own delivery contract may still fail with the stub).
+    expect(ran).toBe(true)
+    void exit
   }
 }))
 

@@ -315,7 +315,7 @@ const layer = Layer.effect(
         input.sessionID && ownedRole
           ? yield* workRoute(input.sessionID).pipe(Effect.provideService(Session.Service, sessions), Effect.orDie)
           : undefined
-      const restricted = ownedRole && input.sessionID !== undefined && admission?.kind !== "nonprogramming"
+      const restricted = ownedRole && input.sessionID !== undefined && admission !== undefined && WorkFlow.hardRoute(admission)
       // `invalid` only reports a failed call back to the model (it runs nothing), so a restricted
       // route keeps it: the repair path of a call to an unavailable tool lands on it.
       const reportsInvalidCall = (tool: Tool.Def) => tool.id === InvalidTool.id && known.builtin.includes(tool)
@@ -398,7 +398,7 @@ const layer = Layer.effect(
                 const current = ownedRole
                   ? yield* workRoute(ctx.sessionID).pipe(Effect.provideService(Session.Service, sessions), Effect.orDie)
                   : undefined
-                const routeRestricted = ownedRole && current?.kind !== "nonprogramming"
+                const routeRestricted = ownedRole && current !== undefined && WorkFlow.hardRoute(current)
                 const routeGuidance =
                   current?.kind === "programming"
                     ? "Programming is coordinator-only for Work and read-only for Think. Complete Think planning, then delegate implementation and commands to Code."

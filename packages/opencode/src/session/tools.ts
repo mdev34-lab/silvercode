@@ -1,3 +1,4 @@
+import { WorkFlow } from "@opencode-ai/core/work-flow"
 import { route as workRoute } from "./work-flow"
 import { Agent } from "@/agent/agent"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
@@ -426,7 +427,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
   const admission = controlled
     ? yield* workRoute(input.session.id).pipe(Effect.provideService(Session.Service, sessions), Effect.orDie)
     : undefined
-  if ((controlled && admission?.kind !== "nonprogramming") || flags.experimentalCodeMode) {
+  if ((controlled && admission !== undefined && WorkFlow.hardRoute(admission)) || flags.experimentalCodeMode) {
     yield* catalog.sync(entries, toolSearch)
     return tools
   }
@@ -460,8 +461,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
           const ctx = context(args, opts)
           if (
             controlled &&
-            (yield* workRoute(input.session.id).pipe(Effect.provideService(Session.Service, sessions))).kind !==
-              "nonprogramming"
+            WorkFlow.hardRoute(yield* workRoute(input.session.id).pipe(Effect.provideService(Session.Service, sessions)))
           )
             return yield* Effect.die(
               new Error(

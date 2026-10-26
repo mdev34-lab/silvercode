@@ -158,7 +158,7 @@ const layer = Layer.effect(
           return [
             "Programming requests require completed Think planning before Code implementation, then a clean Review. Work cannot implement programming directly, including tiny edits.",
             "Non-programming work must not go to Code. At fast effort, medium-sized work may be manual; complex or thorough work goes to General; medium effort balances direct work and General delegation.",
-            "Uncertain requests allow inspection and questions only before execution. Use the question tool to clarify task scope through the runtime-owned question. Do not relabel programming to evade its workflow.",
+            "When it is unclear whether a request changes software, carry on with the work (inspect, run commands, delegate to General); use the question tool only if the answer would change what you do. If it turns out to be programming, follow the Think, Code, Review workflow. Do not relabel programming to evade its workflow.",
             "Failed, cancelled or pending children are not successful stage completion. A pass budget cannot excuse reporting success with blocking findings.",
           ].join("\n")
 

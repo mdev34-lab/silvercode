@@ -156,6 +156,15 @@ const inspection = new Set([
   "tool_search",
   "tool_search_regex",
 ])
+/**
+ * Routes that hard-limit the native Work and Think tools: a programming request (the Think, Code,
+ * Review workflow) and a route nothing can classify (unknown root, no request). An ordinary request
+ * the classifier is merely unsure about is not blocked: the model gets guidance instead.
+ */
+export function hardRoute(route: { kind: Route["kind"]; requestID?: string | undefined }) {
+  return route.kind === "programming" || (route.kind === "uncertain" && route.requestID === undefined)
+}
+
 export function inspectionTool(id: string) {
   return inspection.has(id)
 }
