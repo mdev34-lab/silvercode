@@ -13,7 +13,7 @@ import { fileURLToPath } from "url"
 import { Config } from "@/config/config"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Shell } from "@opencode-ai/core/shell"
-import { windowsPowerShellCommand } from "@opencode-ai/core/shell-encoding"
+import { windowsCmdCommand, windowsPowerShellCommand } from "@opencode-ai/core/shell-encoding"
 import { ShellID } from "./shell/id"
 import { ToolFailure } from "@opencode-ai/llm"
 
@@ -310,7 +310,7 @@ function cmd(shell: string, command: string, cwd: string, env: NodeJS.ProcessEnv
     )
   }
 
-  return ChildProcess.make(command, [], {
+  return ChildProcess.make(windowsCmdCommand(shell, command), [], {
     shell,
     cwd,
     env,

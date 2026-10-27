@@ -1,7 +1,7 @@
 export * as Shell from "./shell"
 
 import path from "path"
-import { windowsPowerShellCommand } from "./shell-encoding"
+import { windowsCmdCommand, windowsPowerShellCommand } from "./shell-encoding"
 import { spawn, type ChildProcess } from "child_process"
 import { readFile } from "fs/promises"
 import { statSync } from "fs"
@@ -197,7 +197,7 @@ export function args(file: string, command: string, cwd: string) {
       command,
     ]
   }
-  if (n === "cmd") return ["/c", command]
+  if (n === "cmd") return ["/c", windowsCmdCommand(file, command)]
   if (ps(file)) return ["-NoProfile", "-Command", windowsPowerShellCommand(file, command)]
   return ["-c", command]
 }

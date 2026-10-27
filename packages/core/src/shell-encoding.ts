@@ -5,3 +5,10 @@ export function windowsPowerShellCommand(shell: string, command: string, platfor
   // Keep the original command on its own line, including leading comments.
   return "$OutputEncoding = [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false);\n" + command
 }
+
+/** cmd.exe builtins write in the console's OEM codepage; switch it to UTF-8 so the text readers decode them. */
+export function windowsCmdCommand(shell: string, command: string, platform = process.platform): string {
+  if (platform !== "win32" || !/(?:^|[\\/])cmd(?:\.exe)?$/i.test(shell)) return command
+  // `&` (not `&&`) so a failing chcp (no console attached) never blocks the user's command.
+  return "chcp 65001>nul & " + command
+}
