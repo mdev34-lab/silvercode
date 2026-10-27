@@ -65,7 +65,11 @@ describe("cmd.exe UTF-8 output (#543)", () => {
       writeFileSync(path.join(dir, "chcp.cmd"), "@echo HIJACKED\r\n")
       writeFileSync(path.join(dir, "chcp.bat"), "@echo HIJACKED\r\n")
       const cmd = process.env.COMSPEC || "cmd.exe"
-      const echo = `echo ${text.split(" ")[0]} & exit /b 7`
+      // A literal non-ASCII argument is lossy before cmd runs (the command line is code-page converted), so the
+      // text comes from a file name the shell lists itself.
+      const file = "ação-日本.txt"
+      writeFileSync(path.join(dir, file), "")
+      const echo = "dir /b *.txt & exit /b 7"
       const wrapped = windowsCmdCommand(cmd, echo)
       expect(wrapped).not.toBe(echo)
       // Baseline before any wrapped run. The probe uses the absolute System32 helper (never a bare chcp) and a
@@ -77,7 +81,7 @@ describe("cmd.exe UTF-8 output (#543)", () => {
       }
       const cpBefore = probe()
       const base = spawnSync(echo, { cwd: dir, shell: cmd, windowsHide: true })
-      console.log("cmd baseline (child view):", cpBefore, "| unwrapped echo is utf8 =", base.stdout.toString("utf8").includes("Área"))
+      console.log("cmd baseline (child view):", cpBefore, "| unwrapped echo is utf8 =", base.stdout.toString("utf8").includes(file))
       const shapes = {
         // Shell.args applies the wrapper itself: argv form, piped stdio, hidden window.
         args: spawnSync(cmd, Shell.args(cmd, echo, dir), { cwd: dir, windowsHide: true }),
@@ -93,7 +97,7 @@ describe("cmd.exe UTF-8 output (#543)", () => {
         console.log(`cmd shape ${name}: status=${out.status} stdout=${out.stdout?.toString("hex")} stderr=${out.stderr?.toString("utf8").trim()}`)
       for (const [name, out] of Object.entries(shapes)) {
         expect({ name, status: out.status }).toEqual({ name, status: 7 })
-        expect({ name, out: out.stdout.toString("utf8").includes("Área") }).toEqual({ name, out: true })
+        expect({ name, out: out.stdout.toString("utf8").includes(file) }).toEqual({ name, out: true })
         expect(out.stdout.toString("utf8")).not.toContain("HIJACKED")
       }
     } finally {
