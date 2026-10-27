@@ -27,7 +27,10 @@ import { directory, json, type FetchRequest } from "../../fixture/tui-sdk"
 //   - the aborted assistant message stays in the transcript as interrupted,
 //   - every follow-up prompt reaches `/session/:id/message` with its own text,
 //   - no cancelled run is resurrected and no duplicate prompt is re-sent,
-//   - the fresh run's own streaming output renders normally afterwards.
+//   - the fresh run's own streaming output renders normally afterwards,
+//   - a dropped idle status event leaves the stored status busy without
+//     gating the follow-up prompt, and every session-mutation request the TUI
+//     sent is accounted for (none fired at another session or endpoint).
 //
 // Environment caveat: the harness replaces the HTTP boundary with a scripted
 // server, so this covers the client half of the contract (interrupt -> abort ->
@@ -53,6 +56,23 @@ const isAbort = (request: FetchRequest) =>
   request.method === "POST" && request.pathname === `/session/${SESSION_ID}/abort`
 
 const abortCount = (requests: FetchRequest[]) => requests.filter(isAbort).length
+
+// Every session-mutation request the TUI sent, unfiltered by session. Counting
+// aborts and prompts only for the routed session would read a write fired at
+// the wrong session as "nothing happened", so the tests assert on the full
+// mutation record: every write under /session must name the routed session
+// (aborts, prompts, and the local-context metadata PATCH all do), and an abort
+// or message fired at another session - or at none - fails here. The fixture
+// still throws on any request no route answers, so an unaccounted write fails
+// the run even before this check.
+const isMutation = (request: FetchRequest) => request.method !== "GET" && request.pathname.startsWith("/session")
+
+function expectMutationsTargeted(requests: FetchRequest[]) {
+  const untargeted = requests
+    .filter(isMutation)
+    .filter((request) => /^\/session(?:\/([^/]+))?/.exec(request.pathname)?.[1] !== SESSION_ID)
+  expect(untargeted.map((request) => `${request.method} ${request.pathname}`)).toEqual([])
+}
 
 // The user-visible text each submitted prompt carried, read from the recorded
 // request body so an empty or stale payload cannot pass as a successful prompt.
@@ -158,7 +178,7 @@ async function interrupt(harness: Setup, expectedAborts: number) {
     undefined,
     `the second Escape never issued abort #${expectedAborts}`,
   )
-  expect(harness.requests.filter(isAbort).every((request) => request.pathname.includes(SESSION_ID))).toBe(true)
+  expectMutationsTargeted(harness.requests)
 }
 
 // The server's answer to an abort: the cancelled assistant message carries
@@ -241,6 +261,7 @@ describe("interrupt then a new prompt (#292)", () => {
     expect(occurrences(running, "· interrupted")).toBe(1)
     // No duplicate run and no re-sent cancelled prompt.
     expect(promptsSent(harness.requests)).toEqual(["Second prompt"])
+    expectMutationsTargeted(harness.requests)
   })
 
   test("repeated interrupts and a prompt queued while running still restart the session", async () => {
@@ -298,5 +319,33 @@ describe("interrupt then a new prompt (#292)", () => {
       "After the second interrupt",
     ])
     expect(abortCount(harness.requests)).toBe(2)
+    expectMutationsTargeted(harness.requests)
+  })
+
+  test("a dropped idle status event leaves the stored status busy without gating the follow-up prompt", async () => {
+    const harness = await mountRunningSession()
+    await interrupt(harness, 1)
+
+    // The server answers the abort with the cancelled message, but its idle
+    // status event is lost on the wire: the transcript must settle without
+    // the client ever seeing the session return to idle.
+    harness.events.emit(messageEvent(abortedInfo("msg_assistant_first", "msg_user_first")))
+    const interrupted = await frameSettled(
+      harness,
+      (frame) => frame.includes("· interrupted"),
+      "the aborted turn was never marked interrupted without an idle event",
+    )
+    expect(interrupted).toContain("Working on the first prompt")
+
+    // The status store keeps the stale busy state: nothing client-side
+    // invents an idle transition the server never sent.
+    expect(harness.sync.data.session_status[SESSION_ID]).toEqual({ type: "busy" })
+
+    // Prompt submission reads the input, not the session status, so the
+    // follow-up still reaches the server unchanged with its own text.
+    await submitPrompt(harness, "Prompt after a dropped idle event", 1)
+    expect(promptsSent(harness.requests)).toEqual(["Prompt after a dropped idle event"])
+    expect(abortCount(harness.requests)).toBe(1)
+    expectMutationsTargeted(harness.requests)
   })
 })
