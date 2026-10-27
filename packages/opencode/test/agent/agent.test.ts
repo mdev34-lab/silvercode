@@ -15,6 +15,11 @@ import { Plugin } from "../../src/plugin"
 import { Provider } from "../../src/provider/provider"
 import { Skill } from "../../src/skill"
 import { Truncate } from "../../src/tool/truncate"
+import { assertExternalDirectoryEffect } from "../../src/tool/external-directory"
+import { Session } from "../../src/session/session"
+import { InstanceState } from "../../src/effect/instance-state"
+import { SessionID, MessageID } from "../../src/session/schema"
+import type { Tool } from "../../src/tool/tool"
 
 const agentLayer = (flags: Partial<RuntimeFlags.Info> = {}) =>
   LayerNode.compile(
@@ -590,6 +595,64 @@ it.instance(
         const agent = yield* load((svc) => svc.get(name))
         expect(Permission.evaluate("external_directory", plan, agent!.permission).action).toBe("ask")
       }
+    }),
+  { git: true },
+)
+
+// Runs the real external-directory check (the one that asks for dirname/*) against the real
+// plan path and resolves the ask with the agent's actual permission rules.
+const externalAsk = (role: string, target: string) =>
+  Effect.gen(function* () {
+    const agent = yield* load((svc) => svc.get(role))
+    let outcome = "no-ask"
+    const ctx: Tool.Context = {
+      sessionID: SessionID.make("ses_plan_probe"),
+      messageID: MessageID.make("msg_plan_probe"),
+      callID: "",
+      agent: role,
+      abort: AbortSignal.any([]),
+      messages: [],
+      metadata: () => Effect.void,
+      ask: (req) =>
+        Effect.sync(() => {
+          outcome = Permission.evaluate("external_directory", req.patterns[0]!, agent!.permission).action
+        }),
+    }
+    yield* assertExternalDirectoryEffect(ctx, target)
+    return outcome
+  })
+
+it.instance("the real external-directory check lets Code and Work reach the non-VCS plan file only", () =>
+  Effect.gen(function* () {
+    const instance = yield* InstanceState.context
+    const plan = Session.plan({ slug: "probe", time: { created: 1 } }, instance)
+    for (const role of ["code", "work"]) {
+      expect(yield* externalAsk(role, plan)).toBe("allow")
+      expect(yield* externalAsk(role, path.join(Global.Path.data, "other", "x.md"))).toBe("ask")
+      expect(yield* externalAsk(role, path.join(path.dirname(Global.Path.data), "elsewhere", "x.md"))).toBe("ask")
+    }
+    expect(yield* externalAsk("general", plan)).toBe("ask")
+  }),
+)
+
+it.instance(
+  "the real external-directory check keeps an explicit user deny on the non-VCS plan file",
+  () =>
+    Effect.gen(function* () {
+      const instance = yield* InstanceState.context
+      const plan = Session.plan({ slug: "probe", time: { created: 1 } }, instance)
+      for (const role of ["code", "work"]) expect(yield* externalAsk(role, plan)).toBe("deny")
+    }),
+  { config: { permission: { external_directory: { [path.join(Global.Path.data, "plans", "*")]: "deny" } } } },
+)
+
+it.instance(
+  "in a VCS project the plan file is inside the worktree and needs no external ask",
+  () =>
+    Effect.gen(function* () {
+      const instance = yield* InstanceState.context
+      const plan = Session.plan({ slug: "probe", time: { created: 1 } }, instance)
+      for (const role of ["code", "work"]) expect(yield* externalAsk(role, plan)).toBe("no-ask")
     }),
   { git: true },
 )
