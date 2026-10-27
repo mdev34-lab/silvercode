@@ -80,8 +80,8 @@ describe("cmd.exe UTF-8 output (#543)", () => {
         shell: spawnSync(wrapped, { cwd: dir, shell: cmd, windowsHide: true }),
       }
       // The prefix must not leak an error level into the user's command, and the parent console CP must not move.
-      const level = spawnSync(windowsCmdCommand(cmd, "echo LEVEL=%ERRORLEVEL%"), { cwd: dir, shell: cmd, windowsHide: true })
-      expect(level.stdout.toString("utf8")).toContain("LEVEL=0")
+      const level = spawnSync(windowsCmdCommand(cmd, "if errorlevel 1 (echo LEVEL=BAD) else (echo LEVEL=OK)"), { cwd: dir, shell: cmd, windowsHide: true })
+      expect(level.stdout.toString("utf8")).toContain("LEVEL=OK")
       console.log("cmd parent CP after:", probe())
       expect(probe()).toBe(cpBefore)
       for (const [name, out] of Object.entries(shapes)) {
