@@ -129,12 +129,31 @@ test("next", () => { mark("next-test") })
       copies.push(target)
       return target
     }
+    // No live handles: the body only writes one marker synchronously, then never settles.
+    writeFileSync(
+      path.join(scratch, "notimer-plain.ts"),
+      head +
+        `test("hang", () => new Promise<void>(() => { mark("body-enter") }))
+test("next", () => { mark("next-test") })
+`,
+    )
+    // The original control text, with nothing added (no marker, no timer), run from scratch.
+    writeFileSync(
+      path.join(scratch, "original-plain.ts"),
+      `import { test } from "bun:test"
+test("plain hang is abandoned by the host timeout", () => new Promise<void>(() => {}))
+test("next plain test still runs", () => {})
+`,
+    )
     const runs = [
       { name: "clean-plain", file: path.join(scratch, "clean-plain.ts"), cwd: scratch },
       { name: "clean-effect", file: path.join(scratch, "clean-effect.ts"), cwd: scratch },
       { name: "preloaded-plain", file: path.join(import.meta.dir, "fixtures", "host-timeout-plain.ts"), cwd },
       { name: "package-plain-marked", file: inPackage("clean-plain"), cwd },
       { name: "package-effect-marked", file: inPackage("clean-effect"), cwd },
+      { name: "scratch-notimer", file: path.join(scratch, "notimer-plain.ts"), cwd: scratch },
+      { name: "package-notimer", file: inPackage("notimer-plain"), cwd },
+      { name: "scratch-original", file: path.join(scratch, "original-plain.ts"), cwd: scratch },
     ]
     for (const run of runs) {
       const markFile = path.join(scratch, run.name + ".marks")
@@ -152,4 +171,4 @@ test("next", () => { mark("next-test") })
     for (const file of copies) rmSync(file, { force: true })
     rmSync(scratch, { recursive: true, force: true })
   }
-}, 90000)
+}, 120000)
