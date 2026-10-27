@@ -1,4 +1,6 @@
 import { expect, test } from "bun:test"
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { tmpdir } from "node:os"
 import path from "node:path"
 import { collectDeadlineChild } from "./owned-deadline-child"
 
@@ -72,3 +74,71 @@ test("control: plain Bun host timeout observation", async () => {
     `host-timeout control: ${process.platform} bun ${Bun.version} timedOut=${timedOut} elapsed=${Date.now() - started}ms exit=${code}\nstdout: ${stdout.slice(-1500)}\nstderr: ${stderr.slice(-1500)}`,
   )
 }, 20000)
+
+// Diagnostic matrix (assertion-free, no ownership claim): where does the host timeout stop on Windows?
+// Children append markers to a file synchronously, so the record survives a kill that loses piped output.
+//  clean-plain   : bare bun:test, hung promise, scratch cwd outside the repo (no bunfig/preloads)
+//  clean-effect  : the exact repo testEffect + Effect (resolved explicitly), same hang, 50ms finalizer, scratch cwd
+//  preloaded     : the existing plain fixture from the package cwd (preloads present)
+test("control: host timeout matrix with markers", async () => {
+  const scratch = mkdtempSync(path.join(tmpdir(), "host-timeout-matrix-"))
+  try {
+    const ancestors: string[] = []
+    for (let dir = scratch; ; dir = path.dirname(dir)) {
+      for (const name of ["bunfig.toml", "package.json"]) if (existsSync(path.join(dir, name))) ancestors.push(path.join(dir, name))
+      if (path.dirname(dir) === dir) break
+    }
+    console.log(`matrix: ${process.platform} bun ${Bun.version} scratch-ancestor bunfig/package files: ${JSON.stringify(ancestors)}`)
+    const posix = (value: string) => value.replaceAll("\\", "/")
+    const effectEntry = posix(Bun.resolveSync("effect", import.meta.dir))
+    const testEffect = posix(path.resolve(import.meta.dir, "effect.ts"))
+    console.log(`matrix: effect resolved to ${effectEntry}`)
+    const head = `import { test } from "bun:test"
+import { appendFileSync } from "node:fs"
+const mark = (m: string) => appendFileSync(process.env.MARK_FILE!, (Date.now() - Number(process.env.T0)) + " " + m + "\\n")
+const arm = () => { mark("body-enter"); setTimeout(() => mark("timer-100"), 100); setTimeout(() => mark("timer-1200"), 1200) }
+`
+    writeFileSync(
+      path.join(scratch, "clean-plain.ts"),
+      head +
+        `test("hang", () => new Promise<void>(() => arm()))
+test("next", () => { mark("next-test") })
+`,
+    )
+    writeFileSync(
+      path.join(scratch, "clean-effect.ts"),
+      head +
+        `import { Context, Effect, Layer } from "${effectEntry}"
+import { testEffect } from "${testEffect}"
+class Resource extends Context.Service<Resource, {}>()("MatrixResource") {}
+const layer = Layer.effect(
+  Resource,
+  Effect.acquireRelease(Effect.sync(() => { mark("acquired"); return {} }), () =>
+    Effect.promise(async () => { mark("finalizer-start"); await new Promise((r) => setTimeout(r, 50)); mark("finalizer-end") })),
+)
+const it = testEffect(layer)
+it.live("hang", () => Effect.gen(function* () { arm(); yield* Resource; yield* Effect.never }))
+test("next", () => { mark("next-test") })
+`,
+    )
+    const runs = [
+      { name: "clean-plain", file: path.join(scratch, "clean-plain.ts"), cwd: scratch },
+      { name: "clean-effect", file: path.join(scratch, "clean-effect.ts"), cwd: scratch },
+      { name: "preloaded-plain", file: path.join(import.meta.dir, "fixtures", "host-timeout-plain.ts"), cwd },
+    ]
+    for (const run of runs) {
+      const markFile = path.join(scratch, run.name + ".marks")
+      writeFileSync(markFile, "")
+      const started = Date.now()
+      const out = await collectDeadlineChild([process.execPath, "test", "--timeout", String(HOST_TIMEOUT_MS), run.file], run.cwd, 8000, {
+        MARK_FILE: markFile,
+        T0: String(started),
+      })
+      console.log(
+        `matrix ${run.name}: timedOut=${out.timedOut} elapsed=${Date.now() - started}ms exit=${out.code}\nmarks: ${JSON.stringify(readFileSync(markFile, "utf8").trim().split("\n"))}\nstdout: ${out.stdout.slice(-800)}\nstderr: ${out.stderr.slice(-800)}`,
+      )
+    }
+  } finally {
+    rmSync(scratch, { recursive: true, force: true })
+  }
+}, 60000)
