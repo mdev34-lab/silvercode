@@ -68,21 +68,23 @@ describe("cmd.exe UTF-8 output (#543)", () => {
       const echo = `echo ${text.split(" ")[0]} & exit /b 7`
       const wrapped = windowsCmdCommand(cmd, echo)
       expect(wrapped).not.toBe(echo)
-      // Controlled baseline BEFORE any wrapped run, in its own console: the OEM default and what an unwrapped echo yields.
-      const probe = () => spawnSync("chcp", { cwd: dir, shell: cmd, windowsHide: true }).stdout.toString("utf8").trim()
+      // Baseline before any wrapped run. The probe uses the absolute System32 helper (never a bare chcp) and a
+      // cwd without planted files. It reports what a separate hidden child sees; it is NOT the parent's console state.
+      const probe = () =>
+        spawnSync(`${process.env.SystemRoot}\\System32\\chcp.com`, { cwd: tmpdir(), windowsHide: true }).stdout.toString("utf8").trim()
       const cpBefore = probe()
       const base = spawnSync(echo, { cwd: dir, shell: cmd, windowsHide: true })
-      console.log("cmd baseline:", cpBefore, "| unwrapped echo is utf8 =", base.stdout.toString("utf8").includes("Área"))
+      console.log("cmd baseline (child view):", cpBefore, "| unwrapped echo is utf8 =", base.stdout.toString("utf8").includes("Área"))
       const shapes = {
         // Shell.args applies the wrapper itself: argv form, piped stdio, hidden window.
         args: spawnSync(cmd, Shell.args(cmd, echo, dir), { cwd: dir, windowsHide: true }),
         // Spawn with the shell option: the host builds /d /s /c "<command>".
         shell: spawnSync(wrapped, { cwd: dir, shell: cmd, windowsHide: true }),
       }
-      // The prefix must not leak an error level into the user's command, and the parent console CP must not move.
+      // The prefix must not leak an error level into the user's command; a fresh child's reported CP must not change.
       const level = spawnSync(windowsCmdCommand(cmd, "if errorlevel 1 (echo LEVEL=BAD) else (echo LEVEL=OK)"), { cwd: dir, shell: cmd, windowsHide: true })
       expect(level.stdout.toString("utf8")).toContain("LEVEL=OK")
-      console.log("cmd parent CP after:", probe())
+      console.log("cmd child-view CP after:", probe())
       expect(probe()).toBe(cpBefore)
       for (const [name, out] of Object.entries(shapes)) {
         expect({ name, status: out.status }).toEqual({ name, status: 7 })
