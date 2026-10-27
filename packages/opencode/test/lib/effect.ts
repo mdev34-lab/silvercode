@@ -48,20 +48,29 @@ type Runner = <A, E, R, E2>(value: Body<A, E, R | Scope.Scope>, layer: Layer.Lay
 // aborts while settlement is still pending — and the callback keeps observing the same
 // promise the hook joins, so a genuine failure is still reported to Bun.
 //
-// Unverified: concurrent tests (Bun may interleave another test's callback and fiber with
-// this hook) and finalizers that hang forever (the hook joins settlement without a budget of
-// its own, so only the host runner can stop those).
+// Concurrent tests are unsupported: Bun rejects onTestFinished inside test.concurrent, and
+// the registration-first ordering above turns that rejection into a test failure before any
+// fiber starts rather than an orphan run. Finalizers that hang forever stay unowned: the
+// hook joins settlement without a budget of its own, so the before-next guarantee covers
+// only finite, cooperative finalizers and the host runner remains the stop for hung ones.
 function runOwned<A, E>(execution: Effect.Effect<A, E>): Promise<A> {
   const controller = new AbortController()
   let settled = false
-  const run = Effect.runPromiseExit(execution, { signal: controller.signal }).then((exit) => {
-    settled = true
-    return exit
-  })
+  // Assigned synchronously right after the hook is registered; the hook can only fire once
+  // the test has finished, which is after this function returned.
+  let run: Promise<Exit.Exit<A, E>>
+  // Registering before the fiber starts keeps a registration failure from orphaning work:
+  // Bun rejects onTestFinished outside a serial test (e.g. inside test.concurrent), and with
+  // this ordering that rejection propagates out of the test callback before any fiber
+  // launches, so an unsupported context fails the calling test instead of leaking a run.
   onTestFinished(async () => {
     if (settled) return
     controller.abort()
     await run
+  })
+  run = Effect.runPromiseExit(execution, { signal: controller.signal }).then((exit) => {
+    settled = true
+    return exit
   })
   return run.then((exit) => {
     if (!Exit.isFailure(exit)) return exit.value
