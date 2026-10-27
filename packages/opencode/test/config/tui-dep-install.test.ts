@@ -20,12 +20,14 @@ const install = {
   mode: "ok" as "ok" | "fail" | "stall",
   calls: 0,
   interrupted: false,
+  versions: [] as (string | undefined)[],
 }
 
 const npmMock = Layer.mock(Npm.Service)({
   install: (dir, input) =>
     Effect.sync(() => {
       install.calls++
+      for (const pkg of input?.add ?? []) install.versions.push(pkg.version)
     }).pipe(
       Effect.andThen(
         install.mode === "ok"
@@ -94,6 +96,7 @@ const run = (mode: "ok" | "fail" | "stall", timeoutMs: string, retry = false, di
           const test = yield* TestInstance
           install.mode = mode
           install.calls = 0
+          install.versions = []
           install.interrupted = false
           const local = path.join(test.directory, ".opencode")
           yield* fs.makeDirectory(local, { recursive: true })
@@ -142,6 +145,9 @@ it.instance(
       Effect.tap(() =>
         Effect.sync(() => {
           expect(install.calls).toBeGreaterThan(0)
+          // The app's own (dev/dirty/branch) version is never a published @opencode-ai/plugin version.
+          expect(install.versions.length).toBeGreaterThan(0)
+          expect(install.versions.every((v) => v === undefined)).toBe(true)
           expect(warned("background dependency install failed")).toBe(true)
           expect(warned("timed out")).toBe(false)
           expect(reported).toEqual(["Could not install @opencode-ai/plugin"])
