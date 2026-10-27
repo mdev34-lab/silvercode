@@ -766,6 +766,11 @@ const layer: Layer.Layer<
         path: sessionPath(ctx.worktree, ctx.directory),
         workspaceID: original.workspaceID,
         title,
+        // A fork continues the same conversation, so it keeps the rules the user or a parent set on it
+        // (denies, asks) and the agent pinned to it. Dropping them would let the fork do what the
+        // original was forbidden to do.
+        agent: original.agent,
+        permission: original.permission,
         metadata: original.metadata === undefined ? undefined : clonePersistable(original.metadata),
       })
       const msgs = yield* messages({ sessionID: input.sessionID })
