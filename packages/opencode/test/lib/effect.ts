@@ -52,7 +52,9 @@ type Runner = <A, E, R, E2>(value: Body<A, E, R | Scope.Scope>, layer: Layer.Lay
 // the registration-first ordering above turns that rejection into a test failure before any
 // fiber starts rather than an orphan run. Finalizers that hang forever stay unowned: the
 // hook joins settlement without a budget of its own, so the before-next guarantee covers
-// only finite, cooperative finalizers and the host runner remains the stop for hung ones.
+// only finite, cooperative finalizers. A finalizer that never settles can hang the test
+// process (observed: a host timeout with an uninterruptible Effect.never release made no
+// progress until an external kill); nothing here bounds that case.
 function runOwned<A, E>(execution: Effect.Effect<A, E>): Promise<A> {
   const controller = new AbortController()
   let settled = false
