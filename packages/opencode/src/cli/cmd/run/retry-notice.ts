@@ -15,7 +15,10 @@ export const make = (input: {
 }) => {
   const now = input.now ?? Date.now
   const noticed = new Map<string, number>()
+  // Retry statuses of sessions not (yet) owned. Bounded: a run only ever needs the few children whose launch
+  // is still on its way, so the oldest entries are dropped past the cap and expired waits are pruned.
   const held = new Map<string, RetryStatus>()
+  const HELD_CAP = 32
 
   const notice = (sessionID: string, status: RetryStatus) => {
     if (status.type !== "retry") {
@@ -45,14 +48,22 @@ export const make = (input: {
       if (input.owns(sessionID)) {
         held.delete(sessionID)
         notice(sessionID, status)
-      } else if (status.type === "retry") held.set(sessionID, status)
-      else held.delete(sessionID)
+      } else if (status.type === "retry" && !input.json) {
+        held.delete(sessionID)
+        held.set(sessionID, status)
+        for (const key of held.keys()) {
+          if (held.size <= HELD_CAP) break
+          held.delete(key)
+        }
+      } else held.delete(sessionID)
     },
     /** Call after a launch was recorded: announces held waits of sessions that are now owned. */
     launched() {
       for (const [sessionID, status] of held) {
+        // An ended wait can never be announced, owned or not.
+        if ((status.next ?? 0) <= now()) held.delete(sessionID)
         if (!input.owns(sessionID)) continue
-        held.delete(sessionID)
+        if (!held.delete(sessionID)) continue
         notice(sessionID, status)
       }
     },

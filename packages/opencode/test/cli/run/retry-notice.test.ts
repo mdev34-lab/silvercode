@@ -67,10 +67,23 @@ describe("retry wait notice ordering (#555)", () => {
     expect(root.lines).toEqual(["waiting about 12s before retrying (attempt 1): free usage limit reached"])
   })
 
-  test("without the held replay the launch alone announces nothing (fails against the old ordering)", () => {
+  test("the held map is capped, JSON mode holds nothing, and ended waits are pruned", () => {
     const { lines, background, notice, retry } = setup()
-    notice.status("child", retry(1))
-    background.launch({ sessionID: "child", parentSessionID: "root", run: "r1", launchID: "p1" })
-    expect(lines).toEqual([])
+    for (let i = 0; i < 100; i++) notice.status(`s${i}`, retry(1))
+    // The oldest entries were dropped; the newest still replays after its launch.
+    background.launch({ sessionID: "s0", parentSessionID: "root", run: "r0", launchID: "p0" })
+    background.launch({ sessionID: "s99", parentSessionID: "root", run: "r99", launchID: "p99" })
+    notice.launched()
+    expect(lines).toEqual(["subagent waiting about 12s before retrying (attempt 1): free usage limit reached"])
+    const json = setup(true)
+    json.notice.status("child", json.retry(1))
+    json.background.launch({ sessionID: "child", parentSessionID: "root", run: "r1", launchID: "p1" })
+    json.notice.launched()
+    expect(json.lines).toEqual([])
+    const ended = setup()
+    ended.notice.status("child", ended.retry(1, -1))
+    ended.background.launch({ sessionID: "child", parentSessionID: "root", run: "r1", launchID: "p1" })
+    ended.notice.launched()
+    expect(ended.lines).toEqual([])
   })
 })
