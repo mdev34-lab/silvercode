@@ -51,19 +51,40 @@ const bash = (id: string, session = "session_timeout") => ({
   ruleset: [],
 })
 
+// On a timeout the error carries what was observed: how long the wait actually ran, how
+// many polls got to run (a starved event loop runs few), the worst gap between polls, and
+// the pending requests. A slow runner and a request that never arrived look different here.
+// The 1 second bound is unchanged.
 const waitForPending = (count: number) =>
   Effect.gen(function* () {
-    while (true) {
-      const pending = yield* list()
-      if (pending.length === count) return pending
-      yield* Effect.sleep("10 millis")
-    }
-  }).pipe(
-    Effect.timeoutOrElse({
-      duration: "1 second",
-      orElse: () => Effect.fail(new Error(`timed out waiting for ${count} pending permission request(s)`)),
-    }),
-  )
+    const started = Date.now()
+    let polls = 0
+    let last = started
+    let worstGap = 0
+    let seen = -1
+    return yield* Effect.gen(function* () {
+      while (true) {
+        const now = Date.now()
+        worstGap = Math.max(worstGap, now - last)
+        last = now
+        polls++
+        const pending = yield* list()
+        seen = pending.length
+        if (pending.length === count) return pending
+        yield* Effect.sleep("10 millis")
+      }
+    }).pipe(
+      Effect.timeoutOrElse({
+        duration: "1 second",
+        orElse: () =>
+          Effect.fail(
+            new Error(
+              `timed out waiting for ${count} pending permission request(s): elapsed=${Date.now() - started}ms polls=${polls} worstPollGap=${worstGap}ms lastSeenPending=${seen}`,
+            ),
+          ),
+      }),
+    )
+  })
 
 const rejectAll = () =>
   Effect.gen(function* () {
