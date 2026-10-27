@@ -89,6 +89,8 @@ describe("cmd.exe UTF-8 output (#543)", () => {
       expect(level.stdout.toString("utf8")).toContain("LEVEL=OK")
       console.log("cmd child-view CP after:", probe())
       expect(probe()).toBe(cpBefore)
+      for (const [name, out] of Object.entries(shapes))
+        console.log(`cmd shape ${name}: status=${out.status} stdout=${out.stdout?.toString("hex")} stderr=${out.stderr?.toString("utf8").trim()}`)
       for (const [name, out] of Object.entries(shapes)) {
         expect({ name, status: out.status }).toEqual({ name, status: 7 })
         expect({ name, out: out.stdout.toString("utf8").includes("Área") }).toEqual({ name, out: true })
