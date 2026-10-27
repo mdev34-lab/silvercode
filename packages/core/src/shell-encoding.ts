@@ -9,7 +9,9 @@ export function windowsPowerShellCommand(shell: string, command: string, platfor
 /**
  * cmd.exe builtins write in the console's OEM codepage; switch it to UTF-8 so the text readers decode them.
  * cmd resolves a bare `chcp` from the working directory first, and that is the project, so the helper is
- * addressed by its absolute System32 path. Without a safe system root the command is left unchanged.
+ * addressed by its absolute System32 path, left unquoted so the command never starts with a quote (cmd /c
+ * parsing strips or keeps leading quotes depending on how the host spawns it). A system root with spaces or
+ * metacharacters leaves the command unchanged.
  */
 export function windowsCmdCommand(
   shell: string,
@@ -19,7 +21,7 @@ export function windowsCmdCommand(
 ): string {
   if (platform !== "win32" || !/(?:^|[\\/])cmd(?:\.exe)?$/i.test(shell)) return command
   const root = env.SystemRoot ?? env.SYSTEMROOT ?? env.windir
-  if (!root || !/^[A-Za-z]:\\[^"%&^|<>!\r\n]*$/.test(root)) return command
+  if (!root || !/^[A-Za-z]:\\[^\s"%&^|<>!()]*$/.test(root)) return command
   // `&` (not `&&`) so a failing chcp never blocks the user's command.
-  return `"${root.replace(/\\+$/, "")}\\System32\\chcp.com" 65001>nul & ${command}`
+  return `${root.replace(/\\+$/, "")}\\System32\\chcp.com 65001>nul & ${command}`
 }
