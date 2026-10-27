@@ -66,7 +66,7 @@ test(
   async () => {
     for (const probe of [
       { fixture: "host-timeout-aftereach.ts", contains: ["(pass) next test starts without the value the hung run restored"] },
-      { fixture: "host-timeout-defect.ts", contains: ["finalizer defect marker", "(pass) next test still runs"] },
+      { fixture: "host-timeout-defect.ts", contains: ["finalizer defect marker", "second finalizer defect marker", "(pass) next test sees that the file afterEach still ran"] },
     ]) {
       const { stdout, stderr, code, timedOut } = await collectDeadlineChild(
         [process.execPath, "test", "--timeout", String(HOST_TIMEOUT_MS), path.join(import.meta.dir, "fixtures", probe.fixture)],

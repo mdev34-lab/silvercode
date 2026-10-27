@@ -72,17 +72,35 @@ function runOwned<A, E>(execution: Effect.Effect<A, E>): Promise<A> {
   // while onTestFinished runs after it. Interrupting first keeps a finalizer from restoring a value that the
   // test's afterEach already reset. The second registration is the fallback and is a no-op after the first.
   let released = false
+  let defect: unknown
   const release = async () => {
     if (released) return
     released = true
     if (settled) return
     controller.abort()
     const exit = await run
-    // Interruption is the expected result of this abort. Anything else came from a finalizer and is surfaced.
-    if (Exit.isFailure(exit) && !Cause.hasInterruptsOnly(exit.cause)) throw Cause.squash(exit.cause)
+    // Interruption is the expected result of this abort. Anything else came from a finalizer. It is kept and
+    // thrown from the last hook, because a throw here would stop Bun from running the file's own afterEach.
+    if (Exit.isFailure(exit) && !Cause.hasInterruptsOnly(exit.cause)) {
+      const errors = Cause.prettyErrors(exit.cause)
+      defect =
+        errors.length === 1
+          ? errors[0]
+          : new Error(
+              `${errors.length} finalizer failures after the run was abandoned: ${errors.map((error) => error.message).join("; ")}`,
+              { cause: errors },
+            )
+    }
+  }
+  const report = async () => {
+    await release()
+    if (defect === undefined) return
+    const error = defect
+    defect = undefined
+    throw error
   }
   afterEach(release)
-  onTestFinished(release)
+  onTestFinished(report)
   run = Effect.runPromiseExit(execution, { signal: controller.signal }).then((exit) => {
     settled = true
     return exit
