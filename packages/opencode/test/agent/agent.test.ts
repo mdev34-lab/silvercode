@@ -569,6 +569,31 @@ it.instance("Code and Work reach the session plan directory only, not other exte
   }),
 )
 
+it.instance("an explicit user deny on the plan directory still wins over the Code and Work plan grant", () =>
+  Effect.gen(function* () {
+    const plan = path.join(Global.Path.data, "plans", "1-slug.md")
+    for (const name of ["code", "work"]) {
+      const agent = yield* load((svc) => svc.get(name))
+      expect(Permission.evaluate("external_directory", plan, agent!.permission).action).toBe("deny")
+      expect(Permission.evaluate("external_directory", path.join(Global.Path.data, "plans", "x.txt"), agent!.permission).action).toBe("deny")
+    }
+  }),
+  { config: { permission: { external_directory: { [path.join(Global.Path.data, "plans", "*")]: "deny" } } } },
+)
+
+it.instance(
+  "in a VCS project Code and Work get no external plan directory grant",
+  () =>
+    Effect.gen(function* () {
+      const plan = path.join(Global.Path.data, "plans", "1-slug.md")
+      for (const name of ["code", "work"]) {
+        const agent = yield* load((svc) => svc.get(name))
+        expect(Permission.evaluate("external_directory", plan, agent!.permission).action).toBe("ask")
+      }
+    }),
+  { git: true },
+)
+
 it.instance("webfetch is allowed by default", () =>
   Effect.gen(function* () {
     const work = yield* load((svc) => svc.get("work"))

@@ -148,10 +148,14 @@ const layer = Layer.effect(
 
         const user = Permission.fromConfig(cfg.permission ?? {})
 
-        // Non-VCS sessions keep the living plan file under the global data dir,
-        // outside the worktree. Code (writes it) and Work (reads it) get exactly
-        // that directory, not a broad external-directory grant.
-        const sessionPlans = { [path.join(Global.Path.data, "plans", "*")]: "allow" } as const
+        // Only non-VCS sessions keep the living plan file outside the worktree, under the
+        // global data dir (VCS projects keep it in .opencode/plans inside the worktree, which
+        // needs no external grant). Code (writes it) and Work (reads it) get plan markdown
+        // files there, not the whole directory or other external paths. Explicit user
+        // permission rules are merged after this and still win.
+        const sessionPlans: Record<string, "allow"> = ctx.project.vcs
+          ? {}
+          : { [path.join(Global.Path.data, "plans", "*.md")]: "allow" }
 
         const planPermissions = Permission.fromConfig({
           question: "allow",
