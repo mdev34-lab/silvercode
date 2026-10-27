@@ -274,8 +274,9 @@ describe("AppProcess", () => {
               stage = "waiting for the ready file"
               pid = yield* waitForFile(ready)
               expect(pid).toMatch(/^\d+$/)
-              stage = "waiting for the settled file after interrupting the run fiber"
+              stage = "interrupting and joining the run fiber"
               yield* Fiber.interrupt(fiber)
+              stage = "waiting for the settled file"
               expect(yield* waitForFile(settled)).toBe("settled")
               stage = "done"
             })
