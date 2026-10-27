@@ -78,6 +78,9 @@ export interface Interface {
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/SystemPrompt") {}
 
+const LIVING_PLAN =
+  "If a plan file exists for this session (the planner's reply names it, or a reminder gives its path), it is the run's living scratchpad: it is updated at milestones (completed steps, discoveries, revised remaining steps), never after every tool call, and never in a way that blocks the work itself. If you cannot edit files yourself, have the Code step that does the work tick its steps there and read the file before the next step."
+
 const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
@@ -160,6 +163,7 @@ const layer = Layer.effect(
             "Non-programming work should not go to Code. At fast effort, medium-sized work may be manual; complex or thorough work goes to General; medium effort balances direct work and General delegation.",
             "When it is unclear whether a request changes software, carry on with the work (inspect, run commands, delegate); use the question tool only if the answer would change what you do. Do not relabel programming work to avoid its workflow.",
             "Failed, cancelled or pending children are not successful stage completion. A pass budget cannot excuse reporting success with blocking findings.",
+            LIVING_PLAN,
           ].join("\n")
 
         // Built from the live registry: any non-primary, non-hidden agent the
@@ -221,6 +225,7 @@ const layer = Layer.effect(
           return [
             `When a request needs non-trivial implementation planning, delegate that planning to ${names(plannersToAdvertise)} once, at the start, with the task tool.`,
             "Then work the plan step by step, carrying it forward instead of re-deriving or re-planning it at every tool call.",
+            LIVING_PLAN,
           ].join("\n")
         }
         if (plannersToAdvertise.length === 0) {
@@ -238,6 +243,7 @@ const layer = Layer.effect(
           ...(scopeNote ? [scopeNote] : []),
           "Direct work is the exception, reserved for small tasks - a quick lookup, a tiny edit, a short answer.",
           "You stay responsible for the outcome: give each subagent complete context, then verify and integrate what it returns instead of re-deriving or re-planning it at every tool call.",
+          LIVING_PLAN,
         ].join("\n")
       }),
 
