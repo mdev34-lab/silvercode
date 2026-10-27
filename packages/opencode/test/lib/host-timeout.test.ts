@@ -82,6 +82,7 @@ test("control: plain Bun host timeout observation", async () => {
 //  preloaded     : the existing plain fixture from the package cwd (preloads present)
 test("control: host timeout matrix with markers", async () => {
   const scratch = mkdtempSync(path.join(tmpdir(), "host-timeout-matrix-"))
+  const copies: string[] = []
   try {
     const ancestors: string[] = []
     for (let dir = scratch; ; dir = path.dirname(dir)) {
@@ -121,10 +122,19 @@ it.live("hang", () => Effect.gen(function* () { arm(); yield* Resource; yield* E
 test("next", () => { mark("next-test") })
 `,
     )
+    // Same generated file text, but placed inside the package so the package cwd, bunfig and preloads apply.
+    const inPackage = (name: string) => {
+      const target = path.join(import.meta.dir, "fixtures", "__matrix-" + name + ".ts")
+      writeFileSync(target, readFileSync(path.join(scratch, name + ".ts"), "utf8"))
+      copies.push(target)
+      return target
+    }
     const runs = [
       { name: "clean-plain", file: path.join(scratch, "clean-plain.ts"), cwd: scratch },
       { name: "clean-effect", file: path.join(scratch, "clean-effect.ts"), cwd: scratch },
       { name: "preloaded-plain", file: path.join(import.meta.dir, "fixtures", "host-timeout-plain.ts"), cwd },
+      { name: "package-plain-marked", file: inPackage("clean-plain"), cwd },
+      { name: "package-effect-marked", file: inPackage("clean-effect"), cwd },
     ]
     for (const run of runs) {
       const markFile = path.join(scratch, run.name + ".marks")
@@ -139,6 +149,7 @@ test("next", () => { mark("next-test") })
       )
     }
   } finally {
+    for (const file of copies) rmSync(file, { force: true })
     rmSync(scratch, { recursive: true, force: true })
   }
-}, 60000)
+}, 90000)
