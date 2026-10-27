@@ -70,8 +70,11 @@ describe("cmd.exe UTF-8 output (#543)", () => {
       expect(wrapped).not.toBe(echo)
       // Baseline before any wrapped run. The probe uses the absolute System32 helper (never a bare chcp) and a
       // cwd without planted files. It reports what a separate hidden child sees; it is NOT the parent's console state.
-      const probe = () =>
-        spawnSync(`${process.env.SystemRoot}\\System32\\chcp.com`, { cwd: tmpdir(), windowsHide: true }).stdout.toString("utf8").trim()
+      const sysRoot = process.env.SystemRoot ?? process.env.windir
+      const probe = () => {
+        const out = spawnSync(`${sysRoot}\\System32\\chcp.com`, { cwd: tmpdir(), shell: cmd, windowsHide: true })
+        return `${out.error ? `error ${out.error.message}` : ""}${out.stdout?.toString("utf8").trim() ?? "no stdout"}`
+      }
       const cpBefore = probe()
       const base = spawnSync(echo, { cwd: dir, shell: cmd, windowsHide: true })
       console.log("cmd baseline (child view):", cpBefore, "| unwrapped echo is utf8 =", base.stdout.toString("utf8").includes("Área"))
