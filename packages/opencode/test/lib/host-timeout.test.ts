@@ -58,3 +58,17 @@ test(
   },
   CHILD_GUARD_MS * 2 + 10000,
 )
+
+// Diagnostic control, not an ownership claim: does Bun's own host timeout fire for a plain hung test on this
+// platform within a bounded wait? It records the observation and asserts nothing about the outcome.
+test("control: plain Bun host timeout observation", async () => {
+  const started = Date.now()
+  const { stdout, stderr, code, timedOut } = await collectDeadlineChild(
+    [process.execPath, "test", "--timeout", String(HOST_TIMEOUT_MS), path.join(import.meta.dir, "fixtures", "host-timeout-plain.ts")],
+    cwd,
+    8000,
+  )
+  console.log(
+    `host-timeout control: ${process.platform} bun ${Bun.version} timedOut=${timedOut} elapsed=${Date.now() - started}ms exit=${code}\nstdout: ${stdout.slice(-1500)}\nstderr: ${stderr.slice(-1500)}`,
+  )
+}, 20000)
