@@ -68,14 +68,22 @@ describe("cmd.exe UTF-8 output (#543)", () => {
       const echo = `echo ${text.split(" ")[0]} & exit /b 7`
       const wrapped = windowsCmdCommand(cmd, echo)
       expect(wrapped).not.toBe(echo)
+      // Controlled baseline BEFORE any wrapped run, in its own console: the OEM default and what an unwrapped echo yields.
+      const probe = () => spawnSync("chcp", { cwd: dir, shell: cmd, windowsHide: true }).stdout.toString("utf8").trim()
+      const cpBefore = probe()
+      const base = spawnSync(echo, { cwd: dir, shell: cmd, windowsHide: true })
+      console.log("cmd baseline:", cpBefore, "| unwrapped echo is utf8 =", base.stdout.toString("utf8").includes("Área"))
       const shapes = {
         // Shell.args applies the wrapper itself: argv form, piped stdio, hidden window.
         args: spawnSync(cmd, Shell.args(cmd, echo, dir), { cwd: dir, windowsHide: true }),
         // Spawn with the shell option: the host builds /d /s /c "<command>".
         shell: spawnSync(wrapped, { cwd: dir, shell: cmd, windowsHide: true }),
       }
-      const base = spawnSync(echo, { cwd: dir, shell: cmd, windowsHide: true })
-      console.log("cmd baseline utf8 =", base.stdout.toString("utf8").includes("Área"))
+      // The prefix must not leak an error level into the user's command, and the parent console CP must not move.
+      const level = spawnSync(windowsCmdCommand(cmd, "echo LEVEL=%ERRORLEVEL%"), { cwd: dir, shell: cmd, windowsHide: true })
+      expect(level.stdout.toString("utf8")).toContain("LEVEL=0")
+      console.log("cmd parent CP after:", probe())
+      expect(probe()).toBe(cpBefore)
       for (const [name, out] of Object.entries(shapes)) {
         expect({ name, status: out.status }).toEqual({ name, status: 7 })
         expect({ name, out: out.stdout.toString("utf8").includes("Área") }).toEqual({ name, out: true })
