@@ -58,3 +58,27 @@ test(
   },
   CHILD_GUARD_MS * 2 + 10000,
 )
+
+// Hook order and finalizer defects after a host timeout. Each child fixture below fails its hung test on purpose;
+// the assertions are about what the owner does around it.
+test(
+  "testEffect interrupts an abandoned run before the file's afterEach and reports finalizer defects",
+  async () => {
+    for (const probe of [
+      { fixture: "host-timeout-aftereach.ts", contains: ["(pass) next test starts without the value the hung run restored"] },
+      { fixture: "host-timeout-defect.ts", contains: ["finalizer defect marker", "(pass) next test still runs"] },
+    ]) {
+      const { stdout, stderr, code, timedOut } = await collectDeadlineChild(
+        [process.execPath, "test", "--timeout", String(HOST_TIMEOUT_MS), path.join(import.meta.dir, "fixtures", probe.fixture)],
+        cwd,
+        CHILD_GUARD_MS,
+      )
+      const output = stdout + stderr
+      if (timedOut) throw new Error(`child ${probe.fixture} hit the ${CHILD_GUARD_MS}ms guard\nstdout: ${stdout.slice(-2000)}\nstderr: ${stderr.slice(-2000)}`)
+      expect(code).toBe(1)
+      expect(output).toContain(`this test timed out after ${HOST_TIMEOUT_MS}ms`)
+      for (const text of probe.contains) expect(output).toContain(text)
+    }
+  },
+  CHILD_GUARD_MS * 2 + 10000,
+)

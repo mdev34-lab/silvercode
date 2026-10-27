@@ -1,5 +1,5 @@
 import { ownedDeadlineTest, validateOwnedDeadline, type OwnedDeadline } from "./owned-deadline"
-import { onTestFinished, test, type TestOptions } from "bun:test"
+import { afterEach, onTestFinished, test, type TestOptions } from "bun:test"
 import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import { Cause, Duration, Effect, Exit, Layer } from "effect"
 import * as Scope from "effect/Scope"
@@ -55,6 +55,9 @@ type Runner = <A, E, R, E2>(value: Body<A, E, R | Scope.Scope>, layer: Layer.Lay
 // only finite, cooperative finalizers. A finalizer that never settles can hang the test
 // process (observed: a host timeout with an uninterruptible Effect.never release made no
 // progress until an external kill); nothing here bounds that case.
+// A finite finalizer that outlasts Bun's own hook timeout (observed locally: a 1200ms release with
+// --timeout 800) is cut off by that timeout, reported as a hook timeout, and the next test can still
+// start while it runs. Bun keeps no wait longer than its hook timeout, so that case stays unowned too.
 function runOwned<A, E>(execution: Effect.Effect<A, E>): Promise<A> {
   const controller = new AbortController()
   let settled = false
@@ -65,11 +68,21 @@ function runOwned<A, E>(execution: Effect.Effect<A, E>): Promise<A> {
   // Bun rejects onTestFinished outside a serial test (e.g. inside test.concurrent), and with
   // this ordering that rejection propagates out of the test callback before any fiber
   // launches, so an unsupported context fails the calling test instead of leaking a run.
-  onTestFinished(async () => {
+  // Registered twice, one cleanup: Bun runs a hook registered inside a test before the file's own afterEach,
+  // while onTestFinished runs after it. Interrupting first keeps a finalizer from restoring a value that the
+  // test's afterEach already reset. The second registration is the fallback and is a no-op after the first.
+  let released = false
+  const release = async () => {
+    if (released) return
+    released = true
     if (settled) return
     controller.abort()
-    await run
-  })
+    const exit = await run
+    // Interruption is the expected result of this abort. Anything else came from a finalizer and is surfaced.
+    if (Exit.isFailure(exit) && !Cause.hasInterruptsOnly(exit.cause)) throw Cause.squash(exit.cause)
+  }
+  afterEach(release)
+  onTestFinished(release)
   run = Effect.runPromiseExit(execution, { signal: controller.signal }).then((exit) => {
     settled = true
     return exit
