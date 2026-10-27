@@ -1,10 +1,9 @@
 import path from "path"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
-import { Effect, Option, Schema } from "effect"
+import { Effect, Schema } from "effect"
 import * as Tool from "./tool"
 import { Question } from "../question"
 import { Session } from "@/session/session"
-import { walkToRoot } from "@/session/reminders"
 import { MessageV2 } from "../session/message-v2"
 import { Provider } from "@/provider/provider"
 import { InstanceState } from "@/effect/instance-state"
@@ -27,15 +26,15 @@ export const PlanExitTool = Tool.define(
         Effect.gen(function* () {
           const instance = yield* InstanceState.context
           const info = yield* session.get(ctx.sessionID)
-          const root = yield* walkToRoot(session, info)
-          if (Option.isNone(root))
-            return {
-              title: "Cannot switch to work agent",
-              output:
-                "Could not resolve the root session: an ancestor session is missing from storage, so the plan file location is unknown. Resolve the session storage issue and try again.",
-              metadata: {},
-            }
-          const plan = path.relative(instance.worktree, Session.plan(root.value, instance))
+          // The approval and the switch to Work belong to the root session that owns the
+          // plan. A delegated child would ask and switch itself, not the root (#637).
+          if (info.parentID)
+            return yield* Effect.fail(
+              new Error(
+                "plan_exit only runs in the session that owns the plan. Return the finished plan to the parent session instead of switching this delegated session.",
+              ),
+            )
+          const plan = path.relative(instance.worktree, Session.plan(info, instance))
           const answers = yield* question.ask({
             sessionID: ctx.sessionID,
             questions: [

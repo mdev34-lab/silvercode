@@ -864,6 +864,7 @@ it.instance(
       const body = JSON.stringify(hits[0]?.body)
       expect(body).toContain("Think planning, then Code implementation, then a clean Review")
       expect(body).toContain("Prefer that route for programming")
+      expect(body).toContain("living scratchpad")
       yield* Fiber.interrupt(fiber)
     }),
   15_000,

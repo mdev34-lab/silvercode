@@ -714,21 +714,34 @@ it.instance("programming and non-programming Work keep the same tools (workflow 
   }
 }))
 
-it.instance("programming session living-plan handoff: Work and Think cannot write the plan file, Code can", () => Effect.gen(function* () {
+it.instance("a programming Work route keeps execution tools and the invalid-call reporter", () => Effect.gen(function* () {
   const sessions=yield* Session.Service
   const agents=yield* Agent.Service
   const registry=yield* ToolRegistry.Service
   const chat=yield* sessions.create({title:"admission"})
   const user=yield* sessions.updateMessage({id:MessageID.ascending(),role:"user",sessionID:chat.id,agent:"work",model:{providerID:ProviderV2.ID.make("test"),modelID:ModelV2.ID.make("test")},time:{created:Date.now()}})
   yield* sessions.updatePart({id:PartID.ascending(),messageID:user.id,sessionID:chat.id,type:"text",text:"Fix Python software"})
-  const toolIDs=(role:string)=>Effect.gen(function* () {
-    const found=yield* registry.tools({sessionID:chat.id,agent:yield* agents.get(role),providerID:ProviderV2.ID.make("test"),modelID:ModelV2.ID.make("test")})
-    return found.map(tool=>tool.id)
-  })
   for (const role of ["work","think"]) {
-    const ids=yield* toolIDs(role)
-    for (const writer of ["write","edit","apply_patch","plan_exit"]) expect(ids.includes(writer)).toBe(false)
+    const found=yield* registry.tools({sessionID:chat.id,agent:yield* agents.get(role),providerID:ProviderV2.ID.make("test"),modelID:ModelV2.ID.make("test")})
+    const ids=found.map(tool=>tool.id)
+    expect(ids.includes("invalid")).toBe(true)
+    expect(ids.includes("bash")).toBe(true)
+    const ctx={sessionID:chat.id,messageID:user.id,agent:role,abort:new AbortController().signal,messages:[],metadata:()=>Effect.void,ask:()=>Effect.void} as never
+    const out=yield* found.find(tool=>tool.id==="invalid")!.execute({tool:"bash",error:"Model tried to call unavailable tool 'bash'."},ctx)
+    expect(out.output).toContain("unavailable tool 'bash'")
   }
-  const code=yield* toolIDs("code")
-  expect(code.includes("write")||code.includes("apply_patch")).toBe(true)
+}))
+
+it.instance("a request the classifier is unsure about keeps Work's execution tools and Task; the model is advised, not blocked", () => Effect.gen(function* () {
+  const sessions=yield* Session.Service
+  const agents=yield* Agent.Service
+  const registry=yield* ToolRegistry.Service
+  for (const text of ["run echo hi","Fetch the pull request"]) {
+    const chat=yield* sessions.create({title:"admission"})
+    const user=yield* sessions.updateMessage({id:MessageID.ascending(),role:"user",sessionID:chat.id,agent:"work",model:{providerID:ProviderV2.ID.make("test"),modelID:ModelV2.ID.make("test")},time:{created:Date.now()}})
+    yield* sessions.updatePart({id:PartID.ascending(),messageID:user.id,sessionID:chat.id,type:"text",text})
+    const found=yield* registry.tools({sessionID:chat.id,agent:yield* agents.get("work"),providerID:ProviderV2.ID.make("test"),modelID:ModelV2.ID.make("test")})
+    const ids=found.map(tool=>tool.id)
+    for (const id of ["bash","edit","write","task","read"]) expect(ids.includes(id)).toBe(true)
+  }
 }))
