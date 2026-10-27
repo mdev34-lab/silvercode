@@ -127,7 +127,10 @@ export function createFetch(override?: FetchHandler, events?: ReturnType<typeof 
     if (url.pathname === "/api/reference")
       return json({ location: { directory, project: { id: "proj_test", directory } }, data: [] })
     if (url.pathname === "/provider") return json({ all: [], default: {}, connected: [] })
-    if (url.pathname === "/session") return json([])
+    // Read route: the session collection only answers GET. A write here (e.g. session
+    // creation) is a session mutation no fixture accounts for, so it must reach the
+    // unexpected-request throw below rather than read as an empty list.
+    if (url.pathname === "/session" && request.method === "GET") return json([])
     if (url.pathname === "/vcs") return json({ branch: "main" })
     throw new Error(`unexpected request: ${url.pathname}`)
   }) as typeof globalThis.fetch
