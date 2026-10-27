@@ -4,6 +4,7 @@
 // the release finalizer restores the previous value before the next test runs.
 import { expect, test } from "bun:test"
 import { Context, Effect, Layer } from "effect"
+import { hangWithLiveHandle } from "./host-timeout-keepalive"
 import { testEffect } from "../effect"
 
 class Resource extends Context.Service<Resource, {}>()("HostTimeoutResource") {}
@@ -40,7 +41,7 @@ const it = testEffect(layer)
 it.live("hangs on a scoped Effect until the host timeout abandons it", () =>
   Effect.gen(function* () {
     yield* Resource
-    yield* Effect.never
+    yield* hangWithLiveHandle
   }),
 )
 

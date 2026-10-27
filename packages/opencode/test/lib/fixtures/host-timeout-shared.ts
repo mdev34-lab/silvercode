@@ -3,6 +3,7 @@
 // layer before the next test observes the environment, and a settled run must still release it.
 import { expect, test } from "bun:test"
 import { Context, Effect, Layer } from "effect"
+import { hangWithLiveHandle } from "./host-timeout-keepalive"
 import { testEffectShared } from "../effect"
 
 class Resource extends Context.Service<Resource, {}>()("HostTimeoutSharedResource") {}
@@ -51,7 +52,7 @@ test("next Bun test sees the settled shared run released", () => {
 it.live("hangs on a scoped Effect until the host timeout abandons it", () =>
   Effect.gen(function* () {
     yield* Resource
-    yield* Effect.never
+    yield* hangWithLiveHandle
   }),
 )
 
