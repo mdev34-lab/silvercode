@@ -22,6 +22,7 @@ test(
         fail: 2,
       },
     ]) {
+      const started = Date.now()
       const { stdout, stderr, code, timedOut } = await collectDeadlineChild(
         [
           process.execPath,
@@ -34,7 +35,16 @@ test(
         CHILD_GUARD_MS,
       )
       const output = stdout + stderr
-      expect(timedOut).toBe(false)
+      // Carry the child's own output into the failure: a guard hit with no output says nothing.
+      if (timedOut)
+        throw new Error(
+          [
+            `child ${probe.fixture} hit the ${CHILD_GUARD_MS}ms guard (elapsed ${Date.now() - started}ms, exit ${code})`,
+            `bun ${Bun.version} ${process.platform} ${path.basename(process.execPath)}`,
+            `stdout (last 3000): ${stdout.slice(-3000)}`,
+            `stderr (last 3000): ${stderr.slice(-3000)}`,
+          ].join("\n"),
+        )
       expect(code).toBe(1)
       // The host timeout stays the failure Bun reports for the abandoned test.
       expect(output).toContain(`this test timed out after ${HOST_TIMEOUT_MS}ms`)
