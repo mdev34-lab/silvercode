@@ -1,5 +1,5 @@
 import { ownedDeadlineTest, validateOwnedDeadline, type OwnedDeadline } from "./owned-deadline"
-import { test, type TestOptions } from "bun:test"
+import { onTestFinished, test, type TestOptions } from "bun:test"
 import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import { Cause, Duration, Effect, Exit, Layer } from "effect"
 import * as Scope from "effect/Scope"
@@ -36,6 +36,43 @@ const body = <A, E, R>(value: Body<A, E, R>) => Effect.suspend(() => (typeof val
 
 type Runner = <A, E, R, E2>(value: Body<A, E, R | Scope.Scope>, layer: Layer.Layer<R, E2>, deadline?: OwnedDeadline) => Promise<A>
 
+// A host-level Bun timeout only rejects the test Promise; it never interrupts the Effect
+// fiber, so scoped finalizers (and anything they restore) could still run while the next test
+// is already running. Own each run instead: a per-test AbortController interrupts the fiber,
+// and the test-scoped `onTestFinished` hook joins that interruption, so finalizers complete
+// before Bun moves on.
+//
+// The hook must be registered synchronously from the test callback, before the callback
+// yields anything (Bun only collects hooks registered while the callback starts; a hook
+// registered later never runs). Runs that settle on their own make it a no-op — it only
+// aborts while settlement is still pending — and the callback keeps observing the same
+// promise the hook joins, so a genuine failure is still reported to Bun.
+//
+// Unverified: concurrent tests (Bun may interleave another test's callback and fiber with
+// this hook) and finalizers that hang forever (the hook joins settlement without a budget of
+// its own, so only the host runner can stop those).
+function runOwned<A, E>(execution: Effect.Effect<A, E>): Promise<A> {
+  const controller = new AbortController()
+  let settled = false
+  const run = Effect.runPromiseExit(execution, { signal: controller.signal }).then((exit) => {
+    settled = true
+    return exit
+  })
+  onTestFinished(async () => {
+    if (settled) return
+    controller.abort()
+    await run
+  })
+  return run.then((exit) => {
+    if (!Exit.isFailure(exit)) return exit.value
+    // Only reachable here because this run was abandoned: the host already reported the
+    // timeout, so keep the abandoned callback pending instead of adding a second, redundant
+    // interruption failure for a test that is already failed.
+    if (controller.signal.aborted) return new Promise<A>(() => {})
+    throw Cause.squash(exit.cause)
+  })
+}
+
 const isolatedRun: Runner = (value, layer, deadline) => {
   const execution = Effect.gen(function* () {
     const exit = yield* body(value).pipe(Effect.scoped, Effect.provide(layer), Effect.exit)
@@ -46,7 +83,7 @@ const isolatedRun: Runner = (value, layer, deadline) => {
     }
     return yield* exit
   })
-  return deadline ? ownedDeadlineTest(() => execution, deadline)() : Effect.runPromise(execution)
+  return deadline ? ownedDeadlineTest(() => execution, deadline)() : runOwned(execution)
 }
 
 // Builds the test layer through the shared process-wide memoMap so cached
@@ -54,25 +91,28 @@ const isolatedRun: Runner = (value, layer, deadline) => {
 // that publish to an in-process HTTP server and need pub/sub identity with
 // the server's handlers.
 const sharedRun: Runner = (value, layer) =>
-  Effect.gen(function* () {
-    const scope = yield* Scope.make()
-    const ctx = yield* Layer.buildWithMemoMap(layer, memoMap, scope)
-    const exit = yield* body(value).pipe(Effect.scoped, Effect.provide(ctx), Effect.exit)
-    yield* Scope.close(scope, Exit.void)
-    if (Exit.isFailure(exit)) {
-      for (const err of Cause.prettyErrors(exit.cause)) {
-        yield* Effect.logError(err)
+  runOwned(
+    Effect.gen(function* () {
+      // Close the shared scope as a finalizer, not as a trailing statement: when a host
+      // timeout interrupts the body, the fiber unwinds past any following statement, so only
+      // a finalizer still releases the layer's resources before the run settles.
+      const scope = yield* Effect.acquireRelease(Scope.make(), (scope) => Scope.close(scope, Exit.void))
+      const ctx = yield* Layer.buildWithMemoMap(layer, memoMap, scope)
+      const exit = yield* body(value).pipe(Effect.scoped, Effect.provide(ctx), Effect.exit)
+      if (Exit.isFailure(exit)) {
+        for (const err of Cause.prettyErrors(exit.cause)) {
+          yield* Effect.logError(err)
+        }
       }
-    }
-    return yield* exit
-  }).pipe(Effect.runPromise)
+      return yield* exit
+    }).pipe(Effect.scoped),
+  )
 
-// A Bun test-level timeout only rejects the test promise; it does not interrupt the Effect
-// fiber, so scoped finalizers could run after the next test started. When the test declares
-// its own host timeout, own cancellation a little before it so the fiber is interrupted and
-// joined first. Bun does not expose the configured default (CLI --timeout or its 5000ms
-// default), so tests without an explicit timeout keep the previous unowned behavior rather
-// than guessing a budget.
+// A test that declares its own host timeout can be cancelled a little before Bun gives up, so
+// cooperative Effect work is interrupted and joined while the test still owns the clock. Bun
+// does not expose the configured default (CLI --timeout or its 5000ms default), so tests
+// without an explicit timeout cannot pick a deadline and rely on the host-timeout hook in
+// `runOwned` instead of a guessed budget.
 function ownedFor(opts?: number | TestOptions): OwnedDeadline | undefined {
   const hostTimeoutMs = typeof opts === "number" ? opts : opts?.timeout
   if (hostTimeoutMs === undefined || !Number.isFinite(hostTimeoutMs) || hostTimeoutMs <= 0) return undefined
