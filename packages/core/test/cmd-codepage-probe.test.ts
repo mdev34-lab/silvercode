@@ -32,6 +32,10 @@ winOnly(
         // %COMSPEC% is expanded by the outer cmd, so the line carries no quote characters.
         "N0 nested cmd dir, no chcp": `%COMSPEC% /d /c dir /b *.txt & exit /b 7`,
         "N1 chcp then nested cmd dir": `${chcp} 65001>nul & %COMSPEC% /d /c dir /b *.txt & exit /b 7`,
+        // Command-shape cases for a nested wrapper: the inner line is wrapped as `/s /c "<line>"`.
+        "Q1 nested /s /c quoted line with quotes, && and pipe": `${chcp} 65001>nul & %COMSPEC% /d /s /c "echo "a b" && dir /b *.txt | findstr txt" & exit /b 7`,
+        "Q2 nested /s /c inner exit code": `${chcp} 65001>nul & %COMSPEC% /d /s /c "dir /b *.txt & exit /b 3" & echo outer=%ERRORLEVEL% & exit /b 7`,
+        "Q3 nested /s /c percent var and caret": `${chcp} 65001>nul & %COMSPEC% /d /s /c "echo %CD:~0,2% ^& done" & exit /b 7`,
       }
       for (const [name, line] of Object.entries(variants)) {
         const out = spawnSync(cmd, Shell.args(cmd, line, dir), {
