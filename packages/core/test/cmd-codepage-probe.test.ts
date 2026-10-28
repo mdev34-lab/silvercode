@@ -109,33 +109,47 @@ winOnly(
           subs.push(proc.onExit((e) => resolve(e.exitCode)))
         })
         subs.push(proc.onData((data) => chunks.push(data)))
-        const first = await Promise.race([
-          exited,
-          new Promise<"timeout">((resolve) => {
-            timer = setTimeout(() => resolve("timeout"), CHILD_TIMEOUT_MS)
-          }),
-        ])
-        clearTimeout(timer)
+        let killTimer: ReturnType<typeof setTimeout> | undefined
         let state: string
-        if (first === "timeout") {
-          try {
-            proc.kill()
-          } catch {}
-          const after = await Promise.race([
+        let stop = false
+        try {
+          const first = await Promise.race([
             exited,
-            new Promise<"none">((resolve) => setTimeout(() => resolve("none"), 5000)),
+            new Promise<"timeout">((resolve) => {
+              timer = setTimeout(() => resolve("timeout"), CHILD_TIMEOUT_MS)
+            }),
           ])
-          state =
-            after === "none" ? "INCOMPLETE timeout, no exit after kill" : `INCOMPLETE timeout, killed, exit=${after}`
-          if (after === "none") {
-            console.log(`pty-probe [${name}] ${state}; stopping, directory left in place`)
-            return
+          clearTimeout(timer)
+          if (first === "timeout") {
+            try {
+              proc.kill()
+            } catch {}
+            const after = await Promise.race([
+              exited,
+              new Promise<"none">((resolve) => {
+                killTimer = setTimeout(() => resolve("none"), 5000)
+              }),
+            ])
+            if (after === "none") {
+              state = "INCOMPLETE timeout, no exit after kill"
+              stop = true
+            } else {
+              childLive = false
+              state = `INCOMPLETE timeout, killed, exit=${after}`
+            }
+          } else {
+            childLive = false
+            state = `exit=${first}`
           }
-        } else {
-          state = `exit=${first}`
+        } finally {
+          clearTimeout(timer)
+          clearTimeout(killTimer)
+          for (const sub of subs) sub.dispose()
         }
-        childLive = false
-        for (const sub of subs) sub.dispose()
+        if (stop) {
+          console.log(`pty-probe [${name}] ${state}; stopping, directory left in place`)
+          return
+        }
         const text = chunks.join("")
         console.log(
           `pty-probe [${name}] modeled=Shell.args /c via node-pty default backend ${state} hasFile=${text.includes(file)} hasU8=${text.includes("ação")} reencodedUtf8Hex=${Buffer.from(text, "utf8").toString("hex")}`,
