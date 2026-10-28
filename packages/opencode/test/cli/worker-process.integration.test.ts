@@ -307,19 +307,38 @@ setInterval(() => {}, 1000)
         process.kill(-ownerProcess.pid, "SIGCONT")
       } catch {}
       ownerProcess.kill("SIGKILL")
+      await ownerProcess.exited
       await resumer.exited
-      // The detached worker outlives its hard-killed owner and exits on its
-      // own (IPC disconnect or the owner watchdog). Wait for that exit before
-      // removing the temp dir: a pending tick write against the deleted
-      // directory crashes the worker with an uncaught ENOENT printed to the
-      // inherited stderr as a Bun crash banner.
-      try {
-        // The log may not exist if the test failed before the worker started; never let that mask the real error.
-        const started = (await Bun.file(log).text().catch(() => "")).match(/^start pid=(\d+)/m)
-        if (started) await waitForWorkerExit(Number(started[1]))
-      } finally {
-        await rm(dir, { recursive: true, force: true })
-      }
+      // The detached worker outlives its hard-killed owner; see removeDirAfterWorkerExit.
+      await removeDirAfterWorkerExit(dir, log)
+    }
+  })
+
+  test("removeDirAfterWorkerExit keeps the dir until a writing worker has exited", async () => {
+    if (process.platform === "win32") return
+    const dir = await mkdtemp(join(tmpdir(), "silvercode-worker-rm-"))
+    const log = join(dir, "ticks.log")
+    const target = join(dir, "worker.ts")
+    await Bun.write(
+      target,
+      `const fs = require("fs")
+fs.appendFileSync(${JSON.stringify(log)}, "start pid=" + process.pid + "\\n")
+setInterval(() => fs.appendFileSync(${JSON.stringify(log)}, "tick\\n"), 5)
+`,
+    )
+    const worker = Bun.spawn([process.execPath, target], { stdin: "ignore", stdout: "ignore", stderr: "pipe" })
+    try {
+      await waitForFileText(log, "start pid=", 10_000)
+      // The worker keeps writing every 5 ms and only dies 150 ms from now, like a worker that outlives its owner.
+      setTimeout(() => worker.kill("SIGTERM"), 150)
+      await removeDirAfterWorkerExit(dir, log)
+      // Removal came after the exit: nothing wrote into the removed dir, so stderr holds no ENOENT banner.
+      expect(worker.exitCode !== null || worker.signalCode !== null).toBe(true)
+      expect(await new Response(worker.stderr).text()).toBe("")
+    } finally {
+      if (worker.exitCode === null && worker.signalCode === null) worker.kill("SIGKILL")
+      await worker.exited
+      await rm(dir, { recursive: true, force: true })
     }
   })
 
@@ -460,19 +479,42 @@ async function waitForFileText(path: string, needle: string, timeout: number) {
 
 // The detached worker is reparented when its owner dies, so its exit is only
 // observable through its PID: poll signal 0 until the kernel reports ESRCH.
-// Removing a temp dir before this settles leaves the worker's pending writes
-// hitting ENOENT, which Bun prints as a crash banner on the inherited stderr.
+// Returns false if it was still alive at the deadline after a forced kill.
 async function waitForWorkerExit(pid: number, timeoutMs = 10_000) {
-  const deadline = Date.now() + timeoutMs
-  for (;;) {
+  const alive = () => {
     try {
       process.kill(pid, 0)
+      return true
     } catch (error) {
-      if ((error as NodeJS.ErrnoException)?.code === "ESRCH") return
+      return (error as NodeJS.ErrnoException)?.code !== "ESRCH"
     }
-    // Bounded: if the worker is still alive, clean up anyway rather than hang or replace the test's own error.
-    if (Date.now() > deadline) return
+  }
+  const deadline = Date.now() + timeoutMs
+  while (alive()) {
+    if (Date.now() > deadline) {
+      // Never leave the writer running into a removed directory: force it, then give the kernel a moment.
+      try {
+        process.kill(pid, "SIGKILL")
+      } catch {}
+      for (let i = 0; i < 80 && alive(); i++) await Bun.sleep(25)
+      return !alive()
+    }
     await Bun.sleep(25)
+  }
+  return true
+}
+
+// Remove a test's temp dir only after its worker (identified by the
+// `start pid=` line the worker wrote to `log`) is gone. A tick written after
+// the removal is an uncaught ENOENT that bun prints as a crash banner on the
+// inherited stderr. A missing log (the test failed before the worker started)
+// skips the wait, and the removal always runs, so the test's own error is kept.
+async function removeDirAfterWorkerExit(dir: string, log: string) {
+  try {
+    const started = (await Bun.file(log).text().catch(() => "")).match(/^start pid=(\d+)/m)
+    if (started) await waitForWorkerExit(Number(started[1]))
+  } finally {
+    await rm(dir, { recursive: true, force: true })
   }
 }
 
