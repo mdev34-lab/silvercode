@@ -1,16 +1,13 @@
 // Opt-in trace for delayed registry-fetch aborts (#560).
 //
-// The core suite runs every test file in one Bun process, in the order Bun
-// discovers them (directory traversal, not sorted - measured on the pinned
-// 1.3.14), and Bun reports an unhandled rejection against whichever test is
-// running when it lands (with the origin's code frame printed above it).
-// Registry work aborted by an install fiber that was interrupted after its
-// owning test finished therefore surfaces as `AbortError` / `FETCH_ABORTED`
-// under an unrelated test - the npm-config registry assertion in #560, which
-// cannot fetch at all (@npmcli/config only reads env, argv and .npmrc files).
-// What the log never shows is which code aborted the signal, so this trace
-// prints that: the creation stack (which install owned the fetch) and the
-// abort() stack (who cancelled it).
+// In the #560 run the abort surfaced under test/npm-config.test.ts, which only
+// reads env, argv and .npmrc files and cannot fetch. The stack ends in a
+// promise-retry callback inside make-fetch-happen that issued a fetch with a
+// signal that was already aborted. The log does not show who created that
+// request or who aborted its signal, and no npm install test file appears
+// before npm-config in that log, so the cause is NOT established. This trace
+// prints the two missing facts: the creation site of each AbortController and
+// the site that aborted it.
 //
 // Off unless OPENCODE_TRACE_TEST_ABORTS is set, so a normal run patches nothing
 // and prints nothing: `OPENCODE_TRACE_TEST_ABORTS=1 bun test <file>`.
@@ -21,10 +18,13 @@
 //   an abort() fired from a promise continuation reports `aborted at unknown`.
 // - Only `new AbortController()` instances are traced; signals from
 //   AbortSignal.timeout()/any() are native and stay untraced.
-// - While tracing, the traced abort() adds its own frame to stacks of code that
+// - While tracing, the patched abort() adds its own frame to stacks of code that
 //   runs inside abort listeners. Run with the flag only to diagnose.
+// - It patches AbortController.prototype.abort for the process while on. The
+//   original runs on every call, even if logging fails; restoreAborts() undoes it.
 
 const flag = "OPENCODE_TRACE_TEST_ABORTS"
+const state = Symbol.for("opencode.test.abort-trace")
 
 interface Owner {
   id: number
@@ -32,34 +32,67 @@ interface Owner {
   site: string
 }
 
+interface Installed {
+  restore: () => void
+}
+
 export function traceAborts() {
   if (!process.env[flag]) return
+  const global = globalThis as unknown as Record<symbol, Installed | undefined>
+  // Idempotent: a second call must not wrap the wrappers.
+  if (global[state]) return
   const NativeAbortController = globalThis.AbortController
+  const nativeAbort = NativeAbortController.prototype.abort
+  const owners = new WeakMap<object, Owner>()
   let created = 0
 
-  // A Proxy keeps the native constructor, prototype and instanceof chain intact:
-  // only the instances gain a traced abort(), so opt-in cannot change how
-  // registry code observes cancellation.
-  globalThis.AbortController = new Proxy(NativeAbortController, {
-    construct(target, args) {
-      const controller = Reflect.construct(target, args) as AbortController
-      const owner: Owner = { id: ++created, started: performance.now(), site: site() }
-      const abort = controller.abort.bind(controller)
-      Object.defineProperty(controller, "abort", {
-        configurable: true,
-        value: (reason?: unknown) => {
-          if (!controller.signal.aborted) {
-            const elapsed = Math.round(performance.now() - owner.started)
-            console.error(
-              `[abort-trace] abort #${owner.id} ${elapsed}ms after creation at ${owner.site}; aborted at ${site()}`,
-            )
-          }
-          abort(reason)
-        },
-      })
+  // Reflect.construct forwards new.target, so subclasses keep their own
+  // prototype and instanceof chain; only the creation site is recorded.
+  const Traced = new Proxy(NativeAbortController, {
+    construct(target, args, newTarget) {
+      const controller = Reflect.construct(target, args, newTarget) as AbortController
+      try {
+        owners.set(controller, { id: ++created, started: performance.now(), site: site() })
+      } catch {
+        // Tracing must never change how a controller is constructed.
+      }
       return controller
     },
   })
+
+  // The original abort always runs: a failure while logging is swallowed, and the
+  // wrapper keeps the native name and length. Prototype-level, so the controller
+  // has no extra own property and subclass overrides still reach it via super.
+  const tracedAbort = function abort(this: AbortController, ...args: unknown[]) {
+    try {
+      const owner = owners.get(this)
+      if (owner && !this.signal.aborted) {
+        const elapsed = Math.round(performance.now() - owner.started)
+        console.error(
+          `[abort-trace] abort #${owner.id} ${elapsed}ms after creation at ${owner.site}; aborted at ${site()}`,
+        )
+      }
+    } catch {
+      // Logging is best effort.
+    }
+    return Reflect.apply(nativeAbort, this, args)
+  }
+  Object.defineProperty(tracedAbort, "length", { value: nativeAbort.length })
+
+  NativeAbortController.prototype.abort = tracedAbort as typeof nativeAbort
+  globalThis.AbortController = Traced
+  global[state] = {
+    restore() {
+      NativeAbortController.prototype.abort = nativeAbort
+      globalThis.AbortController = NativeAbortController
+      global[state] = undefined
+    },
+  }
+}
+
+export function restoreAborts() {
+  const global = globalThis as unknown as Record<symbol, Installed | undefined>
+  global[state]?.restore()
 }
 
 // Nearest source frame outside this file: the module that created the signal, or

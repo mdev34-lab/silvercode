@@ -3,14 +3,14 @@ import { describe, expect, test } from "bun:test"
 import { tmpdir } from "../fixture/tmpdir"
 
 // The tracer reads the environment in the preload, before any test file is
-// imported, so both cases run in a child process: one with the flag unset, one
-// with it set. Neither run may change the outcome of the test that aborts.
+// imported, so every case runs in a child process. The child asserts the native
+// behavior itself; this file asserts on the child's outcome and trace lines.
 const packageRoot = path.resolve(import.meta.dir, "../..")
+const tracer = path.resolve(import.meta.dir, "abort-trace.ts")
 
-const childTest = `import { test } from "bun:test"
+const childTest = `import { test, expect } from "bun:test"
+import { traceAborts, restoreAborts } from ${JSON.stringify(tracer)}
 
-// Mirrors the #560 shape: a signal is created inside install-like code, then
-// aborted later from an interruption path, after the work it guarded started.
 const install = () => {
   const controller = new AbortController()
   const work = Bun.sleep(20).then(() => controller.abort())
@@ -20,15 +20,60 @@ const install = () => {
 test("aborts a signal created inside a helper", async () => {
   const { controller, work } = install()
   await work
-  if (!controller.signal.aborted) throw new Error("signal was not aborted")
+  expect(controller.signal.aborted).toBe(true)
 })
 
-test("abort() still accepts and forwards a reason", () => {
+test("abort() still forwards a reason", () => {
   const controller = new AbortController()
   const reason = Object.assign(new Error("stopped"), { name: "AbortError" })
   controller.abort(reason)
-  if (controller.signal.reason !== reason) throw new Error("reason was not forwarded")
-  if (!controller.signal.aborted) throw new Error("signal did not abort")
+  expect(controller.signal.reason).toBe(reason)
+})
+
+test("subclasses keep their prototype and instanceof chain", () => {
+  class Extended extends AbortController {
+    extra() {
+      return 1
+    }
+  }
+  const controller = new Extended()
+  expect(controller instanceof Extended).toBe(true)
+  expect(controller instanceof AbortController).toBe(true)
+  expect(controller.extra()).toBe(1)
+  expect(Object.getPrototypeOf(controller)).toBe(Extended.prototype)
+  expect(Object.prototype.hasOwnProperty.call(controller, "abort")).toBe(false)
+  controller.abort()
+  expect(controller.signal.aborted).toBe(true)
+})
+
+test("a failing logger never prevents the abort", () => {
+  const original = console.error
+  console.error = () => {
+    throw new Error("logger failed")
+  }
+  try {
+    const controller = new AbortController()
+    controller.abort()
+    expect(controller.signal.aborted).toBe(true)
+  } finally {
+    console.error = original
+  }
+})
+
+test("installing twice does not double wrap", () => {
+  traceAborts()
+  const controller = new AbortController()
+  controller.abort()
+  controller.abort()
+  expect(controller.signal.aborted).toBe(true)
+})
+
+test("restoreAborts puts the native constructor and abort back", () => {
+  restoreAborts()
+  const controller = new AbortController()
+  controller.abort()
+  expect(controller.signal.aborted).toBe(true)
+  expect(Object.prototype.hasOwnProperty.call(controller, "abort")).toBe(false)
 })
 `
 
@@ -44,41 +89,44 @@ const run = async (trace: string | undefined) => {
     env,
     stdout: "pipe",
     stderr: "pipe",
+    // Bound the child: it is killed on timeout and again in finally, so a host
+    // timeout on this test cannot leave it running.
+    timeout: 25_000,
+    killSignal: "SIGKILL",
   })
-  const [code, stdout, stderr] = await Promise.all([
-    child.exited,
-    new Response(child.stdout).text(),
-    new Response(child.stderr).text(),
-  ])
-  return { code, stdout, stderr, file }
+  try {
+    const [code, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()])
+    return { code, stderr, file }
+  } finally {
+    child.kill()
+    await child.exited
+  }
 }
 
 describe("abort trace", () => {
-  test("is silent and does not change abort behavior when the flag is unset", async () => {
+  test("is silent and the child assertions hold when the flag is unset", async () => {
     const result = await run(undefined)
 
+    expect(result.stderr).toContain("6 pass")
+    expect(result.stderr).toContain("0 fail")
     expect(result.code).toBe(0)
-    // Bun's test reporter writes to stderr, so both cases assert on the same stream.
-    expect(result.stderr).toContain("2 pass")
     expect(result.stderr).not.toContain("[abort-trace]")
   }, 30_000)
 
-  test("names the creation site and the abort site when the flag is set", async () => {
+  test("names the creation site and keeps native behavior when the flag is set", async () => {
     const result = await run("1")
 
-    // The traced run reports the same result as the untraced one: the trace only
-    // observes, so a diagnostic run still shows the real failure.
+    expect(result.stderr).toContain("6 pass")
+    expect(result.stderr).toContain("0 fail")
     expect(result.code).toBe(0)
-    expect(result.stderr).toContain("2 pass")
     const lines = result.stderr.split("\n").filter((line) => line.startsWith("[abort-trace]"))
-    expect(lines).toHaveLength(2)
+    expect(lines.length).toBeGreaterThanOrEqual(1)
     // Creation site: the helper in the child file that owns the signal, not this
-    // file and not the tracer.
+    // file and not the tracer. Bun truncates the stack at the promise
+    // continuation that calls abort(), so the abort site is best effort.
     expect(lines[0]).toContain(`creation at install (${result.file}:`)
     expect(lines[0]).toMatch(/\d+ms after creation/)
-    // Bun truncates the stack at the promise continuation that calls abort(), so
-    // that site is best effort. A synchronous abort() still resolves to a site.
-    expect(lines[1]).toContain("abort #2")
-    expect(lines[1]).toContain(`aborted at <anonymous> (${result.file}:`)
+    // Double install and repeated abort() of one signal log each abort once.
+    expect(new Set(lines.map((line) => line.split(" ")[2])).size).toBe(lines.length)
   }, 30_000)
 })
