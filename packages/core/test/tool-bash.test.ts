@@ -2,7 +2,7 @@ import fs from "fs/promises"
 import { realpathSync } from "node:fs"
 import path from "path"
 import { describe, expect, test } from "bun:test"
-import { Effect, Layer } from "effect"
+import { Duration, Effect, Layer } from "effect"
 import { ChildProcess } from "effect/unstable/process"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Config } from "@opencode-ai/core/config"
@@ -27,8 +27,11 @@ const sessionID = SessionV2.ID.make("ses_bash_tool_test")
 const assertions: PermissionV2.AssertInput[] = []
 const runs: Array<{
   readonly command: string
+  readonly args: ReadonlyArray<string>
   readonly cwd?: string
   readonly shell?: string | boolean
+  readonly stdin?: ChildProcess.CommandOptions["stdin"]
+  readonly forceKillAfter?: ChildProcess.CommandOptions["forceKillAfter"]
   readonly options?: AppProcess.RunOptions
 }> = []
 let denyAction: string | undefined
@@ -68,7 +71,15 @@ const appProcess = Layer.succeed(
     run: (command: ChildProcess.Command, options?: AppProcess.RunOptions) =>
       Effect.suspend(() => {
         if (command._tag !== "StandardCommand") throw new Error("expected standard command")
-        runs.push({ command: command.command, cwd: command.options.cwd, shell: command.options.shell, options })
+        runs.push({
+          command: command.command,
+          args: command.args,
+          cwd: command.options.cwd,
+          shell: command.options.shell,
+          stdin: command.options.stdin,
+          forceKillAfter: command.options.forceKillAfter,
+          options,
+        })
         return runFailure ? Effect.fail(runFailure) : Effect.succeed(result)
       }),
   } as unknown as AppProcess.Interface),
@@ -169,6 +180,7 @@ describe("BashTool", () => {
               },
             })
             expect(runs).toMatchObject([{ command: "pwd", cwd: realpathSync(tmp.path) }])
+            expect(runs[0]).toMatchObject({ args: [], stdin: "ignore", forceKillAfter: Duration.seconds(3) })
             expect(runs[0]?.options).toMatchObject({
               combineOutput: true,
               maxOutputBytes: BashTool.MAX_CAPTURE_BYTES,
@@ -227,6 +239,28 @@ describe("BashTool", () => {
       (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
     ),
   )
+
+  if (process.platform === "win32") {
+    it.live("decodes cmd builtin output and preserves exit through AppProcess (#543)", () =>
+      Effect.acquireUseRelease(
+        Effect.promise(() => tmpdir()),
+        (tmp) =>
+          Effect.gen(function* () {
+            reset()
+            const file = "ação-日本.txt"
+            yield* Effect.promise(() => fs.writeFile(path.join(tmp.path, file), ""))
+            const settled = yield* withTool(
+              tmp.path,
+              (registry) => settleTool(registry, call({ command: "dir /b *.txt & exit /b 7" })),
+              LayerNode.compile(AppProcess.node),
+            )
+            expect(settled.output?.structured).toMatchObject({ exit: 7, truncated: false })
+            expect(JSON.stringify(settled.result)).toContain(file)
+          }),
+        (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+      ),
+    )
+  }
 
   if (process.platform !== "win32") {
     it.live("executes a real shell command through AppProcess", () =>
@@ -523,9 +557,7 @@ describe("BashTool — narration-only guidance", () => {
       Effect.promise(() => tmpdir()),
       (tmp) => {
         reset()
-        return withTool(tmp.path, (registry) =>
-          settleTool(registry, call({ command: 'echo "$PATH"' })),
-        ).pipe(
+        return withTool(tmp.path, (registry) => settleTool(registry, call({ command: 'echo "$PATH"' }))).pipe(
           Effect.andThen((settled) =>
             Effect.sync(() => {
               for (const part of settled.output?.content ?? []) {
@@ -686,9 +718,7 @@ describe("BashTool — narration-only guidance", () => {
       Effect.promise(() => tmpdir()),
       (tmp) => {
         reset()
-        return withTool(tmp.path, (registry) =>
-          settleTool(registry, call({ command: 'echo "Running tests"' })),
-        ).pipe(
+        return withTool(tmp.path, (registry) => settleTool(registry, call({ command: 'echo "Running tests"' }))).pipe(
           Effect.andThen((settled) =>
             Effect.sync(() => {
               for (const part of settled.output?.content ?? []) {
@@ -707,9 +737,7 @@ describe("BashTool — narration-only guidance", () => {
       Effect.promise(() => tmpdir()),
       (tmp) => {
         reset()
-        return withTool(tmp.path, (registry) =>
-          settleTool(registry, call({ command: 'echo "Sending request"' })),
-        ).pipe(
+        return withTool(tmp.path, (registry) => settleTool(registry, call({ command: 'echo "Sending request"' }))).pipe(
           Effect.andThen((settled) =>
             Effect.sync(() => {
               for (const part of settled.output?.content ?? []) {
@@ -728,9 +756,7 @@ describe("BashTool — narration-only guidance", () => {
       Effect.promise(() => tmpdir()),
       (tmp) => {
         reset()
-        return withTool(tmp.path, (registry) =>
-          settleTool(registry, call({ command: 'echo "Getting coffee"' })),
-        ).pipe(
+        return withTool(tmp.path, (registry) => settleTool(registry, call({ command: 'echo "Getting coffee"' }))).pipe(
           Effect.andThen((settled) =>
             Effect.sync(() => {
               for (const part of settled.output?.content ?? []) {
@@ -753,7 +779,6 @@ describe("BashTool — narration-only guidance", () => {
     expect(NarrationDetector.GUIDANCE).toContain("[SilverCode]")
   })
 })
-
 
 test("keeps locked deferred parity TODOs visible", async () => {
   const source = await fs.readFile(new URL("../src/tool/bash.ts", import.meta.url), "utf8")
