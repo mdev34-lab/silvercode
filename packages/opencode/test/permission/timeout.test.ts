@@ -18,11 +18,11 @@ const noopBootstrap = Layer.succeed(InstanceBootstrap.Service, InstanceBootstrap
 // forkDetach'es an in-process `npm install @opencode-ai/plugin` (Arborist reify) per
 // config directory — always including the process-wide global config dir. A detached
 // fiber outlives the test scope it started in, so one test's Arborist import/tree-build/
-// extraction CPU bursts run on the same single thread while the NEXT test's
-// waitForPending window is open. Under load that starved the readiness poll: the reported
-// failure spent 2074ms inside a 1s live bound because neither the poll loop nor its
-// timeout could get the loop. The flag keeps these fixtures out of the preseed (none of
-// them configure plugins); the stub additionally records calls so the readiness guard
+// extraction CPU bursts can run on the same single thread while the NEXT test's
+// waitForPending window is open. Locally that interference reproduced the same starvation
+// signature as the reported 2074ms failure (readiness poll and its timeout both delayed);
+// it is not established that it caused the originally reported run. The flag keeps these
+// fixtures out of the preseed (none of them configure plugins); the stub additionally records calls so the readiness guard
 // test below can prove no fixture in this file ever kicks an install off.
 const depInstalls: string[] = []
 const stubNpm = Layer.succeed(
@@ -243,8 +243,7 @@ it.instance(
 
 // Guards the #579 quarantine: every fixture in this file routes through a fresh instance
 // config load, and none of them may fork the background dependency install — its
-// in-process Arborist work is what overlapped and starved the default-countdown test's
-// readiness window. Without the beforeEach flag (or if loadInstanceState stops honoring
+// in-process Arborist work is the interference that overlapped the readiness windows. Without the beforeEach flag (or if loadInstanceState stops honoring
 // it), the stubbed Npm.install records the attempt and this fails, instead of the flake
 // sneaking back as an intermittent 1s timeout.
 it.instance(
