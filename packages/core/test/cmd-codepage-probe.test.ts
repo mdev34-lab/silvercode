@@ -32,10 +32,6 @@ winOnly(
         // %COMSPEC% is expanded by the outer cmd, so the line carries no quote characters.
         "N0 nested cmd dir, no chcp": `%COMSPEC% /d /c dir /b *.txt & exit /b 7`,
         "N1 chcp then nested cmd dir": `${chcp} 65001>nul & %COMSPEC% /d /c dir /b *.txt & exit /b 7`,
-        // Command-shape cases for a nested wrapper: the inner line is wrapped as `/s /c "<line>"`.
-        "Q1 nested /s /c quoted line with quotes, && and pipe": `${chcp} 65001>nul & %COMSPEC% /d /s /c "echo "a b" && dir /b *.txt | findstr txt" & exit /b 7`,
-        "Q2 nested /s /c inner exit code": `${chcp} 65001>nul & %COMSPEC% /d /s /c "dir /b *.txt & exit /b 3" & echo outer=%ERRORLEVEL% & exit /b 7`,
-        "Q3 nested /s /c percent var and caret": `${chcp} 65001>nul & %COMSPEC% /d /s /c "echo %CD:~0,2% ^& done" & exit /b 7`,
       }
       for (const [name, line] of Object.entries(variants)) {
         const out = spawnSync(cmd, Shell.args(cmd, line, dir), {
@@ -68,6 +64,53 @@ winOnly(
 // listener yields JS strings; the hex printed is those strings re-encoded as UTF-8, not the raw wire bytes. The
 // result concerns this transport only. Prints only. Exit, timeout and spawn failure are reported explicitly; a
 // outer test budget is 75 s: 4 variants x (10 s + 5 s) = 60 s plus spawn, import and cleanup headroom. A child that does not exit after kill stops the probe and leaves its directory in place.
+winOnly(
+  "probe: nested cmd after chcp under the node `shell` option (tool bash / shell tool spawn shape)",
+  () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "cmd-cp-probe2-"))
+    try {
+      writeFileSync(path.join(dir, "ação-日本.txt"), "")
+      const cmd = process.env.COMSPEC || "cmd.exe"
+      const root = process.env.SystemRoot ?? process.env.windir ?? ""
+      const chcp = `${root}\\System32\\chcp.com`
+      if (!/^[A-Za-z]:\\[^\s"%&^|<>!()]*$/.test(root) || !existsSync(chcp)) {
+        console.log(`cp-probe2 INCOMPLETE: unusable SystemRoot or missing chcp.com (root=${root})`)
+        return
+      }
+      // Node builds `<shell> /d /s /c "<line>"` itself and passes it verbatim, so these lines reach cmd as written.
+      const lines: Record<string, string> = {
+        "S0 plain dir": `dir /b *.txt`,
+        "S1 chcp then dir (same cmd)": `${chcp} 65001>nul & dir /b *.txt`,
+        "S2 chcp then nested /s /c": `${chcp} 65001>nul & %COMSPEC% /d /s /c "dir /b *.txt"`,
+        "S3 nested with quotes, && and pipe": `${chcp} 65001>nul & %COMSPEC% /d /s /c "echo "a b" && dir /b *.txt | findstr txt"`,
+        "S4 nested inner exit 3, outer maps failure to 9": `${chcp} 65001>nul & %COMSPEC% /d /s /c "dir /b *.txt & exit /b 3" || exit /b 9`,
+        "S5 nested quoted non-ASCII arg": `${chcp} 65001>nul & %COMSPEC% /d /s /c "echo "ação 日本""`,
+      }
+      for (const [name, line] of Object.entries(lines)) {
+        const out = spawnSync(line, {
+          cwd: dir,
+          shell: cmd,
+          windowsHide: true,
+          timeout: CHILD_TIMEOUT_MS,
+          killSignal: "SIGKILL",
+        })
+        const state = out.error
+          ? `INCOMPLETE error=${out.error.message}`
+          : out.signal
+            ? `INCOMPLETE signal=${out.signal}`
+            : `status=${out.status}`
+        console.log(
+          `cp-probe2 [${name}] modeled=node shell option ${state} hex=${(out.stdout ?? Buffer.alloc(0)).toString("hex")} stderrHex=${(out.stderr ?? Buffer.alloc(0)).toString("hex")}`,
+        )
+      }
+      expect(true).toBe(true)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  },
+  45000,
+)
+
 test.skip("probe: cmd.exe output through ConPTY", async () => {
   const dir = mkdtempSync(path.join(tmpdir(), "cmd-pty-probe-"))
   let childLive = false
