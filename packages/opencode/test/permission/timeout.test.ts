@@ -1,9 +1,10 @@
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
-import { expect } from "bun:test"
+import { afterEach, beforeEach, expect } from "bun:test"
 import { Cause, Deferred, Effect, Exit, Fiber, Layer } from "effect"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+import { Npm } from "@opencode-ai/core/npm"
 import { EventV2Bridge } from "../../src/event-v2-bridge"
 import { Permission } from "../../src/permission"
 import { InstanceBootstrap } from "../../src/project/bootstrap"
@@ -12,11 +13,48 @@ import { SessionID } from "../../src/session/schema"
 import { testEffect } from "../lib/effect"
 
 const noopBootstrap = Layer.succeed(InstanceBootstrap.Service, InstanceBootstrap.Service.of({ run: Effect.void }))
+
+// #579: every fixture below builds a fresh tmpdir instance, and its first config load
+// forkDetach'es an in-process `npm install @opencode-ai/plugin` (Arborist reify) per
+// config directory — always including the process-wide global config dir. A detached
+// fiber outlives the test scope it started in, so one test's Arborist import/tree-build/
+// extraction CPU bursts run on the same single thread while the NEXT test's
+// waitForPending window is open. Under load that starved the readiness poll: the reported
+// failure spent 2074ms inside a 1s live bound because neither the poll loop nor its
+// timeout could get the loop. The flag keeps these fixtures out of the preseed (none of
+// them configure plugins); the stub additionally records calls so the readiness guard
+// test below can prove no fixture in this file ever kicks an install off.
+const depInstalls: string[] = []
+const stubNpm = Layer.succeed(
+  Npm.Service,
+  Npm.Service.of({
+    add: () => Effect.die(new Error("permission timeout fixtures must not install packages")),
+    install: (dir) => Effect.sync(() => void depInstalls.push(dir)),
+    which: () => Effect.die(new Error("permission timeout fixtures must not install packages")),
+  }),
+)
+
 const env = AppNodeBuilder.build(
   LayerNode.group([Permission.node, EventV2Bridge.node, CrossSpawnSpawner.node, InstanceStore.node]),
-  [[InstanceStore.bootstrapNode, noopBootstrap]],
+  [
+    [InstanceStore.bootstrapNode, noopBootstrap],
+    [Npm.node, stubNpm],
+  ],
 )
 const it = testEffect(env)
+
+let priorDepInstallFlag: string | undefined
+beforeEach(() => {
+  priorDepInstallFlag = process.env.OPENCODE_DISABLE_CONFIG_DEP_INSTALL
+  // Same convention as test/project/instance-bootstrap.test.ts: keep the countdown
+  // contract independent from npm dependency preseed timing. Evaluated at access time
+  // during instance config load, so setting it per test is enough.
+  process.env.OPENCODE_DISABLE_CONFIG_DEP_INSTALL = "1"
+})
+afterEach(() => {
+  if (priorDepInstallFlag === undefined) delete process.env.OPENCODE_DISABLE_CONFIG_DEP_INSTALL
+  else process.env.OPENCODE_DISABLE_CONFIG_DEP_INSTALL = priorDepInstallFlag
+})
 
 // One second is the shortest countdown the config accepts, so every test here outlives
 // it: a request that is still pending afterwards proves the timer was cancelled rather
@@ -201,6 +239,38 @@ it.instance(
       yield* Fiber.await(fiber)
     }),
   { git: true },
+)
+
+// Guards the #579 quarantine: every fixture in this file routes through a fresh instance
+// config load, and none of them may fork the background dependency install — its
+// in-process Arborist work is what overlapped and starved the default-countdown test's
+// readiness window. Without the beforeEach flag (or if loadInstanceState stops honoring
+// it), the stubbed Npm.install records the attempt and this fails, instead of the flake
+// sneaking back as an intermittent 1s timeout.
+it.instance(
+  "readiness - config startup never forks a background dependency install",
+  () =>
+    Effect.gen(function* () {
+      const fiber = yield* ask(bash("per_timeout_no_dep_install")).pipe(Effect.forkScoped)
+
+      const [request] = yield* waitForPending(1)
+      // The deadline is stamped from the loaded config (this instance sets the 1s
+      // countdown), so observing it proves the ask really went through config load and
+      // the assertion below is not vacuously passing on a config path that never ran.
+      const expiresAt = request.expiresAt ?? 0
+      expect(expiresAt - Date.now()).toBeLessThanOrEqual(1000)
+      expect(expiresAt - Date.now()).toBeGreaterThan(0)
+
+      // A detached install fiber records synchronously when it starts; it is forked
+      // inside the config load that just completed, so a short beat is enough for a
+      // regressed fork to surface here.
+      yield* Effect.sleep("100 millis")
+      expect(depInstalls).toEqual([])
+
+      yield* rejectAll()
+      yield* Fiber.await(fiber)
+    }),
+  { git: true, config: countdown },
 )
 
 for (const answer of ["once", "always", "reject"] as const) {
