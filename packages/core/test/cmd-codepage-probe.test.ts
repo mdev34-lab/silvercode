@@ -42,9 +42,9 @@ winOnly(
         })
         const b = out.stdout ?? Buffer.alloc(0)
         const state = out.error
-          ? `error=${out.error.message}`
+          ? `INCOMPLETE error=${out.error.message}`
           : out.signal
-            ? `signal=${out.signal}`
+            ? `INCOMPLETE signal=${out.signal}`
             : `status=${out.status}`
         console.log(
           `cp-probe [${name}] modeled=Shell.args /c ${state} utf8=${b.toString("utf8").includes(file)} hex=${b.toString("hex")} stderrHex=${(out.stderr ?? Buffer.alloc(0)).toString("hex")}`,
@@ -58,13 +58,17 @@ winOnly(
   60000,
 )
 
-// Second question: does the existing ConPTY transport (@lydell/node-pty) deliver the non-ASCII file name from
-// cmd's own `dir` as UTF-8, with no chcp prefix? Spawned directly, no product code. A UTF-8 file listed by
-// `type` is the external-content control. Prints only; reports exit, timeout and spawn errors explicitly.
+// Second question: with the default @lydell/node-pty ConPTY backend (not the repo's DLL fallback path), spawned
+// directly with the same Shell.args shape, what text does cmd's own `dir /b` deliver for the non-ASCII file name?
+// `type` of a UTF-8 file is a second cmd builtin, NOT an external-executable or mixed-output control. The data
+// listener yields JS strings; the hex printed is those strings re-encoded as UTF-8, not the raw wire bytes. The
+// result concerns this transport only. Prints only. Exit, timeout and spawn failure are reported explicitly; a
+// child that does not exit after SIGKILL stops the probe and leaves its directory in place.
 winOnly(
   "probe: cmd.exe output through ConPTY",
   async () => {
     const dir = mkdtempSync(path.join(tmpdir(), "cmd-pty-probe-"))
+    let childLive = false
     try {
       const file = "ação-日本.txt"
       writeFileSync(path.join(dir, file), "")
@@ -82,9 +86,11 @@ winOnly(
         return
       }
       for (const [name, line] of Object.entries(lines)) {
-        let proc: ReturnType<typeof nodePty.spawn> | undefined
+        const chunks: string[] = []
+        const subs: { dispose(): void }[] = []
+        let timer: ReturnType<typeof setTimeout> | undefined
+        let proc: ReturnType<typeof nodePty.spawn>
         try {
-          const chunks: string[] = []
           proc = nodePty.spawn(cmd, Shell.args(cmd, line, dir), {
             cwd: dir,
             cols: 200,
@@ -92,28 +98,52 @@ winOnly(
             name: "xterm-256color",
             env: process.env as Record<string, string>,
           })
-          proc.onData((data) => chunks.push(data))
-          const exit = await Promise.race([
-            new Promise<string>((resolve) => proc!.onExit((e) => resolve(`exit=${e.exitCode}`))),
-            new Promise<string>((resolve) => setTimeout(() => resolve("TIMEOUT"), CHILD_TIMEOUT_MS)),
-          ])
-          const text = chunks.join("")
-          console.log(
-            `pty-probe [${name}] modeled=Shell.args /c via node-pty ${exit} hasFile=${text.includes(file)} hasU8=${text.includes("ação")} hex=${Buffer.from(text, "utf8").toString("hex")}`,
-          )
         } catch (error) {
           console.log(
             `pty-probe [${name}] INCOMPLETE: spawn failed ${error instanceof Error ? error.message : String(error)}`,
           )
-        } finally {
-          try {
-            proc?.kill()
-          } catch {}
+          continue
         }
+        childLive = true
+        const exited = new Promise<number>((resolve) => {
+          subs.push(proc.onExit((e) => resolve(e.exitCode)))
+        })
+        subs.push(proc.onData((data) => chunks.push(data)))
+        const first = await Promise.race([
+          exited,
+          new Promise<"timeout">((resolve) => {
+            timer = setTimeout(() => resolve("timeout"), CHILD_TIMEOUT_MS)
+          }),
+        ])
+        clearTimeout(timer)
+        let state: string
+        if (first === "timeout") {
+          try {
+            proc.kill()
+          } catch {}
+          const after = await Promise.race([
+            exited,
+            new Promise<"none">((resolve) => setTimeout(() => resolve("none"), 5000)),
+          ])
+          state =
+            after === "none" ? "INCOMPLETE timeout, no exit after kill" : `INCOMPLETE timeout, killed, exit=${after}`
+          if (after === "none") {
+            console.log(`pty-probe [${name}] ${state}; stopping, directory left in place`)
+            return
+          }
+        } else {
+          state = `exit=${first}`
+        }
+        childLive = false
+        for (const sub of subs) sub.dispose()
+        const text = chunks.join("")
+        console.log(
+          `pty-probe [${name}] modeled=Shell.args /c via node-pty default backend ${state} hasFile=${text.includes(file)} hasU8=${text.includes("ação")} reencodedUtf8Hex=${Buffer.from(text, "utf8").toString("hex")}`,
+        )
       }
       expect(true).toBe(true)
     } finally {
-      rmSync(dir, { recursive: true, force: true })
+      if (!childLive) rmSync(dir, { recursive: true, force: true })
     }
   },
   60000,
