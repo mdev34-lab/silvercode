@@ -198,6 +198,23 @@ const mustTruncate = (result: {
 }
 
 describe("tool.shell", () => {
+  if (process.platform === "win32" && cmdShell) {
+    it.live("decodes cmd builtin output and preserves exit through the shell tool (#543)", () =>
+      withShell(
+        cmdShell,
+        Effect.gen(function* () {
+          const directory = yield* tmpdirScoped()
+          const file = "ação-日本.txt"
+          yield* Effect.promise(() => fs.writeFile(path.join(directory, file), ""))
+          const result = yield* runIn(directory, run({ command: "dir /b *.txt & exit /b 7" }))
+          expect(result.metadata.exit).toBe(7)
+          expect(result.output).toContain(file)
+          expect(result.output).not.toContain("\ufffd")
+        }),
+      ),
+    )
+  }
+
   for (const item of ps) {
     it.live(`preserves non-ASCII PowerShell stdout/stderr and nonzero exit (#543) [${item.label}]`, () =>
       withShell(

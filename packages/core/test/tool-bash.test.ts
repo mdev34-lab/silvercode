@@ -170,7 +170,9 @@ describe("BashTool", () => {
               },
             })
             // On Windows cmd.exe the tool prefixes the UTF-8 codepage switch (#543); other shells run the command as given.
-            expect(runs).toMatchObject([{ command: windowsCmdCommand(String(runs[0]?.shell), "pwd"), cwd: realpathSync(tmp.path) }])
+            expect(runs).toMatchObject([
+              { command: windowsCmdCommand(String(runs[0]?.shell), "pwd"), cwd: realpathSync(tmp.path) },
+            ])
             expect(runs[0]?.options).toMatchObject({
               combineOutput: true,
               maxOutputBytes: BashTool.MAX_CAPTURE_BYTES,
@@ -229,6 +231,28 @@ describe("BashTool", () => {
       (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
     ),
   )
+
+  if (process.platform === "win32") {
+    it.live("decodes cmd builtin output and preserves exit through AppProcess (#543)", () =>
+      Effect.acquireUseRelease(
+        Effect.promise(() => tmpdir()),
+        (tmp) =>
+          Effect.gen(function* () {
+            reset()
+            const file = "ação-日本.txt"
+            yield* Effect.promise(() => fs.writeFile(path.join(tmp.path, file), ""))
+            const settled = yield* withTool(
+              tmp.path,
+              (registry) => settleTool(registry, call({ command: "dir /b *.txt & exit /b 7" })),
+              LayerNode.compile(AppProcess.node),
+            )
+            expect(settled.output?.structured).toMatchObject({ exit: 7, truncated: false })
+            expect(JSON.stringify(settled.result)).toContain(file)
+          }),
+        (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+      ),
+    )
+  }
 
   if (process.platform !== "win32") {
     it.live("executes a real shell command through AppProcess", () =>
@@ -525,9 +549,7 @@ describe("BashTool — narration-only guidance", () => {
       Effect.promise(() => tmpdir()),
       (tmp) => {
         reset()
-        return withTool(tmp.path, (registry) =>
-          settleTool(registry, call({ command: 'echo "$PATH"' })),
-        ).pipe(
+        return withTool(tmp.path, (registry) => settleTool(registry, call({ command: 'echo "$PATH"' }))).pipe(
           Effect.andThen((settled) =>
             Effect.sync(() => {
               for (const part of settled.output?.content ?? []) {
@@ -688,9 +710,7 @@ describe("BashTool — narration-only guidance", () => {
       Effect.promise(() => tmpdir()),
       (tmp) => {
         reset()
-        return withTool(tmp.path, (registry) =>
-          settleTool(registry, call({ command: 'echo "Running tests"' })),
-        ).pipe(
+        return withTool(tmp.path, (registry) => settleTool(registry, call({ command: 'echo "Running tests"' }))).pipe(
           Effect.andThen((settled) =>
             Effect.sync(() => {
               for (const part of settled.output?.content ?? []) {
@@ -709,9 +729,7 @@ describe("BashTool — narration-only guidance", () => {
       Effect.promise(() => tmpdir()),
       (tmp) => {
         reset()
-        return withTool(tmp.path, (registry) =>
-          settleTool(registry, call({ command: 'echo "Sending request"' })),
-        ).pipe(
+        return withTool(tmp.path, (registry) => settleTool(registry, call({ command: 'echo "Sending request"' }))).pipe(
           Effect.andThen((settled) =>
             Effect.sync(() => {
               for (const part of settled.output?.content ?? []) {
@@ -730,9 +748,7 @@ describe("BashTool — narration-only guidance", () => {
       Effect.promise(() => tmpdir()),
       (tmp) => {
         reset()
-        return withTool(tmp.path, (registry) =>
-          settleTool(registry, call({ command: 'echo "Getting coffee"' })),
-        ).pipe(
+        return withTool(tmp.path, (registry) => settleTool(registry, call({ command: 'echo "Getting coffee"' }))).pipe(
           Effect.andThen((settled) =>
             Effect.sync(() => {
               for (const part of settled.output?.content ?? []) {
@@ -755,7 +771,6 @@ describe("BashTool — narration-only guidance", () => {
     expect(NarrationDetector.GUIDANCE).toContain("[SilverCode]")
   })
 })
-
 
 test("keeps locked deferred parity TODOs visible", async () => {
   const source = await fs.readFile(new URL("../src/tool/bash.ts", import.meta.url), "utf8")

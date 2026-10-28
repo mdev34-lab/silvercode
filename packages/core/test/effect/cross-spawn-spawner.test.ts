@@ -7,6 +7,7 @@ import type * as PlatformError from "effect/PlatformError"
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+import { windowsCmdCommand } from "@opencode-ai/core/shell-encoding"
 import { testEffect } from "../lib/effect"
 
 const live = LayerNode.compile(CrossSpawnSpawner.node)
@@ -289,6 +290,34 @@ describe("cross-spawn spawner", () => {
         expect(Exit.isFailure(exit) ? true : exit.value !== ChildProcessSpawner.ExitCode(0)).toBe(true)
       }),
     )
+
+    if (process.platform === "win32") {
+      fx.live(
+        "forceKillAfter terminates a nested cmd descendant",
+        Effect.gen(function* () {
+          const tmp = yield* Effect.acquireRelease(
+            Effect.promise(() => tmpdir()),
+            (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+          )
+          const shell = process.env.COMSPEC || "cmd.exe"
+          const node = Bun.which("node")
+          expect(node).toBeDefined()
+          const file = path.join(tmp.path, "child.pid")
+          const code = "require('fs').writeFileSync(process.argv[1],String(process.pid));setInterval(()=>{},1000)"
+          const line = `"${node}" -e "${code}" "${file}"`
+          const handle = yield* ChildProcess.make(windowsCmdCommand(shell, line), [], {
+            shell,
+            stdin: "ignore",
+            detached: false,
+            forceKillAfter: "3 seconds",
+          })
+          const pid = yield* Effect.promise(() => readPid(file))
+          expect(alive(pid)).toBe(true)
+          yield* handle.kill({ forceKillAfter: "3 seconds" })
+          expect(yield* Effect.promise(() => gone(pid))).toBe(true)
+        }),
+      )
+    }
 
     fx.effect(
       "isRunning reflects process state",
