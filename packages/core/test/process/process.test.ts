@@ -1,6 +1,6 @@
 import { describe, expect, onTestFinished } from "bun:test"
 import fs from "fs/promises"
-import { realpathSync } from "node:fs"
+import { existsSync, readFileSync, realpathSync } from "node:fs"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import { Effect, Exit, Fiber, Stream } from "effect"
@@ -257,28 +257,50 @@ describe("AppProcess", () => {
             const ready = path.join(directory, "ready")
             const settled = path.join(directory, "settled")
             const script = `const fs=require('fs');fs.writeFileSync(${JSON.stringify(ready)},String(process.pid));process.on('SIGTERM',()=>{fs.writeFileSync(${JSON.stringify(settled)},'settled');process.exit(0)});setInterval(()=>{},60000)`
+            const started = Date.now()
+            let stage = "spawn"
+            let stageStarted = started
+            let pid = "unknown"
+            let done = false
+            const events: string[] = []
+            // Only timestamps and facts established by the test are recorded on a pass.
+            // The run API does not expose the underlying child's exit code or signal.
+            const mark = (next: string, files: string) => {
+              const now = Date.now()
+              events.push(
+                `${stage}: +${stageStarted - started}ms to +${now - started}ms (${now - stageStarted}ms); ${files}; exitCode/signal=unavailable`,
+              )
+              stage = next
+              stageStarted = now
+            }
+            onTestFinished(() => {
+              if (done) return
+              const now = Date.now()
+              let state = "unavailable"
+              if (/^\d+$/.test(pid) && process.platform === "linux") {
+                try {
+                  const stat = readFileSync(`/proc/${pid}/stat`, "utf8")
+                  state = stat.slice(stat.lastIndexOf(")") + 2).split(" ")[0] ?? "unavailable"
+                } catch {
+                  state = "not observable in /proc"
+                }
+              }
+              console.error(
+                `[process-interrupt] started=${new Date(started).toISOString()}\n${events.join("\n")}\n${stage}: +${stageStarted - started}ms to +${now - started}ms (${now - stageStarted}ms, incomplete); pid=${pid} processState=${state} exitCode/signal=unavailable ready=${existsSync(ready)} settled=${existsSync(settled)} (test-finished snapshot; timeout cleanup may already have changed child and files)`,
+              )
+            })
             return Effect.gen(function* () {
-              // Both waits below are unbounded, so a host timeout looks the same whichever one stalls.
-              // Record the stage and print it only when the test did not finish, so a pass stays silent.
-              const started = Date.now()
-              let stage = "starting the child"
-              let pid = "unknown"
-              onTestFinished(() => {
-                if (stage === "done") return
-                console.error(
-                  `[process-interrupt] stopped while ${stage} (child pid ${pid}, ${Date.now() - started}ms after start)`,
-                )
-              })
               const svc = yield* AppProcess.Service
               const fiber = yield* svc.run(cmd("-e", script)).pipe(Effect.forkChild)
-              stage = "waiting for the ready file"
+              mark("readiness wait", "ready/settled=unknown")
               pid = yield* waitForFile(ready)
               expect(pid).toMatch(/^\d+$/)
-              stage = "interrupting and joining the run fiber"
+              mark("interrupt", "ready=true settled=unknown")
               yield* Fiber.interrupt(fiber)
-              stage = "waiting for the settled file"
+              mark("settled wait", "ready=true (previously observed) settled=unknown")
               expect(yield* waitForFile(settled)).toBe("settled")
-              stage = "done"
+              mark("done", "ready=true (previously observed) settled=true")
+              done = true
             })
           },
           (directory) => Effect.promise(() => fs.rm(directory, { recursive: true, force: true })),
