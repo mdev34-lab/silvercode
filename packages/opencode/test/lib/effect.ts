@@ -1,4 +1,4 @@
-import { ownedDeadlineTest, validateOwnedDeadline, type OwnedDeadline } from "./owned-deadline"
+import { runOwned, takeActiveOwnedScope, validateOwnedDeadline, type OwnedDeadline } from "./owned-deadline"
 import { test, type TestOptions } from "bun:test"
 import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import { Cause, Duration, Effect, Exit, Layer } from "effect"
@@ -36,43 +36,45 @@ const body = <A, E, R>(value: Body<A, E, R>) => Effect.suspend(() => (typeof val
 
 type Runner = <A, E, R, E2>(value: Body<A, E, R | Scope.Scope>, layer: Layer.Layer<R, E2>, deadline?: OwnedDeadline) => Promise<A>
 
-const isolatedRun: Runner = (value, layer, deadline) => {
-  const execution = Effect.gen(function* () {
-    const exit = yield* body(value).pipe(Effect.scoped, Effect.provide(layer), Effect.exit)
-    if (Exit.isFailure(exit)) {
-      for (const err of Cause.prettyErrors(exit.cause)) {
-        yield* Effect.logError(err)
+const runExecution = <A, E>(scoped: Effect.Effect<A, E>, deadline?: OwnedDeadline): Promise<A> =>
+  runOwned(
+    Effect.gen(function* () {
+      const exit = yield* Effect.exit(scoped)
+      if (Exit.isFailure(exit)) {
+        for (const err of Cause.prettyErrors(exit.cause)) {
+          yield* Effect.logError(err)
+        }
       }
-    }
-    return yield* exit
-  })
-  return deadline ? ownedDeadlineTest(() => execution, deadline)() : Effect.runPromise(execution)
-}
+      return yield* exit
+    }),
+    deadline,
+  )
+
+const isolatedRun: Runner = (value, layer, deadline) =>
+  runExecution(body(value).pipe(Effect.scoped, Effect.provide(layer)), deadline)
 
 // Builds the test layer through the shared process-wide memoMap so cached
 // services (Bus, Session, …) match Server.Default's instances. Use for tests
 // that publish to an in-process HTTP server and need pub/sub identity with
 // the server's handlers.
-const sharedRun: Runner = (value, layer) =>
-  Effect.gen(function* () {
-    const scope = yield* Scope.make()
-    const ctx = yield* Layer.buildWithMemoMap(layer, memoMap, scope)
-    const exit = yield* body(value).pipe(Effect.scoped, Effect.provide(ctx), Effect.exit)
-    yield* Scope.close(scope, Exit.void)
-    if (Exit.isFailure(exit)) {
-      for (const err of Cause.prettyErrors(exit.cause)) {
-        yield* Effect.logError(err)
-      }
-    }
-    return yield* exit
-  }).pipe(Effect.runPromise)
+const sharedRun: Runner = (value, layer, deadline) =>
+  runExecution(
+    Effect.acquireUseRelease(
+      Scope.make(),
+      (scope) =>
+        Effect.gen(function* () {
+          const ctx = yield* Layer.buildWithMemoMap(layer, memoMap, scope)
+          return yield* body(value).pipe(Effect.scoped, Effect.provide(ctx))
+        }),
+      (scope, exit) => Scope.close(scope, exit),
+    ),
+    deadline,
+  )
 
-// A Bun test-level timeout only rejects the test promise; it does not interrupt the Effect
-// fiber, so scoped finalizers could run after the next test started. When the test declares
-// its own host timeout, own cancellation a little before it so the fiber is interrupted and
-// joined first. Bun does not expose the configured default (CLI --timeout or its 5000ms
-// default), so tests without an explicit timeout keep the previous unowned behavior rather
-// than guessing a budget.
+// When a test declares its own host timeout, start cooperative Effect cancellation a little
+// before Bun gives up; if cleanup still outlasts the host timeout (or when no explicit timeout
+// is declared and Bun's host timeout fires), `runOwned` joins the abandoned fiber before the
+// next test starts.
 function ownedFor(opts?: number | TestOptions): OwnedDeadline | undefined {
   const hostTimeoutMs = typeof opts === "number" ? opts : opts?.timeout
   if (hostTimeoutMs === undefined || !Number.isFinite(hostTimeoutMs) || hostTimeoutMs <= 0) return undefined
@@ -82,24 +84,29 @@ function ownedFor(opts?: number | TestOptions): OwnedDeadline | undefined {
   return { deadlineMs, hostTimeoutMs, cleanupHeadroomMs }
 }
 
+const beginOwned = <A>(start: () => Promise<A>): Promise<A> => {
+  const stale = takeActiveOwnedScope()
+  return stale ? stale.then(start) : start()
+}
+
 const make = <R, E>(testLayer: Layer.Layer<R, E>, liveLayer: Layer.Layer<R, E>, run: Runner = isolatedRun) => {
   const effect = <A, E2>(name: string, value: Body<A, E2, R | Scope.Scope>, opts?: number | TestOptions) =>
-    test(name, () => run(value, testLayer, ownedFor(opts)), opts)
+    test(name, () => beginOwned(() => run(value, testLayer, ownedFor(opts))), opts)
 
   effect.only = <A, E2>(name: string, value: Body<A, E2, R | Scope.Scope>, opts?: number | TestOptions) =>
-    test.only(name, () => run(value, testLayer, ownedFor(opts)), opts)
+    test.only(name, () => beginOwned(() => run(value, testLayer, ownedFor(opts))), opts)
 
   effect.skip = <A, E2>(name: string, value: Body<A, E2, R | Scope.Scope>, opts?: number | TestOptions) =>
-    test.skip(name, () => run(value, testLayer), opts)
+    test.skip(name, () => beginOwned(() => run(value, testLayer)), opts)
 
   const live = <A, E2>(name: string, value: Body<A, E2, R | Scope.Scope>, opts?: number | TestOptions) =>
-    test(name, () => run(value, liveLayer, ownedFor(opts)), opts)
+    test(name, () => beginOwned(() => run(value, liveLayer, ownedFor(opts))), opts)
 
   live.only = <A, E2>(name: string, value: Body<A, E2, R | Scope.Scope>, opts?: number | TestOptions) =>
-    test.only(name, () => run(value, liveLayer, ownedFor(opts)), opts)
+    test.only(name, () => beginOwned(() => run(value, liveLayer, ownedFor(opts))), opts)
 
   live.skip = <A, E2>(name: string, value: Body<A, E2, R | Scope.Scope>, opts?: number | TestOptions) =>
-    test.skip(name, () => run(value, liveLayer), opts)
+    test.skip(name, () => beginOwned(() => run(value, liveLayer)), opts)
 
   const instance = <A, E2, E3 = never>(
     name: string,
@@ -110,7 +117,7 @@ const make = <R, E>(testLayer: Layer.Layer<R, E>, liveLayer: Layer.Layer<R, E>, 
     const args = instanceArgs(options, opts)
     return test(
       name,
-      () => run(body(value).pipe(withTmpdirInstance(args.instanceOptions)), liveLayer, ownedFor(args.testOptions)),
+      () => beginOwned(() => run(body(value).pipe(withTmpdirInstance(args.instanceOptions)), liveLayer, ownedFor(args.testOptions))),
       args.testOptions,
     )
   }
@@ -124,7 +131,7 @@ const make = <R, E>(testLayer: Layer.Layer<R, E>, liveLayer: Layer.Layer<R, E>, 
     const args = instanceArgs(options, opts)
     return test.only(
       name,
-      () => run(body(value).pipe(withTmpdirInstance(args.instanceOptions)), liveLayer, ownedFor(args.testOptions)),
+      () => beginOwned(() => run(body(value).pipe(withTmpdirInstance(args.instanceOptions)), liveLayer, ownedFor(args.testOptions))),
       args.testOptions,
     )
   }
@@ -138,7 +145,7 @@ const make = <R, E>(testLayer: Layer.Layer<R, E>, liveLayer: Layer.Layer<R, E>, 
     const args = instanceArgs(options, opts)
     return test.skip(
       name,
-      () => run(body(value).pipe(withTmpdirInstance(args.instanceOptions)), liveLayer, ownedFor(args.testOptions)),
+      () => beginOwned(() => run(body(value).pipe(withTmpdirInstance(args.instanceOptions)), liveLayer, ownedFor(args.testOptions))),
       args.testOptions,
     )
   }
