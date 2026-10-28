@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test"
+import { appendFileSync } from "node:fs"
 import { mkdtemp, rm } from "fs/promises"
 import { tmpdir } from "os"
 import { join } from "path"
@@ -46,12 +47,16 @@ setInterval(() => {}, 1000)
 
 // Bounds an await that has no internal deadline: under CI starvation a
 // missed settlement must fail fast with a clear message, not hang the test
-// to the runner timeout (#468).
+// to the runner timeout (#468). The losing timer is cleared once the race
+// settles so it cannot fire (or hold the event loop) afterwards.
 async function bounded<T>(promise: Promise<T>, what: string, ms = 15000): Promise<T> {
-  return Promise.race([
-    promise,
-    new Promise<T>((_, reject) => setTimeout(() => reject(new Error(what)), ms)),
-  ])
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const rejectAfter = new Promise<T>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(what)), ms)
+  })
+  return Promise.race([promise, rejectAfter]).finally(() => {
+    if (timer !== undefined) clearTimeout(timer)
+  })
 }
 
 async function waitForCount(messages: string[], text: string, count: number, what: string) {
@@ -196,6 +201,11 @@ describe("TUI worker process integration", () => {
     }
   })
 
+  // Aggregate budget for the suspend test's finally cleanup (resume + hard-kill
+  // the owner, resumer exit, worker-exit wait): one owned deadline inside the
+  // host per-test budget, shared by the independent cleanup attempts.
+  const SUSPEND_CLEANUP_BUDGET_MS = 10_000
+
   test("a detached worker keeps running while its parent process group is stopped", async () => {
     if (process.platform === "win32") return
     const dir = await mkdtemp(join(tmpdir(), "silvercode-worker-suspend-"))
@@ -206,6 +216,7 @@ describe("TUI worker process integration", () => {
       `import { watchOwnerProcess } from ${JSON.stringify(new URL("../../src/cli/tui/owner-watch.ts", import.meta.url).pathname)}
 const log = ${JSON.stringify(log)}
 const note = (message) => require("fs").appendFileSync(log, message + "\\n")
+note("start pid=" + process.pid)
 // Exit when the owner dies so the test never leaks this process.
 process.on("disconnect", () => process.exit(0))
 process.on("message", (message) => {
@@ -278,6 +289,7 @@ setInterval(() => {}, 1000)
       ],
       { stdout: "ignore", stderr: "ignore" },
     )
+    let bodyFailure: unknown
     try {
       await ready
       await new Promise((resolve) => setTimeout(resolve, 200))
@@ -301,12 +313,154 @@ setInterval(() => {}, 1000)
       // The production watchdog must stay quiet while the owner is merely
       // stopped: a spurious orphan would exit the worker and end the ticks.
       expect(await Bun.file(log).text()).not.toContain("orphaned")
+    } catch (error) {
+      bodyFailure = error
+      throw error
     } finally {
+      // Cleanup runs under one owned aggregate budget inside the host test
+      // budget: each step is attempted independently, so a rejection or
+      // timeout in one does not skip the others. The worker dir is removed
+      // only when its exit is established; removeDirAfterWorkerExit preserves
+      // it whenever that stays unverified.
+      const cleanupDeadline = Date.now() + SUSPEND_CLEANUP_BUDGET_MS
+      const remaining = () => Math.max(200, cleanupDeadline - Date.now())
+      const cleanupFailures: unknown[] = []
+
       try {
-        process.kill(-ownerProcess.pid, "SIGCONT")
-      } catch {}
-      ownerProcess.kill("SIGKILL")
-      await resumer.exited
+        try {
+          process.kill(-ownerProcess.pid, "SIGCONT")
+        } catch {}
+        ownerProcess.kill("SIGKILL")
+        await bounded(ownerProcess.exited, "owner did not exit after SIGKILL", remaining())
+      } catch (error) {
+        cleanupFailures.push(error)
+      }
+
+      try {
+        await bounded(resumer.exited, "resumer did not exit", remaining())
+      } catch (error) {
+        cleanupFailures.push(error)
+      }
+
+      try {
+        // The detached worker outlives its hard-killed owner; see removeDirAfterWorkerExit.
+        await removeDirAfterWorkerExit(dir, log, remaining())
+      } catch (error) {
+        cleanupFailures.push(error)
+      }
+
+      if (cleanupFailures.length > 0) {
+        if (bodyFailure === undefined) {
+          throw cleanupFailures[0]
+        }
+        // The body already failed: attach the cleanup failures to it so they
+        // are reported, without masking the original error.
+        if (bodyFailure instanceof Error) {
+          ;(bodyFailure as Error & { cleanup?: unknown[] }).cleanup = cleanupFailures
+        }
+      }
+    }
+  })
+
+  test("removeDirAfterWorkerExit keeps the dir until a writing worker has exited", async () => {
+    if (process.platform === "win32") return
+    const dir = await mkdtemp(join(tmpdir(), "silvercode-worker-rm-"))
+    const log = join(dir, "ticks.log")
+    const target = join(dir, "worker.ts")
+    await Bun.write(
+      target,
+      `const fs = require("fs")
+fs.appendFileSync(${JSON.stringify(log)}, "start pid=" + process.pid + "\\n")
+setInterval(() => fs.appendFileSync(${JSON.stringify(log)}, "tick\\n"), 5)
+`,
+    )
+    const worker = Bun.spawn([process.execPath, target], { stdin: "ignore", stdout: "ignore", stderr: "pipe" })
+    try {
+      await waitForFileText(log, "start pid=", 10_000)
+      // The worker keeps writing every 5 ms and only dies 150 ms from now, like a worker that outlives its owner.
+      setTimeout(() => worker.kill("SIGTERM"), 150)
+      await removeDirAfterWorkerExit(dir, log)
+      // Removal came after the exit: nothing wrote into the removed dir, so stderr holds no ENOENT banner.
+      expect(worker.exitCode !== null || worker.signalCode !== null).toBe(true)
+      expect(await new Response(worker.stderr).text()).toBe("")
+    } finally {
+      if (worker.exitCode === null && worker.signalCode === null) worker.kill("SIGKILL")
+      await worker.exited
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("removeDirAfterWorkerExit preserves the dir when the worker cannot be established as gone", async () => {
+    if (process.platform === "win32") return
+    const dir = await mkdtemp(join(tmpdir(), "silvercode-worker-rm-stale-"))
+    const log = join(dir, "ticks.log")
+    const target = join(dir, "worker.ts")
+    await Bun.write(
+      target,
+      `const fs = require("fs")
+setInterval(() => fs.appendFileSync(${JSON.stringify(log)}, "tick\\n"), 5)
+`,
+    )
+    const worker = Bun.spawn([process.execPath, target], { stdin: "ignore", stdout: "ignore", stderr: "pipe" })
+    try {
+      await waitForFileText(log, "tick", 10_000)
+      // The worker keeps writing ticks, but the injected probe reports its pid
+      // as alive and the forced kill does not take it: the wait must report
+      // false and the dir must be preserved, not removed under the live
+      // writer. The pid is the test's own child; the probe is fake, so no
+      // process outside the test is ever signalled.
+      appendFileSync(log, `start pid=${worker.pid}\n`)
+      let incomplete: unknown
+      try {
+        await removeDirAfterWorkerExit(dir, log, 500, {
+          alive: () => true,
+          forceKill: () => {},
+        })
+      } catch (error) {
+        incomplete = error
+      }
+      expect(String(incomplete)).toContain("INCOMPLETE")
+      expect(await Bun.file(join(dir, "worker.ts")).exists()).toBe(true)
+      expect(worker.exitCode).toBe(null)
+      // The dir was preserved, so the live worker's ticks never hit a removed
+      // dir: after it is killed, its stderr must be free of the ENOENT banner.
+      worker.kill("SIGKILL")
+      await worker.exited
+      expect(await new Response(worker.stderr).text()).toBe("")
+    } finally {
+      if (worker.exitCode === null && worker.signalCode === null) worker.kill("SIGKILL")
+      await worker.exited
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("removeDirAfterWorkerExit preserves the dir when the log has no worker pid", async () => {
+    if (process.platform === "win32") return
+    const dir = await mkdtemp(join(tmpdir(), "silvercode-worker-rm-nopid-"))
+    const log = join(dir, "ticks.log")
+    const target = join(dir, "worker.ts")
+    await Bun.write(
+      target,
+      `const fs = require("fs")
+setInterval(() => fs.appendFileSync(${JSON.stringify(log)}, "tick\\n"), 5)
+`,
+    )
+    const worker = Bun.spawn([process.execPath, target], { stdin: "ignore", stdout: "ignore", stderr: "pipe" })
+    try {
+      await waitForFileText(log, "tick", 10_000)
+      let incomplete: unknown
+      try {
+        await removeDirAfterWorkerExit(dir, log)
+      } catch (error) {
+        incomplete = error
+      }
+      // No pid line means no proof the worker is absent: preserve the dir.
+      expect(String(incomplete)).toContain("INCOMPLETE")
+      expect(await Bun.file(join(dir, "worker.ts")).exists()).toBe(true)
+      expect(worker.exitCode).toBe(null)
+    } finally {
+      if (worker.exitCode === null && worker.signalCode === null) worker.kill("SIGKILL")
+      await worker.exited
       await rm(dir, { recursive: true, force: true })
     }
   })
@@ -444,6 +598,70 @@ async function waitForFileText(path: string, needle: string, timeout: number) {
     if (Date.now() > deadline) throw new Error(`${needle} never appeared in ${path} (saw ${text.length} bytes)`)
     await Bun.sleep(25)
   }
+}
+
+// Liveness/kill probe used by the worker-exit wait. The default signals the
+// real pid; tests inject fakes to exercise the wait deterministically without
+// signalling any process they do not own.
+interface WorkerProbe {
+  alive: (pid: number) => boolean
+  forceKill: (pid: number) => void
+}
+
+const defaultProbe: WorkerProbe = {
+  alive: (pid) => {
+    try {
+      process.kill(pid, 0)
+      return true
+    } catch (error) {
+      return (error as NodeJS.ErrnoException)?.code !== "ESRCH"
+    }
+  },
+  forceKill: (pid) => {
+    try {
+      process.kill(pid, "SIGKILL")
+    } catch {}
+  },
+}
+
+// The detached worker is reparented when its owner dies, so its exit is only
+// observable through its PID: poll signal 0 until the kernel reports ESRCH.
+// Returns false if it was still alive at the deadline after a forced kill.
+async function waitForWorkerExit(pid: number, timeoutMs = 10_000, probe: WorkerProbe = defaultProbe) {
+  const deadline = Date.now() + timeoutMs
+  while (probe.alive(pid)) {
+    if (Date.now() > deadline) {
+      // Never leave the writer running into a removed directory: force it, then give the kernel a moment.
+      probe.forceKill(pid)
+      for (let i = 0; i < 80 && probe.alive(pid); i++) await Bun.sleep(25)
+      return !probe.alive(pid)
+    }
+    await Bun.sleep(25)
+  }
+  return true
+}
+
+// Remove a test's temp dir only once its worker is established as gone. The
+// worker identifies itself with a `start pid=` line in `log`; a tick written
+// after the removal is an uncaught ENOENT that bun prints as a crash banner
+// on the inherited stderr. If the log is missing/unreadable (no proof the
+// worker is absent) or the worker cannot be established as gone, report
+// INCOMPLETE and preserve the dir instead of removing it under a live writer.
+async function removeDirAfterWorkerExit(
+  dir: string,
+  log: string,
+  timeoutMs = 10_000,
+  probe: WorkerProbe = defaultProbe,
+) {
+  const started = (await Bun.file(log).text().catch(() => "")).match(/^start pid=(\d+)/m)
+  if (!started) {
+    throw new Error(`INCOMPLETE: no worker pid in ${log}; preserve ${dir}`)
+  }
+  const exited = await waitForWorkerExit(Number(started[1]), timeoutMs, probe)
+  if (!exited) {
+    throw new Error(`INCOMPLETE: worker ${started[1]} not established as gone; preserve ${dir}`)
+  }
+  await rm(dir, { recursive: true, force: true })
 }
 
 function windowsPidAlive(pid: number) {
