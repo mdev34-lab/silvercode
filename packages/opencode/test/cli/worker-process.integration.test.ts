@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test"
+import { appendFileSync, readdirSync } from "node:fs"
 import { mkdtemp, rm } from "fs/promises"
 import { tmpdir } from "os"
 import { join } from "path"
@@ -279,6 +280,7 @@ setInterval(() => {}, 1000)
       ],
       { stdout: "ignore", stderr: "ignore" },
     )
+    let bodyFailure: unknown
     try {
       await ready
       await new Promise((resolve) => setTimeout(resolve, 200))
@@ -302,15 +304,26 @@ setInterval(() => {}, 1000)
       // The production watchdog must stay quiet while the owner is merely
       // stopped: a spurious orphan would exit the worker and end the ticks.
       expect(await Bun.file(log).text()).not.toContain("orphaned")
+    } catch (error) {
+      bodyFailure = error
+      throw error
     } finally {
+      // Collect cleanup failures instead of letting them replace a body
+      // failure; only surface them when the body itself passed.
+      let cleanupFailure: unknown
       try {
-        process.kill(-ownerProcess.pid, "SIGCONT")
-      } catch {}
-      ownerProcess.kill("SIGKILL")
-      await ownerProcess.exited
-      await resumer.exited
-      // The detached worker outlives its hard-killed owner; see removeDirAfterWorkerExit.
-      await removeDirAfterWorkerExit(dir, log)
+        try {
+          process.kill(-ownerProcess.pid, "SIGCONT")
+        } catch {}
+        ownerProcess.kill("SIGKILL")
+        await bounded(ownerProcess.exited, "owner did not exit after SIGKILL")
+        await bounded(resumer.exited, "resumer did not exit")
+        // The detached worker outlives its hard-killed owner; see removeDirAfterWorkerExit.
+        await removeDirAfterWorkerExit(dir, log)
+      } catch (error) {
+        cleanupFailure = error
+      }
+      if (cleanupFailure !== undefined && bodyFailure === undefined) throw cleanupFailure
     }
   })
 
@@ -335,6 +348,78 @@ setInterval(() => fs.appendFileSync(${JSON.stringify(log)}, "tick\\n"), 5)
       // Removal came after the exit: nothing wrote into the removed dir, so stderr holds no ENOENT banner.
       expect(worker.exitCode !== null || worker.signalCode !== null).toBe(true)
       expect(await new Response(worker.stderr).text()).toBe("")
+    } finally {
+      if (worker.exitCode === null && worker.signalCode === null) worker.kill("SIGKILL")
+      await worker.exited
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("removeDirAfterWorkerExit preserves the dir when the worker cannot be established as gone", async () => {
+    if (process.platform === "win32") return
+    const dir = await mkdtemp(join(tmpdir(), "silvercode-worker-rm-stale-"))
+    const log = join(dir, "ticks.log")
+    const target = join(dir, "worker.ts")
+    await Bun.write(
+      target,
+      `const fs = require("fs")
+setInterval(() => fs.appendFileSync(${JSON.stringify(log)}, "tick\\n"), 5)
+`,
+    )
+    const worker = Bun.spawn([process.execPath, target], { stdin: "ignore", stdout: "ignore", stderr: "pipe" })
+    try {
+      await waitForFileText(log, "tick", 10_000)
+      const unsignalable = findUnsignalablePid()
+      if (unsignalable === null) return
+      // The worker keeps writing ticks, but the pid named in the log exists
+      // and cannot be signalled: the wait must report false and the dir must
+      // be preserved, not removed under the live writer.
+      appendFileSync(log, `start pid=${unsignalable}\n`)
+      let incomplete: unknown
+      try {
+        await removeDirAfterWorkerExit(dir, log, 500)
+      } catch (error) {
+        incomplete = error
+      }
+      expect(String(incomplete)).toContain("INCOMPLETE")
+      expect(await Bun.file(join(dir, "worker.ts")).exists()).toBe(true)
+      expect(worker.exitCode).toBe(null)
+      // The dir was preserved, so the live worker's ticks never hit a removed
+      // dir: after it is killed, its stderr must be free of the ENOENT banner.
+      worker.kill("SIGKILL")
+      await worker.exited
+      expect(await new Response(worker.stderr).text()).toBe("")
+    } finally {
+      if (worker.exitCode === null && worker.signalCode === null) worker.kill("SIGKILL")
+      await worker.exited
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("removeDirAfterWorkerExit preserves the dir when the log has no worker pid", async () => {
+    if (process.platform === "win32") return
+    const dir = await mkdtemp(join(tmpdir(), "silvercode-worker-rm-nopid-"))
+    const log = join(dir, "ticks.log")
+    const target = join(dir, "worker.ts")
+    await Bun.write(
+      target,
+      `const fs = require("fs")
+setInterval(() => fs.appendFileSync(${JSON.stringify(log)}, "tick\\n"), 5)
+`,
+    )
+    const worker = Bun.spawn([process.execPath, target], { stdin: "ignore", stdout: "ignore", stderr: "pipe" })
+    try {
+      await waitForFileText(log, "tick", 10_000)
+      let incomplete: unknown
+      try {
+        await removeDirAfterWorkerExit(dir, log)
+      } catch (error) {
+        incomplete = error
+      }
+      // No pid line means no proof the worker is absent: preserve the dir.
+      expect(String(incomplete)).toContain("INCOMPLETE")
+      expect(await Bun.file(join(dir, "worker.ts")).exists()).toBe(true)
+      expect(worker.exitCode).toBe(null)
     } finally {
       if (worker.exitCode === null && worker.signalCode === null) worker.kill("SIGKILL")
       await worker.exited
@@ -477,6 +562,32 @@ async function waitForFileText(path: string, needle: string, timeout: number) {
   }
 }
 
+// A pid whose signals are refused (EPERM) exists but can never be
+// established as gone: `kill(pid, 0)` reports EPERM, so it reads as alive and
+// a forced kill cannot take it. Returns null where no such pid can be found
+// (e.g. running as root, or no /proc), in which case the false-return path
+// cannot be exercised and the caller skips.
+function findUnsignalablePid(): number | null {
+  let entries: string[]
+  try {
+    entries = readdirSync("/proc")
+  } catch {
+    return null
+  }
+  for (const entry of entries) {
+    if (!/^\d+$/.test(entry)) continue
+    const pid = Number(entry)
+    if (pid === process.pid) continue
+    try {
+      process.kill(pid, 0)
+      continue
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EPERM") return pid
+    }
+  }
+  return null
+}
+
 // The detached worker is reparented when its owner dies, so its exit is only
 // observable through its PID: poll signal 0 until the kernel reports ESRCH.
 // Returns false if it was still alive at the deadline after a forced kill.
@@ -504,18 +615,22 @@ async function waitForWorkerExit(pid: number, timeoutMs = 10_000) {
   return true
 }
 
-// Remove a test's temp dir only after its worker (identified by the
-// `start pid=` line the worker wrote to `log`) is gone. A tick written after
-// the removal is an uncaught ENOENT that bun prints as a crash banner on the
-// inherited stderr. A missing log (the test failed before the worker started)
-// skips the wait, and the removal always runs, so the test's own error is kept.
-async function removeDirAfterWorkerExit(dir: string, log: string) {
-  try {
-    const started = (await Bun.file(log).text().catch(() => "")).match(/^start pid=(\d+)/m)
-    if (started) await waitForWorkerExit(Number(started[1]))
-  } finally {
-    await rm(dir, { recursive: true, force: true })
+// Remove a test's temp dir only once its worker is established as gone. The
+// worker identifies itself with a `start pid=` line in `log`; a tick written
+// after the removal is an uncaught ENOENT that bun prints as a crash banner
+// on the inherited stderr. If the log is missing/unreadable (no proof the
+// worker is absent) or the worker cannot be established as gone, report
+// INCOMPLETE and preserve the dir instead of removing it under a live writer.
+async function removeDirAfterWorkerExit(dir: string, log: string, timeoutMs = 10_000) {
+  const started = (await Bun.file(log).text().catch(() => "")).match(/^start pid=(\d+)/m)
+  if (!started) {
+    throw new Error(`INCOMPLETE: no worker pid in ${log}; preserve ${dir}`)
   }
+  const exited = await waitForWorkerExit(Number(started[1]), timeoutMs)
+  if (!exited) {
+    throw new Error(`INCOMPLETE: worker ${started[1]} not established as gone; preserve ${dir}`)
+  }
+  await rm(dir, { recursive: true, force: true })
 }
 
 function windowsPidAlive(pid: number) {
