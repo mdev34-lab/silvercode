@@ -59,7 +59,7 @@ test.skip("probe: cmd.exe output code page under piped spawn (Shell.args shape) 
 // `type` of a UTF-8 file is a second cmd builtin, NOT an external-executable or mixed-output control. The data
 // listener yields JS strings; the hex printed is those strings re-encoded as UTF-8, not the raw wire bytes. The
 // result concerns this transport only. Prints only. Exit, timeout and spawn failure are reported explicitly; a
-// child that does not exit after SIGKILL stops the probe and leaves its directory in place.
+// outer test budget is 75 s: 4 variants x (10 s + 5 s) = 60 s plus spawn, import and cleanup headroom. A child that does not exit after kill stops the probe and leaves its directory in place.
 winOnly(
   "probe: cmd.exe output through ConPTY",
   async () => {
@@ -164,5 +164,5 @@ winOnly(
       if (!childLive) rmSync(dir, { recursive: true, force: true })
     }
   },
-  60000,
+  75000,
 )
