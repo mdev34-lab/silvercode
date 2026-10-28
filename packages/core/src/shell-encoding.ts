@@ -19,7 +19,8 @@ export function windowsCmdCommand(
 ): string {
   if (platform !== "win32" || !/(?:^|[\\/])cmd(?:\.exe)?$/i.test(shell)) return command
   const root = env.SystemRoot ?? env.SYSTEMROOT ?? env.windir
-  if (!root || !/^[A-Za-z]:\\[^\s"%&^|<>!()]*$/.test(root) || /[\r\n]/.test(command)) return command
+  // A second cmd can change delayed-expansion semantics; keep `!` and multiline input on the original route.
+  if (!root || !/^[A-Za-z]:\\[^\s"%&^|<>!()]*$/.test(root) || /[!\r\n]/.test(command)) return command
   // The inner command expands COMSPEC in the child's environment, not necessarily process.env.
   // Refuse absent, ambiguous, relative, or shell-metacharacter-bearing values rather than breaking the command.
   const comspec = Object.entries(env).filter(([key]) => key.toLowerCase() === "comspec")

@@ -78,11 +78,12 @@ describe("cmd.exe UTF-8 output (#543)", () => {
     expect(windowsCmdCommand("cmd.exe", "dir", "win32", { ...env, COMSPEC: env.ComSpec })).toBe("dir")
   })
 
-  test("leaves other shells, non-Windows hosts, and multiline commands unchanged", () => {
+  test("leaves other shells, non-Windows hosts, multiline input, and delayed expansion unchanged", () => {
     for (const shell of ["pwsh", "C:\\Git\\bin\\bash.exe", "/bin/sh"])
       expect(windowsCmdCommand(shell, "dir", "win32", env)).toBe("dir")
     expect(windowsCmdCommand("cmd.exe", "dir", "linux", env)).toBe("dir")
     expect(windowsCmdCommand("cmd.exe", "echo one\r\necho two", "win32", env)).toBe("echo one\r\necho two")
+    expect(windowsCmdCommand("cmd.exe", "echo !VAR!", "win32", env)).toBe("echo !VAR!")
   })
 
   test("the argv route still passes cmd's command unchanged", () => {
