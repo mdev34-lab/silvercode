@@ -19,7 +19,7 @@ import type {
 import { tmpdir } from "./fixture"
 import { waitFor } from "./frame"
 import { createTuiResolvedConfig } from "./tui-runtime"
-import { createEventSource, createFetch, directory, json } from "./tui-sdk"
+import { createEventSource, createFetch, directory, json, type FetchRequest } from "./tui-sdk"
 import { TestTuiContexts } from "./tui-environment"
 import { createTuiAttention } from "../../src/attention"
 import { TuiConfigProvider, useTuiConfig } from "../../src/config"
@@ -165,6 +165,10 @@ export type MountOptions = {
   permissions?: Record<string, PermissionRequest[]>
   theme?: string
   kv?: Record<string, unknown>
+  // Answers the writes a test drives (abort, prompt submit) before the fixture's
+  // read-only routes. Anything still unaccounted for keeps throwing, so a stray
+  // request fails the run instead of passing silently.
+  respond?: (request: FetchRequest) => Response | undefined
 }
 
 const setups: { app: Setup; dispose: () => Promise<void> }[] = []
@@ -183,7 +187,19 @@ export async function mountSessionRoute(options: MountOptions) {
   const routed = options.sessions[0]
   const providers = options.providers ?? [provider()]
   const events = createEventSource()
-  const calls = createFetch((url) => {
+  const calls = createFetch((url, request) => {
+    const answered = options.respond?.(request)
+    if (answered) return answered
+    // The handlers below are read routes and must not answer writes: a PATCH or DELETE to
+    // one of these paths has to fall through and throw as an unexpected request, not read
+    // as a successful read. The single legitimate write every mount performs is the
+    // local-context metadata sync, a PATCH of the session row, answered explicitly here;
+    // tests answer their own writes through `respond`.
+    if (request.method !== "GET") {
+      const patched = options.sessions.find((item) => url.pathname === `/session/${item.id}`)
+      if (request.method === "PATCH" && patched) return json(patched)
+      return undefined
+    }
     const session = options.sessions.find((item) => url.pathname === `/session/${item.id}`)
     if (session) return json(session)
     const messages = options.sessions.find((item) => url.pathname === `/session/${item.id}/message`)
@@ -340,7 +356,7 @@ export async function mountSessionRoute(options: MountOptions) {
   }
   await settle(app)
 
-  return { app, events, sync, keymap: () => keymapRef! }
+  return { app, events, sync, requests: calls.requests, keymap: () => keymapRef! }
 }
 
 // The frame pump lives in its own module so the tests that mount their own app share it.

@@ -238,6 +238,28 @@ describe("Session", () => {
     }),
   )
 
+  it.instance("a fork keeps the permission rules and the pinned agent of the original session", () =>
+    Effect.gen(function* () {
+      const session = yield* SessionNs.Service
+      const permission = [
+        { permission: "question", pattern: "*", action: "deny" as const },
+        { permission: "edit", pattern: "secrets/*", action: "deny" as const },
+      ]
+      const created = yield* Effect.acquireRelease(
+        session.create({ title: "restricted", agent: "work", permission }),
+        (info) => session.remove(info.id).pipe(Effect.ignore),
+      )
+      const fork = yield* Effect.acquireRelease(session.fork({ sessionID: created.id }), (info) =>
+        session.remove(info.id).pipe(Effect.ignore),
+      )
+      const stored = yield* session.get(fork.id)
+      expect(stored.permission).toEqual(permission)
+      expect(stored.agent).toBe("work")
+      // Independent copy: editing the fork's rules must not touch the original.
+      expect(stored.permission).not.toBe(created.permission)
+    }),
+  )
+
   it.instance("fork tolerates non-cloneable values in session metadata", () =>
     Effect.gen(function* () {
       const session = yield* SessionNs.Service
