@@ -7,7 +7,7 @@ import type * as PlatformError from "effect/PlatformError"
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
-import { windowsCmdCommand } from "@opencode-ai/core/shell-encoding"
+import { windowsCmdCommand } from "../fixture/cmd-option-candidate"
 import { testEffect } from "../lib/effect"
 
 const live = LayerNode.compile(CrossSpawnSpawner.node)

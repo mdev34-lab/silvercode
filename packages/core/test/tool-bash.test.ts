@@ -15,7 +15,6 @@ import { AppProcess } from "@opencode-ai/core/process"
 import { AbsolutePath } from "@opencode-ai/core/schema"
 import { SessionV2 } from "@opencode-ai/core/session"
 import { BashTool } from "@opencode-ai/core/tool/bash"
-import { windowsCmdCommand } from "@opencode-ai/core/shell-encoding"
 import { NarrationDetector } from "@opencode-ai/core/tool/narration"
 import { ToolRegistry } from "@opencode-ai/core/tool/registry"
 import { ToolOutputStore } from "@opencode-ai/core/tool-output-store"
@@ -180,10 +179,7 @@ describe("BashTool", () => {
                 ],
               },
             })
-            // On Windows cmd.exe the tool prefixes the UTF-8 codepage switch (#543); other shells run the command as given.
-            expect(runs).toMatchObject([
-              { command: windowsCmdCommand(String(runs[0]?.shell), "pwd"), cwd: realpathSync(tmp.path) },
-            ])
+            expect(runs).toMatchObject([{ command: "pwd", cwd: realpathSync(tmp.path) }])
             expect(runs[0]).toMatchObject({ args: [], stdin: "ignore", forceKillAfter: Duration.seconds(3) })
             expect(runs[0]?.options).toMatchObject({
               combineOutput: true,

@@ -4,7 +4,8 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import { Shell } from "../src/shell"
-import { windowsCmdCommand, windowsPowerShellCommand } from "../src/shell-encoding"
+import { windowsPowerShellCommand } from "../src/shell-encoding"
+import { windowsCmdCommand } from "./fixture/cmd-option-candidate"
 
 const text = "Área de Trabalho - ação 日本語 😀"
 const command = `[Console]::Write('${text}'); [Console]::Error.Write('${text}'); exit 7`
@@ -65,7 +66,7 @@ describe("cmd.exe UTF-8 output (#543)", () => {
       expect(windowsCmdCommand("cmd.exe", "dir", "win32", { ...env, SystemRoot })).toBe("dir")
   })
 
-  test("leaves the command alone when COMSPEC cannot safely name the inner cmd", () => {
+  test("the experimental guard bypasses absent or unusual COMSPEC values", () => {
     for (const ComSpec of [
       undefined,
       "",

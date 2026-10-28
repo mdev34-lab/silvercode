@@ -197,8 +197,6 @@ export function args(file: string, command: string, cwd: string) {
       command,
     ]
   }
-  // This is an argv spawn (e.g. the bang path), not Node's `shell` option. Windows argv quoting
-  // breaks the nested /s /c wrapper; keep this route unchanged rather than claiming UTF-8 here.
   if (n === "cmd") return ["/c", command]
   if (ps(file)) return ["-NoProfile", "-Command", windowsPowerShellCommand(file, command)]
   return ["-c", command]

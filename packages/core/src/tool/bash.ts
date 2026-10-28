@@ -5,7 +5,7 @@ import { ToolFailure } from "@opencode-ai/llm"
 import { Duration, Effect, Layer, Schema } from "effect"
 import { ChildProcess } from "effect/unstable/process"
 import { Config } from "../config"
-import { windowsCmdCommand, windowsPowerShellCommand } from "../shell-encoding"
+import { windowsPowerShellCommand } from "../shell-encoding"
 import { makeLocationNode } from "../effect/app-node"
 import { FSUtil } from "../fs-util"
 import { LocationMutation } from "../location-mutation"
@@ -165,17 +165,13 @@ const layer = Layer.effectDiscard(
               const shell =
                 Object.assign({}, ...entries.flatMap((entry) => (entry.type === "document" ? [entry.info] : [])))
                   .shell ?? defaultShell()
-              const command = ChildProcess.make(
-                windowsCmdCommand(shell, windowsPowerShellCommand(shell, input.command)),
-                [],
-                {
-                  cwd: target.canonical,
-                  shell,
-                  stdin: "ignore",
-                  detached: process.platform !== "win32",
-                  forceKillAfter: Duration.seconds(3),
-                },
-              )
+              const command = ChildProcess.make(windowsPowerShellCommand(shell, input.command), [], {
+                cwd: target.canonical,
+                shell,
+                stdin: "ignore",
+                detached: process.platform !== "win32",
+                forceKillAfter: Duration.seconds(3),
+              })
               const timeout = input.timeout ?? DEFAULT_TIMEOUT_MS
               const result = yield* appProcess
                 .run(command, {
