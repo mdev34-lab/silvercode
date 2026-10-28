@@ -2,7 +2,7 @@ import fs from "fs/promises"
 import { realpathSync } from "node:fs"
 import path from "path"
 import { describe, expect, test } from "bun:test"
-import { Effect, Layer } from "effect"
+import { Duration, Effect, Layer } from "effect"
 import { ChildProcess } from "effect/unstable/process"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Config } from "@opencode-ai/core/config"
@@ -28,8 +28,11 @@ const sessionID = SessionV2.ID.make("ses_bash_tool_test")
 const assertions: PermissionV2.AssertInput[] = []
 const runs: Array<{
   readonly command: string
+  readonly args: ReadonlyArray<string>
   readonly cwd?: string
   readonly shell?: string | boolean
+  readonly stdin?: ChildProcess.CommandOptions["stdin"]
+  readonly forceKillAfter?: ChildProcess.CommandOptions["forceKillAfter"]
   readonly options?: AppProcess.RunOptions
 }> = []
 let denyAction: string | undefined
@@ -69,7 +72,15 @@ const appProcess = Layer.succeed(
     run: (command: ChildProcess.Command, options?: AppProcess.RunOptions) =>
       Effect.suspend(() => {
         if (command._tag !== "StandardCommand") throw new Error("expected standard command")
-        runs.push({ command: command.command, cwd: command.options.cwd, shell: command.options.shell, options })
+        runs.push({
+          command: command.command,
+          args: command.args,
+          cwd: command.options.cwd,
+          shell: command.options.shell,
+          stdin: command.options.stdin,
+          forceKillAfter: command.options.forceKillAfter,
+          options,
+        })
         return runFailure ? Effect.fail(runFailure) : Effect.succeed(result)
       }),
   } as unknown as AppProcess.Interface),
@@ -173,6 +184,7 @@ describe("BashTool", () => {
             expect(runs).toMatchObject([
               { command: windowsCmdCommand(String(runs[0]?.shell), "pwd"), cwd: realpathSync(tmp.path) },
             ])
+            expect(runs[0]).toMatchObject({ args: [], stdin: "ignore", forceKillAfter: Duration.seconds(3) })
             expect(runs[0]?.options).toMatchObject({
               combineOutput: true,
               maxOutputBytes: BashTool.MAX_CAPTURE_BYTES,
