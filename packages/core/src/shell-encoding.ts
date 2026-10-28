@@ -9,7 +9,7 @@ export function windowsPowerShellCommand(shell: string, command: string, platfor
 /**
  * For the Node `shell: cmd` spawn route only: start a new cmd after changing the codepage.
  * The original cmd can keep writing its startup OEM codepage even after chcp succeeds.
- * Use an absolute helper, never a project-resolved `chcp`; unsafe system roots are left alone.
+ * Use an absolute helper, never a project-resolved `chcp`; unsafe roots or COMSPEC values are left alone.
  */
 export function windowsCmdCommand(
   shell: string,
@@ -20,6 +20,12 @@ export function windowsCmdCommand(
   if (platform !== "win32" || !/(?:^|[\\/])cmd(?:\.exe)?$/i.test(shell)) return command
   const root = env.SystemRoot ?? env.SYSTEMROOT ?? env.windir
   if (!root || !/^[A-Za-z]:\\[^\s"%&^|<>!()]*$/.test(root) || /[\r\n]/.test(command)) return command
+  // The inner command expands COMSPEC in the child's environment, not necessarily process.env.
+  // Refuse absent, ambiguous, relative, or shell-metacharacter-bearing values rather than breaking the command.
+  const comspec = Object.entries(env).filter(([key]) => key.toLowerCase() === "comspec")
+  if (comspec.length !== 1 || !comspec[0]?.[1]) return command
+  if (!/^[A-Za-z]:\\[^\s"%&^|<>!()]*$/.test(comspec[0][1]) || !/(?:^|\\)cmd(?:\.exe)?$/i.test(comspec[0][1]))
+    return command
   // `&` (not `&&`) so a failing chcp never blocks the user's command.
   return `${root.replace(/\\+$/, "")}\\System32\\chcp.com 65001>nul & %COMSPEC% /d /s /c ${cmdLine(command)}`
 }

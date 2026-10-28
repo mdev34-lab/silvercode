@@ -310,7 +310,7 @@ function cmd(shell: string, command: string, cwd: string, env: NodeJS.ProcessEnv
     )
   }
 
-  return ChildProcess.make(windowsCmdCommand(shell, command), [], {
+  return ChildProcess.make(windowsCmdCommand(shell, command, process.platform, env), [], {
     shell,
     cwd,
     env,

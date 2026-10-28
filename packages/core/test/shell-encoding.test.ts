@@ -43,7 +43,7 @@ describe("PowerShell UTF-8 output (#543)", () => {
 })
 
 describe("cmd.exe UTF-8 output (#543)", () => {
-  const env = { SystemRoot: "C:\\Windows" }
+  const env = { SystemRoot: "C:\\Windows", ComSpec: "C:\\Windows\\System32\\cmd.exe" }
   const prefix = "C:\\Windows\\System32\\chcp.com 65001>nul & %COMSPEC% /d /s /c "
 
   test("switches the codepage using the absolute helper and starts a new cmd", () => {
@@ -62,7 +62,20 @@ describe("cmd.exe UTF-8 output (#543)", () => {
 
   test("never uses a bare chcp: unsafe or missing system root leaves the command unchanged", () => {
     for (const SystemRoot of [undefined, "", "relative", 'C:\\W"in', "C:\\%PATH%", "C:\\a&b", "C:\\Program Files\\Win"])
-      expect(windowsCmdCommand("cmd.exe", "dir", "win32", { SystemRoot })).toBe("dir")
+      expect(windowsCmdCommand("cmd.exe", "dir", "win32", { ...env, SystemRoot })).toBe("dir")
+  })
+
+  test("leaves the command alone when COMSPEC cannot safely name the inner cmd", () => {
+    for (const ComSpec of [
+      undefined,
+      "",
+      "cmd.exe",
+      "C:\\Program Files\\cmd.exe",
+      "C:\\evil&cmd.exe",
+      "C:\\Windows\\pwsh.exe",
+    ])
+      expect(windowsCmdCommand("cmd.exe", "dir", "win32", { ...env, ComSpec })).toBe("dir")
+    expect(windowsCmdCommand("cmd.exe", "dir", "win32", { ...env, COMSPEC: env.ComSpec })).toBe("dir")
   })
 
   test("leaves other shells, non-Windows hosts, and multiline commands unchanged", () => {
