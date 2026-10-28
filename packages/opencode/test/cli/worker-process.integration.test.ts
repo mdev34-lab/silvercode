@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { appendFileSync, readdirSync } from "node:fs"
+import { appendFileSync } from "node:fs"
 import { mkdtemp, rm } from "fs/promises"
 import { tmpdir } from "os"
 import { join } from "path"
@@ -47,12 +47,16 @@ setInterval(() => {}, 1000)
 
 // Bounds an await that has no internal deadline: under CI starvation a
 // missed settlement must fail fast with a clear message, not hang the test
-// to the runner timeout (#468).
+// to the runner timeout (#468). The losing timer is cleared once the race
+// settles so it cannot fire (or hold the event loop) afterwards.
 async function bounded<T>(promise: Promise<T>, what: string, ms = 15000): Promise<T> {
-  return Promise.race([
-    promise,
-    new Promise<T>((_, reject) => setTimeout(() => reject(new Error(what)), ms)),
-  ])
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const rejectAfter = new Promise<T>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(what)), ms)
+  })
+  return Promise.race([promise, rejectAfter]).finally(() => {
+    if (timer !== undefined) clearTimeout(timer)
+  })
 }
 
 async function waitForCount(messages: string[], text: string, count: number, what: string) {
@@ -197,6 +201,11 @@ describe("TUI worker process integration", () => {
     }
   })
 
+  // Aggregate budget for the suspend test's finally cleanup (resume + hard-kill
+  // the owner, resumer exit, worker-exit wait): one owned deadline inside the
+  // host per-test budget, shared by the independent cleanup attempts.
+  const SUSPEND_CLEANUP_BUDGET_MS = 10_000
+
   test("a detached worker keeps running while its parent process group is stopped", async () => {
     if (process.platform === "win32") return
     const dir = await mkdtemp(join(tmpdir(), "silvercode-worker-suspend-"))
@@ -308,22 +317,48 @@ setInterval(() => {}, 1000)
       bodyFailure = error
       throw error
     } finally {
-      // Collect cleanup failures instead of letting them replace a body
-      // failure; only surface them when the body itself passed.
-      let cleanupFailure: unknown
+      // Cleanup runs under one owned aggregate budget inside the host test
+      // budget: each step is attempted independently, so a rejection or
+      // timeout in one does not skip the others. The worker dir is removed
+      // only when its exit is established; removeDirAfterWorkerExit preserves
+      // it whenever that stays unverified.
+      const cleanupDeadline = Date.now() + SUSPEND_CLEANUP_BUDGET_MS
+      const remaining = () => Math.max(200, cleanupDeadline - Date.now())
+      const cleanupFailures: unknown[] = []
+
       try {
         try {
           process.kill(-ownerProcess.pid, "SIGCONT")
         } catch {}
         ownerProcess.kill("SIGKILL")
-        await bounded(ownerProcess.exited, "owner did not exit after SIGKILL")
-        await bounded(resumer.exited, "resumer did not exit")
-        // The detached worker outlives its hard-killed owner; see removeDirAfterWorkerExit.
-        await removeDirAfterWorkerExit(dir, log)
+        await bounded(ownerProcess.exited, "owner did not exit after SIGKILL", remaining())
       } catch (error) {
-        cleanupFailure = error
+        cleanupFailures.push(error)
       }
-      if (cleanupFailure !== undefined && bodyFailure === undefined) throw cleanupFailure
+
+      try {
+        await bounded(resumer.exited, "resumer did not exit", remaining())
+      } catch (error) {
+        cleanupFailures.push(error)
+      }
+
+      try {
+        // The detached worker outlives its hard-killed owner; see removeDirAfterWorkerExit.
+        await removeDirAfterWorkerExit(dir, log, remaining())
+      } catch (error) {
+        cleanupFailures.push(error)
+      }
+
+      if (cleanupFailures.length > 0) {
+        if (bodyFailure === undefined) {
+          throw cleanupFailures[0]
+        }
+        // The body already failed: attach the cleanup failures to it so they
+        // are reported, without masking the original error.
+        if (bodyFailure instanceof Error) {
+          ;(bodyFailure as Error & { cleanup?: unknown[] }).cleanup = cleanupFailures
+        }
+      }
     }
   })
 
@@ -369,15 +404,18 @@ setInterval(() => fs.appendFileSync(${JSON.stringify(log)}, "tick\\n"), 5)
     const worker = Bun.spawn([process.execPath, target], { stdin: "ignore", stdout: "ignore", stderr: "pipe" })
     try {
       await waitForFileText(log, "tick", 10_000)
-      const unsignalable = findUnsignalablePid()
-      if (unsignalable === null) return
-      // The worker keeps writing ticks, but the pid named in the log exists
-      // and cannot be signalled: the wait must report false and the dir must
-      // be preserved, not removed under the live writer.
-      appendFileSync(log, `start pid=${unsignalable}\n`)
+      // The worker keeps writing ticks, but the injected probe reports its pid
+      // as alive and the forced kill does not take it: the wait must report
+      // false and the dir must be preserved, not removed under the live
+      // writer. The pid is the test's own child; the probe is fake, so no
+      // process outside the test is ever signalled.
+      appendFileSync(log, `start pid=${worker.pid}\n`)
       let incomplete: unknown
       try {
-        await removeDirAfterWorkerExit(dir, log, 500)
+        await removeDirAfterWorkerExit(dir, log, 500, {
+          alive: () => true,
+          forceKill: () => {},
+        })
       } catch (error) {
         incomplete = error
       }
@@ -562,53 +600,41 @@ async function waitForFileText(path: string, needle: string, timeout: number) {
   }
 }
 
-// A pid whose signals are refused (EPERM) exists but can never be
-// established as gone: `kill(pid, 0)` reports EPERM, so it reads as alive and
-// a forced kill cannot take it. Returns null where no such pid can be found
-// (e.g. running as root, or no /proc), in which case the false-return path
-// cannot be exercised and the caller skips.
-function findUnsignalablePid(): number | null {
-  let entries: string[]
-  try {
-    entries = readdirSync("/proc")
-  } catch {
-    return null
-  }
-  for (const entry of entries) {
-    if (!/^\d+$/.test(entry)) continue
-    const pid = Number(entry)
-    if (pid === process.pid) continue
-    try {
-      process.kill(pid, 0)
-      continue
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "EPERM") return pid
-    }
-  }
-  return null
+// Liveness/kill probe used by the worker-exit wait. The default signals the
+// real pid; tests inject fakes to exercise the wait deterministically without
+// signalling any process they do not own.
+interface WorkerProbe {
+  alive: (pid: number) => boolean
+  forceKill: (pid: number) => void
 }
 
-// The detached worker is reparented when its owner dies, so its exit is only
-// observable through its PID: poll signal 0 until the kernel reports ESRCH.
-// Returns false if it was still alive at the deadline after a forced kill.
-async function waitForWorkerExit(pid: number, timeoutMs = 10_000) {
-  const alive = () => {
+const defaultProbe: WorkerProbe = {
+  alive: (pid) => {
     try {
       process.kill(pid, 0)
       return true
     } catch (error) {
       return (error as NodeJS.ErrnoException)?.code !== "ESRCH"
     }
-  }
+  },
+  forceKill: (pid) => {
+    try {
+      process.kill(pid, "SIGKILL")
+    } catch {}
+  },
+}
+
+// The detached worker is reparented when its owner dies, so its exit is only
+// observable through its PID: poll signal 0 until the kernel reports ESRCH.
+// Returns false if it was still alive at the deadline after a forced kill.
+async function waitForWorkerExit(pid: number, timeoutMs = 10_000, probe: WorkerProbe = defaultProbe) {
   const deadline = Date.now() + timeoutMs
-  while (alive()) {
+  while (probe.alive(pid)) {
     if (Date.now() > deadline) {
       // Never leave the writer running into a removed directory: force it, then give the kernel a moment.
-      try {
-        process.kill(pid, "SIGKILL")
-      } catch {}
-      for (let i = 0; i < 80 && alive(); i++) await Bun.sleep(25)
-      return !alive()
+      probe.forceKill(pid)
+      for (let i = 0; i < 80 && probe.alive(pid); i++) await Bun.sleep(25)
+      return !probe.alive(pid)
     }
     await Bun.sleep(25)
   }
@@ -621,12 +647,17 @@ async function waitForWorkerExit(pid: number, timeoutMs = 10_000) {
 // on the inherited stderr. If the log is missing/unreadable (no proof the
 // worker is absent) or the worker cannot be established as gone, report
 // INCOMPLETE and preserve the dir instead of removing it under a live writer.
-async function removeDirAfterWorkerExit(dir: string, log: string, timeoutMs = 10_000) {
+async function removeDirAfterWorkerExit(
+  dir: string,
+  log: string,
+  timeoutMs = 10_000,
+  probe: WorkerProbe = defaultProbe,
+) {
   const started = (await Bun.file(log).text().catch(() => "")).match(/^start pid=(\d+)/m)
   if (!started) {
     throw new Error(`INCOMPLETE: no worker pid in ${log}; preserve ${dir}`)
   }
-  const exited = await waitForWorkerExit(Number(started[1]), timeoutMs)
+  const exited = await waitForWorkerExit(Number(started[1]), timeoutMs, probe)
   if (!exited) {
     throw new Error(`INCOMPLETE: worker ${started[1]} not established as gone; preserve ${dir}`)
   }
