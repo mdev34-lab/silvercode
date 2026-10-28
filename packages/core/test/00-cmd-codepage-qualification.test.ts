@@ -1,9 +1,9 @@
-import { expect, test } from "bun:test"
+import { afterAll, expect, test } from "bun:test"
 import { spawnSync, type SpawnSyncReturns } from "node:child_process"
 import { appendFileSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import path from "node:path"
-import { unguardedCmdCommand, windowsCmdCommand } from "../../core/test/fixture/cmd-option-candidate"
+import { unguardedCmdCommand, windowsCmdCommand } from "./fixture/cmd-option-candidate"
 
 // Diagnostic only: compare identical user lines through Node's `shell: cmd` option. The candidate is
 // test-only, not enabled in either tool. No equality is assumed: every result reports raw stdout/stderr
@@ -29,13 +29,41 @@ const describeOutput = (out: SpawnSyncReturns<Buffer>) => ({
   stderrUtf8: (out.stderr ?? Buffer.alloc(0)).toString("utf8"),
 })
 
-const report = (name: string, result: Record<string, unknown>) => {
+type Output = ReturnType<typeof describeOutput>
+const notices: string[] = []
+const flushNotices = () => {
+  if (notices.length === 0) return
+  // Turbo prefixes log lines, so use the runner's prefix-tolerant annotation form. Batch two cases
+  // per notice because the runner records at most ten notices per step. Full JSON stays in the log.
+  console.log(`##[notice]cmd qualification: ${notices.join(" | ")}`)
+  notices.length = 0
+}
+afterAll(flushNotices)
+
+const report = (name: string, result: Record<string, unknown> & { baseline: Output; candidate: Output }) => {
   const text = JSON.stringify({ case: name, ...result }, null, 2)
   console.log(`cmd-qualification ${text}`)
-  // This package's existing Turbo task passes through its environment. If GitHub provides a job
-  // summary, expose the same controlled diagnostic there as well as in the ordinary test log.
   if (process.env.GITHUB_STEP_SUMMARY)
     appendFileSync(process.env.GITHUB_STEP_SUMMARY, `### cmd qualification: ${name}\n\n\`\`\`json\n${text}\n\`\`\`\n\n`)
+  if (process.env.CI) {
+    const compact = ({ status, signal, error, stdoutHex, stderrHex }: Output) => ({
+      status,
+      signal,
+      error,
+      stdoutHex,
+      stderrHex,
+    })
+    notices.push(
+      JSON.stringify({
+        case: name,
+        shell: result.shell,
+        environmentChanges: result.environmentChanges,
+        baseline: compact(result.baseline),
+        candidate: compact(result.candidate),
+      }),
+    )
+    if (notices.length === 2) flushNotices()
+  }
 }
 
 const fixture = () => {
