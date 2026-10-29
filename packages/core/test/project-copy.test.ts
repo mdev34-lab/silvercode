@@ -1,4 +1,4 @@
-import { describe, expect } from "bun:test"
+import { afterAll, describe, expect } from "bun:test"
 import { $ } from "bun"
 import fs from "fs/promises"
 import path from "path"
@@ -27,13 +27,41 @@ function abs(input: string) {
 
 const gitWorktree = ProjectCopy.StrategyID.make("git_worktree")
 
+const GIT_CONFIG = [
+  "[core]",
+  "\tfsmonitor = false",
+  "[commit]",
+  "\tgpgsign = false",
+  "[user]",
+  "\temail = test@opencode.test",
+  "\tname = Test",
+  "",
+].join("\n")
+
+let templateRepo: Awaited<ReturnType<typeof tmpdir>> | undefined
+
+afterAll(async () => {
+  const repo = templateRepo
+  templateRepo = undefined
+  if (repo) await repo[Symbol.asyncDispose]()
+})
+
+async function ensureTemplateGitDir() {
+  if (!templateRepo) {
+    const repo = await tmpdir()
+    await $`git -c core.fsmonitor=false init --quiet`.cwd(repo.path).quiet()
+    await fs.appendFile(path.join(repo.path, ".git", "config"), GIT_CONFIG)
+    await $`git -c core.fsmonitor=false -c commit.gpgsign=false commit --quiet --allow-empty -m root`
+      .cwd(repo.path)
+      .quiet()
+    templateRepo = repo
+  }
+  return path.join(templateRepo.path, ".git")
+}
+
 async function initRepo(directory: string) {
-  await $`git init`.cwd(directory).quiet()
-  await $`git config core.fsmonitor false`.cwd(directory).quiet()
-  await $`git config commit.gpgsign false`.cwd(directory).quiet()
-  await $`git config user.email test@opencode.test`.cwd(directory).quiet()
-  await $`git config user.name Test`.cwd(directory).quiet()
-  await $`git commit --allow-empty -m root`.cwd(directory).quiet()
+  const sourceGitDir = await ensureTemplateGitDir()
+  await fs.cp(sourceGitDir, path.join(directory, ".git"), { recursive: true })
 }
 
 function setup() {
@@ -305,7 +333,9 @@ describe("ProjectCopy", () => {
       yield* Effect.addFinalizer(() =>
         Effect.promise(() => fs.rm(target, { recursive: true, force: true })).pipe(Effect.ignore),
       )
-      yield* Effect.promise(() => $`git worktree add --detach ${target} HEAD`.cwd(input.root.path).quiet())
+      yield* Effect.promise(() =>
+        $`git -c core.fsmonitor=false worktree add --detach ${target} HEAD`.cwd(input.root.path).quiet(),
+      )
       yield* input.db
         .insert(ProjectDirectoryTable)
         .values({ project_id: input.projectID, directory: target })
@@ -327,7 +357,9 @@ describe("ProjectCopy", () => {
       )
       expect(Array.from(yield* Fiber.join(fiber))[0]?.data).toEqual({ projectID: input.projectID })
 
-      yield* Effect.promise(() => $`git worktree remove --force ${target}`.cwd(input.root.path).quiet())
+      yield* Effect.promise(() =>
+        $`git -c core.fsmonitor=false worktree remove --force ${target}`.cwd(input.root.path).quiet(),
+      )
       expect(yield* copy.refresh({ projectID: input.projectID })).toEqual({ updated: [], removed: [discovered] })
       expect(yield* stored(input.projectID)).toEqual([{ directory: input.sourceDirectory, strategy: null }])
     }),
@@ -342,9 +374,13 @@ describe("ProjectCopy", () => {
       yield* Effect.addFinalizer(() =>
         Effect.promise(() => fs.rm(target, { recursive: true, force: true })).pipe(Effect.ignore),
       )
-      yield* Effect.promise(() => $`git worktree add --detach ${stale} HEAD`.cwd(input.root.path).quiet())
+      yield* Effect.promise(() =>
+        $`git -c core.fsmonitor=false worktree add --detach ${stale} HEAD`.cwd(input.root.path).quiet(),
+      )
       yield* Effect.promise(() => fs.rm(stale, { recursive: true, force: true }))
-      yield* Effect.promise(() => $`git worktree add --detach ${target} HEAD`.cwd(input.root.path).quiet())
+      yield* Effect.promise(() =>
+        $`git -c core.fsmonitor=false worktree add --detach ${target} HEAD`.cwd(input.root.path).quiet(),
+      )
 
       yield* copy.refresh({ projectID: input.projectID })
 

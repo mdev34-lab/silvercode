@@ -75,6 +75,17 @@ async function stop(dir: string) {
   await $`git fsmonitor--daemon stop`.cwd(dir).quiet().nothrow()
 }
 
+const TEST_GIT_CONFIG = [
+  "[core]",
+  "\tfsmonitor = false",
+  "[commit]",
+  "\tgpgsign = false",
+  "[user]",
+  "\temail = test@opencode.test",
+  "\tname = Test",
+  "",
+].join("\n")
+
 type TmpDirOptions<T> = {
   git?: boolean
   config?: Partial<ConfigV1.Info>
@@ -85,12 +96,11 @@ export async function tmpdir<T>(options?: TmpDirOptions<T>) {
   const dirpath = sanitizePath(path.join(os.tmpdir(), "opencode-test-" + Math.random().toString(36).slice(2)))
   await fs.mkdir(dirpath, { recursive: true })
   if (options?.git) {
-    await $`git init`.cwd(dirpath).quiet()
-    await $`git config core.fsmonitor false`.cwd(dirpath).quiet()
-    await $`git config commit.gpgsign false`.cwd(dirpath).quiet()
-    await $`git config user.email "test@opencode.test"`.cwd(dirpath).quiet()
-    await $`git config user.name "Test"`.cwd(dirpath).quiet()
-    await $`git commit --allow-empty -m "root commit ${dirpath}"`.cwd(dirpath).quiet()
+    await $`git -c core.fsmonitor=false init --quiet`.cwd(dirpath).quiet()
+    await fs.appendFile(path.join(dirpath, ".git", "config"), TEST_GIT_CONFIG)
+    await $`git -c core.fsmonitor=false -c commit.gpgsign=false commit --quiet --allow-empty -m "root commit ${dirpath}"`
+      .cwd(dirpath)
+      .quiet()
   }
   if (options?.config) {
     await Bun.write(
@@ -138,15 +148,26 @@ export function tmpdirScoped<E = never, R = never>(options?: {
     )
 
     const git = (...args: string[]) =>
-      spawner.spawn(ChildProcess.make("git", args, { cwd: dir })).pipe(Effect.flatMap((handle) => handle.exitCode))
+      Effect.scoped(
+        spawner
+          .spawn(ChildProcess.make("git", args, { cwd: dir, stdin: "ignore", stdout: "ignore", stderr: "ignore" }))
+          .pipe(Effect.flatMap((handle) => handle.exitCode)),
+      )
 
     if (options?.git) {
-      yield* git("init")
-      yield* git("config", "core.fsmonitor", "false")
-      yield* git("config", "commit.gpgsign", "false")
-      yield* git("config", "user.email", "test@opencode.test")
-      yield* git("config", "user.name", "Test")
-      yield* git("commit", "--allow-empty", "-m", `root commit ${dir}`)
+      yield* git("-c", "core.fsmonitor=false", "init", "--quiet")
+      yield* Effect.promise(() => fs.appendFile(path.join(dir, ".git", "config"), TEST_GIT_CONFIG))
+      yield* git(
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "--quiet",
+        "--allow-empty",
+        "-m",
+        `root commit ${dir}`,
+      )
     }
 
     if (options?.config) {

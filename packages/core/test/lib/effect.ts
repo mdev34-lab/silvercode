@@ -1,4 +1,4 @@
-import { test, type TestOptions } from "bun:test"
+import { afterEach, test, type TestOptions } from "bun:test"
 import { Cause, Effect, Exit, Layer } from "effect"
 import type * as Scope from "effect/Scope"
 import * as TestClock from "effect/testing/TestClock"
@@ -8,16 +8,45 @@ type Body<A, E, R> = Effect.Effect<A, E, R> | (() => Effect.Effect<A, E, R>)
 
 const body = <A, E, R>(value: Body<A, E, R>) => Effect.suspend(() => (typeof value === "function" ? value() : value))
 
-const run = <A, E, R, E2>(value: Body<A, E, R | Scope.Scope>, layer: Layer.Layer<R, E2>) =>
-  Effect.gen(function* () {
-    const exit = yield* body(value).pipe(Effect.scoped, Effect.provide(layer), Effect.exit)
-    if (Exit.isFailure(exit)) {
-      for (const err of Cause.prettyErrors(exit.cause)) {
-        yield* Effect.logError(err)
+export function runScopedEffect<A, E>(scoped: Effect.Effect<A, E>): {
+  readonly result: Promise<A>
+  readonly cancel: () => Promise<void>
+} {
+  const controller = new AbortController()
+  let settled = false
+  let abandoned = false
+  const exitPromise = Effect.runPromiseExit(
+    Effect.gen(function* () {
+      const exit = yield* Effect.exit(scoped)
+      if (Exit.isFailure(exit) && !abandoned) {
+        for (const err of Cause.prettyErrors(exit.cause)) {
+          yield* Effect.logError(err)
+        }
       }
-    }
-    return yield* exit
-  }).pipe(Effect.runPromise)
+      return yield* exit
+    }),
+    { signal: controller.signal },
+  )
+  const result = exitPromise.then((exit) => {
+    settled = true
+    if (!Exit.isFailure(exit)) return exit.value
+    if (abandoned) return new Promise<A>(() => {})
+    throw Cause.squash(exit.cause)
+  })
+  const cancel = async () => {
+    if (settled) return
+    abandoned = true
+    controller.abort()
+    await exitPromise
+  }
+  return { result, cancel }
+}
+
+const run = <A, E, R, E2>(value: Body<A, E, R | Scope.Scope>, layer: Layer.Layer<R, E2>) => {
+  const { result, cancel } = runScopedEffect(body(value).pipe(Effect.scoped, Effect.provide(layer)))
+  afterEach(cancel)
+  return result
+}
 
 const make = <R, E>(testLayer: Layer.Layer<R, E>, liveLayer: Layer.Layer<R, E>) => {
   const effect = <A, E2>(name: string, value: Body<A, E2, R | Scope.Scope>, opts?: number | TestOptions) =>
