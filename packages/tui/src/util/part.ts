@@ -38,11 +38,13 @@ function isTextLike(part: Part): part is TextPart | ReasoningPart {
 // (`packages/opencode/src/session/processor.ts`):
 // - `message.part.delta` text evolves only by append (`text-delta`,
 //   `reasoning-delta`), so a snapshot that is a strict prefix of what is
-//   already rendered is necessarily older — keep the longer streamed text;
+//   already rendered is older — keep the longer streamed text, except for
+//   the first terminal text snapshot described below;
 // - a snapshot that extends the rendered text accumulated more deltas — adopt;
 // - the only legitimate non-cumulative text write is the `text-end` snapshot
 //   (the `experimental.text.complete` plugin rewrites the final text) and it
-//   is published together with `time.end`; that snapshot is adopted;
+//   is published together with `time.end`; adopt it even if it is a prefix or
+//   empty. Reasoning snapshots retain the existing prefix behavior;
 // - a part reaches its terminal snapshot exactly once, so once `time.end` is
 //   set the part is a sink: a replayed row without `time.end` — even one that
 //   "extends" the final text — is older and must not reopen the part, and a
@@ -65,6 +67,9 @@ export function mergePartText(current: Part | undefined, incoming: Part): Part {
     return { ...incoming, text: currentText }
   }
 
+  // text-end may rewrite text to a strict prefix or even an empty string.
+  // Reasoning has no corresponding plugin rewrite and keeps prefix protection.
+  if (current.type === "text" && incoming.type === "text" && incomingTerminal) return incoming
   if (currentText.startsWith(incomingText)) return { ...incoming, text: currentText }
   if (incomingText.startsWith(currentText)) return incoming
   if (incomingTerminal) return incoming

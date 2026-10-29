@@ -374,6 +374,35 @@ test("the terminal text-end snapshot is the only non-cumulative write allowed", 
   expect(partText(parts[0])).toBe("Hello there")
 })
 
+test.each(["Hello", ""])("terminal text rewrite accepts prefix or empty text: %j", (rewritten) => {
+  let parts = applyPartUpdated(undefined, text({ text: "", time: { start: 1 } }))
+  const original = parts[0]
+  parts = applyPartDelta(parts, "part-1", "text", "Hello secret")!
+  parts = applyPartUpdated(parts, text({ text: rewritten, time: { start: 99, end: 2 } }))
+  expect(parts[0]).toBe(original)
+  expect(partText(parts[0])).toBe(rewritten)
+  expect((parts[0] as TextPart).time).toEqual({ start: 1, end: 2 })
+})
+
+test.each(["Hello", ""])("non-terminal text prefix or empty snapshot remains stale: %j", (stale) => {
+  let parts = applyPartUpdated(undefined, text({ text: "", time: { start: 1 } }))
+  const original = parts[0]
+  parts = applyPartDelta(parts, "part-1", "text", "Hello secret")!
+  parts = applyPartUpdated(parts, text({ text: stale, time: { start: 1 } }))
+  expect(parts[0]).toBe(original)
+  expect(partText(parts[0])).toBe("Hello secret")
+  expect((parts[0] as TextPart).time).toEqual({ start: 1 })
+})
+
+test.each(["Hello", ""])("already-terminal text rejects another terminal prefix or empty snapshot: %j", (stale) => {
+  let parts = applyPartUpdated(undefined, text({ text: "Hello secret", time: { start: 1, end: 10 } }))
+  const original = parts[0]
+  parts = applyPartUpdated(parts, text({ text: stale, time: { start: 99, end: 5 } }))
+  expect(parts[0]).toBe(original)
+  expect(partText(parts[0])).toBe("Hello secret")
+  expect((parts[0] as TextPart).time).toEqual({ start: 1, end: 10 })
+})
+
 test("a finished part is not rewound by an unfinished conflicting snapshot", () => {
   let parts = applyPartUpdated(undefined, text({ text: "Hello there", time: { start: 1, end: 2 } }))
   const original = parts[0]
@@ -382,7 +411,7 @@ test("a finished part is not rewound by an unfinished conflicting snapshot", () 
   expect(partText(parts[0])).toBe("Hello there")
 })
 
-test("a prefix snapshot is always older than the streamed text", () => {
+test("a non-terminal prefix snapshot is older than the streamed text", () => {
   let parts = applyPartUpdated(undefined, text({ text: "Hello world" }))
   const original = parts[0]
   // Durable row persisted partway through the same stream.
