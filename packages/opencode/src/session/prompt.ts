@@ -1226,9 +1226,11 @@ const layer = Layer.effect(
       return { info, parts }
     }, Effect.scoped)
 
-    const prompt: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error> = Effect.fn(
-      "SessionPrompt.prompt",
-    )(function* (input: PromptInput) {
+    const promptWithEpoch = Effect.fn("SessionPrompt.prompt")(function* (
+      input: PromptInput,
+      initialEpoch?: number,
+    ) {
+      const epoch = initialEpoch ?? (yield* state.cancelEpoch(input.sessionID))
       const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
       yield* revert.cleanup(session)
       const message = yield* createUserMessage(input)
@@ -1244,8 +1246,11 @@ const layer = Layer.effect(
       }
 
       if (input.noReply === true) return message
-      return yield* loop({ sessionID: input.sessionID, messageID: message.info.id })
+      return yield* loopWithEpoch({ sessionID: input.sessionID, messageID: message.info.id }, epoch)
     })
+
+    const prompt: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error> = (input) =>
+      promptWithEpoch(input)
 
     const lastAssistant = Effect.fnUntraced(function* (sessionID: SessionID) {
       const match = yield* sessions.findMessage(sessionID, (m) => m.info.role !== "user").pipe(Effect.orDie)
@@ -1877,9 +1882,7 @@ const layer = Layer.effect(
       }
     })
 
-    const loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.loop")(function* (
-      input: LoopInput,
-    ) {
+    const loopWithEpoch = Effect.fn("SessionPrompt.loop")(function* (input: LoopInput, initialEpoch?: number) {
       // A loop call arriving while another run is active joins that run and
       // its own runLoop work never executes (the runner keeps a single run),
       // so the caller's freshly persisted user message could stay unanswered
@@ -1887,20 +1890,30 @@ const layer = Layer.effect(
       // a run has actually answered this caller's message; if a newer user
       // message overtook it and got answered instead, return the latest state
       // rather than spinning on a superseded prompt.
-      // A cancel that ends the run this caller joined must not be followed by a
-      // fresh run for the caller's queued message: cancel releases queued callers.
-      const epoch = yield* state.cancelEpoch(input.sessionID)
+      // A cancel that happens while a prompt/command is preparing or while this
+      // caller is waiting to (re-)enter the loop must not be followed by a fresh
+      // run: cancel releases callers already submitted to the session.
+      const epoch = initialEpoch ?? (yield* state.cancelEpoch(input.sessionID))
+      let last: SessionV1.WithParts | undefined
       while (true) {
+        if ((yield* state.cancelEpoch(input.sessionID)) !== epoch) {
+          yield* state.awaitCancel(input.sessionID)
+          return last ?? (yield* lastAssistant(input.sessionID))
+        }
         const result = yield* state.ensureRunning(
           input.sessionID,
           lastAssistant(input.sessionID),
           runLoop(input.sessionID).pipe(Effect.ensuring(settleOrphanedParts(input.sessionID))),
         )
+        last = result
         if (!input.messageID || (result.info.role === "assistant" && result.info.parentID === input.messageID))
           return result
         // Checked before every other re-entry path: once the run this caller joined was
         // cancelled, no queued prompt (this one or a newer one) may start a fresh run.
-        if ((yield* state.cancelEpoch(input.sessionID)) !== epoch) return result
+        if ((yield* state.cancelEpoch(input.sessionID)) !== epoch) {
+          yield* state.awaitCancel(input.sessionID)
+          return result
+        }
 
         const msgs = yield* sessions
           .messages({ sessionID: input.sessionID })
@@ -1914,6 +1927,8 @@ const layer = Layer.effect(
       }
     })
 
+    const loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts> = (input) => loopWithEpoch(input)
+
     const shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError> = Effect.fn(
       "SessionPrompt.shell",
     )(function* (input: ShellInput) {
@@ -1922,6 +1937,7 @@ const layer = Layer.effect(
     })
 
     const command = Effect.fn("SessionPrompt.command")(function* (input: CommandInput) {
+      const epoch = yield* state.cancelEpoch(input.sessionID)
       yield* Effect.logInfo("command", {
         "session.id": input.sessionID,
         command: input.command,
@@ -2042,14 +2058,17 @@ const layer = Layer.effect(
         { parts },
       )
 
-      const result = yield* prompt({
-        sessionID: input.sessionID,
-        messageID: input.messageID,
-        model: userModel,
-        agent: userAgent,
-        parts,
-        variant: input.variant,
-      })
+      const result = yield* promptWithEpoch(
+        {
+          sessionID: input.sessionID,
+          messageID: input.messageID,
+          model: userModel,
+          agent: userAgent,
+          parts,
+          variant: input.variant,
+        },
+        epoch,
+      )
       yield* events.publish(Command.Event.Executed, {
         name: input.command,
         sessionID: input.sessionID,
