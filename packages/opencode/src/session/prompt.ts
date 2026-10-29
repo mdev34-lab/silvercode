@@ -1260,6 +1260,38 @@ const layer = Layer.effect(
       throw new Error("Impossible")
     })
 
+    const abortedResult = Effect.fnUntraced(function* (input: LoopInput) {
+      const messageID = input.messageID
+      if (!messageID) return yield* lastAssistant(input.sessionID)
+      const existing = yield* sessions
+        .findMessage(input.sessionID, (m) => m.info.role === "assistant" && m.info.parentID === messageID)
+        .pipe(Effect.orDie)
+      if (Option.isSome(existing)) return existing.value
+      const user = yield* sessions.findMessage(input.sessionID, (m) => m.info.id === messageID).pipe(Effect.orDie)
+      if (Option.isNone(user) || user.value.info.role !== "user") return yield* lastAssistant(input.sessionID)
+
+      const ctx = yield* InstanceState.context
+      const now = Date.now()
+      const info: SessionV1.Assistant = {
+        id: MessageID.ascending(),
+        parentID: messageID,
+        role: "assistant",
+        mode: user.value.info.agent,
+        agent: user.value.info.agent,
+        variant: user.value.info.model.variant,
+        path: { cwd: ctx.directory, root: ctx.worktree },
+        cost: 0,
+        tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+        modelID: user.value.info.model.modelID,
+        providerID: user.value.info.model.providerID,
+        time: { created: now, completed: now },
+        sessionID: input.sessionID,
+        error: new SessionV1.AbortedError({ message: "Aborted" }).toObject(),
+      }
+      yield* sessions.updateMessage(info)
+      return { info, parts: [] }
+    })
+
     // Hard backstop for a review that ignored the recovery nudge (issue #176).
     // It runs the same `finish` tool the model would have called, so the report
     // envelope check and the review/finish gate apply unchanged, and persists
@@ -1902,7 +1934,7 @@ const layer = Layer.effect(
       while (true) {
         if ((yield* state.cancelEpoch(input.sessionID)) !== epoch) {
           yield* state.awaitCancel(input.sessionID)
-          return last ?? (yield* lastAssistant(input.sessionID))
+          return last ?? (yield* abortedResult(input))
         }
         const result = yield* state.ensureRunning(
           input.sessionID,
@@ -2073,6 +2105,7 @@ const layer = Layer.effect(
         },
         epoch,
       )
+      if ((yield* state.cancelEpoch(input.sessionID)) !== epoch) return result
       yield* events.publish(Command.Event.Executed, {
         name: input.command,
         sessionID: input.sessionID,
