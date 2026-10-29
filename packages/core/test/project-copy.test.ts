@@ -14,6 +14,7 @@ import { Project } from "@opencode-ai/core/project"
 import { ProjectDirectoryTable, ProjectTable } from "@opencode-ai/core/project/sql"
 import { ProjectCopy } from "@opencode-ai/core/project/copy"
 import { ProjectDirectories } from "@opencode-ai/core/project/directories"
+import { TEST_GIT_CONFIG } from "./fixture/git"
 import { tmpdir } from "./fixture/tmpdir"
 import { testEffect } from "./lib/effect"
 
@@ -27,17 +28,6 @@ function abs(input: string) {
 
 const gitWorktree = ProjectCopy.StrategyID.make("git_worktree")
 
-const GIT_CONFIG = [
-  "[core]",
-  "\tfsmonitor = false",
-  "[commit]",
-  "\tgpgsign = false",
-  "[user]",
-  "\temail = test@opencode.test",
-  "\tname = Test",
-  "",
-].join("\n")
-
 let templateRepo: Awaited<ReturnType<typeof tmpdir>> | undefined
 
 afterAll(async () => {
@@ -49,11 +39,16 @@ afterAll(async () => {
 async function ensureTemplateGitDir() {
   if (!templateRepo) {
     const repo = await tmpdir()
-    await $`git -c core.fsmonitor=false init --quiet`.cwd(repo.path).quiet()
-    await fs.appendFile(path.join(repo.path, ".git", "config"), GIT_CONFIG)
-    await $`git -c core.fsmonitor=false -c commit.gpgsign=false commit --quiet --allow-empty -m root`
-      .cwd(repo.path)
-      .quiet()
+    try {
+      await $`git -c core.fsmonitor=false init --quiet`.cwd(repo.path).quiet()
+      await fs.appendFile(path.join(repo.path, ".git", "config"), TEST_GIT_CONFIG)
+      await $`git -c core.fsmonitor=false -c commit.gpgsign=false commit --quiet --allow-empty -m root`
+        .cwd(repo.path)
+        .quiet()
+    } catch (error) {
+      await repo[Symbol.asyncDispose]()
+      throw error
+    }
     templateRepo = repo
   }
   return path.join(templateRepo.path, ".git")

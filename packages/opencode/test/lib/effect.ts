@@ -1,4 +1,4 @@
-import { runOwned, takeActiveOwnedScope, validateOwnedDeadline, type OwnedDeadline } from "./owned-deadline"
+import { beginOwned, ownedFor, runOwned, validateOwnedDeadline, type OwnedDeadline } from "./owned-deadline"
 import { test, type TestOptions } from "bun:test"
 import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import { Cause, Duration, Effect, Exit, Layer } from "effect"
@@ -70,24 +70,6 @@ const sharedRun: Runner = (value, layer, deadline) =>
     ),
     deadline,
   )
-
-// When a test declares its own host timeout, start cooperative Effect cancellation a little
-// before Bun gives up; if cleanup still outlasts the host timeout (or when no explicit timeout
-// is declared and Bun's host timeout fires), `runOwned` joins the abandoned fiber before the
-// next test starts.
-function ownedFor(opts?: number | TestOptions): OwnedDeadline | undefined {
-  const hostTimeoutMs = typeof opts === "number" ? opts : opts?.timeout
-  if (hostTimeoutMs === undefined || !Number.isFinite(hostTimeoutMs) || hostTimeoutMs <= 0) return undefined
-  const cleanupHeadroomMs = Math.max(1, Math.min(500, Math.floor(hostTimeoutMs / 10)))
-  const deadlineMs = hostTimeoutMs - cleanupHeadroomMs
-  if (deadlineMs <= 0) return undefined
-  return { deadlineMs, hostTimeoutMs, cleanupHeadroomMs }
-}
-
-const beginOwned = <A>(start: () => Promise<A>): Promise<A> => {
-  const stale = takeActiveOwnedScope()
-  return stale ? stale.then(start) : start()
-}
 
 const make = <R, E>(testLayer: Layer.Layer<R, E>, liveLayer: Layer.Layer<R, E>, run: Runner = isolatedRun) => {
   const effect = <A, E2>(name: string, value: Body<A, E2, R | Scope.Scope>, opts?: number | TestOptions) =>

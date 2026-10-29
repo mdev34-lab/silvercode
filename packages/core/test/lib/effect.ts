@@ -1,71 +1,51 @@
-import { afterEach, test, type TestOptions } from "bun:test"
+import { test, type TestOptions } from "bun:test"
 import { Cause, Effect, Exit, Layer } from "effect"
 import type * as Scope from "effect/Scope"
 import * as TestClock from "effect/testing/TestClock"
 import * as TestConsole from "effect/testing/TestConsole"
+import { beginOwned, ownedFor, runOwned, runScopedEffect, type OwnedDeadline } from "./owned-deadline"
+
+export { beginOwned, ownedFor, runOwned, runScopedEffect, type OwnedDeadline }
 
 type Body<A, E, R> = Effect.Effect<A, E, R> | (() => Effect.Effect<A, E, R>)
 
 const body = <A, E, R>(value: Body<A, E, R>) => Effect.suspend(() => (typeof value === "function" ? value() : value))
 
-export function runScopedEffect<A, E>(scoped: Effect.Effect<A, E>): {
-  readonly result: Promise<A>
-  readonly cancel: () => Promise<void>
-} {
-  const controller = new AbortController()
-  let settled = false
-  let abandoned = false
-  const exitPromise = Effect.runPromiseExit(
+const runExecution = <A, E>(scoped: Effect.Effect<A, E>, deadline?: OwnedDeadline): Promise<A> =>
+  runOwned(
     Effect.gen(function* () {
       const exit = yield* Effect.exit(scoped)
-      if (Exit.isFailure(exit) && !abandoned) {
+      if (Exit.isFailure(exit)) {
         for (const err of Cause.prettyErrors(exit.cause)) {
           yield* Effect.logError(err)
         }
       }
       return yield* exit
     }),
-    { signal: controller.signal },
+    deadline,
   )
-  const result = exitPromise.then((exit) => {
-    settled = true
-    if (!Exit.isFailure(exit)) return exit.value
-    if (abandoned) return new Promise<A>(() => {})
-    throw Cause.squash(exit.cause)
-  })
-  const cancel = async () => {
-    if (settled) return
-    abandoned = true
-    controller.abort()
-    await exitPromise
-  }
-  return { result, cancel }
-}
 
-const run = <A, E, R, E2>(value: Body<A, E, R | Scope.Scope>, layer: Layer.Layer<R, E2>) => {
-  const { result, cancel } = runScopedEffect(body(value).pipe(Effect.scoped, Effect.provide(layer)))
-  afterEach(cancel)
-  return result
-}
+const run = <A, E, R, E2>(value: Body<A, E, R | Scope.Scope>, layer: Layer.Layer<R, E2>, deadline?: OwnedDeadline) =>
+  runExecution(body(value).pipe(Effect.scoped, Effect.provide(layer)), deadline)
 
 const make = <R, E>(testLayer: Layer.Layer<R, E>, liveLayer: Layer.Layer<R, E>) => {
   const effect = <A, E2>(name: string, value: Body<A, E2, R | Scope.Scope>, opts?: number | TestOptions) =>
-    test(name, () => run(value, testLayer), opts)
+    test(name, () => beginOwned(() => run(value, testLayer, ownedFor(opts))), opts)
 
   effect.only = <A, E2>(name: string, value: Body<A, E2, R | Scope.Scope>, opts?: number | TestOptions) =>
-    test.only(name, () => run(value, testLayer), opts)
+    test.only(name, () => beginOwned(() => run(value, testLayer, ownedFor(opts))), opts)
 
   effect.skip = <A, E2>(name: string, value: Body<A, E2, R | Scope.Scope>, opts?: number | TestOptions) =>
-    test.skip(name, () => run(value, testLayer), opts)
+    test.skip(name, () => beginOwned(() => run(value, testLayer)), opts)
 
   const live = <A, E2>(name: string, value: Body<A, E2, R | Scope.Scope>, opts?: number | TestOptions) =>
-    test(name, () => run(value, liveLayer), opts)
+    test(name, () => beginOwned(() => run(value, liveLayer, ownedFor(opts))), opts)
 
   live.only = <A, E2>(name: string, value: Body<A, E2, R | Scope.Scope>, opts?: number | TestOptions) =>
-    test.only(name, () => run(value, liveLayer), opts)
+    test.only(name, () => beginOwned(() => run(value, liveLayer, ownedFor(opts))), opts)
 
   live.skip = <A, E2>(name: string, value: Body<A, E2, R | Scope.Scope>, opts?: number | TestOptions) =>
-    test.skip(name, () => run(value, liveLayer), opts)
+    test.skip(name, () => beginOwned(() => run(value, liveLayer)), opts)
 
   return { effect, live }
 }

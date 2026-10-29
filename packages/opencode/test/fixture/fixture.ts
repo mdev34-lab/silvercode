@@ -16,6 +16,7 @@ import { InstanceBootstrap } from "../../src/project/bootstrap-service"
 import type { InstanceContext } from "../../src/project/instance-context"
 import { InstanceRuntime } from "../../src/project/instance-runtime"
 import { InstanceStore } from "../../src/project/instance-store"
+import { TEST_GIT_CONFIG } from "../../../core/test/fixture/git"
 import { TestLLMServer } from "../lib/llm-server"
 
 const noopBootstrap = Layer.succeed(InstanceBootstrap.Service, InstanceBootstrap.Service.of({ run: Effect.void }))
@@ -74,17 +75,6 @@ async function stop(dir: string) {
   if (!(await exists(dir))) return
   await $`git fsmonitor--daemon stop`.cwd(dir).quiet().nothrow()
 }
-
-const TEST_GIT_CONFIG = [
-  "[core]",
-  "\tfsmonitor = false",
-  "[commit]",
-  "\tgpgsign = false",
-  "[user]",
-  "\temail = test@opencode.test",
-  "\tname = Test",
-  "",
-].join("\n")
 
 type TmpDirOptions<T> = {
   git?: boolean

@@ -1,7 +1,7 @@
 import { NodeHttpServer, NodeServices } from "@effect/platform-node"
 import { describe, expect } from "bun:test"
-import { Effect, Fiber, Layer, Schema } from "effect"
-import { HttpClient, HttpClientRequest, HttpRouter } from "effect/unstable/http"
+import { Context, Effect, Fiber, Layer, Schema } from "effect"
+import { HttpClient, HttpClientRequest, HttpRouter, HttpServerResponse } from "effect/unstable/http"
 import { HttpApi, HttpApiBuilder, HttpApiEndpoint, HttpApiGroup } from "effect/unstable/httpapi"
 import * as Socket from "effect/unstable/socket/Socket"
 import { mkdir } from "node:fs/promises"
@@ -25,6 +25,7 @@ import {
   instanceContextLayer,
 } from "../../src/server/routes/instance/httpapi/middleware/instance-context"
 import {
+  WorkspaceRouteContext,
   WorkspaceRoutingMiddleware,
   WorkspaceRoutingQuery,
   workspaceRoutingLayer,
@@ -413,6 +414,30 @@ describe("HttpApi instance context middleware", () => {
         headless: true,
         headlessMaxDelayMs: 5000,
       })
+    }),
+  )
+
+  it.live("preserves ambient HeadlessRunRef when invoked without an HttpServerRequest", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped({ git: true })
+      const endpoint = HttpApiEndpoint.get("ambientProbe", "/ambient-probe", { success: Schema.Boolean })
+      const group = HttpApiGroup.make("ambientProbeGroup").add(endpoint)
+      const middleware = yield* InstanceContextMiddleware.pipe(Effect.provide(instanceContextLayer))
+      let observed: { maxDelayMs?: number } | undefined
+
+      yield* middleware(
+        Effect.gen(function* () {
+          observed = yield* HeadlessRunRef
+          return HttpServerResponse.empty()
+        }),
+        { endpoint, group },
+      ).pipe(
+        Effect.provide(Context.empty() as Context.Context<HttpRouter.Provided>),
+        Effect.provideService(WorkspaceRouteContext, { directory: dir, workspaceID: undefined }),
+        Effect.provideService(HeadlessRunRef, { maxDelayMs: 4321 }),
+      )
+
+      expect(observed).toEqual({ maxDelayMs: 4321 })
     }),
   )
 })

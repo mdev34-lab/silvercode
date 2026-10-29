@@ -21,6 +21,17 @@ const config = [
   "user.name=Test",
 ]
 
+export const TEST_GIT_CONFIG = [
+  "[core]",
+  "\tfsmonitor = false",
+  "[commit]",
+  "\tgpgsign = false",
+  "[user]",
+  "\temail = test@opencode.test",
+  "\tname = Test",
+  "",
+].join("\n")
+
 // Absolute budget for building one fixture remote. Bun SIGTERMs children still
 // running when a test hits its budget, and that cancellation resurfaces in the
 // next test as an unhandled error (#278). Canceling here keeps the failure and

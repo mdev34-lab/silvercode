@@ -140,6 +140,20 @@ async function toolError(part: ToolPart) {
 /** Retry delays longer than this are announced by a non-interactive run; shorter ones stay silent. */
 const RUN_RETRY_NOTICE_MS = 10_000
 
+/**
+ * Post-response SSE drain budget for `--attach` runs when a foreign/older server omits
+ * `session.status: idle` or leaves remote background subagents running after the root turn returns.
+ */
+const ATTACH_EVENT_DRAIN_MS = 300
+
+function extractAssistantError(data: unknown): unknown {
+  if (!data || typeof data !== "object" || !("info" in data)) return undefined
+  const info = (data as { info?: unknown }).info
+  if (!info || typeof info !== "object") return undefined
+  const record = info as { role?: unknown; error?: unknown }
+  return record.role === "assistant" && record.error ? record.error : undefined
+}
+
 export const RunCommand = effectCmd({
   command: "run [message..]",
   describe: "run silvercode with a message",
@@ -723,11 +737,18 @@ export const RunCommand = effectCmd({
           return false
         }
 
+        let turnSettled = false
+        let onTurnSettled: (() => void) | undefined
+
         // Consume one subscribed event stream for the active session and mirror it
         // to stdout/UI. `client` is passed explicitly because attach mode may
         // rebind the SDK to the session's directory after the subscription is
         // created, and replies issued from inside the loop must use that client.
-        async function loop(client: OpencodeClient, events: Awaited<ReturnType<typeof sdk.event.subscribe>>) {
+        async function loop(
+          client: OpencodeClient,
+          events: Awaited<ReturnType<typeof sdk.event.subscribe>>,
+          abortEvents: () => void,
+        ) {
           const toggles = new Map<string, boolean>()
           // Background subagents are the default task mode: the parent turn may
           // finish while child jobs still run. Track the sessions this run
@@ -759,6 +780,14 @@ export const RunCommand = effectCmd({
           let rootIdle = false
           let lastText = ""
           let error: string | undefined
+          const rootTerminal = () => rootIdle || (turnSettled && error !== undefined)
+          onTurnSettled = () => {
+            if (args.attach && error !== undefined) {
+              abortEvents()
+              return
+            }
+            if (rootTerminal() && background.settled()) abortEvents()
+          }
           // Announces long retry waits of the root and of owned background children (#555).
           const retryNotice = RetryNotice.make({
             rootSessionID: sessionID,
@@ -817,7 +846,7 @@ export const RunCommand = effectCmd({
                   // exit in the gap between its user part and busy status.
                   if (part.sessionID === sessionID && part.synthetic && part.metadata?.backgroundNoReply !== true)
                     rootIdle = false
-                  if (rootIdle && background.settled()) break
+                  if (rootTerminal() && background.settled()) break
                 }
               }
 
@@ -890,8 +919,12 @@ export const RunCommand = effectCmd({
                 err = String(props.error.data.message)
               }
               error = error ? error + EOL + err : err
-              if (emit("error", { error: props.error })) continue
-              UI.error(err)
+              if (!emit("error", { error: props.error })) {
+                UI.error(err)
+              }
+              if (args.attach && turnSettled) break
+              if (rootTerminal() && background.settled()) break
+              continue
             }
 
             if (event.type === "session.status") {
@@ -902,7 +935,7 @@ export const RunCommand = effectCmd({
             // A deferred/silent descendant delivery can arrive after the root's
             // last idle event. Recheck on every event, not only another root
             // turn: teardown deliberately does not wake the stopped session.
-            if (rootIdle && background.settled()) break
+            if (rootTerminal() && background.settled()) break
 
             if (event.type === "permission.asked") {
               const permission = event.properties
@@ -939,49 +972,89 @@ export const RunCommand = effectCmd({
         await share(client, sessionID)
 
         if (!interactive) {
-          const events = await client.event.subscribe()
-          const completed = loop(client, events).catch((e) => {
+          const eventAbort = new AbortController()
+          const abortEvents = () => {
+            if (!eventAbort.signal.aborted) eventAbort.abort()
+          }
+          const events = await client.event.subscribe(undefined, {
+            signal: eventAbort.signal,
+            sseDefaultRetryDelay: 10,
+            sseMaxRetryDelay: 25,
+          })
+          const completed = loop(client, events, abortEvents).catch((e) => {
+            if (eventAbort.signal.aborted) return undefined
             console.error(e)
             process.exitCode = 1
+            return undefined
           })
-          async function finish() {
-            const error = await completed
-            if (error) process.exitCode = 1
+          const stopEvents = async () => {
+            abortEvents()
+            await events.stream.return(undefined).catch(() => undefined)
+            return await completed
+          }
+          async function finish(responseData?: unknown) {
+            turnSettled = true
+            onTurnSettled?.()
+            if (args.attach) {
+              await Promise.race([
+                completed,
+                new Promise<void>((resolve) => {
+                  const timer = setTimeout(resolve, ATTACH_EVENT_DRAIN_MS)
+                  timer.unref?.()
+                }),
+              ])
+            } else {
+              await completed
+            }
+            const loopError = await stopEvents()
+            if (loopError) {
+              process.exitCode = 1
+              return
+            }
+            const assistantError = extractAssistantError(responseData)
+            if (assistantError) {
+              if (!emit("error", { error: assistantError })) UI.error(formatRunError(assistantError))
+              process.exitCode = 1
+            }
           }
 
-          if (args.command) {
-            const result = await client.session.command({
+          try {
+            if (args.command) {
+              const result = await client.session.command({
+                sessionID,
+                agent,
+                model: args.model,
+                command: args.command,
+                arguments: message,
+                variant: args.variant,
+              })
+              if (result.error) {
+                if (!emit("error", { error: result.error })) UI.error(formatRunError(result.error))
+                process.exitCode = 1
+                return
+              }
+              await finish(result.data)
+              return
+            }
+
+            const model = pick(args.model)
+            const result = await client.session.prompt({
               sessionID,
               agent,
-              model: args.model,
-              command: args.command,
-              arguments: message,
+              model,
               variant: args.variant,
+              parts: [...files, { type: "text", text: message }],
             })
             if (result.error) {
               if (!emit("error", { error: result.error })) UI.error(formatRunError(result.error))
               process.exitCode = 1
               return
             }
-            await finish()
+            await finish(result.data)
             return
+          } finally {
+            await stopEvents()
           }
-
-          const model = pick(args.model)
-          const result = await client.session.prompt({
-            sessionID,
-            agent,
-            model,
-            variant: args.variant,
-            parts: [...files, { type: "text", text: message }],
-          })
-          if (result.error) {
-            if (!emit("error", { error: result.error })) UI.error(formatRunError(result.error))
-            process.exitCode = 1
-            return
-          }
-          await finish()
-          return
         }
 
         const model = pick(args.model)
