@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, readFile, writeFile } from "node:fs/promises"
+import { mkdtemp, mkdir, readFile, writeFile, rm, stat } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import { afterEach, describe, expect, test } from "bun:test"
@@ -84,35 +84,144 @@ interface Sandbox {
   cleanup: () => Promise<void>
 }
 
-async function makeSandbox(): Promise<Sandbox> {
-  const dir = await mkdtemp(path.join(tmpdir(), "silvercode-release-flow-"))
-  const origin = path.join(dir, "origin.git")
-  const work = path.join(dir, "work")
-  const state = path.join(dir, "ghstate")
-  const bin = path.join(dir, "bin")
-  const out = path.join(dir, "github-output.txt")
-  await mkdir(state, { recursive: true })
-  await mkdir(bin, { recursive: true })
-  await installGhStub(bin)
+// Per-call dependencies keep failure injection local to the real factories.
+type Setup = {
+  mkdtemp: (prefix: string) => Promise<string>
+  mkdir: (dir: string, options: { recursive: true }) => Promise<string | undefined>
+  git: typeof git
+  write: (file: string, data: string) => Promise<number>
+  cleanup: (dir: string) => Promise<void>
+}
+const setupDefaults: Setup = { mkdtemp, mkdir, git, write: Bun.write, cleanup: removeFixture }
 
-  git(dir, "init", "--quiet", "--bare", origin)
-  git(dir, "clone", "--quiet", origin, work)
-  git(work, "config", "user.name", "SilverCode Test")
-  git(work, "config", "user.email", "silvercode-test@example.com")
-  git(work, "checkout", "--quiet", "-b", "dev")
-  await writeFile(path.join(work, "seed.txt"), "seed\n")
-  git(work, "add", "--all")
-  git(work, "commit", "--quiet", "-m", "chore: seed")
-  git(work, "push", "--quiet", "-u", "origin", "dev")
+async function makeSandbox(overrides: Partial<Setup> = {}): Promise<Sandbox> {
+  const setup = { ...setupDefaults, ...overrides }
+  const dir = await setup.mkdtemp(path.join(tmpdir(), "silvercode-release-flow-"))
+  try {
+    const origin = path.join(dir, "origin.git")
+    const work = path.join(dir, "work")
+    const state = path.join(dir, "ghstate")
+    const bin = path.join(dir, "bin")
+    const out = path.join(dir, "github-output.txt")
+    await setup.mkdir(state, { recursive: true })
+    await setup.mkdir(bin, { recursive: true })
+    await installGhStub(bin)
 
-  return {
-    dir,
-    origin,
-    work,
-    state,
-    bin,
-    out,
-    cleanup: () => removeFixture(dir),
+    setup.git(dir, "init", "--quiet", "--bare", origin)
+    setup.git(dir, "clone", "--quiet", origin, work)
+    setup.git(work, "config", "user.name", "SilverCode Test")
+    setup.git(work, "config", "user.email", "silvercode-test@example.com")
+    setup.git(work, "checkout", "--quiet", "-b", "dev")
+    await writeFile(path.join(work, "seed.txt"), "seed\n")
+    setup.git(work, "add", "--all")
+    setup.git(work, "commit", "--quiet", "-m", "chore: seed")
+    setup.git(work, "push", "--quiet", "-u", "origin", "dev")
+
+    return {
+      dir,
+      origin,
+      work,
+      state,
+      bin,
+      out,
+      cleanup: () => removeFixture(dir),
+    }
+  } catch (error) {
+    // removeFixture reports cleanup failures separately; never replace setup failure.
+    await setup.cleanup(dir)
+    throw error
+  }
+}
+
+function setupFailureTests(
+  factory: (setup: Partial<Setup>) => Promise<{ dir: string; cleanup: () => Promise<void> }>,
+  late: "git" | "write",
+) {
+  for (const stage of ["early", "late"] as const) {
+    for (const cleanupFails of [false, true]) {
+      test(`partial setup ${stage}: original error survives; cleanup ${cleanupFails ? "failure is reported separately" : "removes owned directory"}`, async () => {
+        const original = new Error(`injected ${stage} setup failure`)
+        const cleanupError = new Error("injected cleanup failure")
+        let owned: string | undefined
+        let cleanupCalls = 0
+        let reached = false
+        const setup: Partial<Setup> = {
+          mkdtemp: async (...args) => {
+            owned = await mkdtemp(...args)
+            return owned
+          },
+          mkdir: async (...args) => {
+            if (stage === "early") {
+              reached = true
+              throw original
+            }
+            return mkdir(...args)
+          },
+          cleanup: async (dir) => {
+            expect(dir).toBe(owned)
+            cleanupCalls++
+            await removeFixture(
+              dir,
+              cleanupFails
+                ? async () => {
+                    throw cleanupError
+                  }
+                : rm,
+            )
+          },
+        }
+        if (stage === "late" && late === "git")
+          setup.git = (cwd, ...args) => {
+            if (args[0] === "push") {
+              reached = true
+              throw original
+            }
+            return git(cwd, ...args)
+          }
+        if (stage === "late" && late === "write")
+          setup.write = async () => {
+            reached = true
+            throw original
+          }
+        try {
+          let caught: unknown
+          try {
+            await factory(setup)
+          } catch (error) {
+            caught = error
+          }
+          expect(reached).toBe(true)
+          expect(caught).toBe(original)
+          expect(owned).toBeDefined()
+          const remains = await stat(owned!).then(
+            () => true,
+            (error) => {
+              if (error.code === "ENOENT") return false
+              throw error
+            },
+          )
+          console.log(
+            `[partial-setup] ${late}/${stage}: sameError=${caught === original} cleanupCalls=${cleanupCalls} remains=${remains} cleanupFails=${cleanupFails}`,
+          )
+          expect(cleanupCalls).toBe(1)
+          if (cleanupFails) {
+            expect(await stat(owned!)).toBeDefined()
+            expect(() => assertNoCleanupFailures()).toThrow("injected cleanup failure")
+            expect(() => assertNoCleanupFailures()).not.toThrow()
+          } else {
+            await expect(stat(owned!)).rejects.toMatchObject({ code: "ENOENT" })
+            expect(() => assertNoCleanupFailures()).not.toThrow()
+          }
+        } finally {
+          // Test-owned fallback also removes leaked fixtures on the unpatched base.
+          if (owned) await rm(owned, { recursive: true, force: true })
+          // Consume diagnostics even when an earlier regression assertion failed.
+          try {
+            assertNoCleanupFailures()
+          } catch {}
+        }
+      })
+    }
   }
 }
 
@@ -174,6 +283,7 @@ async function gh(sandbox: Sandbox, ...args: string[]) {
 afterEach(() => assertNoCleanupFailures())
 
 describe("release lifecycle with stubbed gh and a real git remote", () => {
+  setupFailureTests(makeSandbox, "git")
   test(
     "pushes the tag before the draft exists, so the build job can check the tag out",
     async () => {
@@ -381,21 +491,33 @@ describe("release archive upload", () => {
     { name: "silvercode-ai-windows-x64-baseline", os: "win32" },
   ]
 
-  async function makeUploadSandbox() {
-    const dir = await mkdtemp(path.join(tmpdir(), "silvercode-upload-"))
-    const state = path.join(dir, "ghstate")
-    const bin = path.join(dir, "bin")
-    await mkdir(path.join(state, "releases"), { recursive: true })
-    await mkdir(path.join(dir, "dist"), { recursive: true })
-    await mkdir(bin, { recursive: true })
-    await installGhStub(bin)
-    await Bun.write(path.join(state, "releases", "v0.1.0.json"), '{"tagName":"v0.1.0","databaseId":1001,"isDraft":true}\n')
-    return {
-      dir,
-      state,
-      cleanup: () => removeFixture(dir),
+  async function makeUploadSandbox(overrides: Partial<Setup> = {}) {
+    const setup = { ...setupDefaults, ...overrides }
+    const dir = await setup.mkdtemp(path.join(tmpdir(), "silvercode-upload-"))
+    try {
+      const state = path.join(dir, "ghstate")
+      const bin = path.join(dir, "bin")
+      await setup.mkdir(path.join(state, "releases"), { recursive: true })
+      await setup.mkdir(path.join(dir, "dist"), { recursive: true })
+      await setup.mkdir(bin, { recursive: true })
+      await installGhStub(bin)
+      await setup.write(
+        path.join(state, "releases", "v0.1.0.json"),
+        '{"tagName":"v0.1.0","databaseId":1001,"isDraft":true}\n',
+      )
+      return {
+        dir,
+        state,
+        cleanup: () => removeFixture(dir),
+      }
+    } catch (error) {
+      // removeFixture reports cleanup failures separately; never replace setup failure.
+      await setup.cleanup(dir)
+      throw error
     }
   }
+
+  setupFailureTests(makeUploadSandbox, "write")
 
   // Runs the upload through a subprocess so `gh` resolves from the stubbed PATH
   // (the sandbox never touches the real gh).
