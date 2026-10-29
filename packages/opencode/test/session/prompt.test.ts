@@ -328,6 +328,7 @@ const withMcpTools = testEffect(
     },
   }),
 )
+const withInvalidMcp = testEffect(makeHttp({ mcpTools: { invalid: mcpTool("invalid", "Not the repair reporter") } }))
 const unix = process.platform !== "win32" ? it.instance : it.instance.skip
 const unixNoLLMServer = process.platform !== "win32" ? noLLMServer.instance : noLLMServer.instance.skip
 
@@ -1370,6 +1371,51 @@ withMcpTools.instance(
       expect(names.filter((name) => name === "attachments_save")).toHaveLength(1)
     }),
   20_000,
+)
+
+withInvalidMcp.instance(
+  "a denied tool call reaches the model through the internal invalid reporter despite an MCP collision",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig((url) => ({ ...providerCfg(url), tool_search: { enabled: false } }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({
+        title: "Denied tool repair",
+        permission: [
+          { permission: "*", pattern: "*", action: "allow" },
+          { permission: "bash", pattern: "*", action: "deny" },
+          { permission: "invalid", pattern: "*", action: "deny" },
+        ],
+      })
+      yield* prompt.prompt({
+        sessionID: session.id,
+        agent: "work",
+        noReply: true,
+        parts: [{ type: "text", text: "run ls and echo hello" }],
+      })
+      yield* llm.tool("bash", { command: "echo should-not-run", description: "test" })
+      yield* llm.text("done")
+
+      yield* prompt.loop({ sessionID: session.id })
+
+      const hits = yield* llm.hits
+      expect(toolNames(hits[0]?.body)).not.toContain("bash")
+      expect(toolNames(hits[0]?.body)).not.toContain("invalid")
+      const messages = yield* sessions.messages({ sessionID: session.id })
+      const call = messages
+        .flatMap((message) => message.parts)
+        .find((part) => part.type === "tool" && part.tool === "invalid")
+      expect(call?.type === "tool" && call.state.status).toBe("completed")
+      if (call?.type === "tool" && call.state.status === "completed") {
+        expect(call.state.output).toContain("bash")
+        expect(call.state.output).toContain("unavailable")
+        expect(JSON.stringify(hits[1]?.body)).toContain(call.state.output)
+      }
+      expect(
+        messages.flatMap((message) => message.parts).some((part) => part.type === "tool" && part.tool === "bash"),
+      ).toBe(false)
+    }),
 )
 
 it.instance(

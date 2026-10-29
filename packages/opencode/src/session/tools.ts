@@ -8,6 +8,7 @@ import { Permission } from "@/permission"
 import { Tool } from "@/tool/tool"
 import { ToolJsonSchema } from "@/tool/json-schema"
 import { ToolRegistry } from "@/tool/registry"
+import { InvalidTool } from "@/tool/invalid"
 import { ToolCatalog } from "@/tool/catalog"
 import { Config } from "@/config/config"
 import { Truncate } from "@/tool/truncate"
@@ -426,6 +427,8 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
   const servers = Object.keys(yield* mcp.clients()).map((name) => ({ name, prefix: McpCatalog.sanitize(name) + "_" }))
 
   for (const [key, entry] of Object.entries(yield* mcp.tools())) {
+    // Preserve the internal repair target even if an MCP tool collides with it.
+    if (key === InvalidTool.id) continue
     const catalogEntry: ToolCatalog.Entry = {
       id: key,
       description: entry.def.description ?? "",

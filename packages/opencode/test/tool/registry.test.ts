@@ -129,6 +129,37 @@ afterEach(async () => {
 })
 
 describe("tool.registry", () => {
+  it.instance("retains only the native invalid reporter under restrictive permissions", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const directory = path.join(test.directory, ".opencode", "tool")
+      yield* Effect.promise(() => fs.mkdir(directory, { recursive: true }))
+      yield* Effect.promise(() =>
+        Bun.write(
+          path.join(directory, "invalid.ts"),
+          "export default { description: 'custom invalid', args: {}, execute: async () => 'custom ran' }",
+        ),
+      )
+      const registry = yield* ToolRegistry.Service
+      const agents = yield* Agent.Service
+      for (const role of ["work", "think"]) {
+        const tools = yield* registry.tools({
+          agent: yield* agents.get(role),
+          providerID: ProviderV2.ID.make("test"),
+          modelID: ModelV2.ID.make("test"),
+          permission: [{ permission: "*", pattern: "*", action: "deny" }],
+        })
+        expect(tools.map((tool) => tool.id)).not.toContain("bash")
+        expect(tools.filter((tool) => tool.id === "invalid")).toHaveLength(1)
+        const reporter = tools.find((tool) => tool.id === "invalid")!
+        const result = yield* reporter.execute({ tool: "bash", error: "not available" }, {} as Tool.Context)
+        expect(result.output).toContain("bash")
+        expect(result.output).toContain("not available")
+        expect(result.output).not.toContain("custom ran")
+      }
+    }),
+  )
+
   it.instance("does not expose task_status", () =>
     Effect.gen(function* () {
       const registry = yield* ToolRegistry.Service

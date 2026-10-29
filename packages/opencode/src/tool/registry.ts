@@ -278,7 +278,9 @@ const layer = Layer.effect(
 
     const all: Interface["all"] = Effect.fn("ToolRegistry.all")(function* () {
       const s = yield* InstanceState.get(state)
-      return [...s.builtin, ...s.custom] as Tool.Def[]
+      // The repair hook targets this internal reporter by name; a custom tool
+      // must not replace it, especially when permissions hide executable tools.
+      return [...s.builtin, ...s.custom.filter((tool) => tool.id !== InvalidTool.id)] as Tool.Def[]
     })
 
     const ids: Interface["ids"] = Effect.fn("ToolRegistry.ids")(function* () {
@@ -325,15 +327,15 @@ const layer = Layer.effect(
       })
 
       // Tool visibility is the same permission boundary used at execution:
-      // a blanket deny hides the tool from the model, while Finish remains
-      // available so every agent can terminate cleanly.
+      // a blanket deny hides the tool from the model. Finish remains available
+      // to terminate, and invalid remains available for the internal repair hook.
       const ruleset = Permission.merge(input.agent.permission, input.permission ?? [])
       const disabled = Permission.disabled(
         filtered.map((t) => t.id),
         ruleset,
       )
       const permissionFiltered = filtered.filter((tool) => {
-        if (tool.id === FinishTool.id) return true
+        if (tool.id === FinishTool.id || tool.id === InvalidTool.id) return true
         return !disabled.has(tool.id)
       })
 

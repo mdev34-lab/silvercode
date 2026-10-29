@@ -252,7 +252,9 @@ function resolveTools(input: Pick<PrepareInput, "tools" | "agent" | "permission"
   )
   return Record.filter(
     input.tools,
-    (_, k) => input.user.tools?.[k] !== false && (PROTOCOL_TOOLS.has(k) || !disabled.has(k)),
+    // The internal repair target is not a model capability and must survive
+    // both permission filtering and per-message tool disabling.
+    (_, k) => k === "invalid" || (input.user.tools?.[k] !== false && (PROTOCOL_TOOLS.has(k) || !disabled.has(k))),
   )
 }
 
