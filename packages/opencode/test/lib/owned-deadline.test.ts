@@ -1,7 +1,7 @@
 import { test, expect } from "bun:test"
 import { Cause, Effect, Exit } from "effect"
 import * as TestClock from "effect/testing/TestClock"
-import { ownedDeadlineTest, runWithOwnedDeadline, validateOwnedDeadline } from "./owned-deadline"
+import { inflightOwnedRunCount, ownedDeadlineTest, runOwned, runWithOwnedDeadline, validateOwnedDeadline } from "./owned-deadline"
 const budget = { deadlineMs: 25, hostTimeoutMs: 1000, cleanupHeadroomMs: 100 }
 let flag = "original"
 const events: string[] = []
@@ -71,4 +71,29 @@ test("wrapper snapshots explicit budget before caller mutation",async()=>{
  const callback=ownedDeadlineTest(()=>Effect.never,mutable)
  mutable.deadlineMs=Infinity;mutable.hostTimeoutMs=0;mutable.cleanupHeadroomMs=-1
  await expect(callback()).rejects.toThrow("interrupted")
+},1000)
+
+test("runOwned preserves Cause.squash rethrow and clears keyed run entries on settlement",async()=>{
+ expect(await runOwned(Effect.succeed(42))).toBe(42)
+ expect(inflightOwnedRunCount()).toBe(0)
+ const sentinel=new Error("exact cause squash failure")
+ try{await runOwned(Effect.fail(sentinel));throw new Error("expected failure")}
+ catch(error){expect(error).toBe(sentinel)}
+ expect(inflightOwnedRunCount()).toBe(0)
+ for(const eff of [Effect.fail(undefined),Effect.die(undefined)]){
+  let caught=false
+  let value:unknown="not-undefined"
+  try{await runOwned(eff)}
+  catch(error){caught=true;value=error}
+  expect(caught).toBe(true)
+  expect(value).toBeUndefined()
+  expect(inflightOwnedRunCount()).toBe(0)
+ }
+ try{await runOwned(Effect.never,{deadlineMs:15,hostTimeoutMs:1000,cleanupHeadroomMs:100});throw new Error("expected interruption")}
+ catch(error){expect(String(error)).toContain("interrupted")}
+ expect(inflightOwnedRunCount()).toBe(0)
+ let started=false
+ expect(()=>runOwned(Effect.sync(()=>{started=true}),{deadlineMs:0,hostTimeoutMs:1000,cleanupHeadroomMs:100})).toThrow()
+ expect(started).toBe(false)
+ expect(inflightOwnedRunCount()).toBe(0)
 },1000)
