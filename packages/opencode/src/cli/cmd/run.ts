@@ -140,6 +140,12 @@ async function toolError(part: ToolPart) {
 /** Retry delays longer than this are announced by a non-interactive run; shorter ones stay silent. */
 const RUN_RETRY_NOTICE_MS = 10_000
 
+function resolveRunDirectory(dir?: string, envPWD = process.env.PWD, cwd = process.cwd()) {
+  const root = Filesystem.resolve(envPWD ?? cwd)
+  if (dir) return Filesystem.resolve(path.isAbsolute(dir) ? dir : path.join(root, dir))
+  return Filesystem.resolve(cwd)
+}
+
 export const RunCommand = effectCmd({
   command: "run [message..]",
   describe: "run silvercode with a message",
@@ -148,7 +154,7 @@ export const RunCommand = effectCmd({
   instance: (args) => !args.attach,
   // For --dir without --attach, load instance for the resolved target dir.
   // The handler also chdirs (preserving the legacy order: chdir → file resolution).
-  directory: (args) => (args.dir && !args.attach ? path.resolve(process.cwd(), args.dir) : process.cwd()),
+  directory: (args) => (args.dir && !args.attach ? resolveRunDirectory(args.dir) : Filesystem.resolve(process.cwd())),
   builder: (yargs: Argv) =>
     yargs
       .positional("message", {
@@ -280,7 +286,9 @@ export const RunCommand = effectCmd({
   handler: Effect.fn("Cli.run")(function* (args) {
     const { Agent } = yield* Effect.promise(() => import("@/agent/agent"))
     const { RuntimeFlags } = yield* Effect.promise(() => import("@/effect/runtime-flags"))
-    const { InstanceRef } = yield* Effect.promise(() => import("@/effect/instance-ref"))
+    const { HEADLESS_RETRY_MAX_DELAY_HEADER, HEADLESS_RUN_HEADER, InstanceRef } = yield* Effect.promise(
+      () => import("@/effect/instance-ref"),
+    )
     const { ServerAuth } = yield* Effect.promise(() => import("@/server/auth"))
     const agentSvc = yield* Agent.Service
     const flags = yield* RuntimeFlags.Service
@@ -347,21 +355,35 @@ export const RunCommand = effectCmd({
 
       const replay = args.replay === false ? false : args.replay || args["replay-limit"] !== undefined
 
-      const root = Filesystem.resolve(process.env.PWD ?? process.cwd())
+      const root = Filesystem.resolve(process.cwd())
       const directory = (() => {
         if (!args.dir) return args.attach ? undefined : root
         if (args.attach) return args.dir
 
         try {
-          process.chdir(path.isAbsolute(args.dir) ? args.dir : path.join(root, args.dir))
-          return process.cwd()
+          process.chdir(resolveRunDirectory(args.dir))
+          return Filesystem.resolve(process.cwd())
         } catch {
           UI.error("Failed to change directory to " + args.dir)
           process.exit(1)
         }
       })()
+      const headlessHeaders: Record<string, string> = !interactive
+        ? {
+            [HEADLESS_RUN_HEADER]: "1",
+            ...(flags.retryMaxDelayMs !== undefined
+              ? { [HEADLESS_RETRY_MAX_DELAY_HEADER]: String(flags.retryMaxDelayMs) }
+              : {}),
+          }
+        : {}
       const attachHeaders = args.attach
-        ? ServerAuth.headers({ password: args.password, username: args.username })
+        ? (() => {
+            const merged = {
+              ...ServerAuth.headers({ password: args.password, username: args.username }),
+              ...headlessHeaders,
+            }
+            return Object.keys(merged).length > 0 ? merged : undefined
+          })()
         : undefined
       const attachSDK = (dir?: string) => {
         return createOpencodeClient({
@@ -929,7 +951,6 @@ export const RunCommand = effectCmd({
             process.exitCode = 1
           })
           async function finish() {
-            if (args.attach) return
             const error = await completed
             if (error) process.exitCode = 1
           }
@@ -1041,6 +1062,9 @@ export const RunCommand = effectCmd({
         const headers = new Headers(request.headers)
         const auth = ServerAuth.header()
         if (auth) headers.set("Authorization", auth)
+        for (const [key, value] of Object.entries(headlessHeaders)) {
+          headers.set(key, value)
+        }
         return Server.Default().app.fetch(new Request(request, { headers }))
       }) as typeof globalThis.fetch
       const sdk = createOpencodeClient({

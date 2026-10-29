@@ -431,4 +431,35 @@ describe("RuntimeFlags", () => {
       expect(flags.disableClaudeCodeSkills).toBe(true)
     }),
   )
+
+  it.effect("retryMaxDelayMs defaults to undefined", () =>
+    Effect.gen(function* () {
+      const flags = yield* readFlags.pipe(Effect.provide(fromConfig({})))
+
+      expect(flags.retryMaxDelayMs).toBeUndefined()
+    }),
+  )
+
+  it.effect("parses retryMaxDelayMs from config", () =>
+    Effect.gen(function* () {
+      const flags = yield* readFlags.pipe(
+        Effect.provide(
+          fromConfig({
+            OPENCODE_EXPERIMENTAL_RETRY_MAX_DELAY_MS: "5000",
+          }),
+        ),
+      )
+
+      expect(flags.retryMaxDelayMs).toBe(5_000)
+
+      const invalid = yield* readFlags.pipe(
+        Effect.provide(
+          fromConfig({
+            OPENCODE_EXPERIMENTAL_RETRY_MAX_DELAY_MS: "0",
+          }),
+        ),
+      )
+      expect(invalid.retryMaxDelayMs).toBeUndefined()
+    }),
+  )
 })

@@ -10,7 +10,13 @@ import { registerAdapter } from "../../src/control-plane/adapters"
 import { WorkspaceV2 } from "@opencode-ai/core/workspace"
 import type { WorkspaceAdapter } from "../../src/control-plane/types"
 import { Workspace } from "../../src/control-plane/workspace"
-import { InstanceRef, WorkspaceRef } from "../../src/effect/instance-ref"
+import {
+  HEADLESS_RETRY_MAX_DELAY_HEADER,
+  HEADLESS_RUN_HEADER,
+  HeadlessRunRef,
+  InstanceRef,
+  WorkspaceRef,
+} from "../../src/effect/instance-ref"
 import { Project } from "../../src/project/project"
 import { Session } from "../../src/session/session"
 import { disposeMiddleware, markInstanceForDisposal } from "../../src/server/routes/instance/httpapi/lifecycle"
@@ -88,6 +94,16 @@ const probeInstanceContext = Effect.gen(function* () {
   }
 })
 
+const probeHeadlessContext = Effect.gen(function* () {
+  const instance = yield* InstanceRef
+  const headless = yield* HeadlessRunRef
+  return {
+    directory: instance?.directory,
+    headless: Boolean(headless),
+    ...(headless?.maxDelayMs !== undefined ? { headlessMaxDelayMs: headless.maxDelayMs } : {}),
+  }
+})
+
 const ProbeResult = Schema.Struct({
   directory: Schema.optional(Schema.String),
   worktree: Schema.optional(Schema.String),
@@ -95,10 +111,17 @@ const ProbeResult = Schema.Struct({
   workspaceID: Schema.optional(Schema.String),
 })
 
+const HeadlessProbeResult = Schema.Struct({
+  directory: Schema.optional(Schema.String),
+  headless: Schema.Boolean,
+  headlessMaxDelayMs: Schema.optional(Schema.Number),
+})
+
 const ProbeApi = HttpApi.make("instance-context-probe").add(
   HttpApiGroup.make("probe")
     .add(
       HttpApiEndpoint.get("get", "/probe", { query: WorkspaceRoutingQuery, success: ProbeResult }),
+      HttpApiEndpoint.get("headless", "/headless-probe", { query: WorkspaceRoutingQuery, success: HeadlessProbeResult }),
       HttpApiEndpoint.get("session", "/session", { query: WorkspaceRoutingQuery, success: ProbeResult }),
       HttpApiEndpoint.post("dispose", "/dispose-probe", {
         query: WorkspaceRoutingQuery,
@@ -112,6 +135,7 @@ const ProbeApi = HttpApi.make("instance-context-probe").add(
 const probeHandlers = HttpApiBuilder.group(ProbeApi, "probe", (handlers) =>
   handlers
     .handle("get", () => probeInstanceContext)
+    .handle("headless", () => probeHeadlessContext)
     .handle("session", () => probeInstanceContext)
     .handle(
       "dispose",
@@ -347,6 +371,48 @@ describe("HttpApi instance context middleware", () => {
       expect(response.status).toBe(200)
       expect(yield* response.json).toBe(true)
       expect(yield* Fiber.join(disposed)).toEqual({ directory: workspaceDir, workspace: workspace.id })
+    }),
+  )
+
+  it.live("provides HeadlessRunRef only on requests carrying x-opencode-headless", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped({ git: true })
+      yield* serveProbe()
+
+      const normal = yield* HttpClientRequest.get("/headless-probe").pipe(
+        HttpClientRequest.setHeader("x-opencode-directory", dir),
+        HttpClientRequest.setHeader(HEADLESS_RETRY_MAX_DELAY_HEADER, "5000"),
+        HttpClient.execute,
+      )
+      expect(normal.status).toBe(200)
+      expect(yield* normal.json).toEqual({
+        directory: dir,
+        headless: false,
+      })
+
+      const headlessDefault = yield* HttpClientRequest.get("/headless-probe").pipe(
+        HttpClientRequest.setHeader("x-opencode-directory", dir),
+        HttpClientRequest.setHeader(HEADLESS_RUN_HEADER, "1"),
+        HttpClient.execute,
+      )
+      expect(headlessDefault.status).toBe(200)
+      expect(yield* headlessDefault.json).toEqual({
+        directory: dir,
+        headless: true,
+      })
+
+      const headlessOverride = yield* HttpClientRequest.get("/headless-probe").pipe(
+        HttpClientRequest.setHeader("x-opencode-directory", dir),
+        HttpClientRequest.setHeader(HEADLESS_RUN_HEADER, "1"),
+        HttpClientRequest.setHeader(HEADLESS_RETRY_MAX_DELAY_HEADER, "5000"),
+        HttpClient.execute,
+      )
+      expect(headlessOverride.status).toBe(200)
+      expect(yield* headlessOverride.json).toEqual({
+        directory: dir,
+        headless: true,
+        headlessMaxDelayMs: 5000,
+      })
     }),
   )
 })

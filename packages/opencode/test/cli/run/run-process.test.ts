@@ -5,6 +5,10 @@
 // `OPENCODE_CONFIG_CONTENT` providing the test provider config inline.
 import { describe, expect } from "bun:test"
 import { Effect } from "effect"
+import fs from "node:fs/promises"
+import os from "node:os"
+import path from "node:path"
+import { Filesystem } from "../../../src/util/filesystem"
 import { raw, reply } from "../../lib/llm-server"
 import { cliIt } from "../../lib/cli-process"
 
@@ -467,5 +471,38 @@ describe("opencode run (non-interactive subprocess)", () => {
         expect(result.durationMs).toBeLessThan(30_000)
       }),
     30_000,
+  )
+
+  cliIt.live(
+    "uses the child working directory instead of an inherited parent PWD when --dir is omitted",
+    ({ home, llm, opencode }) =>
+      Effect.gen(function* () {
+        const stalePwd = yield* Effect.acquireRelease(
+          Effect.promise(() => fs.mkdtemp(path.join(os.tmpdir(), "oc-stale-pwd-"))),
+          (dir) => Effect.promise(() => fs.rm(dir, { recursive: true, force: true })).pipe(Effect.ignore),
+        )
+        yield* llm.tool("bash", {
+          command: 'bun -e "console.log(process.cwd())"',
+          description: "Print session working directory",
+        })
+        yield* llm.text("directory checked")
+
+        const result = yield* opencode.run("check session directory", {
+          env: { PWD: stalePwd },
+          format: "json",
+          printLogs: true,
+          permission: { bash: "allow" },
+          timeoutMs: 25_000,
+        })
+
+        opencode.expectExit(result, 0)
+        const events = opencode.parseJsonEvents(result.stdout)
+        const toolEvent = events.find((event) => event.type === "tool_use") as
+          | { part?: { state?: { output?: string } } }
+          | undefined
+        expect(Filesystem.resolve(toolEvent?.part?.state?.output?.trim() ?? "")).toBe(Filesystem.resolve(home))
+        expect(result.stderr).not.toContain(path.basename(stalePwd))
+      }),
+    60_000,
   )
 })

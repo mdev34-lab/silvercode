@@ -26,6 +26,8 @@ import { RepetitionGuard } from "./llm/repetition-guard"
 import { errorMessage } from "@/util/error"
 import { isRecord } from "@/util/record"
 import { EventV2Bridge } from "@/event-v2-bridge"
+import { HeadlessRunRef } from "@/effect/instance-ref"
+import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Database } from "@opencode-ai/core/database/database"
 import { Usage, type LLMEvent } from "@opencode-ai/llm"
 import { createGenerationClock } from "./generation-metrics"
@@ -101,6 +103,7 @@ const layer = Layer.effect(
     const status = yield* SessionStatus.Service
     const image = yield* Image.Service
     const events = yield* EventV2Bridge.Service
+    const flags = yield* RuntimeFlags.Service
     const database = yield* Database.Service
 
     const create = Effect.fn("SessionProcessor.create")(function* (input: Input) {
@@ -747,6 +750,10 @@ const layer = Layer.effect(
         // Counts scheduled retries so a terminal error can say the turn did
         // not die on the first failure.
         const retryAttempts = yield* Ref.make(0)
+        const headless = yield* HeadlessRunRef
+        const maxDelay = headless
+          ? (headless.maxDelayMs ?? flags.retryMaxDelayMs ?? SessionRetry.RETRY_HEADLESS_MAX_DELAY)
+          : undefined
 
         return yield* Effect.gen(function* () {
           yield* Effect.gen(function* () {
@@ -838,6 +845,7 @@ const layer = Layer.effect(
               SessionRetry.policy({
                 provider: input.model.providerID,
                 parse,
+                maxDelay,
                 set: (info) => {
                   return Effect.flatMap(Ref.update(retryAttempts, (n) => n + 1), () =>
                     status.set(ctx.sessionID, {
@@ -932,6 +940,7 @@ export const node = LayerNode.make({
     SessionStatus.node,
     Image.node,
     EventV2Bridge.node,
+    RuntimeFlags.node,
     Database.node,
   ],
 })
