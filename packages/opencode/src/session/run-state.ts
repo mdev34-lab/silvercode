@@ -13,7 +13,7 @@ export interface Interface {
   readonly cancel: (sessionID: SessionID) => Effect.Effect<void>
   readonly cancelForeground: (sessionID: SessionID) => Effect.Effect<void>
   readonly cancelBackground: (sessionID: SessionID) => Effect.Effect<void>
-  /** Counts foreground cancels of a session's active run; lets a queued caller tell it was cancelled. */
+  /** Counts every foreground cancel request, including idle-session cancels; lets a queued caller tell it was cancelled. */
   readonly cancelEpoch: (sessionID: SessionID) => Effect.Effect<number>
   /** Waits for any in-flight foreground cancellation of `sessionID` to finish settling. */
   readonly awaitCancel: (sessionID: SessionID) => Effect.Effect<void>
@@ -87,26 +87,37 @@ const layer = Layer.effect(
       data.epochs.set(sessionID, (data.epochs.get(sessionID) ?? 0) + 1)
     }
 
-    const cancelForegroundImpl = Effect.fnUntraced(function* (sessionID: SessionID, alreadyBumped: boolean) {
+    const cancelForegroundImpl = Effect.fnUntraced(function* (
+      sessionID: SessionID,
+      before: Effect.Effect<void> = Effect.void,
+    ) {
       const data = yield* InstanceState.get(state)
-      if (!alreadyBumped) bumpEpoch(data, sessionID)
-      const existing = data.runners.get(sessionID)
-      if (!existing) {
-        const inflight = data.cancelling.get(sessionID)
-        if (inflight) {
-          yield* Deferred.await(inflight)
-          return
-        }
-        yield* status.set(sessionID, { type: "idle" })
+      bumpEpoch(data, sessionID)
+      const inflight = data.cancelling.get(sessionID)
+      if (inflight) {
+        // A cancel already owns settlement. Running only the requested background
+        // pass also covers a full cancel arriving behind cancelForeground without
+        // making a re-entrant background finalizer wait on its own outer cancel.
+        yield* before
         return
       }
+      const existing = data.runners.get(sessionID)
+      // Register before background work so awaitCancel covers the whole cancellation.
       const done = yield* Deferred.make<void>()
-      const prev = data.cancelling.get(sessionID)
       data.cancelling.set(sessionID, done)
-      yield* existing.cancel.pipe(
+      yield* before.pipe(
+        Effect.andThen(
+          Effect.gen(function* () {
+            if (existing) {
+              yield* existing.cancel
+              return
+            }
+            if (data.runners.get(sessionID)?.busy) return
+            yield* status.set(sessionID, { type: "idle" })
+          }),
+        ),
         Effect.ensuring(
           Effect.gen(function* () {
-            if (prev) yield* Deferred.await(prev)
             if (data.cancelling.get(sessionID) === done) data.cancelling.delete(sessionID)
             yield* Deferred.succeed(done, void 0)
           }),
@@ -115,7 +126,7 @@ const layer = Layer.effect(
     })
 
     const cancelForeground = Effect.fn("SessionRunState.cancelForeground")(function* (sessionID: SessionID) {
-      yield* cancelForegroundImpl(sessionID, false)
+      yield* cancelForegroundImpl(sessionID)
     })
 
     const cancelEpoch = Effect.fn("SessionRunState.cancelEpoch")(function* (sessionID: SessionID) {
@@ -134,10 +145,7 @@ const layer = Layer.effect(
     })
 
     const cancel = Effect.fn("SessionRunState.cancel")(function* (sessionID: SessionID) {
-      const data = yield* InstanceState.get(state)
-      bumpEpoch(data, sessionID)
-      yield* cancelBackground(sessionID)
-      yield* cancelForegroundImpl(sessionID, true)
+      yield* cancelForegroundImpl(sessionID, cancelBackground(sessionID))
     })
 
     const ensureRunning = Effect.fn("SessionRunState.ensureRunning")(function* (
