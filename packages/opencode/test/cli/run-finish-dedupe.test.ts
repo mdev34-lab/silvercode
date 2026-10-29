@@ -15,4 +15,29 @@ describe("withoutRepeatedResult", () => {
   test("keeps a result that adds something new", () => {
     expect(withoutRepeatedResult(`Fixed calc.py\n\n${status}`, "OK")).toBeUndefined()
   })
+
+  test("drops a repeated multi-paragraph result and keeps the status line", () => {
+    const answer = "First paragraph.\n\nSecond paragraph."
+    expect(withoutRepeatedResult(`${answer}\n\n${status}`, answer)).toBe(status)
+    expect(withoutRepeatedResult(answer, answer)).toBe("")
+  })
+
+  test("keeps new paragraphs after a repeated multi-paragraph result", () => {
+    const answer = "First paragraph.\n\nSecond paragraph."
+    expect(withoutRepeatedResult(`${answer}\n\nAdditional detail.\n\n${status}`, answer)).toBe(
+      `Additional detail.\n\n${status}`,
+    )
+  })
+
+  test("does not remove a prefix from a different result", () => {
+    expect(withoutRepeatedResult(`OK but not finished\n\n${status}`, "OK")).toBeUndefined()
+    expect(
+      withoutRepeatedResult(`First.\n\nSecond, with more detail.\n\n${status}`, "First.\n\nSecond"),
+    ).toBeUndefined()
+  })
+
+  test("recognizes whitespace and CRLF around the paragraph boundary", () => {
+    const answer = "First paragraph.\r\n\r\nSecond paragraph."
+    expect(withoutRepeatedResult(` ${answer}  \r\n \r\n${status} `, answer)).toBe(status)
+  })
 })

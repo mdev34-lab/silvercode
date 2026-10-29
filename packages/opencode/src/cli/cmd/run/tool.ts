@@ -1804,10 +1804,14 @@ export function toolFiletype(input?: string): string | undefined {
 }
 
 // A finish body is the result, then a blank line and the effort/review status
-// line. When the result only repeats text the run already printed, return what
-// is left (possibly empty); otherwise undefined.
+// line. When the result begins with text the run already printed, return what
+// is left (possibly empty); otherwise undefined. The printed text can itself
+// contain blank lines, so compare it before looking for the separator.
 export function withoutRepeatedResult(body: string, printed: string): string | undefined {
-  const [result = "", ...rest] = body.split(/\n\s*\n/)
-  if (result.trim() !== printed.trim()) return undefined
-  return rest.join("\n\n").trim()
+  const result = body.trim()
+  const text = printed.trim()
+  if (!text || !result.startsWith(text)) return undefined
+  const rest = result.slice(text.length)
+  if (rest && !/^[^\S\n]*\n\s*\n/.test(rest)) return undefined
+  return rest.trim()
 }
