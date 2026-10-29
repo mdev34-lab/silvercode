@@ -385,6 +385,7 @@ export type TextPart = {
   messageID: string
   type: "text"
   text: string
+  recovery?: "orphaned"
   synthetic?: boolean
   ignored?: boolean
   time?: {
@@ -417,6 +418,7 @@ export type ReasoningPart = {
   messageID: string
   type: "reasoning"
   text: string
+  recovery?: "orphaned"
   metadata?: {
     [key: string]: unknown
   }

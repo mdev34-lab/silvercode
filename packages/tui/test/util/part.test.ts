@@ -361,7 +361,7 @@ test("a same-length conflicting terminal snapshot is not accepted either", () =>
   expect(partText(parts[0])).toBe("Hello world!")
 })
 
-test("the terminal text-end snapshot is the only non-cumulative write allowed", () => {
+test("the terminal text-end snapshot can rewrite streamed content", () => {
   // The `experimental.text.complete` plugin rewrites the final text; the
   // processor publishes that rewrite together with `time.end` in the
   // `text-end` snapshot. That snapshot is causally newer than the deltas.
@@ -565,11 +565,57 @@ test("a finished part is not reopened by a shorter non-terminal snapshot", () =>
 })
 
 test("a second terminal snapshot with different text cannot replace the first", () => {
-  // The processor publishes the terminal (`text-end`) snapshot exactly once,
-  // so a second terminal row with different text has no causal ordering.
+  // A second terminal row with different text has no known causal ordering,
+  // including when an orphan settlement snapshot is replayed.
   let parts = applyPartUpdated(undefined, text({ text: "final answer", time: { start: 1, end: 100 } }))
   const original = parts[0]
   parts = applyPartUpdated(parts, text({ text: "final answer plus stale stuff", time: { start: 1, end: 200 } }))
   expect(parts[0]).toBe(original)
   expect(partText(parts[0])).toBe("final answer")
+})
+
+test.each(["text", "reasoning"] as const)(
+  "orphan settlement makes %s terminal without truncating streamed text",
+  (type) => {
+    const initial = type === "text" ? text({ time: { start: 1 } }) : reasoning({ time: { start: 1 } })
+    let parts = applyPartUpdated(undefined, initial)
+    const original = parts[0]
+    parts = applyPartDelta(parts, "part-1", "text", "streamed content")!
+    const recovered = {
+      ...initial,
+      text: "streamed",
+      time: { start: 9, end: 10 },
+      recovery: "orphaned" as const,
+    }
+    parts = applyPartUpdated(parts, recovered)
+    expect(parts[0]).toBe(original)
+    expect(parts[0]).toMatchObject({ text: "streamed content", time: { start: 1, end: 10 } })
+    parts = applyPartDelta(parts, "part-1", "text", " stale")!
+    parts = applyPartUpdated(parts, { ...initial, text: "streamed content plus stale" })
+    expect(parts[0]).toMatchObject({ text: "streamed content", time: { start: 1, end: 10 } })
+  },
+)
+
+test.each(["Hello", ""])(
+  "a stale nonterminal recovery marker cannot poison a terminal plugin rewrite: %j",
+  (rewritten) => {
+    let parts = applyPartUpdated(undefined, { ...text({ time: { start: 1 } }), recovery: "orphaned" })
+    parts = applyPartDelta(parts, "part-1", "text", "Hello secret")!
+    parts = applyPartUpdated(
+      parts,
+      text({ text: rewritten, time: { start: 1, end: 2 }, metadata: { "opencode.orphaned": true } }),
+    )
+    expect(parts[0]).toMatchObject({ text: rewritten, time: { start: 1, end: 2 } })
+    expect((parts[0] as TextPart).recovery).toBeUndefined()
+  },
+)
+
+test("an orphan snapshot adopts a durable extension or the only available text", () => {
+  const recovered = text({ text: "partial durable text", time: { start: 1, end: 2 }, recovery: "orphaned" })
+  expect(mergePartText(undefined, recovered)).toBe(recovered)
+  expect(mergePartText(text({ text: "partial", time: { start: 1 } }), recovered)).toBe(recovered)
+  expect(mergePartText(text({ text: "different live text", time: { start: 1 } }), recovered)).toMatchObject({
+    text: "different live text",
+    time: { start: 1, end: 2 },
+  })
 })

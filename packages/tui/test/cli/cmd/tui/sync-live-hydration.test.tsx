@@ -283,3 +283,55 @@ test("a message removed during hydration does not regain stale parts", async () 
     app.renderer.destroy()
   }
 })
+
+test.each([
+  { name: "orphan recovery", incoming: "", recovery: "orphaned" as const, expected: "streamed secret" },
+  { name: "plugin deletion", incoming: "", recovery: undefined, expected: "" },
+  { name: "plugin prefix", incoming: "streamed", recovery: undefined, expected: "streamed" },
+])("hydration reconciles terminal $name", async ({ incoming, recovery, expected }) => {
+  await using tmp = await tmpdir()
+  await Bun.write(`${tmp.path}/kv.json`, "{}")
+  const terminal = {
+    id: partID,
+    sessionID,
+    messageID,
+    type: "text",
+    text: incoming,
+    time: { start: 1, end: 2 },
+    recovery,
+    metadata: { "opencode.orphaned": true },
+  }
+  const { app, emit, sync } = await mount((url) => {
+    if (url.pathname === `/session/${sessionID}`) return json(session)
+    if (url.pathname === `/session/${sessionID}/message`) return json([{ info: assistant, parts: [terminal] }])
+    if (url.pathname === `/session/${sessionID}/todo` || url.pathname === `/session/${sessionID}/diff`) return json([])
+    return undefined
+  }, tmp.path)
+  try {
+    emit(
+      global({
+        id: "start",
+        type: "message.part.updated",
+        properties: {
+          sessionID,
+          time: 1,
+          part: { id: partID, sessionID, messageID, type: "text", text: "", time: { start: 1 } },
+        },
+      }),
+    )
+    emit(
+      global({
+        id: "delta",
+        type: "message.part.delta",
+        properties: { sessionID, messageID, partID, field: "text", delta: "streamed secret" },
+      }),
+    )
+    await wait(
+      () => sync.data.part[messageID]?.[0]?.type === "text" && sync.data.part[messageID][0].text === "streamed secret",
+    )
+    await sync.session.sync(sessionID)
+    expect(sync.data.part[messageID][0]).toMatchObject({ text: expected, time: { start: 1, end: 2 } })
+  } finally {
+    app.renderer.destroy()
+  }
+})
