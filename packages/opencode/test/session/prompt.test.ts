@@ -5616,6 +5616,80 @@ it.instance(
   10_000,
 )
 
+noLLMServer.instance("cancel settles when a background interrupt finalizer re-enters cancel", () =>
+  Effect.gen(function* () {
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const background = yield* BackgroundJob.Service
+    const chat = yield* sessions.create({ title: "Pinned" })
+
+    yield* background.start({
+      id: chat.id,
+      type: "task",
+      metadata: { sessionId: chat.id },
+      run: Effect.never.pipe(Effect.onInterrupt(() => prompt.cancel(chat.id))),
+    })
+
+    yield* awaitWithTimeout(
+      prompt.cancel(chat.id),
+      "cancel deadlocked while a background interrupt finalizer re-entered cancel",
+      "1 second",
+    )
+    expect((yield* background.get(chat.id))?.status).toBe("cancelled")
+  }),
+)
+
+it.instance(
+  "cancel during background teardown does not mark a replacement run idle",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const status = yield* SessionStatus.Service
+      const background = yield* BackgroundJob.Service
+      const chat = yield* sessions.create({ title: "Pinned" })
+      const interruptingBackground = yield* Deferred.make<void>()
+      const releaseBackground = yield* Deferred.make<void>()
+
+      yield* background.start({
+        id: chat.id,
+        type: "task",
+        metadata: { sessionId: chat.id },
+        run: Effect.never.pipe(
+          Effect.onInterrupt(() =>
+            Deferred.succeed(interruptingBackground, void 0).pipe(Effect.andThen(Deferred.await(releaseBackground))),
+          ),
+        ),
+      })
+      yield* llm.hang
+
+      const cancelling = yield* prompt.cancel(chat.id).pipe(Effect.forkChild)
+      yield* awaitWithTimeout(
+        Deferred.await(interruptingBackground),
+        "timed out waiting for background job interruption",
+      )
+
+      // The session was idle when cancel began. A prompt submitted after that
+      // cancel must be allowed to become the replacement run while teardown is
+      // still yielding.
+      const replacement = yield* prompt
+        .prompt({ sessionID: chat.id, agent: "work", model: ref, parts: [{ type: "text", text: "replacement" }] })
+        .pipe(Effect.forkChild)
+      yield* llm.wait(1)
+      yield* waitForBusy(chat.id)
+
+      yield* Deferred.succeed(releaseBackground, void 0)
+      yield* Fiber.join(cancelling)
+      const statusAfterCancel = (yield* status.get(chat.id)).type
+
+      yield* prompt.cancel(chat.id)
+      yield* Fiber.await(replacement)
+      expect(statusAfterCancel).toBe("busy")
+    }),
+  10_000,
+)
+
 it.instance(
   "prompt cancelled during preparation returns an aborted assistant for its own user message",
   () =>
