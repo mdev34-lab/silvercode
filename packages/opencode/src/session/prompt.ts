@@ -1870,7 +1870,11 @@ const layer = Layer.effect(
           }
           if ((part.type === "text" || part.type === "reasoning") && part.time?.end === undefined) {
             yield* sessions
-              .updatePart({ ...part, time: { start: part.time?.start ?? now, end: now } } as SessionV1.Part)
+              .updatePart({
+                ...part,
+                recovery: "orphaned",
+                time: { start: part.time?.start ?? now, end: now },
+              } as SessionV1.Part)
               .pipe(Effect.catch((error) => Effect.logWarning("failed to settle orphaned text part", { error })))
           }
         }

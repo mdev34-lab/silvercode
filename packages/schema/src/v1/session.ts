@@ -103,6 +103,8 @@ export const TextPart = Schema.Struct({
   ...partBase,
   type: Schema.Literal("text"),
   text: Schema.String,
+  // Orphan settlement closes a durable snapshot that may lag published deltas.
+  recovery: optional(Schema.Literal("orphaned")),
   synthetic: Schema.optional(Schema.Boolean),
   ignored: Schema.optional(Schema.Boolean),
   time: Schema.optional(
@@ -148,6 +150,7 @@ export const ReasoningPart = Schema.Struct({
   ...partBase,
   type: Schema.Literal("reasoning"),
   text: Schema.String,
+  recovery: optional(Schema.Literal("orphaned")),
   metadata: Schema.optional(Schema.Record(Schema.String, Schema.Any)),
   time: Schema.Struct({
     start: NonNegativeInt,

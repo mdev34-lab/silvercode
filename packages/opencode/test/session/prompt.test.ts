@@ -1,4 +1,6 @@
 import { ToolCatalog } from "@/tool/catalog"
+import { applyPartDelta, applyPartUpdated } from "../../../tui/src/util/part"
+import type { Part } from "@opencode-ai/sdk/v2"
 import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Database } from "@opencode-ai/core/database/database"
@@ -7,7 +9,7 @@ import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { eq } from "drizzle-orm"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { expect } from "bun:test"
-import { Cause, Deferred, Duration, Effect, Exit, Fiber, Layer } from "effect"
+import { Cause, Deferred, Duration, Effect, Exit, Fiber, Layer, Schema } from "effect"
 import path from "path"
 import { fileURLToPath } from "url"
 import { readdir, readFile } from "node:fs/promises"
@@ -2017,6 +2019,84 @@ noLLMServer.instance(
       expect(result.info.id).toBe(seeded.assistant.id)
     }),
   { config: { ...cfg, agent: { work: { finishTool: true } } } },
+)
+
+it.instance("settling durable orphans preserves streamed text in a live consumer", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const events = yield* EventV2Bridge.Service
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Pinned" })
+    const seeded = yield* seed(chat.id, { finish: "tool-calls" })
+    let parts: Part[] | undefined
+    const off = yield* events.listen((event) => {
+      if (event.type === MessageV2.Event.PartUpdated.type) {
+        const data = event.data as typeof MessageV2.Event.PartUpdated.data.Type
+        if (data.part.messageID === seeded.assistant.id) parts = applyPartUpdated(parts, data.part as Part)
+      }
+      if (event.type === MessageV2.Event.PartDelta.type) {
+        const data = event.data as typeof MessageV2.Event.PartDelta.data.Type
+        if (data.messageID === seeded.assistant.id) parts = applyPartDelta(parts, data.partID, data.field, data.delta)
+      }
+      return Effect.void
+    })
+    const cases = (["text", "reasoning"] as const).flatMap((type) =>
+      ["", "streamed "].map((durable) => ({ type, durable, id: PartID.ascending() })),
+    )
+    for (const item of cases) {
+      yield* sessions.updatePart({
+        id: item.id,
+        sessionID: chat.id,
+        messageID: seeded.assistant.id,
+        type: item.type,
+        text: item.durable,
+        time: { start: 1 },
+        metadata: { source: "provider" },
+      })
+      yield* sessions.updatePartDelta({
+        sessionID: chat.id,
+        messageID: seeded.assistant.id,
+        partID: item.id,
+        field: "text",
+        delta: item.durable ? item.type : `streamed ${item.type}`,
+      })
+    }
+    const before = yield* sessions.messages({ sessionID: chat.id })
+    const durable = before.find((msg) => msg.info.id === seeded.assistant.id)!
+    expect(
+      durable.parts
+        .filter((part) => cases.some((item) => item.id === part.id))
+        .map((part) => ("text" in part ? part.text : null)),
+    ).toEqual(cases.map((item) => item.durable))
+    const identities = parts!.slice()
+    yield* llm.text("recovered")
+    yield* prompt.loop({ sessionID: chat.id })
+    yield* off
+    const after = yield* sessions.messages({ sessionID: chat.id })
+    const stored = after.find((msg) => msg.info.id === seeded.assistant.id)!
+    // Exercise the public schema's JSON encoding and decoding, not just the DB row.
+    const encoded = Schema.encodeSync(SessionV1.WithParts)(stored)
+    const decoded = Schema.decodeUnknownSync(SessionV1.WithParts)(JSON.parse(JSON.stringify(encoded)))
+    for (const [index, item] of cases.entries()) {
+      const current = parts!.find((part) => part.id === item.id)!
+      expect(current).toBe(identities[index])
+      expect(current).toMatchObject({
+        id: item.id,
+        type: item.type,
+        text: `streamed ${item.type}`,
+        time: { start: 1, end: expect.any(Number) },
+        recovery: "orphaned",
+        metadata: { source: "provider" },
+      })
+      expect(decoded.parts.find((part) => part.id === item.id)).toMatchObject({
+        text: item.durable,
+        recovery: "orphaned",
+        metadata: { source: "provider" },
+        time: { start: 1, end: expect.any(Number) },
+      })
+    }
+  }),
 )
 
 it.instance(

@@ -33,7 +33,7 @@ import { batch, onMount } from "solid-js"
 import path from "path"
 import { useKV } from "./kv"
 import { usePermission } from "./permission"
-import { applyPartDelta, applyPartUpdated } from "../util/part"
+import { applyPartDelta, applyPartUpdated, mergePartInPlace, mergePartText } from "../util/part"
 
 const emptyConsoleState: ConsoleState = {
   consoleManagedProviders: [],
@@ -645,14 +645,8 @@ export const {
                   const parts = message.parts.flatMap((part) => {
                     const current = currentParts.find((item) => item.id === part.id)
                     if (tracker.parts.has(part.id)) return current ? [current] : []
-                    if (
-                      current &&
-                      (part.type === "text" || part.type === "reasoning") &&
-                      (current.type === "text" || current.type === "reasoning") &&
-                      part.text.length === 0 &&
-                      current.text.length > 0
-                    ) {
-                      return [current]
+                    if (current && part.type === current.type && (part.type === "text" || part.type === "reasoning")) {
+                      return [mergePartInPlace(current, mergePartText(current, part))]
                     }
                     return [part]
                   })

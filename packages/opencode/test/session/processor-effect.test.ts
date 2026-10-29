@@ -1,4 +1,7 @@
 import { SessionV1 } from "@opencode-ai/core/v1/session"
+import { applyPartDelta, applyPartUpdated } from "../../../tui/src/util/part"
+import type { Part } from "@opencode-ai/sdk/v2"
+import { pathToFileURL } from "url"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { Database } from "@opencode-ai/core/database/database"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
@@ -1245,6 +1248,63 @@ const runProcessor = Effect.fn("test.runProcessor")(function* (dir: string, text
   const stored = yield* MessageV2.get({ sessionID: chat.id, messageID: msg.id })
   return { value, handle, stored }
 })
+
+
+it.live("text-complete plugins can truncate or delete streamed text", () =>
+  provideTmpdirServer(
+    ({ dir, llm }) =>
+      Effect.gen(function* () {
+        const file = path.join(dir, "rewrite-plugin.ts")
+        yield* Effect.promise(() =>
+          Bun.write(
+            file,
+            `export default async () => ({
+          "experimental.text.complete": async (_input, output) => {
+            output.text = output.text.endsWith("prefix") ? "Hello" : ""
+          },
+        })`,
+          ),
+        )
+        yield* Effect.promise(() =>
+          Bun.write(
+            path.join(dir, "opencode.json"),
+            JSON.stringify({
+              ...providerCfg(llm.url),
+              plugin: [pathToFileURL(file).href],
+            }),
+          ),
+        )
+        const events = yield* EventV2Bridge.Service
+        const seen = new Map<string, Part[]>()
+        const off = yield* events.listen((event) => {
+          if (event.type === MessageV2.Event.PartUpdated.type) {
+            const data = event.data as typeof MessageV2.Event.PartUpdated.data.Type
+            seen.set(data.part.messageID, applyPartUpdated(seen.get(data.part.messageID), data.part as Part))
+          }
+          if (event.type === MessageV2.Event.PartDelta.type) {
+            const data = event.data as typeof MessageV2.Event.PartDelta.data.Type
+            const parts = applyPartDelta(seen.get(data.messageID), data.partID, data.field, data.delta)
+            if (parts) seen.set(data.messageID, parts)
+          }
+          return Effect.void
+        })
+        for (const [input, expected] of [
+          ["Hello secret prefix", "Hello"],
+          ["Hello secret deletion", ""],
+        ]) {
+          yield* llm.text(input)
+          const result = yield* runProcessor(dir, "hi")
+          const stored = result.stored.parts.find((part) => part.type === "text")
+          expect(stored).toMatchObject({ text: expected, time: { end: expect.any(Number) } })
+          expect(seen.get(result.stored.info.id)?.find((part) => part.type === "text")).toMatchObject({
+            text: expected,
+          })
+        }
+        yield* off
+      }),
+    { config: (url) => providerCfg(url) },
+  ),
+)
 
 const itStreamingMetrics = processorWithLLM(() =>
   delayedEvents([
