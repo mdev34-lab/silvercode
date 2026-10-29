@@ -5109,6 +5109,373 @@ it.instance(
   10_000,
 )
 
+it.instance(
+  "queued prompt cancelled as soon as its user message is persisted does not start a run after cancel",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const events = yield* EventV2Bridge.Service
+      const chat = yield* sessions.create({ title: "Pinned" })
+
+      yield* llm.hang
+      yield* llm.text("fresh")
+
+      const a = yield* prompt
+        .prompt({ sessionID: chat.id, agent: "work", model: ref, parts: [{ type: "text", text: "first" }] })
+        .pipe(Effect.forkChild)
+      yield* llm.wait(1)
+      yield* waitForBusy(chat.id)
+
+      const secondID = MessageID.ascending()
+      const persisted = yield* Deferred.make<void>()
+      const release = yield* Deferred.make<void>()
+      const off = yield* events.listen((event) => {
+        if (event.type !== SessionV1.Event.MessageUpdated.type) return Effect.void
+        if (typeof event.data !== "object" || event.data === null) return Effect.void
+        const sessionID = "sessionID" in event.data ? event.data.sessionID : undefined
+        const info = "info" in event.data && typeof event.data.info === "object" ? event.data.info : null
+        const id = info && "id" in info ? info.id : undefined
+        if (sessionID !== chat.id || id !== secondID) return Effect.void
+        return Deferred.succeed(persisted, void 0).pipe(Effect.andThen(Deferred.await(release)))
+      })
+      yield* Effect.addFinalizer(() => off)
+
+      const b = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          messageID: secondID,
+          agent: "work",
+          model: ref,
+          parts: [{ type: "text", text: "second" }],
+        })
+        .pipe(Effect.forkChild)
+
+      yield* awaitWithTimeout(Deferred.await(persisted), "timed out waiting for queued message to persist")
+      yield* prompt.cancel(chat.id)
+      yield* Deferred.succeed(release, void 0)
+
+      const [exitA, exitB] = yield* Effect.all([Fiber.await(a), Fiber.await(b)])
+      expect(Exit.isSuccess(exitA)).toBe(true)
+      expect(Exit.isSuccess(exitB)).toBe(true)
+      if (Exit.isSuccess(exitB)) {
+        expect(exitB.value.info.role).toBe("assistant")
+        if (exitB.value.info.role === "assistant") {
+          expect(exitB.value.info.error?.name).toBe("MessageAbortedError")
+        }
+      }
+      // The queued prompt must not consume the pre-queued "fresh" reply after cancel.
+      expect(yield* llm.hits).toHaveLength(1)
+
+      const interrupted = yield* abortedIDs(chat.id)
+      expect(interrupted).toHaveLength(1)
+
+      const result = yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "work",
+        model: ref,
+        parts: [{ type: "text", text: "after" }],
+      })
+      yield* expectFreshRun(chat.id, result, interrupted)
+      expect(yield* llm.hits).toHaveLength(2)
+    }),
+  10_000,
+)
+
+it.instance(
+  "queued prompt cancelled while resolving a file part does not start a run after cancel",
+  () =>
+    Effect.gen(function* () {
+      const { dir, llm } = yield* useServerConfig(providerCfg)
+      const registry = yield* ToolRegistry.Service
+      const { read } = yield* registry.named()
+      const reading = yield* Deferred.make<void>()
+      const releaseRead = yield* Deferred.make<void>()
+      const original = read.execute.bind(read)
+      read.execute = (args, ctx) =>
+        Deferred.succeed(reading, void 0).pipe(
+          Effect.andThen(Deferred.await(releaseRead)),
+          Effect.andThen(original(args, ctx)),
+        )
+      yield* Effect.addFinalizer(() => Effect.sync(() => void (read.execute = original)))
+
+      const noteFile = path.join(dir, "queued-note.txt")
+      yield* writeText(noteFile, "queued context\n")
+
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Pinned" })
+
+      yield* llm.hang
+      yield* llm.text("fresh")
+
+      const a = yield* prompt
+        .prompt({ sessionID: chat.id, agent: "work", model: ref, parts: [{ type: "text", text: "first" }] })
+        .pipe(Effect.forkChild)
+      yield* llm.wait(1)
+      yield* waitForBusy(chat.id)
+
+      const b = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          agent: "work",
+          model: ref,
+          parts: [
+            { type: "text", text: "second with file" },
+            { type: "file", url: `file://${noteFile}`, filename: "queued-note.txt", mime: "text/plain" },
+          ],
+        })
+        .pipe(Effect.forkChild)
+
+      yield* awaitWithTimeout(Deferred.await(reading), "timed out waiting for queued file resolution")
+      yield* prompt.cancel(chat.id)
+      yield* Deferred.succeed(releaseRead, void 0)
+
+      const [exitA, exitB] = yield* Effect.all([Fiber.await(a), Fiber.await(b)])
+      expect(Exit.isSuccess(exitA)).toBe(true)
+      expect(Exit.isSuccess(exitB)).toBe(true)
+      expect(yield* llm.hits).toHaveLength(1)
+
+      const interrupted = yield* abortedIDs(chat.id)
+      const result = yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "work",
+        model: ref,
+        parts: [{ type: "text", text: "after" }],
+      })
+      yield* expectFreshRun(chat.id, result, interrupted)
+      expect(yield* llm.hits).toHaveLength(2)
+    }),
+  10_000,
+)
+
+it.instance(
+  "cancel on an idle session while a prompt or command is still preparing prevents a provider run",
+  () =>
+    Effect.gen(function* () {
+      const { dir, llm } = yield* useServerConfig((url) => ({
+        ...providerCfg(url),
+        command: {
+          slowcmd: {
+            template: "Read @idle-note.txt",
+          },
+        },
+      }))
+      const registry = yield* ToolRegistry.Service
+      const { read } = yield* registry.named()
+      const reading = yield* Deferred.make<void>()
+      const releaseRead = yield* Deferred.make<void>()
+      const original = read.execute.bind(read)
+      read.execute = (args, ctx) =>
+        Deferred.succeed(reading, void 0).pipe(
+          Effect.andThen(Deferred.await(releaseRead)),
+          Effect.andThen(original(args, ctx)),
+        )
+      yield* Effect.addFinalizer(() => Effect.sync(() => void (read.execute = original)))
+
+      const noteFile = path.join(dir, "idle-note.txt")
+      yield* writeText(noteFile, "idle context\n")
+
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Pinned" })
+
+      yield* llm.text("fresh")
+
+      const first = yield* prompt
+        .command({
+          sessionID: chat.id,
+          command: "slowcmd",
+          arguments: "",
+          agent: "work",
+          model: `${ref.providerID}/${ref.modelID}`,
+        })
+        .pipe(Effect.forkChild)
+
+      yield* awaitWithTimeout(Deferred.await(reading), "timed out waiting for command file resolution")
+      // No runner exists yet because ensureRunning has not been called.
+      yield* prompt.cancel(chat.id)
+      yield* Deferred.succeed(releaseRead, void 0)
+
+      const exit = yield* Fiber.await(first)
+      expect(Exit.isSuccess(exit)).toBe(true)
+      expect(yield* llm.hits).toHaveLength(0)
+
+      const result = yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "work",
+        model: ref,
+        parts: [{ type: "text", text: "after" }],
+      })
+      yield* expectFreshRun(chat.id, result, [])
+      expect(yield* llm.hits).toHaveLength(1)
+    }),
+  { git: true },
+  10_000,
+)
+
+it.instance(
+  "cancel during loop handoff after an errored run prevents a queued prompt from starting a fresh run",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const events = yield* EventV2Bridge.Service
+      const chat = yield* sessions.create({ title: "Pinned" })
+
+      const gate = yield* Deferred.make<void>()
+      yield* llm.push(reply().wait(deferredAsPromise(gate)).text("partial").contentFilter())
+      yield* llm.text("fresh")
+
+      const a = yield* prompt
+        .prompt({ sessionID: chat.id, agent: "work", model: ref, parts: [{ type: "text", text: "first" }] })
+        .pipe(Effect.forkChild)
+      yield* llm.wait(1)
+      yield* waitForBusy(chat.id)
+
+      const secondID = MessageID.ascending()
+      const b = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          messageID: secondID,
+          agent: "work",
+          model: ref,
+          parts: [{ type: "text", text: "second" }],
+        })
+        .pipe(Effect.forkChild)
+
+      yield* pollWithTimeout(
+        sessions
+          .messages({ sessionID: chat.id })
+          .pipe(Effect.map((msgs) => (msgs.some((m) => m.info.id === secondID) ? (true as const) : undefined))),
+        "timed out waiting for second prompt to persist",
+      )
+
+      // When run 1 finishes with a content-filter error, Runner.onIdle deletes
+      // the runner and publishes Idle before the queued caller re-enters
+      // ensureRunning. Cancelling in that handoff gap must still prevent a fresh run.
+      let cancelledInGap = false
+      const off = yield* events.listen((event) => {
+        if (cancelledInGap || event.type !== SessionStatus.Event.Idle.type) return Effect.void
+        if (typeof event.data !== "object" || event.data === null) return Effect.void
+        const sessionID = "sessionID" in event.data ? event.data.sessionID : undefined
+        if (sessionID !== chat.id) return Effect.void
+        cancelledInGap = true
+        return prompt.cancelForeground(chat.id)
+      })
+      yield* Effect.addFinalizer(() => off)
+
+      yield* Deferred.succeed(gate, void 0)
+
+      const [exitA, exitB] = yield* Effect.all([Fiber.await(a), Fiber.await(b)])
+      expect(Exit.isSuccess(exitA)).toBe(true)
+      expect(Exit.isSuccess(exitB)).toBe(true)
+      expect(cancelledInGap).toBe(true)
+      expect(yield* llm.hits).toHaveLength(1)
+    }),
+  10_000,
+)
+
+it.instance(
+  "queued prompt finishing preparation during an in-flight cancel waits for the interrupted assistant to settle",
+  () =>
+    Effect.gen(function* () {
+      const { dir, llm } = yield* useServerConfig(providerCfg)
+      const registry = yield* ToolRegistry.Service
+      const { read } = yield* registry.named()
+      const runFile = path.join(dir, "run.txt")
+      const queuedFile = path.join(dir, "queued.txt")
+      yield* writeText(runFile, "run\n")
+      yield* writeText(queuedFile, "queued\n")
+
+      const toolStarted = yield* Deferred.make<void>()
+      const interruptingRun = yield* Deferred.make<void>()
+      const releaseInterrupt = yield* Deferred.make<void>()
+      const queuedReading = yield* Deferred.make<void>()
+      const releaseQueuedRead = yield* Deferred.make<void>()
+      const original = read.execute.bind(read)
+      read.execute = (args, ctx) => {
+        if (args.filePath.endsWith("run.txt")) {
+          return Deferred.succeed(toolStarted, void 0).pipe(
+            Effect.andThen(Effect.never),
+            Effect.onInterrupt(() =>
+              Deferred.succeed(interruptingRun, void 0).pipe(Effect.andThen(Deferred.await(releaseInterrupt))),
+            ),
+          )
+        }
+        return Deferred.succeed(queuedReading, void 0).pipe(
+          Effect.andThen(Deferred.await(releaseQueuedRead)),
+          Effect.andThen(original(args, ctx)),
+        )
+      }
+      yield* Effect.addFinalizer(() => Effect.sync(() => void (read.execute = original)))
+
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Pinned" })
+
+      yield* llm.tool("read", { filePath: runFile })
+      yield* llm.text("unexpected")
+
+      const a = yield* prompt
+        .prompt({ sessionID: chat.id, agent: "work", model: ref, parts: [{ type: "text", text: "first" }] })
+        .pipe(Effect.forkChild)
+      yield* awaitWithTimeout(Deferred.await(toolStarted), "timed out waiting for active tool call")
+
+      const secondID = MessageID.ascending()
+      const b = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          messageID: secondID,
+          agent: "work",
+          model: ref,
+          parts: [
+            { type: "text", text: "second" },
+            { type: "file", url: `file://${queuedFile}`, filename: "queued.txt", mime: "text/plain" },
+          ],
+        })
+        .pipe(Effect.forkChild)
+      yield* awaitWithTimeout(Deferred.await(queuedReading), "timed out waiting for queued file read")
+
+      // Fork cancel so Runner.cancel drops the runner to Idle and enters Fiber.interrupt
+      // while the interrupted assistant has not settled yet.
+      const cancelFiber = yield* prompt.cancel(chat.id).pipe(Effect.forkChild)
+      yield* awaitWithTimeout(Deferred.await(interruptingRun), "timed out waiting for run interruption")
+
+      // Let the queued prompt finish createUserMessage and enter loop while cancel is still in flight.
+      yield* Deferred.succeed(releaseQueuedRead, void 0)
+      yield* pollWithTimeout(
+        sessions
+          .messages({ sessionID: chat.id })
+          .pipe(Effect.map((msgs) => (msgs.some((m) => m.info.id === secondID) ? (true as const) : undefined))),
+        "timed out waiting for queued message to persist during cancel",
+      )
+      for (let i = 0; i < 10; i++) yield* Effect.yieldNow
+
+      yield* Deferred.succeed(releaseInterrupt, void 0)
+
+      const [exitCancel, exitA, exitB] = yield* Effect.all([
+        Fiber.await(cancelFiber),
+        Fiber.await(a),
+        Fiber.await(b),
+      ])
+      expect(Exit.isSuccess(exitCancel)).toBe(true)
+      expect(Exit.isSuccess(exitA)).toBe(true)
+      expect(Exit.isSuccess(exitB)).toBe(true)
+      if (Exit.isSuccess(exitB)) {
+        expect(exitB.value.info.role).toBe("assistant")
+        if (exitB.value.info.role === "assistant") {
+          expect(exitB.value.info.error?.name).toBe("MessageAbortedError")
+          expect(exitB.value.info.time.completed).toBeDefined()
+        }
+      }
+      expect(yield* llm.hits).toHaveLength(1)
+    }),
+  10_000,
+)
+
 // Context reduction runs on the real request path: the model sees a projection, canonical history
 // stays intact, and the projection is re-derived on every turn.
 it.instance("loop sends a reduced context projection and keeps canonical history intact across turns", () =>

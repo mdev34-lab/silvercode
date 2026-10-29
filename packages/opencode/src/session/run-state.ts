@@ -3,7 +3,7 @@ import { InstanceState } from "@/effect/instance-state"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Runner } from "@/effect/runner"
 import { BackgroundJob } from "@/background/job"
-import { Effect, Latch, Layer, Scope, Context } from "effect"
+import { Effect, Deferred, Latch, Layer, Scope, Context } from "effect"
 import { Session } from "./session"
 import { SessionID } from "./schema"
 import { SessionStatus } from "./status"
@@ -15,6 +15,8 @@ export interface Interface {
   readonly cancelBackground: (sessionID: SessionID) => Effect.Effect<void>
   /** Counts foreground cancels of a session's active run; lets a queued caller tell it was cancelled. */
   readonly cancelEpoch: (sessionID: SessionID) => Effect.Effect<number>
+  /** Waits for any in-flight foreground cancellation of `sessionID` to finish settling. */
+  readonly awaitCancel: (sessionID: SessionID) => Effect.Effect<void>
   readonly ensureRunning: (
     sessionID: SessionID,
     onInterrupt: Effect.Effect<SessionV1.WithParts>,
@@ -41,6 +43,7 @@ const layer = Layer.effect(
         const scope = yield* Scope.Scope
         const runners = new Map<SessionID, Runner.Runner<SessionV1.WithParts>>()
         const epochs = new Map<SessionID, number>()
+        const cancelling = new Map<SessionID, Deferred.Deferred<void>>()
         yield* Effect.addFinalizer(
           Effect.fnUntraced(function* () {
             yield* Effect.forEach(runners.values(), (runner) => runner.cancel, {
@@ -48,9 +51,10 @@ const layer = Layer.effect(
               discard: true,
             })
             runners.clear()
+            cancelling.clear()
           }),
         )
-        return { runners, epochs, scope }
+        return { runners, epochs, cancelling, scope }
       }),
     )
 
@@ -79,15 +83,39 @@ const layer = Layer.effect(
       if (existing?.busy) yield* busyError(sessionID)
     })
 
-    const cancelForeground = Effect.fn("SessionRunState.cancelForeground")(function* (sessionID: SessionID) {
+    const bumpEpoch = (data: { epochs: Map<SessionID, number> }, sessionID: SessionID) => {
+      data.epochs.set(sessionID, (data.epochs.get(sessionID) ?? 0) + 1)
+    }
+
+    const cancelForegroundImpl = Effect.fnUntraced(function* (sessionID: SessionID, alreadyBumped: boolean) {
       const data = yield* InstanceState.get(state)
+      if (!alreadyBumped) bumpEpoch(data, sessionID)
       const existing = data.runners.get(sessionID)
       if (!existing) {
+        const inflight = data.cancelling.get(sessionID)
+        if (inflight) {
+          yield* Deferred.await(inflight)
+          return
+        }
         yield* status.set(sessionID, { type: "idle" })
         return
       }
-      data.epochs.set(sessionID, (data.epochs.get(sessionID) ?? 0) + 1)
-      yield* existing.cancel
+      const done = yield* Deferred.make<void>()
+      const prev = data.cancelling.get(sessionID)
+      data.cancelling.set(sessionID, done)
+      yield* existing.cancel.pipe(
+        Effect.ensuring(
+          Effect.gen(function* () {
+            if (prev) yield* Deferred.await(prev)
+            if (data.cancelling.get(sessionID) === done) data.cancelling.delete(sessionID)
+            yield* Deferred.succeed(done, void 0)
+          }),
+        ),
+      )
+    })
+
+    const cancelForeground = Effect.fn("SessionRunState.cancelForeground")(function* (sessionID: SessionID) {
+      yield* cancelForegroundImpl(sessionID, false)
     })
 
     const cancelEpoch = Effect.fn("SessionRunState.cancelEpoch")(function* (sessionID: SessionID) {
@@ -95,13 +123,21 @@ const layer = Layer.effect(
       return data.epochs.get(sessionID) ?? 0
     })
 
+    const awaitCancel = Effect.fn("SessionRunState.awaitCancel")(function* (sessionID: SessionID) {
+      const data = yield* InstanceState.get(state)
+      const inflight = data.cancelling.get(sessionID)
+      if (inflight) yield* Deferred.await(inflight)
+    })
+
     const cancelBackground = Effect.fn("SessionRunState.cancelBackground")(function* (sessionID: SessionID) {
       yield* cancelBackgroundJobs(background, sessionID)
     })
 
     const cancel = Effect.fn("SessionRunState.cancel")(function* (sessionID: SessionID) {
+      const data = yield* InstanceState.get(state)
+      bumpEpoch(data, sessionID)
       yield* cancelBackground(sessionID)
-      yield* cancelForeground(sessionID)
+      yield* cancelForegroundImpl(sessionID, true)
     })
 
     const ensureRunning = Effect.fn("SessionRunState.ensureRunning")(function* (
@@ -123,7 +159,16 @@ const layer = Layer.effect(
         .pipe(Effect.catchTag("RunnerBusy", () => Effect.fail(busyError(sessionID))))
     })
 
-    return Service.of({ assertNotBusy, cancel, cancelForeground, cancelBackground, cancelEpoch, ensureRunning, startShell })
+    return Service.of({
+      assertNotBusy,
+      cancel,
+      cancelForeground,
+      cancelBackground,
+      cancelEpoch,
+      awaitCancel,
+      ensureRunning,
+      startShell,
+    })
   }),
 )
 
