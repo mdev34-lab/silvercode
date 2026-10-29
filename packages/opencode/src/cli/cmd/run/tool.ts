@@ -63,6 +63,8 @@ export type ToolInline = {
   description?: string
   mode?: "inline" | "block"
   body?: string
+  // The untruncated finish body, used only for deduplication before display.
+  dedupeBody?: string
 }
 
 export type ToolPermissionInfo = {
@@ -588,10 +590,8 @@ function runExecute(p: ToolProps): ToolInline {
 }
 
 function runFinish(p: ToolProps): ToolInline {
-  const result = Locale.truncate(
-    stripAnsi(text(p.frame.state.output).trim() || text(p.frame.input.result).trim()),
-    2000,
-  )
+  const full = stripAnsi(text(p.frame.state.output).trim() || text(p.frame.input.result).trim())
+  const result = Locale.truncate(full, 2000)
   if (p.frame.status === "error") {
     const error = toolError(p.frame)
     return {
@@ -607,7 +607,11 @@ function runFinish(p: ToolProps): ToolInline {
   return {
     icon: waiting ? "◌" : "✓",
     title: waiting ? "Waiting for subagent execution..." : "Task completed",
-    ...(result && { mode: "block" as const, body: result }),
+    ...(result && {
+      mode: "block" as const,
+      body: result,
+      ...(result !== full && { dedupeBody: full }),
+    }),
   }
 }
 
@@ -1806,12 +1810,13 @@ export function toolFiletype(input?: string): string | undefined {
 // A finish body is the result, then a blank line and the effort/review status
 // line. When the result begins with text the run already printed, return what
 // is left (possibly empty); otherwise undefined. The printed text can itself
-// contain blank lines, so compare it before looking for the separator.
+// contain blank lines, so compare it before looking for the separator. Bound
+// any remaining details only after comparing the full text.
 export function withoutRepeatedResult(body: string, printed: string): string | undefined {
   const result = body.trim()
   const text = printed.trim()
   if (!text || !result.startsWith(text)) return undefined
   const rest = result.slice(text.length)
   if (rest && !/^[^\S\n]*\n\s*\n/.test(rest)) return undefined
-  return rest.trim()
+  return Locale.truncate(rest.trim(), 2000)
 }

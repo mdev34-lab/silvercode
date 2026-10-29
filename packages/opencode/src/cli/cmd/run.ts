@@ -97,7 +97,7 @@ async function tool(part: ToolPart, printed?: string) {
     const { toolInlineInfo, withoutRepeatedResult } = await import("./run/tool")
     const next = toolInlineInfo(part)
     if (next.mode === "block" && part.tool === "finish" && printed && next.body) {
-      const rest = withoutRepeatedResult(next.body, printed)
+      const rest = withoutRepeatedResult(next.dedupeBody ?? next.body, printed)
       if (rest !== undefined) {
         const info: Inline = { icon: next.icon, title: next.title, description: next.description }
         if (rest) block(info, rest)
