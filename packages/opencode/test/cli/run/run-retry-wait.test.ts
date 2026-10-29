@@ -1,5 +1,7 @@
 import { describe, expect } from "bun:test"
 import { Effect } from "effect"
+import { writeFile } from "node:fs/promises"
+import path from "node:path"
 import { cliIt } from "../../lib/cli-process"
 import { httpError, reply } from "../../lib/llm-server"
 
@@ -297,15 +299,22 @@ describe("headless run provider retry delay (#555)", () => {
       expect(capped.durationMs).toBeLessThan(10_000)
     }), 60_000)
 
-  cliIt.live("does not leak a headless retry flag into child processes spawned during run", ({ llm, opencode }) =>
+  cliIt.live("does not leak a headless retry flag into child processes spawned during run", ({ home, llm, opencode }) =>
     Effect.gen(function* () {
+      yield* Effect.promise(() =>
+        writeFile(
+          path.join(home, "check-env.mjs"),
+          'console.log(JSON.stringify(Object.keys(process.env).filter((k) => k.includes("HEADLESS"))))\n',
+        ),
+      )
       yield* llm.tool("bash", {
-        command: 'bun -e "console.log(JSON.stringify(Object.keys(process.env).filter((k) => k.includes(\\"HEADLESS\\"))))"',
+        command: "bun check-env.mjs",
         description: "Check child process environment",
       })
       yield* llm.text("env checked")
       const result = yield* opencode.run("check child env", {
         timeoutMs: 25_000,
+        extraArgs: ["--dir", home],
         format: "json",
         permission: { bash: "allow" },
       })

@@ -140,12 +140,6 @@ async function toolError(part: ToolPart) {
 /** Retry delays longer than this are announced by a non-interactive run; shorter ones stay silent. */
 const RUN_RETRY_NOTICE_MS = 10_000
 
-function resolveRunDirectory(dir?: string, envPWD = process.env.PWD, cwd = process.cwd()) {
-  const root = Filesystem.resolve(envPWD ?? cwd)
-  if (dir) return Filesystem.resolve(path.isAbsolute(dir) ? dir : path.join(root, dir))
-  return Filesystem.resolve(cwd)
-}
-
 export const RunCommand = effectCmd({
   command: "run [message..]",
   describe: "run silvercode with a message",
@@ -154,7 +148,7 @@ export const RunCommand = effectCmd({
   instance: (args) => !args.attach,
   // For --dir without --attach, load instance for the resolved target dir.
   // The handler also chdirs (preserving the legacy order: chdir → file resolution).
-  directory: (args) => (args.dir && !args.attach ? resolveRunDirectory(args.dir) : Filesystem.resolve(process.cwd())),
+  directory: (args) => (args.dir && !args.attach ? path.resolve(process.cwd(), args.dir) : process.cwd()),
   builder: (yargs: Argv) =>
     yargs
       .positional("message", {
@@ -355,14 +349,14 @@ export const RunCommand = effectCmd({
 
       const replay = args.replay === false ? false : args.replay || args["replay-limit"] !== undefined
 
-      const root = Filesystem.resolve(process.cwd())
+      const root = Filesystem.resolve(process.env.PWD ?? process.cwd())
       const directory = (() => {
         if (!args.dir) return args.attach ? undefined : root
         if (args.attach) return args.dir
 
         try {
-          process.chdir(resolveRunDirectory(args.dir))
-          return Filesystem.resolve(process.cwd())
+          process.chdir(path.isAbsolute(args.dir) ? args.dir : path.join(root, args.dir))
+          return process.cwd()
         } catch {
           UI.error("Failed to change directory to " + args.dir)
           process.exit(1)

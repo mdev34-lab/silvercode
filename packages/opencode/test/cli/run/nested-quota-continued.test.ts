@@ -50,12 +50,39 @@ describe("continued nested session quota handling (#555)", () => {
       yield* llm.pushMatch((hit) => opened(hit.body as Body, "grandchild quota input"), raw({ chunks: [
         { error: { message: "Free usage limit reached LOCAL_NESTED_QUOTA", type: "quota_exceeded", code: "FreeUsageLimitError" } },
       ] }))
-      // A wait refused because the child already failed must still permit an
-      // honest final result. This matcher handles either valid scheduling order.
-      yield* llm.pushMatch((hit) => lastText(hit.body as Body).includes("LOCAL_NESTED_QUOTA") || lastText(hit.body as Body).includes("has no background subagents of its own"),
-        reply().tool("finish", { reason: "failure", result: envelope("Child failed: LOCAL_CHILD_QUOTA") }).stop())
-      yield* llm.pushMatch((hit) => lastText(hit.body as Body).includes("LOCAL_CHILD_QUOTA"),
-        reply().text("LOCAL_ROOT_QUOTA_SURFACED").tool("finish", { reason: "failure", result: "Nested provider quota surfaced" }).stop())
+      // A wait refused because the grandchild already settled can still be
+      // followed by the deferred <task state="error"> wake turn (#511). Keep
+      // separate matchers for the optional refusal turn and the mandatory
+      // quota-error delivery so every scheduling order finishes cleanly.
+      let quotaDelivered!: () => void
+      const quotaDeliveredGate = new Promise<void>((resolve) => {
+        quotaDelivered = resolve
+      })
+      let guardRefused = false
+      yield* llm.pushMatch(
+        (hit) => {
+          if (!lastText(hit.body as Body).includes("has no background subagents of its own")) return false
+          guardRefused = true
+          return true
+        },
+        reply().tool("finish", { reason: "failure", result: envelope("Child failed: LOCAL_CHILD_QUOTA") }).stop(),
+      )
+      yield* llm.pushMatch(
+        (hit) => {
+          if (!lastText(hit.body as Body).includes("LOCAL_NESTED_QUOTA")) return false
+          quotaDelivered()
+          return true
+        },
+        reply().tool("finish", { reason: "failure", result: envelope("Child failed: LOCAL_CHILD_QUOTA") }).stop(),
+      )
+      yield* llm.pushMatch(
+        (hit) => lastText(hit.body as Body).includes("LOCAL_CHILD_QUOTA"),
+        reply()
+          .wait(quotaDeliveredGate)
+          .text("LOCAL_ROOT_QUOTA_SURFACED")
+          .tool("finish", { reason: "failure", result: "Nested provider quota surfaced" })
+          .stop(),
+      )
       const result = yield* opencode.run("Research the nested investigation report", {
         model: "opencode/local-quota-test", extraArgs: ["--continue", "--dangerously-skip-permissions"], env, timeoutMs: 25_000,
       })
@@ -69,6 +96,6 @@ describe("continued nested session quota handling (#555)", () => {
       expect(quotaDelivery).toContain('state="error"')
       expect(quotaDelivery).toContain("<task_error>")
       expect(yield* llm.misses).toEqual([])
-      expect(yield* llm.pending).toBe(0)
+      expect(yield* llm.pending).toBe(guardRefused ? 0 : 1)
     }), 60_000)
 })

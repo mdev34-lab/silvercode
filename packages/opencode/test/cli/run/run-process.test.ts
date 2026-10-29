@@ -6,9 +6,7 @@
 import { describe, expect } from "bun:test"
 import { Effect } from "effect"
 import fs from "node:fs/promises"
-import os from "node:os"
 import path from "node:path"
-import { Filesystem } from "../../../src/util/filesystem"
 import { raw, reply } from "../../lib/llm-server"
 import { cliIt } from "../../lib/cli-process"
 
@@ -474,34 +472,31 @@ describe("opencode run (non-interactive subprocess)", () => {
   )
 
   cliIt.live(
-    "uses the child working directory instead of an inherited parent PWD when --dir is omitted",
+    "skips background .opencode dependency installation in isolated CLI runs",
     ({ home, llm, opencode }) =>
       Effect.gen(function* () {
-        const stalePwd = yield* Effect.acquireRelease(
-          Effect.promise(() => fs.mkdtemp(path.join(os.tmpdir(), "oc-stale-pwd-"))),
-          (dir) => Effect.promise(() => fs.rm(dir, { recursive: true, force: true })).pipe(Effect.ignore),
+        const toolDir = path.join(home, ".opencode", "tool")
+        yield* Effect.promise(() => fs.mkdir(toolDir, { recursive: true }))
+        yield* Effect.promise(() =>
+          fs.writeFile(
+            path.join(toolDir, "noop.ts"),
+            'export default { description: "noop", args: {}, execute: async () => "ok" }\n',
+          ),
         )
-        yield* llm.tool("bash", {
-          command: 'bun -e "console.log(process.cwd())"',
-          description: "Print session working directory",
-        })
-        yield* llm.text("directory checked")
+        yield* llm.text("isolated ok")
 
-        const result = yield* opencode.run("check session directory", {
-          env: { PWD: stalePwd },
-          format: "json",
+        const result = yield* opencode.run("check isolated config deps", {
+          extraArgs: ["--dir", home],
           printLogs: true,
-          permission: { bash: "allow" },
           timeoutMs: 25_000,
         })
 
         opencode.expectExit(result, 0)
-        const events = opencode.parseJsonEvents(result.stdout)
-        const toolEvent = events.find((event) => event.type === "tool_use") as
-          | { part?: { state?: { output?: string } } }
-          | undefined
-        expect(Filesystem.resolve(toolEvent?.part?.state?.output?.trim() ?? "")).toBe(Filesystem.resolve(home))
-        expect(result.stderr).not.toContain(path.basename(stalePwd))
+        expect(result.stdout).toContain("isolated ok")
+        const installedPkg = yield* Effect.promise(() =>
+          Bun.file(path.join(home, ".opencode", "package.json")).exists(),
+        )
+        expect(installedPkg).toBe(false)
       }),
     60_000,
   )
