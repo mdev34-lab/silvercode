@@ -1230,6 +1230,12 @@ const layer = Layer.effect(
       input: PromptInput,
       initialEpoch?: number,
     ) {
+      // A prompt submitted right after ESC can race with the abort's epoch bump.
+      // If a cancel is still settling, wait for it before capturing the epoch so
+      // the new prompt is not poisoned by the previous run's cancellation and
+      // instead starts a clean run. Prompts already in-flight before the cancel
+      // keep their original epoch and are correctly treated as cancelled.
+      if (initialEpoch === undefined) yield* state.awaitCancel(input.sessionID)
       const epoch = initialEpoch ?? (yield* state.cancelEpoch(input.sessionID))
       const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
       yield* revert.cleanup(session)
@@ -1973,6 +1979,7 @@ const layer = Layer.effect(
     })
 
     const command = Effect.fn("SessionPrompt.command")(function* (input: CommandInput) {
+      yield* state.awaitCancel(input.sessionID)
       const epoch = yield* state.cancelEpoch(input.sessionID)
       yield* Effect.logInfo("command", {
         "session.id": input.sessionID,

@@ -6216,3 +6216,87 @@ withMcpTools.instance("an explicit permission deny still removes the MCP tool wh
  if(Exit.isFailure(exit)) expect(Cause.pretty(exit.cause).toLowerCase()).toMatch(/denied|deny|permission/)
 }))
 
+// ---------------------------------------------------------------------------
+// Regression for #292: ESC interruption must not poison the next prompt.
+// Deterministic (no wall-clock sleeps, only Deferred coordination) - covers
+// the core streaming case. Queued/background/fresh-cancel are covered by
+// existing tests; this one specifically verifies the next prompt after ESC
+// starts a clean run and is not poisoned by the previous cancellation.
+// ---------------------------------------------------------------------------
+it.instance(
+  "ESC interrupt does not poison next prompt - streaming case starts clean run (#292)",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Interrupt resume #292" })
+
+      // Simulate Work agent streaming (hang) - user presses ESC to interrupt.
+      // Queue both the hanging response and the fresh response before starting,
+      // mirroring the existing 'prompt after cancel during streaming' pattern.
+      yield* llm.hang
+      yield* llm.text("Second answer")
+      const first = yield* prompt
+        .prompt({ sessionID: chat.id, agent: "work", model: ref, parts: [{ type: "text", text: "First prompt" }] })
+        .pipe(Effect.forkChild)
+      yield* waitForBusy(chat.id)
+      yield* llm.wait(1)
+
+      // ESC: cancel active run - must preserve cancelled turn as interrupted.
+      yield* prompt.cancel(chat.id)
+      const exitFirst = yield* Fiber.await(first)
+      expect(Exit.isSuccess(exitFirst)).toBe(true)
+      if (Exit.isSuccess(exitFirst)) {
+        expect(exitFirst.value.info.role).toBe("assistant")
+        if (exitFirst.value.info.role === "assistant") expect(exitFirst.value.info.error?.name).toBe("MessageAbortedError")
+      }
+      yield* pollWithTimeout(
+        Effect.gen(function* () {
+          const s = yield* SessionStatus.Service
+          const cur = yield* s.get(chat.id)
+          return cur.type === "idle" ? (true as const) : undefined
+        }),
+        `session ${chat.id} never became idle after cancel`,
+      )
+      const interruptedBefore = yield* abortedIDs(chat.id)
+      expect(interruptedBefore.length).toBe(1)
+      // The hanging request was consumed, so hits should be 1 (the hang).
+      expect(yield* llm.hits).toHaveLength(1)
+
+      // Next prompt after ESC must start a clean run (not interrupted) and
+      // consume the queued fresh response. This is the core #292 check:
+      // cancellation state from the previous run must not poison the next.
+      const second = yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "work",
+        model: ref,
+        parts: [{ type: "text", text: "Second prompt" }],
+      })
+      expect(second.info.role).toBe("assistant")
+      if (second.info.role === "assistant") {
+        expect(second.info.error).toBeUndefined()
+        expect(second.info.finish).toBeDefined()
+      }
+      expect(interruptedBefore.includes(second.info.id)).toBe(false)
+      // After the fresh run, hits should be 2 (hang + fresh).
+      expect(yield* llm.hits).toHaveLength(2)
+      expect((yield* abortedIDs(chat.id)).length).toBe(1)
+
+      // Verify a third prompt after another cancel also stays clean (fresh-cancel on idle).
+      yield* prompt.cancel(chat.id)
+      yield* llm.text("Third answer")
+      const third = yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "work",
+        model: ref,
+        parts: [{ type: "text", text: "Third prompt" }],
+      })
+      expect(third.info.role).toBe("assistant")
+      if (third.info.role === "assistant") expect(third.info.error).toBeUndefined()
+      expect(yield* llm.hits).toHaveLength(3)
+    }),
+  { git: true },
+  10_000,
+)
+
