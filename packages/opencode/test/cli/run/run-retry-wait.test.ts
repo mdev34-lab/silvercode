@@ -7,6 +7,14 @@ import { httpError, reply } from "../../lib/llm-server"
 
 // #555: a provider quota rejection that asks for a long retry delay must not
 // leave a headless run silent until it is killed.
+//
+// Temporal coverage split: the FIRST case below stays on the REAL clock and
+// genuinely sleeps out a 12s retry-after — the wall-clock end-to-end guarantee
+// for long retry waits. The remaining cases set `clockScale` so the spawned
+// CLI observes an accelerated clock (test/lib/clock-scale.preload.ts): every
+// wait still exceeds the same 10s notice threshold and keeps its production
+// delay values, ordering and recovery assertions — only the wall-clock cost
+// shrinks (59s of explicit waits → 12s real + ~4.7s controlled).
 type Body = { messages?: { role?: string; content?: unknown }[] }
 const lastText = (body: Body) => {
   const content = body.messages?.at(-1)?.content
@@ -61,7 +69,7 @@ describe("headless run provider retry delay (#555)", () => {
       yield* llm.error(429, { error: { message: "Too many requests, try again later", type: "rate_limit_error" } }, { "retry-after": "12" })
       yield* llm.text("recovered after the long wait")
       const result = yield* opencode.run("rate limited", {
-        timeoutMs: 40_000, extraArgs: ["--continue"], model: "opencode/local-quota-test", env,
+        timeoutMs: 40_000, extraArgs: ["--continue"], model: "opencode/local-quota-test", env, clockScale: 10,
       })
       expect(result.exitCode).toBe(0)
       expect(result.stderr).toMatch(/waiting about \d+s before retrying \(attempt 1\): retrying after a provider error/)
@@ -77,7 +85,7 @@ describe("headless run provider retry delay (#555)", () => {
       yield* llm.error(429, quota, { "retry-after": "1" })
       yield* llm.text("recovered after retry")
       const result = yield* opencode.run("short retry", {
-        timeoutMs: 20_000, extraArgs: ["--continue"], model: "opencode/local-quota-test", env,
+        timeoutMs: 20_000, extraArgs: ["--continue"], model: "opencode/local-quota-test", env, clockScale: 10,
       })
       expect(result.exitCode).toBe(0)
       expect(result.stdout).toContain("recovered after retry")
@@ -90,7 +98,7 @@ describe("headless run provider retry delay (#555)", () => {
       yield* llm.push(reply().text("first step").tool("bash", { command: "printf step", description: "First step" }))
       yield* llm.error(429, quota, { "retry-after": "11" })
       yield* llm.text("done after two waits")
-      const result = yield* opencode.run("two long waits", { timeoutMs: 50_000, extraArgs: ["--dangerously-skip-permissions"] })
+      const result = yield* opencode.run("two long waits", { timeoutMs: 50_000, extraArgs: ["--dangerously-skip-permissions"], clockScale: 10 })
       expect(result.exitCode).toBe(0)
       expect(result.stdout).toContain("done after two waits")
       expect(result.stderr.match(/waiting about \d+s before retrying \(attempt 1\)/g)?.length).toBe(2)
@@ -126,7 +134,7 @@ describe("headless run provider retry delay (#555)", () => {
       yield* llm.pushMatch((hit) => lastText(hit.body as Body).includes("child done"),
         reply().text("ROOT_FINAL").tool("finish", { reason: "success", result: "done" }).stop())
       const result = yield* opencode.run("Research the child wait report", {
-        timeoutMs: 50_000, extraArgs: ["--continue", "--dangerously-skip-permissions"], model: "opencode/local-quota-test", env,
+        timeoutMs: 50_000, extraArgs: ["--continue", "--dangerously-skip-permissions"], model: "opencode/local-quota-test", env, clockScale: 10,
       })
       // Retry policy unchanged: the child waits, retries and the run finishes.
       expect(result.exitCode).toBe(0)
