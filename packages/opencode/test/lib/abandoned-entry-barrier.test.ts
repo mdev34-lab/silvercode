@@ -31,15 +31,22 @@ test(
       const stderr = (async () => {
         const decoder = new TextDecoder()
         let output = ""
-        for await (const chunk of child.stderr) {
-          output += decoder.decode(chunk, { stream: true })
-          if (!released && output.includes("a beforeEach/afterEach hook timed out for this test")) {
-            released = true
-            // Handshake, not a timing guess: cleanup is blocked until Bun has
-            // abandoned the hook. Restoration still needs another event-loop turn.
-            await child.stdin.write("release\n")
-            await child.stdin.end()
+        const reader = child.stderr.getReader()
+        try {
+          while (true) {
+            const { done, value } = await reader.read()
+            if (done) break
+            output += decoder.decode(value, { stream: true })
+            if (!released && output.includes("a beforeEach/afterEach hook timed out for this test")) {
+              released = true
+              // Handshake, not a timing guess: cleanup is blocked until Bun has
+              // abandoned the hook. Restoration still needs another event-loop turn.
+              await child.stdin.write("release\n")
+              await child.stdin.end()
+            }
           }
+        } finally {
+          reader.releaseLock()
         }
         return output + decoder.decode()
       })()
