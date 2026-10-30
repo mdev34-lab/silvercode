@@ -1,7 +1,7 @@
 import { describe, expect } from "bun:test"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
-import { Deferred, Effect, Fiber, Layer } from "effect"
+import { Cause, Deferred, Effect, Exit, Fiber, Layer } from "effect"
 import { InstanceRef } from "../../src/effect/instance-ref"
 import { registerDisposer } from "../../src/effect/instance-registry"
 import { InstanceBootstrap } from "../../src/project/bootstrap"
@@ -15,11 +15,11 @@ const noopBootstrap = Layer.succeed(
   InstanceBootstrap.Service.of({ run: Effect.suspend(() => bootstrapRun) }),
 )
 
-const it = testEffect(
-  LayerNode.compile(LayerNode.group([InstanceStore.node, CrossSpawnSpawner.node]), [
-    [InstanceStore.bootstrapNode, noopBootstrap],
-  ]),
-)
+const storeLayer = LayerNode.compile(LayerNode.group([InstanceStore.node, CrossSpawnSpawner.node]), [
+  [InstanceStore.bootstrapNode, noopBootstrap],
+])
+
+const it = testEffect(storeLayer)
 
 const setBootstrap = (run: Effect.Effect<void>) =>
   Effect.acquireRelease(
@@ -243,6 +243,91 @@ describe("InstanceStore", () => {
       yield* store.load({ directory: dir2 })
       yield* store.disposeAll()
       expect(disposed).toEqual([dir1, dir2])
+    }),
+  )
+
+  it.live("interrupting an InstanceStore scope while load is in flight does not deadlock disposeAll", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped({ git: true })
+      const started = yield* Deferred.make<void>()
+
+      yield* setBootstrap(
+        Effect.gen(function* () {
+          yield* Deferred.succeed(started, undefined)
+          return yield* Effect.never
+        }),
+      )
+
+      const controller = new AbortController()
+      const exitPromise = Effect.runPromiseExit(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const store = yield* InstanceStore.Service
+            return yield* store.load({ directory: dir })
+          }).pipe(Effect.provide(storeLayer)),
+        ),
+        { signal: controller.signal },
+      )
+
+      yield* Deferred.await(started)
+      controller.abort()
+
+      const settled = yield* Effect.promise(() =>
+        Promise.race([
+          exitPromise.then((exit) => ({ settled: true as const, exit })),
+          Bun.sleep(500).then(() => ({ settled: false as const, exit: undefined })),
+        ]),
+      )
+
+      expect(settled.settled).toBe(true)
+      if (settled.settled) {
+        expect(Exit.isFailure(settled.exit) && Cause.hasInterruptsOnly(settled.exit.cause)).toBe(true)
+      }
+    }),
+  )
+
+  it.live("interrupting an InstanceStore scope while reload is in flight does not deadlock disposeAll", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped({ git: true })
+      const reloading = yield* Deferred.make<void>()
+
+      const controller = new AbortController()
+      const exitPromise = Effect.runPromiseExit(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const store = yield* InstanceStore.Service
+            yield* store.load({ directory: dir })
+            bootstrapRun = Effect.gen(function* () {
+              yield* Deferred.succeed(reloading, undefined)
+              return yield* Effect.never
+            })
+            return yield* store.reload({ directory: dir })
+          }).pipe(Effect.provide(storeLayer)),
+        ),
+        { signal: controller.signal },
+      )
+
+      yield* Effect.ensuring(
+        Effect.gen(function* () {
+          yield* Deferred.await(reloading)
+          controller.abort()
+
+          const settled = yield* Effect.promise(() =>
+            Promise.race([
+              exitPromise.then((exit) => ({ settled: true as const, exit })),
+              Bun.sleep(500).then(() => ({ settled: false as const, exit: undefined })),
+            ]),
+          )
+
+          expect(settled.settled).toBe(true)
+          if (settled.settled) {
+            expect(Exit.isFailure(settled.exit) && Cause.hasInterruptsOnly(settled.exit.cause)).toBe(true)
+          }
+        }),
+        Effect.sync(() => {
+          bootstrapRun = Effect.void
+        }),
+      )
     }),
   )
 })

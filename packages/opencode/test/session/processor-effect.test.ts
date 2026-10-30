@@ -25,6 +25,7 @@ import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { provideTmpdirInstance, provideTmpdirServer } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
 import { raw, reply, TestLLMServer } from "../lib/llm-server"
+import { HeadlessRunRef } from "@/effect/instance-ref"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
@@ -1625,3 +1626,132 @@ itRetryRunning.live("preserves a metadata-promoted running call during retry cle
     expect(call?.state.status).toBe("completed")
     if (call?.state.status === "completed") expect(call.state.output).toBe("RUNNING_EVIDENCE")
   }), { config: cfg }), { timeout: 15000 })
+
+const headlessEnv = LayerNode.compile(
+  LayerNode.group([root, LayerNode.make({ service: TestLLMServer, layer: TestLLMServer.layer, deps: [] })]),
+  [
+    [SessionSummary.node, summary],
+    [RuntimeFlags.node, RuntimeFlags.layer({ experimentalEventSystem: true })],
+  ],
+)
+const itHeadless = testEffect(headlessEnv)
+
+itHeadless.live(
+  "halts immediately with APIError in headless mode when provider retry-after exceeds maxDelay",
+  () =>
+    provideTmpdirServer(
+      ({ dir, llm }) =>
+        Effect.gen(function* () {
+          yield* llm.error(
+            429,
+            {
+              type: "error",
+              error: {
+                type: "FreeUsageLimitError",
+                message: "Free usage limit reached. Subscribe to OpenCode Go for higher limits.",
+              },
+              metadata: {},
+            },
+            { "retry-after": "42504" },
+          )
+
+          const { processors, session, provider } = yield* boot()
+          const status = yield* SessionStatus.Service
+          const chat = yield* session.create({})
+          const parent = yield* user(chat.id, "Reply with exactly: OK")
+          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+          const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+          const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
+
+          const result = yield* handle
+            .process({
+              user: parent as SessionV1.User,
+              sessionID: chat.id,
+              model: mdl,
+              agent: agent(),
+              system: [],
+              messages: [{ role: "user", content: "Reply with exactly: OK" }],
+              tools: {},
+            })
+            .pipe(Effect.provideService(HeadlessRunRef, {}), Effect.timeout("5 seconds"))
+
+          expect(result).toBe("stop")
+          expect(yield* llm.calls).toBe(1)
+          expect(handle.message.error?.name).toBe("APIError")
+          if (handle.message.error?.name === "APIError") {
+            expect(handle.message.error.data.message).toContain("Free usage limit reached")
+          }
+          expect(yield* MessageV2.parts(msg.id)).toEqual([])
+          expect(yield* status.get(chat.id)).toEqual({ type: "idle" })
+        }),
+      { config: (url) => providerCfg(url) },
+    ),
+  { timeout: 15000 },
+)
+
+const nonHeadlessOverrideEnv = LayerNode.compile(
+  LayerNode.group([root, LayerNode.make({ service: TestLLMServer, layer: TestLLMServer.layer, deps: [] })]),
+  [
+    [SessionSummary.node, summary],
+    [RuntimeFlags.node, RuntimeFlags.layer({ experimentalEventSystem: true, retryMaxDelayMs: 50 })],
+  ],
+)
+const itNonHeadlessOverride = testEffect(nonHeadlessOverrideEnv)
+
+itNonHeadlessOverride.live(
+  "ignores retryMaxDelayMs outside headless runs so interactive sessions keep retry status",
+  () =>
+    provideTmpdirServer(
+      ({ dir, llm }) =>
+        Effect.gen(function* () {
+          yield* llm.error(
+            429,
+            {
+              type: "error",
+              error: {
+                type: "FreeUsageLimitError",
+                message: "Free usage limit reached. Subscribe to OpenCode Go for higher limits.",
+              },
+              metadata: {},
+            },
+            { "retry-after": "1" },
+          )
+          yield* llm.text("RECOVERED_INTERACTIVE")
+
+          const { processors, session, provider } = yield* boot()
+          const events = yield* EventV2Bridge.Service
+          const retryActions: Array<string | undefined> = []
+          yield* events.listen((event) => {
+            if (event.type !== SessionStatus.Event.Status.type) return Effect.void
+            const data = event.data as { status?: SessionStatus.Info }
+            if (data.status?.type === "retry") retryActions.push(data.status.action?.reason)
+            return Effect.void
+          })
+
+          const chat = yield* session.create({})
+          const parent = yield* user(chat.id, "Reply with exactly: OK")
+          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+          const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+          const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
+
+          const result = yield* handle
+            .process({
+              user: parent as SessionV1.User,
+              sessionID: chat.id,
+              model: mdl,
+              agent: agent(),
+              system: [],
+              messages: [{ role: "user", content: "Reply with exactly: OK" }],
+              tools: {},
+            })
+            .pipe(Effect.timeout("8 seconds"))
+
+          expect(result).toBe("continue")
+          expect(yield* llm.calls).toBe(2)
+          expect(handle.message.error).toBeUndefined()
+          expect(retryActions).toEqual(["free_tier_limit"])
+        }),
+      { config: (url) => providerCfg(url) },
+    ),
+  { timeout: 15000 },
+)

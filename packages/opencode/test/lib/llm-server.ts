@@ -36,6 +36,7 @@ type Sse = {
   type: "sse"
   head: unknown[]
   tail: unknown[]
+  onSend?: () => void
   wait?: PromiseLike<unknown>
   hang?: boolean
   error?: unknown
@@ -417,6 +418,7 @@ function modelFrom(body: unknown) {
 }
 
 function send(item: Sse) {
+  item.onSend?.()
   const head = bytes(item.head)
   const tail = bytes([...item.tail, ...(item.hang || item.error ? [] : [done])])
   const empty = Stream.fromIterable<Uint8Array>([])
@@ -456,6 +458,7 @@ export class Reply {
   #tail: unknown[] = []
   #usage: Usage | undefined
   #finish: string | undefined
+  #onSend: (() => void) | undefined
   #wait: PromiseLike<unknown> | undefined
   #hang = false
   #error: unknown
@@ -479,6 +482,11 @@ export class Reply {
 
   usage(value: Usage) {
     this.#usage = value
+    return this
+  }
+
+  onSend(fn: () => void) {
+    this.#onSend = fn
     return this
   }
 
@@ -579,6 +587,7 @@ export class Reply {
       : this.#usage
         ? [...this.#tail, chunk({ usage: this.#usage })]
         : this.#tail,
+      onSend: this.#onSend,
       wait: this.#wait,
       hang: this.#hang,
       error: this.#error,
@@ -608,6 +617,7 @@ export function raw(input: {
   chunks?: unknown[]
   head?: unknown[]
   tail?: unknown[]
+  onSend?: () => void
   wait?: PromiseLike<unknown>
   hang?: boolean
   error?: unknown
@@ -617,6 +627,7 @@ export function raw(input: {
     type: "sse",
     head: input.head ?? input.chunks ?? [],
     tail: input.tail ?? [],
+    onSend: input.onSend,
     wait: input.wait,
     hang: input.hang,
     error: input.error,

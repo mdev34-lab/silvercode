@@ -1,17 +1,13 @@
-import { afterEach, expect } from "bun:test"
+import { expect } from "bun:test"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Effect } from "effect"
 import { fileURLToPath } from "url"
 import { InstanceRef } from "../../src/effect/instance-ref"
-import { disposeAllInstances, TestInstance } from "../fixture/fixture"
+import { TestInstance } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
 
 const it = testEffect(LayerNode.compile(FSUtil.node))
-
-afterEach(async () => {
-  await disposeAllInstances()
-})
 
 it.live("effect-cmd.ts does not restore legacy instance ALS", () =>
   Effect.gen(function* () {

@@ -5,6 +5,8 @@
 // `OPENCODE_CONFIG_CONTENT` providing the test provider config inline.
 import { describe, expect } from "bun:test"
 import { Effect } from "effect"
+import fs from "node:fs/promises"
+import path from "node:path"
 import { raw, reply } from "../../lib/llm-server"
 import { cliIt } from "../../lib/cli-process"
 
@@ -467,5 +469,35 @@ describe("opencode run (non-interactive subprocess)", () => {
         expect(result.durationMs).toBeLessThan(30_000)
       }),
     30_000,
+  )
+
+  cliIt.live(
+    "skips background .opencode dependency installation in isolated CLI runs",
+    ({ home, llm, opencode }) =>
+      Effect.gen(function* () {
+        const toolDir = path.join(home, ".opencode", "tool")
+        yield* Effect.promise(() => fs.mkdir(toolDir, { recursive: true }))
+        yield* Effect.promise(() =>
+          fs.writeFile(
+            path.join(toolDir, "noop.ts"),
+            'export default { description: "noop", args: {}, execute: async () => "ok" }\n',
+          ),
+        )
+        yield* llm.text("isolated ok")
+
+        const result = yield* opencode.run("check isolated config deps", {
+          extraArgs: ["--dir", home],
+          printLogs: true,
+          timeoutMs: 25_000,
+        })
+
+        opencode.expectExit(result, 0)
+        expect(result.stdout).toContain("isolated ok")
+        const installedPkg = yield* Effect.promise(() =>
+          Bun.file(path.join(home, ".opencode", "package.json")).exists(),
+        )
+        expect(installedPkg).toBe(false)
+      }),
+    60_000,
   )
 })

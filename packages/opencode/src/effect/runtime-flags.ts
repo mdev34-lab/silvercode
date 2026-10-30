@@ -74,6 +74,10 @@ export class Service extends ConfigService.Service<Service>()("@opencode/Runtime
   // (see ReviewStagnation.resolveRepeats); values below 2 disable the nudge.
   reviewStagnationRepeats: nonNegativeInteger("OPENCODE_EXPERIMENTAL_REVIEW_STAGNATION_REPEATS"),
   bashDefaultTimeoutMs: positiveInteger("OPENCODE_EXPERIMENTAL_BASH_DEFAULT_TIMEOUT_MS"),
+  // Overrides SessionRetry.RETRY_HEADLESS_MAX_DELAY inside headless non-interactive
+  // runs (HeadlessRunRef; issue #555). Ignored outside headless runs so TUI,
+  // --mini, and non-headless serve sessions keep retry status and model switching.
+  retryMaxDelayMs: positiveInteger("OPENCODE_EXPERIMENTAL_RETRY_MAX_DELAY_MS"),
   experimentalNativeLlm: bool("OPENCODE_EXPERIMENTAL_NATIVE_LLM"),
   experimentalWebSockets: bool("OPENCODE_EXPERIMENTAL_WEBSOCKETS"),
   client: Config.string("OPENCODE_CLIENT").pipe(Config.withDefault("cli")),

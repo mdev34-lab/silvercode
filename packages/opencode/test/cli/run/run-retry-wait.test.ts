@@ -1,5 +1,7 @@
 import { describe, expect } from "bun:test"
 import { Effect } from "effect"
+import { writeFile } from "node:fs/promises"
+import path from "node:path"
 import { cliIt } from "../../lib/cli-process"
 import { httpError, reply } from "../../lib/llm-server"
 
@@ -135,4 +137,192 @@ describe("headless run provider retry delay (#555)", () => {
       expect(yield* llm.misses).toEqual([])
       expect(yield* llm.pending).toBe(0)
     }), 90_000)
+
+  cliIt.live("fails fast instead of hanging when Zen quota reset exceeds the headless retry window", ({ llm, opencode }) =>
+    Effect.gen(function* () {
+      const env = setup(llm)
+      yield* llm.error(
+        429,
+        {
+          type: "error",
+          error: {
+            type: "FreeUsageLimitError",
+            message: "Free usage limit reached. Subscribe to OpenCode Go for higher limits.",
+          },
+          metadata: {},
+        },
+        { "retry-after": "42504" },
+      )
+      const result = yield* opencode.run("Reply with exactly: OK", {
+        timeoutMs: 25_000,
+        model: "opencode/local-quota-test",
+        env,
+      })
+      expect(result.exitCode).toBeGreaterThan(0)
+      expect(result.stderr).toContain("Free usage limit reached")
+      expect(result.stderr).not.toContain("waiting about")
+      expect(result.durationMs).toBeLessThan(25_000)
+      const primary = (yield* llm.hits).filter(
+        (hit) => !JSON.stringify(hit.body).includes("Generate a title for this conversation"),
+      )
+      expect(primary).toHaveLength(1)
+      expect(yield* llm.misses).toEqual([])
+      expect(yield* llm.pending).toBe(0)
+    }), 45_000)
+
+  cliIt.live("emits a json error event and exits nonzero when quota reset exceeds the headless retry window", ({ llm, opencode }) =>
+    Effect.gen(function* () {
+      const env = setup(llm)
+      yield* llm.error(
+        429,
+        {
+          type: "error",
+          error: {
+            type: "FreeUsageLimitError",
+            message: "Free usage limit reached. Subscribe to OpenCode Go for higher limits.",
+          },
+          metadata: {},
+        },
+        { "retry-after": "42504" },
+      )
+      const result = yield* opencode.run("Reply with exactly: OK", {
+        timeoutMs: 25_000,
+        format: "json",
+        model: "opencode/local-quota-test",
+        env,
+      })
+      expect(result.exitCode).toBeGreaterThan(0)
+      const events = opencode.parseJsonEvents(result.stdout)
+      expect(events).toEqual([
+        expect.objectContaining({
+          type: "error",
+          error: expect.objectContaining({
+            name: "APIError",
+            data: expect.objectContaining({
+              message: expect.stringContaining("Free usage limit reached"),
+            }),
+          }),
+        }),
+      ])
+      expect(result.durationMs).toBeLessThan(25_000)
+    }), 45_000)
+
+  cliIt.live("surfaces a background child quota reset exceeding the headless retry window without hanging", ({ llm, opencode }) =>
+    Effect.gen(function* () {
+      const env = {
+        OPENCODE_CONFIG_CONTENT: JSON.stringify({
+          provider: { opencode: {
+            npm: "@ai-sdk/openai-compatible", options: { baseURL: llm.url, apiKey: "public" },
+            models: { "local-quota-test": { name: "q", limit: { context: 128000, output: 4096 }, cost: { input: 0, output: 0 } } },
+          } },
+          permission: { "*": "allow" },
+          agent: { work: { finishTool: true }, general: { finishTool: true, permission: { task: "allow" } } },
+        }),
+      }
+      const opened = (body: Body, text: string) => body.messages?.at(-1)?.role === "user" && lastText(body).includes(text)
+      const followed = (body: Body, text: string) => body.messages?.at(-1)?.role === "tool" && JSON.stringify(body).includes(text)
+      yield* llm.pushMatch((hit) => opened(hit.body as Body, "Research the child quota failure"), reply().tool("task", {
+        description: "child quota probe", prompt: "Research CHILD_QUOTA_INPUT", subagent_type: "general", background: true,
+      }))
+      yield* llm.pushMatch((hit) => followed(hit.body as Body, "child quota probe"), reply().tool("finish", {
+        reason: "waiting_for_subagent", result: "Root awaits child",
+      }))
+      yield* llm.pushMatch((hit) => opened(hit.body as Body, "CHILD_QUOTA_INPUT"),
+        httpError(
+          429,
+          {
+            type: "error",
+            error: {
+              type: "FreeUsageLimitError",
+              message: "Free usage limit reached. Subscribe to OpenCode Go for higher limits.",
+            },
+            metadata: {},
+          },
+          { "retry-after": "42504" },
+        ))
+      yield* llm.pushMatch((hit) => lastText(hit.body as Body).includes("Free usage limit reached"),
+        reply().text("CHILD_QUOTA_SURFACED").tool("finish", { reason: "failure", result: "child quota failed" }).stop())
+      const result = yield* opencode.run("Research the child quota failure", {
+        timeoutMs: 25_000, extraArgs: ["--dangerously-skip-permissions"], model: "opencode/local-quota-test", env,
+      })
+      expect(result.exitCode).toBe(0)
+      expect(result.stdout).toContain("CHILD_QUOTA_SURFACED")
+      expect(result.stderr).not.toContain("waiting about")
+      expect(result.durationMs).toBeLessThan(25_000)
+      expect(yield* llm.misses).toEqual([])
+      expect(yield* llm.pending).toBe(0)
+    }), 60_000)
+
+  cliIt.live("propagates the headless retry window to an attached server run", ({ llm, opencode }) =>
+    Effect.gen(function* () {
+      const env = setup(llm)
+      const server = yield* opencode.serve({ env })
+      yield* llm.error(
+        429,
+        {
+          type: "error",
+          error: {
+            type: "FreeUsageLimitError",
+            message: "Free usage limit reached. Subscribe to OpenCode Go for higher limits.",
+          },
+          metadata: {},
+        },
+        { "retry-after": "42504" },
+      )
+      const result = yield* opencode.run("Reply with exactly: OK", {
+        timeoutMs: 25_000,
+        extraArgs: ["--attach", server.url],
+        model: "opencode/local-quota-test",
+        env,
+      })
+      expect(result.exitCode).toBeGreaterThan(0)
+      expect(result.stderr).toContain("Free usage limit reached")
+      expect(result.stderr).not.toContain("waiting about")
+      expect(result.durationMs).toBeLessThan(25_000)
+      const primary = (yield* llm.hits).filter(
+        (hit) => !JSON.stringify(hit.body).includes("Generate a title for this conversation"),
+      )
+      expect(primary).toHaveLength(1)
+      expect(yield* llm.misses).toEqual([])
+      expect(yield* llm.pending).toBe(0)
+
+      yield* llm.reset
+      yield* llm.error(429, quota, { "retry-after": "15" })
+      const capped = yield* opencode.run("Reply with exactly: OK", {
+        timeoutMs: 10_000,
+        extraArgs: ["--attach", server.url],
+        model: "opencode/local-quota-test",
+        env: { ...env, OPENCODE_EXPERIMENTAL_RETRY_MAX_DELAY_MS: "50" },
+      })
+      expect(capped.exitCode).toBeGreaterThan(0)
+      expect(capped.stderr).toContain("Free usage limit reached")
+      expect(capped.durationMs).toBeLessThan(10_000)
+    }), 60_000)
+
+  cliIt.live("does not leak a headless retry flag into child processes spawned during run", ({ home, llm, opencode }) =>
+    Effect.gen(function* () {
+      yield* Effect.promise(() =>
+        writeFile(
+          path.join(home, "check-env.mjs"),
+          'console.log(JSON.stringify(Object.keys(process.env).filter((k) => k.includes("HEADLESS"))))\n',
+        ),
+      )
+      yield* llm.tool("bash", {
+        command: "bun check-env.mjs",
+        description: "Check child process environment",
+      })
+      yield* llm.text("env checked")
+      const result = yield* opencode.run("check child env", {
+        timeoutMs: 25_000,
+        extraArgs: ["--dir", home],
+        format: "json",
+        permission: { bash: "allow" },
+      })
+      opencode.expectExit(result, 0)
+      const events = opencode.parseJsonEvents(result.stdout)
+      const toolEvent = events.find((event) => event.type === "tool_use") as
+        | { part?: { state?: { output?: string } } }
+        | undefined
+      expect(toolEvent?.part?.state?.output?.trim()).toBe("[]")
+    }), 60_000)
 })
