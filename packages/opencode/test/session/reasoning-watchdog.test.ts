@@ -1,5 +1,8 @@
 import { describe, expect } from "bun:test"
 import { Effect, Fiber, Stream } from "effect"
+import { ProviderV2 } from "@opencode-ai/core/provider"
+import { MessageV2 } from "@/session/message-v2"
+import { SessionRetry } from "@/session/retry"
 import { adjust } from "effect/testing/TestClock"
 import { LLMEvent } from "@opencode-ai/llm"
 import { ProviderError } from "@/provider/error"
@@ -324,7 +327,157 @@ describe("reasoning inactivity watchdog", () => {
     }),
   )
 
-  it.effect("recognizes summarized reasoning options and bypasses the guard", () =>
+  for (const scenario of [
+    { name: "pre-first-token", events: [] as LLMEvent[], summarized: false },
+    { name: "text-only", events: [text("partial")], summarized: false },
+    { name: "summarized reasoning", events: [start(), delta("summary")], summarized: true },
+    { name: "summarized pre-first-token", events: [] as LLMEvent[], summarized: true },
+  ]) {
+    it.effect(`retries a ${scenario.name} stall through the session retry policy`, () =>
+      Effect.gen(function* () {
+        let attempts = 0
+        const errors: unknown[] = []
+        const scheduled: number[] = []
+        const providerID = ProviderV2.ID.make("test")
+        const run = Effect.suspend(() => {
+          attempts++
+          return attempts === 1
+            ? ReasoningWatchdog.guard(hanging(...scenario.events), { summarized: scenario.summarized }).pipe(
+                Stream.runDrain,
+                Effect.tapError((error) => Effect.sync(() => errors.push(error))),
+              )
+            : Effect.void
+        }).pipe(
+          Effect.retry(
+            SessionRetry.policy({
+              provider: "test",
+              parse: (error) => MessageV2.fromError(error, { providerID }),
+              set: (info) =>
+                Effect.sync(() => {
+                  scheduled.push(info.attempt)
+                }),
+            }),
+          ),
+          Effect.forkScoped({ startImmediately: true }),
+        )
+        const fiber = yield* run
+        yield* adjust(TIMEOUT)
+        expect(errors).toHaveLength(1)
+        expect(errors[0]).toBeInstanceOf(ProviderError.ResponseStreamError)
+        expect(scheduled).toEqual([1])
+        yield* adjust("3 seconds")
+        yield* Fiber.join(fiber)
+        expect(attempts).toBe(2)
+      }),
+    )
+  }
+
+  for (const cancel of [false, true]) {
+    it.effect(`${cancel ? "cancellation" : "timeout"} aborts a pending async read before iterator cleanup`, () =>
+      Effect.gen(function* () {
+        const ctrl = new AbortController()
+        let returned = false
+        let reading = false
+        const aborted = new Promise<void>((resolve) =>
+          ctrl.signal.addEventListener("abort", () => resolve(), { once: true }),
+        )
+        const iterable: AsyncIterable<LLMEvent> = {
+          [Symbol.asyncIterator]() {
+            return {
+              next: async () => {
+                reading = true
+                await aborted
+                return { done: true, value: undefined }
+              },
+              return: async () => {
+                await aborted
+                returned = true
+                return { done: true, value: undefined }
+              },
+            }
+          },
+        }
+        const fiber = yield* ReasoningWatchdog.guard(
+          Stream.fromAsyncIterable(iterable, (error) => error),
+          {
+            summarized: true,
+            onInterrupt: () => ctrl.abort(),
+          },
+        ).pipe(Stream.runDrain, Effect.forkScoped({ startImmediately: true }))
+        expect(reading).toBe(true)
+        if (cancel) {
+          yield* Fiber.interrupt(fiber)
+        } else {
+          yield* adjust(TIMEOUT)
+          expect(yield* Fiber.join(fiber).pipe(Effect.flip)).toBeInstanceOf(ProviderError.ResponseStreamError)
+        }
+        expect(ctrl.signal.aborted).toBe(true)
+        expect(returned).toBe(true)
+      }),
+    )
+  }
+
+  for (const summarized of [false, true]) {
+    it.effect(`does not time out an active ${summarized ? "summarized" : "ordinary"} stream`, () =>
+      Effect.gen(function* () {
+        const source = Stream.fromIterable(Array.from({ length: 8 }, () => text("token"))).pipe(
+          Stream.mapEffect((event) => Effect.sleep("40 seconds").pipe(Effect.as(event))),
+        )
+        const fiber = yield* ReasoningWatchdog.guard(source, { summarized }).pipe(
+          Stream.runDrain,
+          Effect.forkScoped({ startImmediately: true }),
+        )
+        yield* adjust("5 minutes")
+        yield* pending(fiber)
+        yield* Fiber.interrupt(fiber)
+      }),
+    )
+  }
+
+  it.effect("summarized control events rearm the event deadline, but a later stall still fails", () =>
+    Effect.gen(function* () {
+      const source = Stream.concat(Stream.fromEffect(Effect.sleep("40 seconds").pipe(Effect.as(step()))), Stream.never)
+      const fiber = yield* ReasoningWatchdog.guard(source, { summarized: true }).pipe(
+        Stream.runDrain,
+        Effect.forkScoped({ startImmediately: true }),
+      )
+      yield* adjust("40 seconds")
+      yield* adjust("59 seconds")
+      yield* pending(fiber)
+      yield* adjust("1 second")
+      const error = yield* Fiber.join(fiber).pipe(Effect.flip)
+      expect(error).toBeInstanceOf(ProviderError.ResponseStreamError)
+      expect(error.message).toContain("without new events")
+    }),
+  )
+
+  it.effect("summarized streams do not charge local tool execution to inactivity", () =>
+    Effect.gen(function* () {
+      const source = Stream.concat(
+        Stream.make(LLMEvent.toolCall({ id: "a", name: "bash", input: {} })),
+        Stream.concat(
+          Stream.fromEffect(
+            Effect.sleep("2 minutes").pipe(
+              Effect.as(LLMEvent.toolResult({ id: "a", name: "bash", result: { type: "text", value: "done" } })),
+            ),
+          ),
+          Stream.never,
+        ),
+      )
+      const fiber = yield* ReasoningWatchdog.guard(source, {
+        summarized: true,
+        executableTools: new Set(["bash"]),
+      }).pipe(Stream.runDrain, Effect.forkScoped({ startImmediately: true }))
+      yield* adjust("2 minutes")
+      yield* pending(fiber)
+      yield* adjust("59 seconds")
+      yield* pending(fiber)
+      yield* adjust("1 second")
+      expect(yield* Fiber.join(fiber).pipe(Effect.flip)).toBeInstanceOf(ProviderError.ResponseStreamError)
+    }),
+  )
+
+  it.effect("recognizes summarized reasoning options and exempts them from the token deadline", () =>
     Effect.gen(function* () {
       expect(ReasoningWatchdog.hasSummary({ reasoningSummary: "auto" })).toBe(true)
       expect(ReasoningWatchdog.hasSummary({ reasoningConfig: { display: "summarized" } })).toBe(true)
@@ -334,9 +487,17 @@ describe("reasoning inactivity watchdog", () => {
       )
       expect(ReasoningWatchdog.hasSummary({ thinking: { type: "enabled" } })).toBe(false)
 
-      const fiber = yield* ReasoningWatchdog.guard(hanging(start(), delta("summary")), {
-        summarized: true,
-      }).pipe(Stream.runDrain, Effect.forkScoped({ startImmediately: true }))
+      const fiber = yield* ReasoningWatchdog.guard(
+        Stream.concat(
+          Stream.make(start(), delta("summary")),
+          Stream.fromIterable([step(), step(), step(), step()]).pipe(
+            Stream.mapEffect((event) => Effect.sleep("40 seconds").pipe(Effect.as(event))),
+          ),
+        ),
+        {
+          summarized: true,
+        },
+      ).pipe(Stream.runDrain, Effect.forkScoped({ startImmediately: true }))
 
       yield* adjust("2 minutes")
       yield* pending(fiber)

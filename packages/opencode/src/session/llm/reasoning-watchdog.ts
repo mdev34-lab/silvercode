@@ -2,48 +2,58 @@ import type { LLMEvent } from "@opencode-ai/llm"
 import { Clock, Duration, Effect, Stream } from "effect"
 import { ProviderError } from "@/provider/error"
 
+// Match the existing token inactivity budget: a minute allows slow providers
+// to respond while bounding silent streams, including summarized reasoning.
 export const INACTIVITY_TIMEOUT = "1 minute"
 
 type Options = {
   readonly timeout?: Duration.Input
   readonly summarized?: boolean
   readonly executableTools?: ReadonlySet<string>
+  /** Abort the underlying request before a pending pull's iterator is finalized. */
+  readonly onInterrupt?: () => void
 }
 
 export function guard<E, R>(self: Stream.Stream<LLMEvent, E, R>, options: Options = {}) {
-  if (options.summarized) return self
-
   const timeout = Duration.fromInputUnsafe(options.timeout ?? INACTIVITY_TIMEOUT)
   const timeoutMillis = Duration.toMillis(timeout)
 
   return Stream.transformPull(Stream.rechunk(self, 1), (pull) =>
     Effect.gen(function* () {
-      // General inactivity deadline, armed from stream start: a provider that
-      // holds the stream open with zero events, or stalls during text-only
-      // generation, now trips the retry pipeline instead of leaving the
-      // session busy until the user cancels (#408). Only visible token
-      // deltas count as activity; control events never reset the deadline.
+      // All streams have an event-inactivity deadline from the first pull.
+      // Unsummarized streams also retain the stricter token deadline: control
+      // events cannot keep an otherwise stalled reasoning trace alive.
       let deadline = (yield* Clock.currentTimeMillis) + timeoutMillis
+      let eventDeadline = deadline
       const executing = new Set<string>()
 
       return Effect.gen(function* () {
         const now = yield* Clock.currentTimeMillis
         // Tool execution is owned by the application, not model generation.
         // Keep pulling settlements without charging tool runtime to token inactivity.
+        // Async iterator cleanup can wait for an outstanding read. Abort the
+        // request when that read is interrupted, before its scope is closed.
+        const onInterrupt = options.onInterrupt
+        const interruptiblePull = onInterrupt ? pull.pipe(Effect.onInterrupt(() => Effect.sync(onInterrupt))) : pull
         const events = yield* executing.size > 0
-          ? pull
-          : pull.pipe(
+          ? interruptiblePull
+          : interruptiblePull.pipe(
               Effect.timeoutOrElse({
-                duration: Duration.millis(Math.max(0, deadline - now)),
+                duration: Duration.millis(
+                  Math.max(0, (options.summarized ? eventDeadline : Math.min(deadline, eventDeadline)) - now),
+                ),
                 orElse: () =>
                   Effect.fail(
                     new ProviderError.ResponseStreamError(
-                      `reasoning stream timed out after ${Duration.format(timeout)} without new tokens`,
+                      options.summarized
+                        ? `response stream timed out after ${Duration.format(timeout)} without new events`
+                        : `reasoning stream timed out after ${Duration.format(timeout)} without new tokens`,
                     ),
                   ),
               }),
             )
         const event = events[0]
+        eventDeadline = (yield* Clock.currentTimeMillis) + timeoutMillis
 
         if (event.type === "tool-call" && !event.providerExecuted && options.executableTools?.has(event.name)) {
           executing.add(event.id)

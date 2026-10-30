@@ -9,7 +9,9 @@ import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { eq } from "drizzle-orm"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { expect } from "bun:test"
-import { Cause, Deferred, Duration, Effect, Exit, Fiber, Layer, Schema } from "effect"
+import { Cause, Deferred, Duration, Effect, Exit, Fiber, Layer, Schema, Stream } from "effect"
+import * as TestClock from "effect/testing/TestClock"
+import { ReasoningWatchdog } from "@/session/llm/reasoning-watchdog"
 import path from "path"
 import { fileURLToPath } from "url"
 import { readdir, readFile } from "node:fs/promises"
@@ -5563,6 +5565,55 @@ it.instance(
       expect(yield* llm.hits).toHaveLength(1)
     }),
   10_000,
+)
+
+it.instance("ESC during a guarded stream stall blocks a fresh run until cancellation settles", () =>
+  Effect.gen(function* () {
+    const state = yield* SessionRunState.Service
+    const sessionID = SessionID.make("session-guarded-stall-cancel")
+    const started = yield* Deferred.make<void>()
+    const interrupting = yield* Deferred.make<void>()
+    const release = yield* Deferred.make<void>()
+    const freshStarted = yield* Deferred.make<void>()
+    const interrupted = {} as SessionV1.WithParts
+    const fresh = {} as SessionV1.WithParts
+    const source = Stream.fromEffect(Deferred.succeed(started, void 0)).pipe(Stream.flatMap(() => Stream.never))
+    const work = ReasoningWatchdog.guard(source, { summarized: true }).pipe(
+      Stream.runDrain,
+      Effect.orDie,
+      Effect.onInterrupt(() => Deferred.succeed(interrupting, void 0).pipe(Effect.andThen(Deferred.await(release)))),
+      Effect.as(interrupted),
+    )
+    const run = yield* state
+      .ensureRunning(sessionID, Effect.succeed(interrupted), work)
+      .pipe(Effect.forkScoped({ startImmediately: true }))
+    yield* Deferred.await(started)
+    yield* TestClock.adjust("30 seconds")
+    expect(yield* state.assertNotBusy(sessionID).pipe(Effect.flip)).toBeInstanceOf(Session.BusyError)
+
+    const cancel = yield* state.cancelForeground(sessionID).pipe(Effect.forkScoped({ startImmediately: true }))
+    yield* Deferred.await(interrupting)
+    const replacement = yield* state
+      .awaitCancel(sessionID)
+      .pipe(
+        Effect.andThen(
+          state.ensureRunning(
+            sessionID,
+            Effect.succeed(interrupted),
+            Deferred.succeed(freshStarted, void 0).pipe(Effect.as(fresh)),
+          ),
+        ),
+        Effect.forkScoped({ startImmediately: true }),
+      )
+    yield* Effect.yieldNow
+    expect(yield* Deferred.isDone(freshStarted)).toBe(false)
+    expect(replacement.pollUnsafe()).toBeUndefined()
+    yield* Deferred.succeed(release, void 0)
+    yield* Fiber.join(cancel)
+    expect(yield* Fiber.join(run)).toBe(interrupted)
+    expect(yield* Fiber.join(replacement)).toBe(fresh)
+    expect(yield* Deferred.isDone(freshStarted)).toBe(true)
+  }).pipe(Effect.provide(TestClock.layer())),
 )
 
 it.instance(
