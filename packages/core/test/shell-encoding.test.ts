@@ -104,6 +104,43 @@ describe("shell output decoding (#543)", () => {
     expect(failures).toBe(1)
   })
 
+  test("retries only spurious early timeouts with the same bound", () => {
+    const timeout = () => ({
+      error: Object.assign(new Error("timed out"), { code: "ETIMEDOUT" }),
+      status: null,
+      stdout: "",
+    })
+    let elapsed = 0
+    let earlyCalls = 0
+    const early = {
+      platform: "win32" as const,
+      now: () => elapsed,
+      probe: (_shell: string, timeoutMs: number) => {
+        earlyCalls++
+        expect(timeoutMs).toBe(2_000)
+        elapsed = earlyCalls
+        return earlyCalls === 1 ? timeout() : { status: 0, stdout: "Active code page: 437.\r\n" }
+      },
+    }
+    expect(windowsCmdCodePage("cmd-early-timeout.exe", early)).toBe(437)
+    expect(earlyCalls).toBe(2)
+
+    elapsed = 0
+    let genuineCalls = 0
+    const genuine = {
+      platform: "win32" as const,
+      now: () => elapsed,
+      probe: () => {
+        genuineCalls++
+        elapsed = 2_000
+        return timeout()
+      },
+    }
+    expect(windowsCmdCodePage("cmd-genuine-timeout.exe", genuine)).toBeUndefined()
+    expect(windowsCmdCodePage("cmd-genuine-timeout.exe", genuine)).toBeUndefined()
+    expect(genuineCalls).toBe(1)
+  })
+
   test("flushes trailing incomplete UTF-8 and legacy multibyte sequences", () => {
     for (const [shell, platform, codepage, lead] of [
       ["/bin/sh", "linux", undefined, 0xc3],

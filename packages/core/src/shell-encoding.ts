@@ -16,7 +16,7 @@ type CmdProbe = (
   shell: string,
   timeout: number,
 ) => {
-  error?: Error
+  error?: NodeJS.ErrnoException
   status: number | null
   stdout: string
 }
@@ -32,17 +32,27 @@ export function parseWindowsCmdCodePage(stdout: string) {
  * create a fresh console or inherit an existing one; those scenarios and other no-console launch mechanisms are
  * unverified, so no effective-codepage guarantee is claimed for them.
  */
-export function windowsCmdCodePage(shell: string, options: { platform?: NodeJS.Platform; probe?: CmdProbe } = {}) {
+export function windowsCmdCodePage(
+  shell: string,
+  options: { platform?: NodeJS.Platform; probe?: CmdProbe; now?: () => number } = {},
+) {
   const platform = options.platform ?? process.platform
   if (platform !== "win32") return undefined
   if (codepages.has(shell)) return codepages.get(shell)
 
   let codepage: number | undefined
   try {
-    const probe =
+    const probe: CmdProbe =
       options.probe ??
       ((shell: string, timeout: number) => spawnSync("chcp", { shell, encoding: "utf8", windowsHide: true, timeout }))
-    const result = probe(shell, 2_000)
+    const now = options.now ?? (() => performance.now())
+    const started = now()
+    let result = probe(shell, 2_000)
+    if (result.error?.code === "ETIMEDOUT" && now() - started < 2_000) {
+      // Bun 1.3.x can expire its cached Windows spawn timer early after idle. Retry only that spurious result;
+      // a genuine full timeout remains a cached failure, and every probe retains the same 2000 ms bound.
+      result = probe(shell, 2_000)
+    }
     if (!result.error && result.status === 0) codepage = parseWindowsCmdCodePage(result.stdout)
   } catch {}
   // Cache failures too, so a failed or timed-out probe cannot block every command.
