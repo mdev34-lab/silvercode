@@ -1,5 +1,10 @@
 import path from "path"
+import { beforeEach } from "bun:test"
+import { takeActiveOwnedScope } from "./lib/owned-deadline"
 import { traceAborts } from "./lib/abort-trace"
+
+// Also protect plain Bun tests following an abandoned Effect cleanup hook.
+beforeEach(() => takeActiveOwnedScope())
 
 // Installed before any test file so it covers the whole run; inert unless
 // OPENCODE_TRACE_TEST_ABORTS is set (#560).
