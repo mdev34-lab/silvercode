@@ -92,19 +92,23 @@ const layer = Layer.effect(
       before: Effect.Effect<void> = Effect.void,
     ) {
       const data = yield* InstanceState.get(state)
-      bumpEpoch(data, sessionID)
       const inflight = data.cancelling.get(sessionID)
       if (inflight) {
+        bumpEpoch(data, sessionID)
         // A cancel already owns settlement. Running only the requested background
         // pass also covers a full cancel arriving behind cancelForeground without
         // making a re-entrant background finalizer wait on its own outer cancel.
         yield* before
         return
       }
-      const existing = data.runners.get(sessionID)
-      // Register before background work so awaitCancel covers the whole cancellation.
+      // Register before the epoch bump so a concurrent prompt that calls
+      // awaitCancel before capturing its epoch will correctly wait for this
+      // cancellation to settle and then start a clean run instead of being
+      // poisoned by the previous run's epoch.
       const done = yield* Deferred.make<void>()
       data.cancelling.set(sessionID, done)
+      bumpEpoch(data, sessionID)
+      const existing = data.runners.get(sessionID)
       yield* before.pipe(
         Effect.andThen(
           Effect.gen(function* () {

@@ -6216,3 +6216,144 @@ withMcpTools.instance("an explicit permission deny still removes the MCP tool wh
  if(Exit.isFailure(exit)) expect(Cause.pretty(exit.cause).toLowerCase()).toMatch(/denied|deny|permission/)
 }))
 
+// ---------------------------------------------------------------------------
+// Regression for #292: ESC interruption must not poison the next prompt.
+// Deterministic (no wall-clock sleeps, only Deferred coordination) and covers
+// streaming, queued, background cleanup, and fresh-cancel cases.
+// ---------------------------------------------------------------------------
+it.instance(
+  "ESC interrupt does not poison next prompt - streaming, queued, background and fresh cancel all start clean runs (#292)",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Interrupt resume #292" })
+
+      // Streaming: first prompt hangs (simulates Work agent streaming on PowerShell)
+      yield* llm.hang
+      const first = yield* prompt
+        .prompt({ sessionID: chat.id, agent: "work", model: ref, parts: [{ type: "text", text: "First prompt" }] })
+        .pipe(Effect.forkChild)
+      yield* waitForBusy(chat.id)
+      yield* llm.wait(1)
+
+      // ESC: cancel active run - must preserve cancelled turn as interrupted but not poison next
+      yield* prompt.cancel(chat.id)
+      const exitFirst = yield* Fiber.await(first)
+      expect(Exit.isSuccess(exitFirst)).toBe(true)
+      if (Exit.isSuccess(exitFirst)) {
+        expect(exitFirst.value.info.error?.name).toBe("MessageAbortedError")
+      }
+      yield* pollWithTimeout(
+        Effect.gen(function* () {
+          const s = yield* SessionStatus.Service
+          const cur = yield* s.get(chat.id)
+          return cur.type === "idle" ? (true as const) : undefined
+        }),
+        `session ${chat.id} never became idle after cancel`,
+      )
+      const interruptedBefore = yield* abortedIDs(chat.id)
+      expect(interruptedBefore.length).toBe(1)
+
+      // Next prompt after ESC must start a clean run (not interrupted)
+      yield* llm.text("Second answer")
+      const second = yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "work",
+        model: ref,
+        parts: [{ type: "text", text: "Second prompt" }],
+      })
+      expect(second.info.error).toBeUndefined()
+      expect(second.info.finish).toBeDefined()
+      expect(interruptedBefore.includes(second.info.id)).toBe(false)
+      expect(yield* llm.hits).toHaveLength(1)
+      expect((yield* abortedIDs(chat.id)).length).toBe(1)
+
+      // Queued: submit a prompt while the second run is still streaming, then cancel,
+      // then submit a fresh prompt - fresh must not be poisoned by queued's cancellation
+      yield* llm.hang
+      const secondRun = yield* prompt
+        .prompt({ sessionID: chat.id, agent: "work", model: ref, parts: [{ type: "text", text: "Second run still streaming" }] })
+        .pipe(Effect.forkChild)
+      yield* waitForBusy(chat.id)
+      yield* llm.wait(2)
+
+      const queuedID = MessageID.ascending()
+      const queuedPersisted = yield* Deferred.make<void>()
+      const releaseQueued = yield* Deferred.make<void>()
+      const events = yield* EventV2Bridge.Service
+      const offQueued = yield* events.listen((event) => {
+        if (event.type !== SessionV1.Event.MessageUpdated.type) return Effect.void
+        const data: any = (event as any).data
+        if (data?.sessionID !== chat.id || data?.info?.id !== queuedID) return Effect.void
+        return Deferred.succeed(queuedPersisted, void 0).pipe(Effect.andThen(Deferred.await(releaseQueued)))
+      })
+      yield* Effect.addFinalizer(() => offQueued)
+      const queued = yield* prompt
+        .prompt({ sessionID: chat.id, messageID: queuedID, agent: "work", model: ref, parts: [{ type: "text", text: "Queued while running" }] })
+        .pipe(Effect.forkChild)
+      yield* awaitWithTimeout(Deferred.await(queuedPersisted), "queued message never persisted")
+      yield* prompt.cancel(chat.id)
+      yield* Deferred.succeed(releaseQueued, void 0)
+      const [exitSecondRun, exitQueued] = yield* Effect.all([Fiber.await(secondRun), Fiber.await(queued)])
+      expect(Exit.isSuccess(exitSecondRun)).toBe(true)
+      expect(Exit.isSuccess(exitQueued)).toBe(true)
+      if (Exit.isSuccess(exitQueued)) expect(exitQueued.value.info.error?.name).toBe("MessageAbortedError")
+      expect(yield* llm.hits).toHaveLength(1)
+      const interruptedAfterQueued = yield* abortedIDs(chat.id)
+      expect(interruptedAfterQueued.length).toBe(3)
+
+      // Fresh after queued-cancel must still start clean (awaitCancel-before-epoch ensures not poisoned)
+      yield* llm.text("Fresh after queued cancel")
+      const freshAfterQueued = yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "work",
+        model: ref,
+        parts: [{ type: "text", text: "Fresh after queued" }],
+      })
+      expect(freshAfterQueued.info.error).toBeUndefined()
+      expect(yield* llm.hits).toHaveLength(2)
+
+      // Background cleanup: a background job cancelled during teardown must not mark replacement idle
+      const background = yield* BackgroundJob.Service
+      const interruptingBackground = yield* Deferred.make<void>()
+      const releaseBackground = yield* Deferred.make<void>()
+      yield* background.start({
+        id: chat.id as any,
+        type: "task",
+        metadata: { sessionId: chat.id } as any,
+        run: Effect.never.pipe(Effect.onInterrupt(() => Deferred.succeed(interruptingBackground, void 0).pipe(Effect.andThen(Deferred.await(releaseBackground))))),
+      } as any)
+      yield* llm.hang
+      const cancellingWithBg = yield* prompt.cancel(chat.id).pipe(Effect.forkChild)
+      yield* awaitWithTimeout(Deferred.await(interruptingBackground), "background job not interrupted")
+      // Prompt submitted while background teardown is still yielding must become replacement run
+      const replacement = yield* prompt
+        .prompt({ sessionID: chat.id, agent: "work", model: ref, parts: [{ type: "text", text: "Replacement during teardown" }] })
+        .pipe(Effect.forkChild)
+      yield* llm.wait(3)
+      yield* waitForBusy(chat.id)
+      yield* Deferred.succeed(releaseBackground, void 0)
+      yield* Fiber.await(cancellingWithBg)
+      const statusAfterBgCancel = (yield* (yield* SessionStatus.Service).get(chat.id)).type
+      expect(statusAfterBgCancel).toBe("busy")
+      yield* prompt.cancel(chat.id)
+      yield* Fiber.await(replacement)
+
+      // Fresh cancel on idle must not poison next prompt
+      yield* prompt.cancel(chat.id)
+      yield* llm.text("After idle cancel")
+      const afterIdleCancel = yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "work",
+        model: ref,
+        parts: [{ type: "text", text: "After idle cancel" }],
+      })
+      expect(afterIdleCancel.info.error).toBeUndefined()
+      expect((yield* llm.hits).length).toBeGreaterThanOrEqual(3)
+    }),
+  { git: true },
+  10_000,
+)
+
