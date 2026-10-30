@@ -3,7 +3,8 @@ import { spawnSync } from "node:child_process"
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import path from "node:path"
-import { shellOutputDecoder, windowsPowerShellCommand } from "../src/shell-encoding"
+import iconv from "iconv-lite"
+import { shellOutputDecoder, windowsOemCodePage, windowsPowerShellCommand } from "../src/shell-encoding"
 
 const text = "Área de Trabalho - ação 日本語 😀"
 const command = `[Console]::Write('${text}'); [Console]::Error.Write('${text}'); exit 7`
@@ -46,21 +47,36 @@ describe("shell output decoding (#543)", () => {
     const streamed = shellOutputDecoder("/bin/sh", { platform: "linux" })
     expect(streamed.decode(bom) + streamed.end()).toBe("A")
   })
-  ;(process.platform === "win32" ? test : test.skip)("decodes real cmd builtin output and preserves its exit", () => {
-    const directory = mkdtempSync(path.join(tmpdir(), "shell-encoding-"))
-    try {
-      const file = "área-ç.txt"
-      writeFileSync(path.join(directory, file), "")
-      const shell = process.env.COMSPEC || "cmd.exe"
-      const child = spawnSync("dir /b *.txt & exit /b 7", { cwd: directory, shell, windowsHide: true })
-      expect(child.error).toBeUndefined()
-      expect(child.status).toBe(7)
-      const decoder = shellOutputDecoder(shell)
-      expect(decoder.decode(child.stdout) + decoder.end()).toBe(`${file}\r\n`)
-    } finally {
-      rmSync(directory, { recursive: true, force: true })
-    }
-  })
+  ;(process.platform === "win32" ? test : test.skip)(
+    "emits real non-ASCII cmd bytes and decodes them with the detected OEM codepage",
+    () => {
+      const directory = mkdtempSync(path.join(tmpdir(), "shell-encoding-"))
+      try {
+        const codepage = windowsOemCodePage()
+        if (!codepage) throw new Error("Windows OEM codepage is unavailable")
+        const encoding = String(codepage)
+        if (!iconv.encodingExists(encoding)) throw new Error(`Unsupported Windows OEM codepage: ${codepage}`)
+        const file = ["Área de Trabalho.txt", "área de trabalho.txt"].find((candidate) => {
+          const bytes = iconv.encode(candidate, encoding)
+          return iconv.decode(bytes, encoding) === candidate && bytes.some((byte) => byte >= 0x80)
+        })
+        if (!file) throw new Error(`The accented fixtures are not representable in OEM codepage ${codepage}`)
+
+        writeFileSync(path.join(directory, file), "")
+        const shell = process.env.COMSPEC || "cmd.exe"
+        const child = spawnSync("dir /b *.txt & exit /b 7", { cwd: directory, shell, windowsHide: true })
+        console.log(`cmd.exe OEMCP=${codepage}; file=${JSON.stringify(file)}; stdout=${child.stdout.toString("hex")}`)
+        expect(child.error).toBeUndefined()
+        expect(child.status).toBe(7)
+        expect(child.stdout.toString("hex")).toBe(iconv.encode(`${file}\r\n`, encoding).toString("hex"))
+        expect(child.stdout.some((byte) => byte >= 0x80)).toBe(true)
+        const decoder = shellOutputDecoder(shell)
+        expect(decoder.decode(child.stdout) + decoder.end()).toBe(`${file}\r\n`)
+      } finally {
+        rmSync(directory, { recursive: true, force: true })
+      }
+    },
+  )
 })
 
 describe("PowerShell UTF-8 output (#543)", () => {

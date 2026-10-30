@@ -10,7 +10,7 @@ export function windowsPowerShellCommand(shell: string, command: string, platfor
   return "$OutputEncoding = [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false);\n" + command
 }
 
-function windowsOemCodePage() {
+export function windowsOemCodePage() {
   const root = process.env.SystemRoot ?? process.env.SYSTEMROOT ?? process.env.windir
   if (!root) return undefined
   const result = spawnSync(
