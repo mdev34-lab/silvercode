@@ -2,6 +2,7 @@ import { AgentV2 } from "@opencode-ai/core/agent"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Location } from "@opencode-ai/core/location"
 import { LocationServiceMap, locationServiceMapLayer } from "@opencode-ai/core/location-services"
+import { PluginInternal } from "@opencode-ai/core/plugin/internal"
 import { AbsolutePath } from "@opencode-ai/core/schema"
 import { SessionMessage } from "@opencode-ai/core/session/message"
 import { SessionSchema } from "@opencode-ai/core/session/schema"
@@ -29,8 +30,10 @@ export const AttachmentTool = Tool.define(
           directory: AbsolutePath.make(ctx.directory),
           workspaceID,
         })
+        const locationLayer = locations.get(ref)
+        const internal = yield* PluginInternal.Service.pipe(Effect.provide(locationLayer))
         const materialization = yield* CoreToolRegistry.Service.use((registry) => registry.materialize()).pipe(
-          Effect.provide(locations.get(ref)),
+          Effect.provide(locationLayer),
         )
         const definition = materialization.definitions.find((tool) => tool.name === "attachment")
         if (!definition) return yield* Effect.die(new Error("canonical attachment tool is not registered"))
@@ -41,6 +44,10 @@ export const AttachmentTool = Tool.define(
           jsonSchema: definition.inputSchema,
           execute: (input: unknown, toolCtx: Tool.Context) =>
             Effect.gen(function* () {
+              // The V1 loop can reach this bridge while PluginInternal.boot is still
+              // reloading the agent map. Wait for that batch before canonical settlement
+              // so permission resolution never sees the uninitialized deny-all fallback.
+              yield* internal.ready
               const settlement = yield* materialization
                 .settle({
                   sessionID: SessionSchema.ID.make(toolCtx.sessionID),
