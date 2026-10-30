@@ -8,7 +8,12 @@ export function windowsPowerShellCommand(shell: string, command: string, platfor
   return "$OutputEncoding = [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false);\n" + command
 }
 
-/** Probe a fresh cmd through the same shell option used to run commands, so it reports its inherited startup codepage. */
+/**
+ * Probe a fresh cmd through the same shell option used to run commands, so it reports its inherited startup codepage.
+ * Integration coverage is limited to this exact hidden/piped spawn shape in the headless Windows runner. Tests do not
+ * create a fresh console or inherit an existing one; those scenarios and other no-console launch mechanisms are
+ * unverified, so no effective-codepage guarantee is claimed for them.
+ */
 export function windowsCmdCodePage(shell: string) {
   if (process.platform !== "win32") return undefined
   const result = spawnSync("chcp", { shell, encoding: "utf8", windowsHide: true })

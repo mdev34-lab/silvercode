@@ -21,6 +21,14 @@ const roundtrip = (value: string, codepage: number) => {
   const bytes = encode(value, codepage)
   return codepage === 65001 ? bytes.toString("utf8") : iconv.decode(bytes, String(codepage))
 }
+const readCodePage = (stdout: Buffer, offset = 0) => {
+  const end = stdout.indexOf(0x0a, offset)
+  if (end < 0) throw new Error(`Missing chcp report in stdout: ${stdout.toString("hex")}`)
+  const line = stdout.subarray(offset, end).toString("ascii")
+  const match = /(\d+)\r?$/.exec(line)
+  if (!match) throw new Error(`Invalid chcp report ${JSON.stringify(line)}`)
+  return { codepage: Number(match[1]), offset: end + 1 }
+}
 
 describe("shell output decoding (#543)", () => {
   test("decodes synthetic Windows ANSI and OEM bytes with the console codepage", () => {
@@ -87,8 +95,11 @@ describe("shell output decoding (#543)", () => {
     expect(decoder.warning).toContain("Unable to determine")
     expect(decoder.decode(new TextEncoder().encode("ação")) + decoder.end()).toBe("ação")
   })
+  // The Windows runner supplies the headless scenario. Fresh-console and
+  // inherited-console launches intentionally remain unverified; this test only
+  // covers the hidden/piped child and requires it to report its own codepage.
   ;(process.platform === "win32" ? test : test.skip)(
-    "emits real non-ASCII cmd bytes and decodes them with the inherited process codepage",
+    "matches the probe to a hidden cmd child's own codepage and output bytes",
     () => {
       const directory = mkdtempSync(path.join(tmpdir(), "shell-encoding-"))
       try {
@@ -104,24 +115,31 @@ describe("shell output decoding (#543)", () => {
         if (!file) throw new Error(`The accented fixtures are not representable in cmd codepage ${codepage}`)
 
         writeFileSync(path.join(directory, file), "")
-        const child = spawnSync("dir /b *.txt & exit /b 7", { cwd: directory, shell, windowsHide: true })
-        console.log(
-          `cmd.exe codepage=${codepage}; file=${JSON.stringify(file)}; stdout=${child.stdout.toString("hex")}`,
-        )
+        const child = spawnSync("chcp & dir /b *.txt & exit /b 7", {
+          cwd: directory,
+          shell,
+          windowsHide: true,
+        })
         expect(child.error).toBeUndefined()
         expect(child.status).toBe(7)
-        expect(child.stdout.toString("hex")).toBe(encode(`${file}\r\n`, codepage).toString("hex"))
-        expect(child.stdout.some((byte) => byte >= 0x80)).toBe(true)
+        const actual = readCodePage(child.stdout)
+        const output = child.stdout.subarray(actual.offset)
+        console.log(
+          `headless cmd.exe probe=${codepage}; child=${actual.codepage}; file=${JSON.stringify(file)}; dir=${output.toString("hex")}`,
+        )
+        expect(actual.codepage).toBe(codepage)
+        expect(output.toString("hex")).toBe(encode(`${file}\r\n`, actual.codepage).toString("hex"))
+        expect(output.some((byte) => byte >= 0x80)).toBe(true)
         const decoder = shellOutputDecoder(shell)
         expect(decoder.warning).toBeUndefined()
-        expect(decoder.decode(child.stdout) + decoder.end()).toBe(`${file}\r\n`)
+        expect(decoder.decode(output) + decoder.end()).toBe(`${file}\r\n`)
       } finally {
         rmSync(directory, { recursive: true, force: true })
       }
     },
   )
   ;(process.platform === "win32" ? test : test.skip)(
-    "decodes real non-ASCII cmd dir output after a same-process chcp 65001 request",
+    "documents that hidden cmd dir bytes stay in the startup codepage after chcp 65001",
     () => {
       const directory = mkdtempSync(path.join(tmpdir(), "shell-encoding-chcp-"))
       try {
@@ -137,21 +155,29 @@ describe("shell output decoding (#543)", () => {
         if (!file) throw new Error(`The accented fixtures are not representable in cmd codepage ${codepage}`)
 
         writeFileSync(path.join(directory, file), "")
-        const child = spawnSync("chcp.com 65001 >nul & dir /b *.txt & exit /b 7", {
+        const child = spawnSync("chcp & chcp.com 65001 >nul & chcp & dir /b *.txt & exit /b 7", {
           cwd: directory,
           shell,
           windowsHide: true,
         })
-        console.log(
-          `cmd.exe after chcp 65001: codepage=${codepage}; file=${JSON.stringify(file)}; stdout=${child.stdout.toString("hex")}`,
-        )
         expect(child.error).toBeUndefined()
         expect(child.status).toBe(7)
-        expect(child.stdout.toString("hex")).toBe(encode(`${file}\r\n`, codepage).toString("hex"))
-        expect(child.stdout.some((byte) => byte >= 0x80)).toBe(true)
+        const before = readCodePage(child.stdout)
+        const after = readCodePage(child.stdout, before.offset)
+        const output = child.stdout.subarray(after.offset)
+        console.log(
+          `headless cmd.exe chcp: probe=${codepage}; before=${before.codepage}; after=${after.codepage}; file=${JSON.stringify(file)}; dir=${output.toString("hex")}`,
+        )
+        expect(before.codepage).toBe(codepage)
+        expect(before.codepage).not.toBe(65001)
+        expect(after.codepage).toBe(65001)
+        // This proves the reported codepage changed while the builtin's bytes did
+        // not. It is not coverage for tracking a real output-encoding transition.
+        expect(output.toString("hex")).toBe(encode(`${file}\r\n`, before.codepage).toString("hex"))
+        expect(output.some((byte) => byte >= 0x80)).toBe(true)
         const decoder = shellOutputDecoder(shell)
         expect(decoder.warning).toBeUndefined()
-        expect(decoder.decode(child.stdout) + decoder.end()).toBe(`${file}\r\n`)
+        expect(decoder.decode(output) + decoder.end()).toBe(`${file}\r\n`)
       } finally {
         rmSync(directory, { recursive: true, force: true })
       }
