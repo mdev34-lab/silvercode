@@ -90,7 +90,13 @@ export const createSseClient = <TData = unknown>({
 }: ServerSentEventsOptions): ServerSentEventsResult<TData> => {
   let lastEventId: string | undefined
 
-  const sleep = sseSleepFn ?? ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)))
+  const sleep =
+    sseSleepFn ??
+    ((ms: number) =>
+      new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, ms)
+        timer.unref?.()
+      }))
 
   const createStream = async function* () {
     let retryDelay: number = sseDefaultRetryDelay ?? 3000
@@ -233,13 +239,32 @@ export const createSseClient = <TData = unknown>({
         // connection failed or aborted; retry after delay
         onSseError?.(error)
 
+        // HAND-EDIT (#555, reapplied by script/build.ts): break immediately
+        // when aborted, and wake an active retry backoff on abort so callers
+        // cancelling a disconnected stream do not wait for the 3s-30s sleep.
+        if (signal.aborted) break
+
         if (sseMaxRetryAttempts !== undefined && attempt >= sseMaxRetryAttempts) {
           break // stop after firing error
         }
 
         // exponential backoff: double retry each attempt, cap at 30s
         const backoff = Math.min(retryDelay * 2 ** (attempt - 1), sseMaxRetryDelay ?? 30000)
-        await sleep(backoff)
+        await new Promise<void>((resolve) => {
+          if (signal.aborted) {
+            resolve()
+            return
+          }
+          const onAbort = () => {
+            signal.removeEventListener("abort", onAbort)
+            resolve()
+          }
+          signal.addEventListener("abort", onAbort, { once: true })
+          void sleep(backoff).finally(() => {
+            signal.removeEventListener("abort", onAbort)
+            resolve()
+          })
+        })
       }
     }
   }

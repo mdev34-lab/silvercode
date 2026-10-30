@@ -124,7 +124,7 @@ await Bun.write(sseTypesPath, sseTypesPatched)
 // keep them in sync with the committed generated files.
 const sseParserPath = "./src/v2/gen/core/serverSentEvents.gen.ts"
 const sseParserSource = await Bun.file(sseParserPath).text()
-const sseParserPatched = sseParserSource.replace(
+const sseParserValidated = sseParserSource.replace(
   /if \(responseValidator\) \{\s*await responseValidator\(data\);?\s*\}/,
   `if (responseValidator) {
                   // HAND-EDIT (#435, reapplied by script/build.ts): a
@@ -141,8 +141,55 @@ const sseParserPatched = sseParserSource.replace(
                   }
                 }`,
 )
-if (sseParserPatched === sseParserSource) {
+if (sseParserValidated === sseParserSource) {
   throw new Error(`SSE frame-validation patch did not apply; @hey-api/openapi-ts output may have changed (${sseParserPath})`)
+}
+const sseParserSleepPatched = sseParserValidated.replace(
+  /const sleep =\s*sseSleepFn \?\?\s*\(\(ms: number\) => new Promise\(\(resolve\) => setTimeout\(resolve, ms\)\)\);?/,
+  `const sleep =
+    sseSleepFn ??
+    ((ms: number) =>
+      new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, ms)
+        timer.unref?.()
+      }))`,
+)
+if (sseParserSleepPatched === sseParserValidated) {
+  throw new Error(`SSE sleep unref patch did not apply; @hey-api/openapi-ts output may have changed (${sseParserPath})`)
+}
+const sseParserPatched = sseParserSleepPatched.replace(
+  /onSseError\?\.\(error\);?\s*if \(\s*sseMaxRetryAttempts !== undefined &&\s*attempt >= sseMaxRetryAttempts\s*\) \{\s*break;?\s*(?:\/\/[^\n]*)?\s*\}\s*(?:\/\/[^\n]*\s*)?const backoff = Math\.min\(\s*retryDelay \* 2 \*\* \(attempt - 1\),\s*sseMaxRetryDelay \?\? 30000,?\s*\);?\s*await sleep\(backoff\);?/,
+  `onSseError?.(error)
+
+        // HAND-EDIT (#555, reapplied by script/build.ts): break immediately
+        // when aborted, and wake an active retry backoff on abort so callers
+        // cancelling a disconnected stream do not wait for the 3s-30s sleep.
+        if (signal.aborted) break
+
+        if (sseMaxRetryAttempts !== undefined && attempt >= sseMaxRetryAttempts) {
+          break // stop after firing error
+        }
+
+        // exponential backoff: double retry each attempt, cap at 30s
+        const backoff = Math.min(retryDelay * 2 ** (attempt - 1), sseMaxRetryDelay ?? 30000)
+        await new Promise<void>((resolve) => {
+          if (signal.aborted) {
+            resolve()
+            return
+          }
+          const onAbort = () => {
+            signal.removeEventListener("abort", onAbort)
+            resolve()
+          }
+          signal.addEventListener("abort", onAbort, { once: true })
+          void sleep(backoff).finally(() => {
+            signal.removeEventListener("abort", onAbort)
+            resolve()
+          })
+        })`,
+)
+if (sseParserPatched === sseParserSleepPatched) {
+  throw new Error(`SSE abort-backoff patch did not apply; @hey-api/openapi-ts output may have changed (${sseParserPath})`)
 }
 await Bun.write(sseParserPath, sseParserPatched)
 
