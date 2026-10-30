@@ -13,7 +13,7 @@ import { fileURLToPath } from "url"
 import { Config } from "@/config/config"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Shell } from "@opencode-ai/core/shell"
-import { windowsPowerShellCommand } from "@opencode-ai/core/shell-encoding"
+import { shellOutputDecoder, windowsPowerShellCommand } from "@opencode-ai/core/shell-encoding"
 import { ShellID } from "./shell/id"
 import { ToolFailure } from "@opencode-ai/llm"
 
@@ -501,6 +501,7 @@ export const ShellTool = Tool.define(
       const code: number | null = yield* Effect.scoped(
         Effect.gen(function* () {
           yield* Effect.addFinalizer(closeSink)
+          const decoder = shellOutputDecoder(input.shell)
           const handle = yield* spawner.spawn(cmd(input.shell, input.command, input.cwd, input.env))
           // A heavy command (build, headless browser, busy loop) at normal
           // priority can starve the TUI of CPU time until the screen stops
@@ -511,7 +512,7 @@ export const ShellTool = Tool.define(
           } catch {}
 
           const output = yield* Effect.forkScoped(
-            Stream.runForEach(Stream.decodeText(handle.all), (chunk) => {
+            Stream.runForEach(Stream.map(handle.all, decoder.decode), (chunk) => {
               processing = true
               const size = Buffer.byteLength(chunk, "utf-8")
               list.push({ text: chunk, size })
