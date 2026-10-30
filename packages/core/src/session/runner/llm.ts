@@ -17,6 +17,7 @@ import { FSUtil } from "../../fs-util"
 import { Location } from "../../location"
 import { ModelV2 } from "../../model"
 import { PermissionV2 } from "../../permission"
+import { PluginInternal } from "../../plugin/internal"
 import { ProviderV2 } from "../../provider"
 import { QuestionV2 } from "../../question"
 import { SystemContext } from "../../system-context/index"
@@ -108,6 +109,7 @@ const layer = Layer.effect(
     const skillGuidance = yield* SkillGuidance.Service
     const referenceGuidance = yield* ReferenceGuidance.Service
     const config = yield* Config.Service
+    const internal = yield* PluginInternal.Service
     const snapshots = yield* Snapshot.Service
     const db = (yield* Database.Service).db
     const documents = yield* config.entries()
@@ -227,6 +229,9 @@ const layer = Layer.effect(
       const session = yield* getSession(sessionID)
       if (session.location.directory !== location.directory || session.location.workspaceID !== location.workspaceID)
         return yield* Effect.interrupt
+      // Canonical settlement and agent selection must not observe the pre-boot deny-all
+      // fallback or an empty agent map. The internal plugin batch owns that readiness signal.
+      yield* internal.ready
       const agent = yield* agents.select(session.agent)
       const initialized = yield* SessionContextEpoch.initialize(db, loadSystemContext(agent), session.id)
       const toolFibers = yield* FiberSet.make<void, ToolOutputStore.Error>()
@@ -513,6 +518,7 @@ export const node = makeLocationNode({
     SkillGuidance.node,
     ReferenceGuidance.node,
     Config.node,
+    PluginInternal.node,
     Snapshot.node,
     Database.node,
   ],

@@ -47,6 +47,8 @@ export const AttachmentTool = Tool.define(
               // The V1 loop can reach this bridge while PluginInternal.boot is still
               // reloading the agent map. Wait for that batch before canonical settlement
               // so permission resolution never sees the uninitialized deny-all fallback.
+              // This intentionally covers every action, including read-only `list`:
+              // the bridge keeps one fail-closed readiness boundary.
               yield* internal.ready
               const settlement = yield* materialization
                 .settle({
