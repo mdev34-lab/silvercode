@@ -43,7 +43,7 @@ const layer = Layer.effect(
         const scope = yield* Scope.Scope
         const runners = new Map<SessionID, Runner.Runner<SessionV1.WithParts>>()
         const epochs = new Map<SessionID, number>()
-        const cancelling = new Map<SessionID, Deferred.Deferred<void>>()
+        const cancelling = new Map<SessionID, { done: Deferred.Deferred<void>; wasBusy: boolean }>()
         yield* Effect.addFinalizer(
           Effect.fnUntraced(function* () {
             yield* Effect.forEach(runners.values(), (runner) => runner.cancel, {
@@ -101,14 +101,21 @@ const layer = Layer.effect(
         yield* before
         return
       }
+      // Capture wasBusy before registering, so a concurrent prompt that calls
+      // awaitCancel can decide whether it must wait. For idle-session cancels
+      // (background-only), replacement prompts must be allowed to start while
+      // teardown is still yielding (#696's busy guard). For busy-session cancels
+      // (active run), fresh prompts after ESC must wait for settlement to avoid
+      // being poisoned by the previous run's epoch.
+      const existing = data.runners.get(sessionID)
+      const wasBusy = !!existing?.busy
       // Register before the epoch bump so a concurrent prompt that calls
       // awaitCancel before capturing its epoch will correctly wait for this
       // cancellation to settle and then start a clean run instead of being
       // poisoned by the previous run's epoch.
       const done = yield* Deferred.make<void>()
-      data.cancelling.set(sessionID, done)
+      data.cancelling.set(sessionID, { done, wasBusy })
       bumpEpoch(data, sessionID)
-      const existing = data.runners.get(sessionID)
       yield* before.pipe(
         Effect.andThen(
           Effect.gen(function* () {
@@ -122,7 +129,8 @@ const layer = Layer.effect(
         ),
         Effect.ensuring(
           Effect.gen(function* () {
-            if (data.cancelling.get(sessionID) === done) data.cancelling.delete(sessionID)
+            const cur = data.cancelling.get(sessionID)
+            if (cur?.done === done) data.cancelling.delete(sessionID)
             yield* Deferred.succeed(done, void 0)
           }),
         ),
@@ -141,7 +149,10 @@ const layer = Layer.effect(
     const awaitCancel = Effect.fn("SessionRunState.awaitCancel")(function* (sessionID: SessionID) {
       const data = yield* InstanceState.get(state)
       const inflight = data.cancelling.get(sessionID)
-      if (inflight) yield* Deferred.await(inflight)
+      // Only wait for busy-session cancels. Idle-session cancels (background-only)
+      // must not block replacement prompts that are supposed to become the new
+      // run while teardown is still yielding (#696).
+      if (inflight?.wasBusy) yield* Deferred.await(inflight.done)
     })
 
     const cancelBackground = Effect.fn("SessionRunState.cancelBackground")(function* (sessionID: SessionID) {
