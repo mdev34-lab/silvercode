@@ -1,5 +1,5 @@
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
-import { describe, expect } from "bun:test"
+import { describe, expect, spyOn } from "bun:test"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Cause, Effect, Exit, Layer } from "effect"
 import type * as Scope from "effect/Scope"
@@ -9,6 +9,7 @@ import os from "os"
 import path from "path"
 import { Config } from "@/config/config"
 import { Shell } from "@opencode-ai/core/shell"
+import * as ShellEncoding from "@opencode-ai/core/shell-encoding"
 import { ShellTool } from "../../src/tool/shell"
 import { Filesystem } from "@/util/filesystem"
 import { provideInstance, testInstanceStoreLayer, tmpdirScoped } from "../fixture/fixture"
@@ -233,6 +234,27 @@ describe("tool.shell", () => {
         })
         expect(result.metadata.exit).toBe(0)
         expect(result.metadata.output).toContain("test")
+      }),
+    ),
+  )
+
+  it.live("surfaces decoder warnings in model-facing metadata", () =>
+    runIn(
+      projectRoot,
+      Effect.gen(function* () {
+        const original = ShellEncoding.shellOutputDecoder
+        const decoder = spyOn(ShellEncoding, "shellOutputDecoder").mockImplementation((shell, options) => ({
+          ...original(shell, options),
+          warning: "synthetic decoder warning",
+        }))
+        try {
+          const result = yield* run({ command: "echo test" })
+          expect(result.output).toContain("synthetic decoder warning")
+          expect(result.output).toContain("<shell_metadata>")
+          expect(result.metadata.output).not.toContain("<shell_metadata>")
+        } finally {
+          decoder.mockRestore()
+        }
       }),
     ),
   )

@@ -4,11 +4,18 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import iconv from "iconv-lite"
-import { shellOutputDecoder, windowsCmdCodePage, windowsPowerShellCommand } from "../src/shell-encoding"
+import {
+  parseWindowsCmdCodePage,
+  shellOutputDecoder,
+  windowsCmdCodePage,
+  windowsPowerShellCommand,
+} from "../src/shell-encoding"
 
 const text = "Área de Trabalho - ação 日本語 😀"
 const command = `[Console]::Write('${text}'); [Console]::Error.Write('${text}'); exit 7`
 const pwsh = Bun.which("pwsh") || Bun.which("powershell")
+const defaultCmd = process.env.COMSPEC || "cmd.exe"
+const startupCodepage = process.platform === "win32" ? windowsCmdCodePage(defaultCmd) : undefined
 
 const decode = (shell: string, chunks: ReadonlyArray<Uint8Array>, platform: NodeJS.Platform, codepage?: number) => {
   const decoder = shellOutputDecoder(shell, { platform, codepage })
@@ -63,6 +70,40 @@ describe("shell output decoding (#543)", () => {
     expect(streamed.decode(bom) + streamed.end()).toBe("A")
   })
 
+  test("parses localized chcp output with trailing punctuation", () => {
+    expect(parseWindowsCmdCodePage("Aktive Codepage: 437.\r\n")).toBe(437)
+    expect(parseWindowsCmdCodePage("Página de código ativa: 860.\r\n")).toBe(860)
+    expect(parseWindowsCmdCodePage("codepage unavailable\r\n")).toBeUndefined()
+  })
+
+  test("memoizes bounded codepage probes per shell", () => {
+    let calls = 0
+    const options = {
+      platform: "win32" as const,
+      probe: (shell: string, timeout: number) => {
+        calls++
+        expect(timeout).toBe(2_000)
+        return { status: 0, stdout: `Aktive Codepage: ${shell.includes("other") ? 860 : 437}.\r\n` }
+      },
+    }
+    expect(windowsCmdCodePage("cmd-cache.exe", options)).toBe(437)
+    expect(windowsCmdCodePage("cmd-cache.exe", options)).toBe(437)
+    expect(windowsCmdCodePage("cmd-cache-other.exe", options)).toBe(860)
+    expect(calls).toBe(2)
+
+    let failures = 0
+    const failed = {
+      platform: "win32" as const,
+      probe: () => {
+        failures++
+        return { status: 1, stdout: "" }
+      },
+    }
+    expect(windowsCmdCodePage("cmd-cache-failure.exe", failed)).toBeUndefined()
+    expect(windowsCmdCodePage("cmd-cache-failure.exe", failed)).toBeUndefined()
+    expect(failures).toBe(1)
+  })
+
   test("flushes trailing incomplete UTF-8 and legacy multibyte sequences", () => {
     for (const [shell, platform, codepage, lead] of [
       ["/bin/sh", "linux", undefined, 0xc3],
@@ -81,6 +122,31 @@ describe("shell output decoding (#543)", () => {
     const utf8 = Buffer.from("á", "utf8")
     expect(decoder.decode(legacy)).toBe("á")
     expect(decoder.decode(utf8) + decoder.end()).toBe("├í")
+  })
+
+  test("warns and falls back when the legacy decoder cannot be loaded", () => {
+    const decoder = shellOutputDecoder("cmd.exe", {
+      platform: "win32",
+      codepage: 437,
+      loadIconv: () => {
+        throw new Error("MODULE_NOT_FOUND")
+      },
+    })
+    expect(decoder.warning).toBe("cmd.exe output codepage 437 is unsupported; decoding output as UTF-8.")
+    expect(decoder.decode(new TextEncoder().encode("ação")) + decoder.end()).toBe("ação")
+  })
+
+  test("recognizes quoted cmd invocations and warns for cmd wrappers", () => {
+    for (const shell of ['"cmd.exe"', "cmd.exe /d", '"C:\\Program Files\\Windows\\cmd.exe" /d /s']) {
+      const decoder = shellOutputDecoder(shell, { platform: "win32", codepage: 437 })
+      expect(decoder.warning).toBeUndefined()
+      expect(decoder.decode(iconv.encode("á", "437")) + decoder.end()).toBe("á")
+    }
+    for (const shell of ["wrapper.cmd", "C:\\tools\\wrapper.bat /d"]) {
+      const decoder = shellOutputDecoder(shell, { platform: "win32", codepage: 437 })
+      expect(decoder.warning).toContain("cmd-like shell")
+      expect(decoder.decode(new TextEncoder().encode("ação")) + decoder.end()).toBe("ação")
+    }
   })
 
   test("warns when a cmd codepage is unsupported and falls back to UTF-8", () => {
@@ -103,8 +169,8 @@ describe("shell output decoding (#543)", () => {
     () => {
       const directory = mkdtempSync(path.join(tmpdir(), "shell-encoding-"))
       try {
-        const shell = process.env.COMSPEC || "cmd.exe"
-        const codepage = windowsCmdCodePage(shell)
+        const shell = defaultCmd
+        const codepage = startupCodepage
         if (!codepage) throw new Error("Windows cmd process codepage is unavailable")
         if (codepage !== 65001 && !iconv.encodingExists(String(codepage)))
           throw new Error(`Unsupported Windows cmd codepage: ${codepage}`)
@@ -138,14 +204,14 @@ describe("shell output decoding (#543)", () => {
       }
     },
   )
-  ;(process.platform === "win32" ? test : test.skip)(
-    "documents that hidden cmd dir bytes stay in the startup codepage after chcp 65001",
+  test.skipIf(process.platform !== "win32" || startupCodepage === 65001)(
+    "documents hidden cmd chcp bytes (requires a non-UTF-8 startup codepage)",
     () => {
+      const shell = defaultCmd
+      const codepage = startupCodepage
+      if (!codepage) throw new Error("Windows cmd process codepage is unavailable")
       const directory = mkdtempSync(path.join(tmpdir(), "shell-encoding-chcp-"))
       try {
-        const shell = process.env.COMSPEC || "cmd.exe"
-        const codepage = windowsCmdCodePage(shell)
-        if (!codepage) throw new Error("Windows cmd process codepage is unavailable")
         if (codepage !== 65001 && !iconv.encodingExists(String(codepage)))
           throw new Error(`Unsupported Windows cmd codepage: ${codepage}`)
         const file = ["Área de Trabalho.txt", "área de trabalho.txt"].find((candidate) => {
@@ -179,7 +245,13 @@ describe("shell output decoding (#543)", () => {
         expect(decoder.warning).toBeUndefined()
         expect(decoder.decode(output) + decoder.end()).toBe(`${file}\r\n`)
       } finally {
-        rmSync(directory, { recursive: true, force: true })
+        try {
+          const restored = spawnSync(`chcp.com ${codepage} >nul`, { shell, windowsHide: true })
+          expect(restored.error).toBeUndefined()
+          expect(restored.status).toBe(0)
+        } finally {
+          rmSync(directory, { recursive: true, force: true })
+        }
       }
     },
   )

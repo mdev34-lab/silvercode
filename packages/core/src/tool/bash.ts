@@ -166,7 +166,10 @@ const layer = Layer.effectDiscard(
                 Object.assign({}, ...entries.flatMap((entry) => (entry.type === "document" ? [entry.info] : [])))
                   .shell ?? defaultShell()
               const decoder = shellOutputDecoder(shell, { ignoreBOM: true })
-              if (decoder.warning) yield* Effect.logWarning(decoder.warning)
+              if (decoder.warning) {
+                warnings.push(decoder.warning)
+                yield* Effect.logWarning(decoder.warning)
+              }
               const command = ChildProcess.make(windowsPowerShellCommand(shell, input.command), [], {
                 cwd: target.canonical,
                 shell,

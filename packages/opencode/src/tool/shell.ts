@@ -461,6 +461,7 @@ export const ShellTool = Tool.define(
       let expired = false
       let aborted = false
       let signaled: string | undefined
+      const meta: string[] = []
 
       const markOutputProcessed = Effect.sync(() => {
         processing = false
@@ -502,7 +503,10 @@ export const ShellTool = Tool.define(
         Effect.gen(function* () {
           yield* Effect.addFinalizer(closeSink)
           const decoder = shellOutputDecoder(input.shell)
-          if (decoder.warning) yield* Effect.logWarning(decoder.warning)
+          if (decoder.warning) {
+            meta.push(decoder.warning)
+            yield* Effect.logWarning(decoder.warning)
+          }
           const handle = yield* spawner.spawn(cmd(input.shell, input.command, input.cwd, input.env))
           // A heavy command (build, headless browser, busy loop) at normal
           // priority can starve the TUI of CPU time until the screen stops
@@ -648,7 +652,6 @@ export const ShellTool = Tool.define(
         ),
       )
 
-      const meta: string[] = []
       if (expired) {
         meta.push(
           `shell tool terminated command after exceeding timeout ${input.timeout} ms. If this command is expected to take longer and is not waiting for interactive input, retry with a larger timeout value in milliseconds.`,
