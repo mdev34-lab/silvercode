@@ -3,7 +3,6 @@ import { spawnSync } from "node:child_process"
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import path from "node:path"
-import { pathToFileURL } from "node:url"
 import iconv from "iconv-lite"
 import { shellOutputDecoder, windowsCmdCodePage, windowsPowerShellCommand } from "../src/shell-encoding"
 
@@ -114,62 +113,37 @@ describe("shell output decoding (#543)", () => {
     },
   )
   ;(process.platform === "win32" ? test : test.skip)(
-    "decodes real cmd output inherited from a non-default UTF-8 console",
+    "decodes real non-ASCII cmd dir output after a same-process chcp 65001 request",
     () => {
-      const directory = mkdtempSync(path.join(tmpdir(), "shell-encoding-utf8-"))
+      const directory = mkdtempSync(path.join(tmpdir(), "shell-encoding-chcp-"))
       try {
-        const file = "Área de Trabalho.txt"
-        const module = pathToFileURL(path.join(__dirname, "../src/shell-encoding.ts")).href
-        const probe = path.join(directory, "probe.ts")
-        const runner = path.join(directory, "probe.cmd")
-        writeFileSync(
-          probe,
-          `import { spawnSync } from "node:child_process"
-import { writeFileSync } from "node:fs"
-import path from "node:path"
-import { shellOutputDecoder, windowsCmdCodePage } from ${JSON.stringify(module)}
-const file = ${JSON.stringify(file)}
-writeFileSync(path.join(import.meta.dir, file), "")
-const shell = process.env.COMSPEC || "cmd.exe"
-const codepage = windowsCmdCodePage(shell)
-const child = spawnSync("dir /b *.txt & exit /b 7", { cwd: import.meta.dir, shell, windowsHide: true })
-const decoder = shellOutputDecoder(shell)
-process.stdout.write(JSON.stringify({
-  codepage,
-  status: child.status,
-  error: child.error?.message,
-  stdout: child.stdout.toString("hex"),
-  output: decoder.decode(child.stdout) + decoder.end(),
-  warning: decoder.warning,
-}))
-`,
-        )
-        writeFileSync(
-          runner,
-          ["@echo off", "chcp.com 65001 >nul", `"${process.execPath}" "${probe}"`, "exit /b %ERRORLEVEL%", ""].join(
-            "\r\n",
-          ),
-        )
         const shell = process.env.COMSPEC || "cmd.exe"
-        const child = spawnSync(runner, { cwd: directory, shell, encoding: "utf8", windowsHide: true })
-        console.log(`cmd.exe UTF-8 console: status=${child.status}; stdout=${child.stdout.trim()}`)
+        const codepage = windowsCmdCodePage(shell)
+        if (!codepage) throw new Error("Windows cmd process codepage is unavailable")
+        if (codepage !== 65001 && !iconv.encodingExists(String(codepage)))
+          throw new Error(`Unsupported Windows cmd codepage: ${codepage}`)
+        const file = ["Área de Trabalho.txt", "área de trabalho.txt"].find((candidate) => {
+          const bytes = encode(candidate, codepage)
+          return roundtrip(candidate, codepage) === candidate && bytes.some((byte) => byte >= 0x80)
+        })
+        if (!file) throw new Error(`The accented fixtures are not representable in cmd codepage ${codepage}`)
+
+        writeFileSync(path.join(directory, file), "")
+        const child = spawnSync("chcp.com 65001 >nul & dir /b *.txt & exit /b 7", {
+          cwd: directory,
+          shell,
+          windowsHide: true,
+        })
+        console.log(
+          `cmd.exe after chcp 65001: codepage=${codepage}; file=${JSON.stringify(file)}; stdout=${child.stdout.toString("hex")}`,
+        )
         expect(child.error).toBeUndefined()
-        expect(child.status).toBe(0)
-        expect(child.stderr).toBe("")
-        const result: {
-          codepage?: number
-          status: number | null
-          error?: string
-          stdout: string
-          output: string
-          warning?: string
-        } = JSON.parse(child.stdout)
-        expect(result.error).toBeUndefined()
-        expect(result.codepage).toBe(65001)
-        expect(result.warning).toBeUndefined()
-        expect(result.status).toBe(7)
-        expect(result.stdout).toBe(Buffer.from(`${file}\r\n`, "utf8").toString("hex"))
-        expect(result.output).toBe(`${file}\r\n`)
+        expect(child.status).toBe(7)
+        expect(child.stdout.toString("hex")).toBe(encode(`${file}\r\n`, codepage).toString("hex"))
+        expect(child.stdout.some((byte) => byte >= 0x80)).toBe(true)
+        const decoder = shellOutputDecoder(shell)
+        expect(decoder.warning).toBeUndefined()
+        expect(decoder.decode(child.stdout) + decoder.end()).toBe(`${file}\r\n`)
       } finally {
         rmSync(directory, { recursive: true, force: true })
       }
