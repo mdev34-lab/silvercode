@@ -31,6 +31,9 @@ export function shellOutputDecoder(
   const platform = options.platform ?? process.platform
   let warning: string | undefined
   if (platform === "win32" && /(?:^|[\\/])cmd(?:\.exe)?$/i.test(shell)) {
+    // This startup snapshot stays fixed for the decoder's lifetime. A command
+    // that later runs `chcp`, or a native program emitting another encoding,
+    // is not tracked; its bytes are still decoded with this initial codepage.
     const codepage = options.codepage === undefined ? windowsCmdCodePage(shell) : options.codepage
     if (codepage === null || codepage === undefined) {
       warning = "Unable to determine the inherited cmd.exe output codepage; decoding output as UTF-8."

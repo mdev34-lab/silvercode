@@ -1063,6 +1063,49 @@ describe("tool.shell permissions", () => {
 })
 
 describe("tool.shell abort", () => {
+  if (process.platform !== "win32") {
+    it.live("flushes a trailing incomplete UTF-8 sequence when aborted", () =>
+      runIn(
+        projectRoot,
+        Effect.gen(function* () {
+          const dir = yield* tmpdirScoped()
+          const pidFile = path.join(dir, "daemon.pid")
+          // Keep stdout open in a detached descendant so aborting the shell
+          // closes the output scope without a normal EOF on the output stream.
+          const code =
+            'const cp=require("node:child_process");const fs=require("node:fs");' +
+            'const d=cp.spawn(process.execPath,["-e","await new Promise(()=>{})"],{detached:true,stdio:"inherit"});' +
+            "d.unref();fs.writeFileSync(Bun.argv[1],String(d.pid));" +
+            'process.stdout.write(Buffer.from("61c3","hex"));await new Promise(()=>{})'
+          const controller = new AbortController()
+          const result = yield* run(
+            { command: `${bin} -e ${squote(code)} ${squote(pidFile)}` },
+            {
+              ...ctx,
+              abort: controller.signal,
+              metadata: (input) =>
+                Effect.sync(() => {
+                  const metadata = input.metadata
+                  const output = metadata && "output" in metadata ? metadata.output : undefined
+                  if (output === "a" && !controller.signal.aborted) controller.abort()
+                }),
+            },
+          )
+
+          const pid = yield* readPid(pidFile)
+          yield* Effect.sync(() => {
+            try {
+              process.kill(pid, "SIGKILL")
+            } catch {}
+          })
+
+          expect(result.output).toContain("a�")
+          expect(result.output).toContain("User aborted the command")
+        }),
+      ),
+    )
+  }
+
   it.live(
     "preserves output when aborted",
     () =>

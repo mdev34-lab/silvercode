@@ -512,66 +512,69 @@ export const ShellTool = Tool.define(
             os.setPriority(handle.pid, os.constants.priority.PRIORITY_BELOW_NORMAL)
           } catch {}
 
-          const decoded = Stream.concat(Stream.map(handle.all, decoder.decode), Stream.sync(decoder.end))
-          const output = yield* Effect.forkScoped(
-            Stream.runForEach(decoded, (chunk) => {
-              processing = true
-              const size = Buffer.byteLength(chunk, "utf-8")
-              list.push({ text: chunk, size })
-              used += size
-              while (used > keep && list.length > 1) {
-                const item = list.shift()
-                if (!item) break
-                used -= item.size
-                cut = true
+          const append = (chunk: string) => {
+            processing = true
+            const size = Buffer.byteLength(chunk, "utf-8")
+            list.push({ text: chunk, size })
+            used += size
+            while (used > keep && list.length > 1) {
+              const item = list.shift()
+              if (!item) break
+              used -= item.size
+              cut = true
+            }
+
+            last = preview(last + chunk)
+
+            if (file) {
+              sink?.write(chunk)
+            } else {
+              full += chunk
+              if (Buffer.byteLength(full, "utf-8") > limits.maxBytes) {
+                return trunc.write(full).pipe(
+                  Effect.andThen((next) =>
+                    Effect.sync(() => {
+                      file = next
+                      cut = true
+                      sink = createWriteStream(next, { flags: "a" })
+                      // Listen right away: a mid-command failure (ENOSPC, EACCES,
+                      // EMFILE) with no listener is an uncaughtException that kills
+                      // a bare server process. On failure, stop spilling and keep the
+                      // truncated in-memory output instead of taking down the runtime.
+                      const stream = sink
+                      stream.on("error", (error) => {
+                        spillError = error instanceof Error ? error : new Error(String(error))
+                        if (sink === stream) sink = undefined
+                        stream.destroy()
+                      })
+                      full = ""
+                    }),
+                  ),
+                  Effect.andThen(
+                    ctx.metadata({
+                      metadata: {
+                        output: last,
+                      },
+                    }),
+                  ),
+                  Effect.ensuring(markOutputProcessed),
+                )
               }
+            }
 
-              last = preview(last + chunk)
-
-              if (file) {
-                sink?.write(chunk)
-              } else {
-                full += chunk
-                if (Buffer.byteLength(full, "utf-8") > limits.maxBytes) {
-                  return trunc.write(full).pipe(
-                    Effect.andThen((next) =>
-                      Effect.sync(() => {
-                        file = next
-                        cut = true
-                        sink = createWriteStream(next, { flags: "a" })
-                        // Listen right away: a mid-command failure (ENOSPC, EACCES,
-                        // EMFILE) with no listener is an uncaughtException that kills
-                        // a bare server process. On failure, stop spilling and keep the
-                        // truncated in-memory output instead of taking down the runtime.
-                        const stream = sink
-                        stream.on("error", (error) => {
-                          spillError = error instanceof Error ? error : new Error(String(error))
-                          if (sink === stream) sink = undefined
-                          stream.destroy()
-                        })
-                        full = ""
-                      }),
-                    ),
-                    Effect.andThen(
-                      ctx.metadata({
-                        metadata: {
-                          output: last,
-                        },
-                      }),
-                    ),
-                    Effect.ensuring(markOutputProcessed),
-                  )
-                }
-              }
-
-              return ctx
-                .metadata({
-                  metadata: {
-                    output: last,
-                  },
-                })
-                .pipe(Effect.ensuring(markOutputProcessed))
-            }),
+            return ctx
+              .metadata({
+                metadata: {
+                  output: last,
+                },
+              })
+              .pipe(Effect.ensuring(markOutputProcessed))
+          }
+          const output = yield* Stream.runForEach(Stream.map(handle.all, decoder.decode), append).pipe(
+            // Abort, timeout, and idle cutoff can close the scope before the input
+            // reaches EOF, so flush the decoder when this fiber ends for any reason.
+            Effect.ensuring(Effect.suspend(() => append(decoder.end()))),
+            Effect.forkScoped,
           )
 
           const abort = Effect.callback<void>((resume) => {

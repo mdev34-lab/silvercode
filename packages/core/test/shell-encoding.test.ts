@@ -67,6 +67,14 @@ describe("shell output decoding (#543)", () => {
     }
   })
 
+  test("documents that mid-stream encoding changes are not tracked", () => {
+    const decoder = shellOutputDecoder("cmd.exe", { platform: "win32", codepage: 437 })
+    const legacy = iconv.encode("á", "437")
+    const utf8 = Buffer.from("á", "utf8")
+    expect(decoder.decode(legacy)).toBe("á")
+    expect(decoder.decode(utf8) + decoder.end()).toBe("├í")
+  })
+
   test("warns when a cmd codepage is unsupported and falls back to UTF-8", () => {
     const decoder = shellOutputDecoder("cmd.exe", { platform: "win32", codepage: 1_000_000 })
     expect(decoder.warning).toContain("1000000")
