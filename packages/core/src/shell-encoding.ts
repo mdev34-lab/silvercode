@@ -10,26 +10,27 @@ export function windowsPowerShellCommand(shell: string, command: string, platfor
   return "$OutputEncoding = [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false);\n" + command
 }
 
-function windowsConsoleCodePage() {
+function windowsOemCodePage() {
   const root = process.env.SystemRoot ?? process.env.SYSTEMROOT ?? process.env.windir
   if (!root) return undefined
-  const result = spawnSync(path.win32.join(root, "System32", "chcp.com"), {
-    encoding: "utf8",
-    windowsHide: true,
-  })
+  const result = spawnSync(
+    path.win32.join(root, "System32", "reg.exe"),
+    ["query", String.raw`HKLM\SYSTEM\CurrentControlSet\Control\Nls\CodePage`, "/v", "OEMCP"],
+    { encoding: "utf8", windowsHide: true },
+  )
   if (result.error || result.status !== 0) return undefined
-  const match = result.stdout.match(/(\d+)\s*$/)
+  const match = result.stdout.match(/\bOEMCP\s+REG_SZ\s+(\d+)\b/i)
   return match ? Number(match[1]) : undefined
 }
 
-/** PowerShell is initialized as UTF-8 above; cmd builtins require the console's legacy codepage. */
+/** PowerShell is initialized as UTF-8 above; cmd filenames use the system OEM codepage, independently of chcp. */
 export function shellOutputDecoder(
   shell: string,
   options: { platform?: NodeJS.Platform; codepage?: number; ignoreBOM?: boolean } = {},
 ) {
   const platform = options.platform ?? process.platform
   if (platform === "win32" && /(?:^|[\\/])cmd(?:\.exe)?$/i.test(shell)) {
-    const codepage = options.codepage ?? windowsConsoleCodePage()
+    const codepage = options.codepage ?? windowsOemCodePage()
     const encoding = String(codepage)
     if (codepage !== 65001 && iconv.encodingExists(encoding)) {
       const decoder = iconv.getDecoder(encoding)
