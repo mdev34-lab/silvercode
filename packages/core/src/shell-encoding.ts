@@ -1,6 +1,4 @@
 import { spawnSync } from "node:child_process"
-import path from "node:path"
-import iconv from "iconv-lite"
 
 /** The text readers consume UTF-8, but Windows PowerShell inherits a legacy console encoding. */
 export function windowsPowerShellCommand(shell: string, command: string, platform = process.platform): string {
@@ -10,34 +8,43 @@ export function windowsPowerShellCommand(shell: string, command: string, platfor
   return "$OutputEncoding = [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false);\n" + command
 }
 
-export function windowsOemCodePage() {
-  const root = process.env.SystemRoot ?? process.env.SYSTEMROOT ?? process.env.windir
-  if (!root) return undefined
-  const result = spawnSync(
-    path.win32.join(root, "System32", "reg.exe"),
-    ["query", String.raw`HKLM\SYSTEM\CurrentControlSet\Control\Nls\CodePage`, "/v", "OEMCP"],
-    { encoding: "utf8", windowsHide: true },
-  )
+/** Probe a fresh cmd through the same shell option used to run commands, so it reports its inherited startup codepage. */
+export function windowsCmdCodePage(shell: string) {
+  if (process.platform !== "win32") return undefined
+  const result = spawnSync("chcp", { shell, encoding: "utf8", windowsHide: true })
   if (result.error || result.status !== 0) return undefined
-  const match = result.stdout.match(/\bOEMCP\s+REG_SZ\s+(\d+)\b/i)
+  const match = result.stdout.match(/(\d+)\s*$/)
   return match ? Number(match[1]) : undefined
 }
 
-/** PowerShell is initialized as UTF-8 above; cmd filenames use the system OEM codepage, independently of chcp. */
+type OutputDecoder = {
+  decode: (bytes: Uint8Array) => string
+  end: () => string
+  warning?: string
+}
+
+/** PowerShell is initialized as UTF-8 above; cmd builtins use the codepage inherited when their process starts. */
 export function shellOutputDecoder(
   shell: string,
-  options: { platform?: NodeJS.Platform; codepage?: number; ignoreBOM?: boolean } = {},
-) {
+  options: { platform?: NodeJS.Platform; codepage?: number | null; ignoreBOM?: boolean } = {},
+): OutputDecoder {
   const platform = options.platform ?? process.platform
+  let warning: string | undefined
   if (platform === "win32" && /(?:^|[\\/])cmd(?:\.exe)?$/i.test(shell)) {
-    const codepage = options.codepage ?? windowsOemCodePage()
-    const encoding = String(codepage)
-    if (codepage !== 65001 && iconv.encodingExists(encoding)) {
-      const decoder = iconv.getDecoder(encoding)
-      return {
-        decode: (bytes: Uint8Array) => decoder.write(Buffer.from(bytes)),
-        end: () => decoder.end() ?? "",
+    const codepage = options.codepage === undefined ? windowsCmdCodePage(shell) : options.codepage
+    if (codepage === null || codepage === undefined) {
+      warning = "Unable to determine the inherited cmd.exe output codepage; decoding output as UTF-8."
+    } else if (codepage !== 65001) {
+      const encoding = String(codepage)
+      const iconv: typeof import("iconv-lite") = require("iconv-lite")
+      if (iconv.encodingExists(encoding)) {
+        const decoder = iconv.getDecoder(encoding)
+        return {
+          decode: (bytes: Uint8Array) => decoder.write(Buffer.from(bytes)),
+          end: () => decoder.end() ?? "",
+        }
       }
+      warning = `cmd.exe output codepage ${codepage} is unsupported; decoding output as UTF-8.`
     }
   }
 
@@ -45,5 +52,6 @@ export function shellOutputDecoder(
   return {
     decode: (bytes: Uint8Array) => decoder.decode(bytes, { stream: true }),
     end: () => decoder.decode(),
+    warning,
   }
 }

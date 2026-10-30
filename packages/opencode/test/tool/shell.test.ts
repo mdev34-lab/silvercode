@@ -139,6 +139,11 @@ const fill = (mode: "lines" | "bytes", n: number) => {
   if (PS.has(sh())) return `& ${text}`
   return text
 }
+const emit = (hex: string) => {
+  const text = `${bin} -e ${evalarg(`process.stdout.write(Buffer.from("${hex}","hex"))`)}`
+  if (PS.has(sh())) return `& ${text}`
+  return text
+}
 const glob = (p: string) =>
   process.platform === "win32" ? Filesystem.normalizePathPattern(p) : p.replaceAll("\\", "/")
 
@@ -231,6 +236,19 @@ describe("tool.shell", () => {
       }),
     ),
   )
+
+  if (process.platform !== "win32") {
+    it.live("flushes a trailing incomplete UTF-8 sequence", () =>
+      runIn(
+        projectRoot,
+        Effect.gen(function* () {
+          const result = yield* run({ command: emit("61c3") })
+          expect(result.metadata.exit).toBe(0)
+          expect(result.output).toBe("a�")
+        }),
+      ),
+    )
+  }
 
   it.live("falls back from terminal-only configured shell", () =>
     Effect.gen(function* () {

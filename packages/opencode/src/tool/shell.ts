@@ -502,6 +502,7 @@ export const ShellTool = Tool.define(
         Effect.gen(function* () {
           yield* Effect.addFinalizer(closeSink)
           const decoder = shellOutputDecoder(input.shell)
+          if (decoder.warning) yield* Effect.logWarning(decoder.warning)
           const handle = yield* spawner.spawn(cmd(input.shell, input.command, input.cwd, input.env))
           // A heavy command (build, headless browser, busy loop) at normal
           // priority can starve the TUI of CPU time until the screen stops
@@ -511,8 +512,9 @@ export const ShellTool = Tool.define(
             os.setPriority(handle.pid, os.constants.priority.PRIORITY_BELOW_NORMAL)
           } catch {}
 
+          const decoded = Stream.concat(Stream.map(handle.all, decoder.decode), Stream.sync(decoder.end))
           const output = yield* Effect.forkScoped(
-            Stream.runForEach(Stream.map(handle.all, decoder.decode), (chunk) => {
+            Stream.runForEach(decoded, (chunk) => {
               processing = true
               const size = Buffer.byteLength(chunk, "utf-8")
               list.push({ text: chunk, size })
