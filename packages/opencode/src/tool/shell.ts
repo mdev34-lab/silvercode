@@ -13,7 +13,7 @@ import { fileURLToPath } from "url"
 import { Config } from "@/config/config"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Shell } from "@opencode-ai/core/shell"
-import { windowsPowerShellCommand } from "@opencode-ai/core/shell-encoding"
+import { shellOutputDecoder, windowsPowerShellCommand } from "@opencode-ai/core/shell-encoding"
 import { ShellID } from "./shell/id"
 import { ToolFailure } from "@opencode-ai/llm"
 
@@ -461,6 +461,7 @@ export const ShellTool = Tool.define(
       let expired = false
       let aborted = false
       let signaled: string | undefined
+      const meta: string[] = []
 
       const markOutputProcessed = Effect.sync(() => {
         processing = false
@@ -501,6 +502,11 @@ export const ShellTool = Tool.define(
       const code: number | null = yield* Effect.scoped(
         Effect.gen(function* () {
           yield* Effect.addFinalizer(closeSink)
+          const decoder = shellOutputDecoder(input.shell)
+          if (decoder.warning) {
+            meta.push(decoder.warning)
+            yield* Effect.logWarning(decoder.warning)
+          }
           const handle = yield* spawner.spawn(cmd(input.shell, input.command, input.cwd, input.env))
           // A heavy command (build, headless browser, busy loop) at normal
           // priority can starve the TUI of CPU time until the screen stops
@@ -510,65 +516,69 @@ export const ShellTool = Tool.define(
             os.setPriority(handle.pid, os.constants.priority.PRIORITY_BELOW_NORMAL)
           } catch {}
 
-          const output = yield* Effect.forkScoped(
-            Stream.runForEach(Stream.decodeText(handle.all), (chunk) => {
-              processing = true
-              const size = Buffer.byteLength(chunk, "utf-8")
-              list.push({ text: chunk, size })
-              used += size
-              while (used > keep && list.length > 1) {
-                const item = list.shift()
-                if (!item) break
-                used -= item.size
-                cut = true
+          const append = (chunk: string) => {
+            processing = true
+            const size = Buffer.byteLength(chunk, "utf-8")
+            list.push({ text: chunk, size })
+            used += size
+            while (used > keep && list.length > 1) {
+              const item = list.shift()
+              if (!item) break
+              used -= item.size
+              cut = true
+            }
+
+            last = preview(last + chunk)
+
+            if (file) {
+              sink?.write(chunk)
+            } else {
+              full += chunk
+              if (Buffer.byteLength(full, "utf-8") > limits.maxBytes) {
+                return trunc.write(full).pipe(
+                  Effect.andThen((next) =>
+                    Effect.sync(() => {
+                      file = next
+                      cut = true
+                      sink = createWriteStream(next, { flags: "a" })
+                      // Listen right away: a mid-command failure (ENOSPC, EACCES,
+                      // EMFILE) with no listener is an uncaughtException that kills
+                      // a bare server process. On failure, stop spilling and keep the
+                      // truncated in-memory output instead of taking down the runtime.
+                      const stream = sink
+                      stream.on("error", (error) => {
+                        spillError = error instanceof Error ? error : new Error(String(error))
+                        if (sink === stream) sink = undefined
+                        stream.destroy()
+                      })
+                      full = ""
+                    }),
+                  ),
+                  Effect.andThen(
+                    ctx.metadata({
+                      metadata: {
+                        output: last,
+                      },
+                    }),
+                  ),
+                  Effect.ensuring(markOutputProcessed),
+                )
               }
+            }
 
-              last = preview(last + chunk)
-
-              if (file) {
-                sink?.write(chunk)
-              } else {
-                full += chunk
-                if (Buffer.byteLength(full, "utf-8") > limits.maxBytes) {
-                  return trunc.write(full).pipe(
-                    Effect.andThen((next) =>
-                      Effect.sync(() => {
-                        file = next
-                        cut = true
-                        sink = createWriteStream(next, { flags: "a" })
-                        // Listen right away: a mid-command failure (ENOSPC, EACCES,
-                        // EMFILE) with no listener is an uncaughtException that kills
-                        // a bare server process. On failure, stop spilling and keep the
-                        // truncated in-memory output instead of taking down the runtime.
-                        const stream = sink
-                        stream.on("error", (error) => {
-                          spillError = error instanceof Error ? error : new Error(String(error))
-                          if (sink === stream) sink = undefined
-                          stream.destroy()
-                        })
-                        full = ""
-                      }),
-                    ),
-                    Effect.andThen(
-                      ctx.metadata({
-                        metadata: {
-                          output: last,
-                        },
-                      }),
-                    ),
-                    Effect.ensuring(markOutputProcessed),
-                  )
-                }
-              }
-
-              return ctx
-                .metadata({
-                  metadata: {
-                    output: last,
-                  },
-                })
-                .pipe(Effect.ensuring(markOutputProcessed))
-            }),
+            return ctx
+              .metadata({
+                metadata: {
+                  output: last,
+                },
+              })
+              .pipe(Effect.ensuring(markOutputProcessed))
+          }
+          const output = yield* Stream.runForEach(Stream.map(handle.all, decoder.decode), append).pipe(
+            // Abort, timeout, and idle cutoff can close the scope before the input
+            // reaches EOF, so flush the decoder when this fiber ends for any reason.
+            Effect.ensuring(Effect.suspend(() => append(decoder.end()))),
+            Effect.forkScoped,
           )
 
           const abort = Effect.callback<void>((resume) => {
@@ -642,7 +652,6 @@ export const ShellTool = Tool.define(
         ),
       )
 
-      const meta: string[] = []
       if (expired) {
         meta.push(
           `shell tool terminated command after exceeding timeout ${input.timeout} ms. If this command is expected to take longer and is not waiting for interactive input, retry with a larger timeout value in milliseconds.`,

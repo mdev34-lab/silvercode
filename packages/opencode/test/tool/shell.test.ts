@@ -1,5 +1,5 @@
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
-import { describe, expect } from "bun:test"
+import { describe, expect, spyOn } from "bun:test"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Cause, Effect, Exit, Layer } from "effect"
 import type * as Scope from "effect/Scope"
@@ -9,6 +9,7 @@ import os from "os"
 import path from "path"
 import { Config } from "@/config/config"
 import { Shell } from "@opencode-ai/core/shell"
+import * as ShellEncoding from "@opencode-ai/core/shell-encoding"
 import { ShellTool } from "../../src/tool/shell"
 import { Filesystem } from "@/util/filesystem"
 import { provideInstance, testInstanceStoreLayer, tmpdirScoped } from "../fixture/fixture"
@@ -139,6 +140,11 @@ const fill = (mode: "lines" | "bytes", n: number) => {
   if (PS.has(sh())) return `& ${text}`
   return text
 }
+const emit = (hex: string) => {
+  const text = `${bin} -e ${evalarg(`process.stdout.write(Buffer.from("${hex}","hex"))`)}`
+  if (PS.has(sh())) return `& ${text}`
+  return text
+}
 const glob = (p: string) =>
   process.platform === "win32" ? Filesystem.normalizePathPattern(p) : p.replaceAll("\\", "/")
 
@@ -231,6 +237,40 @@ describe("tool.shell", () => {
       }),
     ),
   )
+
+  it.live("surfaces decoder warnings in model-facing metadata", () =>
+    runIn(
+      projectRoot,
+      Effect.gen(function* () {
+        const original = ShellEncoding.shellOutputDecoder
+        const decoder = spyOn(ShellEncoding, "shellOutputDecoder").mockImplementation((shell, options) => ({
+          ...original(shell, options),
+          warning: "synthetic decoder warning",
+        }))
+        try {
+          const result = yield* run({ command: "echo test" })
+          expect(result.output).toContain("synthetic decoder warning")
+          expect(result.output).toContain("<shell_metadata>")
+          expect(result.metadata.output).not.toContain("<shell_metadata>")
+        } finally {
+          decoder.mockRestore()
+        }
+      }),
+    ),
+  )
+
+  if (process.platform !== "win32") {
+    it.live("flushes a trailing incomplete UTF-8 sequence", () =>
+      runIn(
+        projectRoot,
+        Effect.gen(function* () {
+          const result = yield* run({ command: emit("61c3") })
+          expect(result.metadata.exit).toBe(0)
+          expect(result.output).toBe("a�")
+        }),
+      ),
+    )
+  }
 
   it.live("falls back from terminal-only configured shell", () =>
     Effect.gen(function* () {
@@ -1045,6 +1085,49 @@ describe("tool.shell permissions", () => {
 })
 
 describe("tool.shell abort", () => {
+  if (process.platform !== "win32") {
+    it.live("flushes a trailing incomplete UTF-8 sequence when aborted", () =>
+      runIn(
+        projectRoot,
+        Effect.gen(function* () {
+          const dir = yield* tmpdirScoped()
+          const pidFile = path.join(dir, "daemon.pid")
+          // Keep stdout open in a detached descendant so aborting the shell
+          // closes the output scope without a normal EOF on the output stream.
+          const code =
+            'const cp=require("node:child_process");const fs=require("node:fs");' +
+            'const d=cp.spawn(process.execPath,["-e","await new Promise(()=>{})"],{detached:true,stdio:"inherit"});' +
+            "d.unref();fs.writeFileSync(Bun.argv[1],String(d.pid));" +
+            'process.stdout.write(Buffer.from("61c3","hex"));await new Promise(()=>{})'
+          const controller = new AbortController()
+          const result = yield* run(
+            { command: `${bin} -e ${squote(code)} ${squote(pidFile)}` },
+            {
+              ...ctx,
+              abort: controller.signal,
+              metadata: (input) =>
+                Effect.sync(() => {
+                  const metadata = input.metadata
+                  const output = metadata && "output" in metadata ? metadata.output : undefined
+                  if (output === "a" && !controller.signal.aborted) controller.abort()
+                }),
+            },
+          )
+
+          const pid = yield* readPid(pidFile)
+          yield* Effect.sync(() => {
+            try {
+              process.kill(pid, "SIGKILL")
+            } catch {}
+          })
+
+          expect(result.output).toContain("a�")
+          expect(result.output).toContain("User aborted the command")
+        }),
+      ),
+    )
+  }
+
   it.live(
     "preserves output when aborted",
     () =>
