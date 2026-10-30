@@ -477,6 +477,7 @@ const live: Layer.Layer<
                 ReasoningWatchdog.guard(inner, {
                   summarized: result.summarizedReasoning,
                   executableTools: result.executableTools,
+                  onInterrupt: () => ctrl.abort(),
                 }),
                 { thresholds: result.repetitionThresholds },
               ),
