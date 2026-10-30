@@ -55,27 +55,35 @@ describe("attachment readiness", () => {
         // Invalid input keeps this ordering probe side-effect free; it must still wait
         // for readiness before reaching canonical settlement/validation.
         const settled = yield* Deferred.make<void>()
-        const fiber = yield* definition
-          .execute(
-            { action: "save" },
-            {
-              sessionID: SessionID.descending(),
-              messageID: MessageID.ascending(),
-              agent: "work",
-              abort: new AbortController().signal,
-              messages: [],
-              metadata: () => Effect.void,
-              ask: () => Effect.void,
-            },
-          )
-          .pipe(
-            Effect.onExit(() => Deferred.succeed(settled, undefined)),
-            Effect.forkScoped({ startImmediately: true }),
-          )
+        const toolContext = {
+          sessionID: SessionID.descending(),
+          messageID: MessageID.ascending(),
+          agent: "work",
+          abort: new AbortController().signal,
+          messages: [],
+          metadata: () => Effect.void,
+          ask: () => Effect.void,
+        }
+        const fiber = yield* definition.execute({ action: "save" }, toolContext).pipe(
+          Effect.onExit(() => Deferred.succeed(settled, undefined)),
+          Effect.forkScoped({ startImmediately: true }),
+        )
         expect(yield* Deferred.isDone(settled)).toBe(false)
         yield* Deferred.succeed(release, undefined)
         const exit = yield* Fiber.await(fiber)
         expect(exit._tag).toBe("Failure")
+
+        // Positive companion: once the same readiness signal completes, canonical
+        // settlement succeeds. `list` remains behind the fail-closed readiness gate.
+        const listed = yield* definition.execute(
+          { action: "list" },
+          { ...toolContext, callID: "call-list-after-ready" },
+        )
+        expect(listed).toMatchObject({
+          title: "attachment",
+          metadata: { action: "list", attachments: [] },
+          output: "No attachments in this session.",
+        })
       }).pipe(Effect.provide(layer))
     }),
   )

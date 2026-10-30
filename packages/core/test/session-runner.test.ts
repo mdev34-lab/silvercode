@@ -20,6 +20,7 @@ import { LayerNodePlatform } from "@opencode-ai/core/effect/app-node-platform"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { EventV2 } from "@opencode-ai/core/event"
 import { PermissionV2 } from "@opencode-ai/core/permission"
+import { PluginInternal } from "@opencode-ai/core/plugin/internal"
 import { EventTable } from "@opencode-ai/core/event/sql"
 import { Project } from "@opencode-ai/core/project"
 import { ProjectTable } from "@opencode-ai/core/project/sql"
@@ -139,6 +140,9 @@ const permission = Layer.succeed(
     list: () => Effect.die("unused"),
   }),
 )
+// These runner fixtures isolate orchestration from internal plugin boot; the
+// readiness ordering is covered by session-runner-readiness.test.ts.
+const pluginInternal = Layer.succeed(PluginInternal.Service, PluginInternal.Service.of({ ready: Effect.void }))
 const echo = Layer.effectDiscard(
   ToolRegistry.Service.use((registry) =>
     registry.register({
@@ -253,6 +257,7 @@ const runnerLayer = AppNodeBuilder.build(SessionRunnerLLM.node, [
   [SkillGuidance.node, skillGuidance],
   [ReferenceGuidance.node, referenceGuidance],
   [PermissionV2.node, permission],
+  [PluginInternal.node, pluginInternal],
   [Config.node, config],
 ])
 const execution = Layer.effect(
@@ -297,6 +302,7 @@ const it = testEffect(
     [
       [LayerNodePlatform.llmClient, client],
       [PermissionV2.node, permission],
+      [PluginInternal.node, pluginInternal],
       [SessionRunnerModel.node, models],
       [SystemContextRegistry.node, systemContext],
       [Location.node, Location.boundNode({ directory: AbsolutePath.make(projectDir) })],
