@@ -3,7 +3,8 @@ import path from "path"
 import fs from "fs/promises"
 import { writeSync } from "node:fs"
 import http from "node:http"
-import { Cause, Deferred, Effect, Exit, Fiber, Layer, Logger } from "effect"
+import { Cause, Clock, Deferred, Effect, Exit, Fiber, Layer, Logger } from "effect"
+import * as TestClock from "effect/testing/TestClock"
 import { HttpClient } from "effect/unstable/http"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { FSUtil } from "@opencode-ai/core/fs-util"
@@ -365,7 +366,9 @@ describe("Config Dependency Install Integration with MockRegistry", () => {
       const npmCacheDir = path.join(tmp.path, "npm-cache")
       await fs.mkdir(cacheDir, { recursive: true })
 
-      const { ctx } = await createProjectFixture(tmp.path, registry.url, npmCacheDir)
+      const { ctx, opencodeDir, globalConfigDir } = await createProjectFixture(tmp.path, registry.url, npmCacheDir)
+      const installDirs = [globalConfigDir, opencodeDir]
+      const installsStarted = Deferred.makeUnsafe<void>()
       const started: string[] = []
       const startedAtMs: number[] = []
       // Owner-local phase evidence: when this wrapper's own 300ms pre-install
@@ -385,6 +388,7 @@ describe("Config Dependency Install Integration with MockRegistry", () => {
               Effect.sync(() => {
                 started.push(dir)
                 startedAtMs.push(Date.now())
+                if (started.length === installDirs.length) Deferred.doneUnsafe(installsStarted, Effect.void)
               }).pipe(
                 // The total budget also covers work before the first HTTP request.
                 Effect.andThen(Effect.sleep("300 millis")),
@@ -408,28 +412,44 @@ describe("Config Dependency Install Integration with MockRegistry", () => {
         [httpClient, Layer.succeed(HttpClient.HttpClient, unexpectedHttp)],
       ])
 
-      const startedAt = Date.now()
+      const wallStartedAt = Date.now()
       const result = await Effect.gen(function* () {
+        const startedAt = yield* Clock.currentTimeMillis
         const cfg = yield* Config.Service
         const configInfo = yield* cfg.get()
         // No Effect.timeout wrap: the install's own bound must interrupt the
         // stalled fiber and let waitForDependencies join successfully.
-        yield* cfg.waitForDependencies()
-        return configInfo
+        const waiting = yield* cfg.waitForDependencies().pipe(Effect.forkChild)
+        // Do not start the 250ms budget until both configured installs have entered
+        // the wrapper. This keeps the timer assertion independent of runner scheduling.
+        yield* Deferred.await(installsStarted)
+        yield* TestClock.adjust("250 millis")
+        yield* Fiber.join(waiting)
+        return { configInfo, elapsed: (yield* Clock.currentTimeMillis) - startedAt }
       })
         .pipe(Effect.provide(Logger.layer([captureLog])))
-        .pipe(Effect.provideService(InstanceRef, ctx), Effect.scoped, Effect.provide(layer), Effect.runPromiseExit)
+        .pipe(
+          Effect.provideService(InstanceRef, ctx),
+          Effect.scoped,
+          Effect.provide(layer),
+          Effect.provide(TestClock.layer()),
+          Effect.runPromiseExit,
+        )
       installPhase("startup:joined")
-      const elapsed = Date.now() - startedAt
+      const elapsed = result._tag === "Success" ? result.value.elapsed : 0
+      const wallElapsed = Date.now() - wallStartedAt
 
       expect(result._tag).toBe("Success")
       // The 250ms bound expired before the join returned...
       expect(elapsed).toBeGreaterThanOrEqual(200)
+      expect(elapsed).toBe(250)
       // ...and the join returned instead of hanging on the stalled registry.
-      // The 10s wall bound needs headroom on the loaded windows runner, where
-      // the same join crossed it under load (#485).
       expect(elapsed).toBeLessThan(process.platform === "win32" ? 30_000 : 10_000)
-      expect(started.length).toBeGreaterThan(0)
+      // Preserve the original real-wall ceiling too; TestClock only removes scheduler
+      // timing from the 250ms budget assertion.
+      expect(wallElapsed).toBeLessThan(process.platform === "win32" ? 30_000 : 10_000)
+      expect(started.sort()).toEqual(installDirs.sort())
+      expect(reachedActualInstallAtMs).toEqual([])
       expect(interrupted.sort()).toEqual(started.sort())
       // Same assertion, but a failure carries attribution data: each stray
       // request's method, URL path, query key names, selected client headers and
@@ -448,7 +468,7 @@ describe("Config Dependency Install Integration with MockRegistry", () => {
           userAgent: request.headers["user-agent"],
           npmCommand: request.headers["npm-command"],
           npmSession: request.headers["npm-session"],
-          msAfterFirstInstallStart: request.timestamp - (startedAtMs[0] ?? startedAt),
+          msAfterFirstInstallStart: request.timestamp - (startedAtMs[0] ?? wallStartedAt),
           msBeforeTestEnd: endedAt - request.timestamp,
           installStartsSeen: startedAtMs.length,
           reachedActualInstallCount: reachedActualInstallAtMs.length,

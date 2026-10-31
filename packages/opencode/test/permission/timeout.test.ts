@@ -1,10 +1,12 @@
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { afterEach, beforeEach, expect } from "bun:test"
-import { Cause, Deferred, Effect, Exit, Fiber, Layer } from "effect"
+import { Clock, Cause, Deferred, Effect, Exit, Fiber, Layer, Queue } from "effect"
+import * as TestClock from "effect/testing/TestClock"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Npm } from "@opencode-ai/core/npm"
+import { Config } from "@/config/config"
 import { EventV2Bridge } from "../../src/event-v2-bridge"
 import { Permission } from "../../src/permission"
 import { InstanceBootstrap } from "../../src/project/bootstrap"
@@ -35,13 +37,38 @@ const stubNpm = Layer.succeed(
 )
 
 const env = AppNodeBuilder.build(
-  LayerNode.group([Permission.node, EventV2Bridge.node, CrossSpawnSpawner.node, InstanceStore.node]),
+  LayerNode.group([Permission.node, EventV2Bridge.node, CrossSpawnSpawner.node, InstanceStore.node, Config.node]),
   [
     [InstanceStore.bootstrapNode, noopBootstrap],
     [Npm.node, stubNpm],
   ],
 )
 const it = testEffect(env)
+
+// Permission.ask computes `expiresAt` with Date.now and waits with Effect.sleep.
+// Keep the two clocks on the same timeline, and finish config initialization on
+// the live clock before any countdown assertions begin.
+const withSynchronizedTestClock = <A, E, R>(self: Effect.Effect<A, E, R>) =>
+  Effect.gen(function* () {
+    const realNow = Date.now
+    yield* TestClock.setTime(realNow())
+    yield* TestClock.testClockWith((clock) =>
+      Effect.sync(() => {
+        Date.now = () => clock.currentTimeMillisUnsafe()
+      }),
+    )
+    yield* Effect.addFinalizer(() =>
+      Effect.sync(() => {
+        Date.now = realNow
+      }),
+    )
+
+    const config = yield* Config.Service
+    yield* TestClock.withLive(config.get())
+    // Config loading can take real time; re-anchor immediately before the test body.
+    yield* TestClock.setTime(realNow())
+    return yield* self
+  }).pipe(Effect.scoped, Effect.provide(TestClock.layer()))
 
 let priorDepInstallFlag: string | undefined
 beforeEach(() => {
@@ -89,40 +116,47 @@ const bash = (id: string, session = "session_timeout") => ({
   ruleset: [],
 })
 
-// On a timeout the error carries what was observed: how long the wait actually ran, how
-// many polls got to run (a starved event loop runs few), the worst gap between polls, and
-// the pending requests. A slow runner and a request that never arrived look different here.
-// The 1 second bound is unchanged.
+// Subscribe before checking state so request publication cannot be missed between
+// observation and sleep. Keep the one-second readiness bound on the live clock: the
+// countdown tests advance TestClock explicitly, while this guard still detects a missing
+// permission request under a loaded runner.
 const waitForPending = (count: number) =>
-  Effect.gen(function* () {
-    const started = Date.now()
-    let polls = 0
-    let last = started
-    let worstGap = 0
-    let seen = -1
-    return yield* Effect.gen(function* () {
-      while (true) {
-        const now = Date.now()
-        worstGap = Math.max(worstGap, now - last)
-        last = now
-        polls++
-        const pending = yield* list()
-        seen = pending.length
-        if (pending.length === count) return pending
-        yield* Effect.sleep("10 millis")
-      }
-    }).pipe(
-      Effect.timeoutOrElse({
-        duration: "1 second",
-        orElse: () =>
-          Effect.fail(
-            new Error(
-              `timed out waiting for ${count} pending permission request(s): elapsed=${Date.now() - started}ms polls=${polls} worstPollGap=${worstGap}ms lastSeenPending=${seen}`,
-            ),
-          ),
-      }),
-    )
-  })
+  TestClock.withLive(
+    Effect.gen(function* () {
+      const events = yield* EventV2Bridge.Service
+      const changed = yield* Queue.unbounded<void>()
+      const started = yield* Clock.currentTimeMillis
+      let askedEvents = 0
+      const unsub = yield* events.listen((event) => {
+        if (event.type !== Permission.Event.Asked.type) return Effect.void
+        askedEvents++
+        return Queue.offer(changed, undefined).pipe(Effect.asVoid)
+      })
+      yield* Effect.addFinalizer(() => unsub)
+
+      return yield* Effect.gen(function* () {
+        while (true) {
+          const pending = yield* list()
+          if (pending.length === count) return pending
+          yield* Queue.take(changed)
+        }
+      }).pipe(
+        Effect.timeoutOrElse({
+          duration: "1 second",
+          orElse: () =>
+            Effect.gen(function* () {
+              const elapsed = (yield* Clock.currentTimeMillis) - started
+              const pending = yield* list()
+              return yield* Effect.fail(
+                new Error(
+                  `timed out waiting for ${count} pending permission request(s): elapsed=${elapsed}ms askedEvents=${askedEvents} lastSeenPending=${pending.length}`,
+                ),
+              )
+            }),
+        }),
+      )
+    }).pipe(Effect.scoped),
+  )
 
 const rejectAll = () =>
   Effect.gen(function* () {
@@ -138,23 +172,26 @@ const collectReplies = () =>
   Effect.gen(function* () {
     const events = yield* EventV2Bridge.Service
     const replies: PermissionV1.ReplyOutcome[] = []
+    const changed = yield* Queue.unbounded<void>()
     const unsub = yield* events.listen((event) => {
-      if (event.type === Permission.Event.Replied.type)
-        replies.push((event.data as { reply: PermissionV1.ReplyOutcome }).reply)
-      return Effect.void
+      if (event.type !== Permission.Event.Replied.type) return Effect.void
+      replies.push((event.data as { reply: PermissionV1.ReplyOutcome }).reply)
+      return Queue.offer(changed, undefined).pipe(Effect.asVoid)
     })
     yield* Effect.addFinalizer(() => unsub)
-    return replies
+    return { replies, changed }
   })
 
-const waitForReplies = (replies: ReadonlyArray<unknown>, count: number) =>
-  Effect.gen(function* () {
-    while (replies.length < count) yield* Effect.sleep("10 millis")
-  }).pipe(
-    Effect.timeoutOrElse({
-      duration: "1 second",
-      orElse: () => Effect.fail(new Error(`timed out waiting for ${count} permission replied event(s)`)),
-    }),
+const waitForReplies = (log: { replies: ReadonlyArray<unknown>; changed: Queue.Queue<void> }, count: number) =>
+  TestClock.withLive(
+    Effect.gen(function* () {
+      while (log.replies.length < count) yield* Queue.take(log.changed)
+    }).pipe(
+      Effect.timeoutOrElse({
+        duration: "1 second",
+        orElse: () => Effect.fail(new Error(`timed out waiting for ${count} permission replied event(s)`)),
+      }),
+    ),
   )
 
 // Records the instant the request was announced. The deadline is computed immediately
@@ -176,11 +213,13 @@ const collectAnnounced = () =>
 // more: not a later reply, not the countdown, not the instance dispose finalizer. Fail
 // loudly instead of hanging the suite for the full test timeout.
 const notStranded = <A, E>(self: Effect.Effect<A, E>) =>
-  self.pipe(
-    Effect.timeoutOrElse({
-      duration: "3 seconds",
-      orElse: () => Effect.fail(new Error("permission ask was never settled")),
-    }),
+  TestClock.withLive(
+    self.pipe(
+      Effect.timeoutOrElse({
+        duration: "3 seconds",
+        orElse: () => Effect.fail(new Error("permission ask was never settled")),
+      }),
+    ),
   )
 
 it.instance(
@@ -203,6 +242,7 @@ it.instance(
       expect(expiresAt - announced.at).toBeGreaterThanOrEqual(900)
       expect(expiresAt - announced.at).toBeLessThanOrEqual(1000)
 
+      yield* TestClock.adjust("1 second")
       const exit = yield* Fiber.await(fiber)
       if (Exit.isSuccess(exit)) throw new Error("expected the unanswered prompt to be denied")
       const error = Cause.squash(exit.cause)
@@ -214,8 +254,8 @@ it.instance(
       expect(yield* list()).toHaveLength(0)
       yield* waitForReplies(replies, 1)
       // Clients dismiss the prompt off this event rather than polling for it.
-      expect(replies).toEqual(["timeout"])
-    }),
+      expect(replies.replies).toEqual(["timeout"])
+    }).pipe(withSynchronizedTestClock),
   { git: true, config: countdown },
 )
 
@@ -237,7 +277,7 @@ it.instance(
 
       yield* rejectAll()
       yield* Fiber.await(fiber)
-    }),
+    }).pipe(withSynchronizedTestClock),
   { git: true },
 )
 
@@ -253,9 +293,8 @@ it.instance(
       const fiber = yield* ask(bash("per_timeout_no_dep_install")).pipe(Effect.forkScoped)
 
       const [request] = yield* waitForPending(1)
-      // The deadline is stamped from the loaded config (this instance sets the 1s
-      // countdown), so observing it proves the ask really went through config load and
-      // the assertion below is not vacuously passing on a config path that never ran.
+      // The synchronized-clock wrapper loaded this instance's config before the ask;
+      // this deadline still proves the 1s setting is applied to the published request.
       const expiresAt = request.expiresAt ?? 0
       expect(expiresAt - Date.now()).toBeLessThanOrEqual(1000)
       expect(expiresAt - Date.now()).toBeGreaterThan(0)
@@ -263,12 +302,12 @@ it.instance(
       // A detached install fiber records synchronously when it starts; it is forked
       // inside the config load that just completed, so a short beat is enough for a
       // regressed fork to surface here.
-      yield* Effect.sleep("100 millis")
+      yield* TestClock.adjust("100 millis")
       expect(depInstalls).toEqual([])
 
       yield* rejectAll()
       yield* Fiber.await(fiber)
-    }),
+    }).pipe(withSynchronizedTestClock),
   { git: true, config: countdown },
 )
 
@@ -285,10 +324,10 @@ for (const answer of ["once", "always", "reject"] as const) {
         const exit = yield* Fiber.await(fiber)
         expect(Exit.isFailure(exit)).toBe(answer === "reject")
 
-        yield* Effect.sleep("1500 millis")
-        expect(replies).toEqual([answer])
+        yield* TestClock.adjust("1500 millis")
+        expect(replies.replies).toEqual([answer])
         expect(yield* list()).toHaveLength(0)
-      }),
+      }).pipe(withSynchronizedTestClock),
     { git: true, config: countdown },
   )
 }
@@ -302,10 +341,11 @@ it.instance(
       // Start the second prompt late so its countdown is still running when the first one
       // expires. The stagger doubles as the slack the reply below has to land in, so this
       // test runs a longer countdown than the rest of the file.
-      yield* Effect.sleep("2 seconds")
+      yield* TestClock.adjust("2 seconds")
       const second = yield* ask(bash("per_timeout_second")).pipe(Effect.forkScoped)
       yield* waitForPending(2)
 
+      yield* TestClock.adjust("1 second")
       const exit = yield* Fiber.await(first)
       if (Exit.isSuccess(exit)) throw new Error("expected the first prompt to be denied")
       expect(Cause.squash(exit.cause)).toBeInstanceOf(PermissionV1.TimedOutError)
@@ -318,7 +358,7 @@ it.instance(
       yield* reply({ requestID: PermissionV1.ID.make("per_timeout_second"), reply: "once" })
       yield* Fiber.join(second)
       expect(yield* list()).toHaveLength(0)
-    }),
+    }).pipe(withSynchronizedTestClock),
   { git: true, config: { permission_timeout: { enabled: true, seconds: 3 } } },
 )
 
@@ -334,7 +374,7 @@ it.instance(
 
       yield* rejectAll()
       yield* Effect.all([Fiber.await(parent), Fiber.await(child)])
-    }),
+    }).pipe(withSynchronizedTestClock),
   { git: true, config: countdown },
 )
 
@@ -350,13 +390,13 @@ it.instance(
 
       // Well past the one second countdown this instance is configured with, which
       // stays inert because the timeout is switched off.
-      yield* Effect.sleep("1500 millis")
+      yield* TestClock.adjust("1500 millis")
       expect(yield* list()).toHaveLength(1)
-      expect(replies).toEqual([])
+      expect(replies.replies).toEqual([])
 
       yield* reply({ requestID: PermissionV1.ID.make("per_timeout_disabled"), reply: "once" })
       yield* Fiber.join(fiber)
-    }),
+    }).pipe(withSynchronizedTestClock),
   { git: true, config: { permission_timeout: { enabled: false, seconds: 1 } } },
 )
 
@@ -388,7 +428,7 @@ it.instance(
       // done and the countdown has nothing left to expire.
       yield* notStranded(Fiber.join(fiber))
       expect(yield* list()).toHaveLength(0)
-    }),
+    }).pipe(withSynchronizedTestClock),
   { git: true, config: countdown },
 )
 
@@ -411,12 +451,12 @@ it.instance(
         requestID: PermissionV1.ID.make("per_timeout_interrupt"),
         reply: "once",
       }).pipe(Effect.forkScoped)
-      yield* Effect.sleep("100 millis")
+      yield* TestClock.adjust("100 millis")
       yield* Fiber.interrupt(answering)
 
       yield* notStranded(Fiber.join(fiber))
       expect(yield* list()).toHaveLength(0)
-    }),
+    }).pipe(withSynchronizedTestClock),
   { git: true, config: countdown },
 )
 
@@ -445,9 +485,9 @@ it.instance(
         const fiber = yield* ask(bash("per_timeout_slow_asked")).pipe(Effect.forkScoped)
         // Unlike pending membership, this signal survives the deadline. A delayed
         // observer must not miss the request it is trying to test.
-        const expiresAt = yield* Deferred.await(announced).pipe(Effect.timeout("1 second"))
+        const expiresAt = yield* TestClock.withLive(Deferred.await(announced).pipe(Effect.timeout("1 second")))
         expect(expiresAt).toBeGreaterThan(0)
-        yield* Effect.sleep(Math.max(0, expiresAt - Date.now()) + 500)
+        yield* TestClock.adjust(Math.max(0, expiresAt - Date.now()) + 500)
         expect(yield* list()).toHaveLength(0)
         expect(fiber.pollUnsafe()).toBeUndefined()
 
@@ -456,7 +496,7 @@ it.instance(
         if (Exit.isSuccess(exit)) throw new Error("expected the unanswered prompt to be denied")
         expect(Cause.squash(exit.cause)).toBeInstanceOf(PermissionV1.TimedOutError)
       }).pipe(Effect.ensuring(Deferred.succeed(release, undefined)))
-    }),
+    }).pipe(withSynchronizedTestClock),
   { git: true, config: countdown },
 )
 
@@ -472,11 +512,14 @@ it.instance(
       )
       yield* Effect.addFinalizer(() => unsub)
 
-      const exit = yield* ask(bash("per_timeout_bad_listener")).pipe(Effect.exit)
+      const fiber = yield* ask(bash("per_timeout_bad_listener")).pipe(Effect.forkScoped)
+      yield* waitForPending(1)
+      yield* TestClock.adjust("1 second")
+      const exit = yield* Fiber.await(fiber)
       if (Exit.isSuccess(exit)) throw new Error("expected the unanswered prompt to be denied")
       expect(Cause.squash(exit.cause)).toBeInstanceOf(PermissionV1.TimedOutError)
       expect(yield* list()).toHaveLength(0)
-    }),
+    }).pipe(withSynchronizedTestClock),
   { git: true, config: countdown },
 )
 
@@ -515,7 +558,7 @@ it.instance(
       // Every request the reject decided about is settled before any of them is announced.
       expectAllRejected(yield* notStranded(cascadedExits(first, second)))
       expect(yield* list()).toHaveLength(0)
-    }),
+    }).pipe(withSynchronizedTestClock),
   { git: true, config: countdown },
 )
 
@@ -537,12 +580,12 @@ it.instance(
         requestID: PermissionV1.ID.make("per_timeout_interrupt_a"),
         reply: "reject",
       }).pipe(Effect.forkScoped)
-      yield* Effect.sleep("100 millis")
+      yield* TestClock.adjust("100 millis")
       yield* Fiber.interrupt(rejecting)
 
       expectAllRejected(yield* notStranded(cascadedExits(first, second)))
       expect(yield* list()).toHaveLength(0)
-    }),
+    }).pipe(withSynchronizedTestClock),
   { git: true, config: countdown },
 )
 
@@ -558,9 +601,9 @@ it.instance(
       yield* waitForPending(1)
       yield* Fiber.interrupt(fiber)
       yield* waitForReplies(replies, 1)
-      expect(replies).toEqual(["reject"])
+      expect(replies.replies).toEqual(["reject"])
       expect(yield* list()).toHaveLength(0)
-    }),
+    }).pipe(withSynchronizedTestClock),
   { git: true },
 )
 
@@ -573,8 +616,8 @@ it.instance(
       yield* waitForPending(1)
       yield* reply({ requestID: PermissionV1.ID.make("per_answered_once"), reply: "once" })
       yield* Fiber.join(fiber)
-      yield* Effect.sleep("200 millis")
-      expect(replies).toEqual(["once"])
-    }),
+      yield* TestClock.adjust("200 millis")
+      expect(replies.replies).toEqual(["once"])
+    }).pipe(withSynchronizedTestClock),
   { git: true },
 )

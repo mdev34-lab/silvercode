@@ -142,6 +142,10 @@ describe("headless run provider retry delay (#555)", () => {
       expect(result.stderr).toMatch(/subagent waiting about \d+s before retrying \(attempt 1\): free usage limit reached/)
       expect(result.stderr).not.toContain("CHILD_RAW_SECRET")
       expect(result.stderr).not.toContain("quota_exceeded")
+      // The 429 and its recovery response are both matched to the child-wait prompt;
+      // one extra stream request here would exhaust the script and expose a mock miss.
+      const childWaitHits = (yield* llm.hits).filter((hit) => opened(hit.body as Body, "CHILD_WAIT_INPUT"))
+      expect(childWaitHits).toHaveLength(2)
       expect(yield* llm.misses).toEqual([])
       expect(yield* llm.pending).toBe(0)
     }), 90_000)

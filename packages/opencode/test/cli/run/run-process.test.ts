@@ -7,8 +7,19 @@ import { describe, expect } from "bun:test"
 import { Effect } from "effect"
 import fs from "node:fs/promises"
 import path from "node:path"
-import { raw, reply } from "../../lib/llm-server"
 import { cliIt } from "../../lib/cli-process"
+import { raw, reply } from "../../lib/llm-server"
+
+type Body = { messages?: { role?: string; content?: unknown }[] }
+const lastText = (body: Body) => {
+  const content = body.messages?.at(-1)?.content
+  if (typeof content === "string") return content
+  if (Array.isArray(content))
+    return content
+      .map((part) => (part && typeof part === "object" && "text" in part ? String(part.text ?? "") : ""))
+      .join("\n")
+  return ""
+}
 
 describe("opencode run (non-interactive subprocess)", () => {
   cliIt.live(
@@ -40,7 +51,11 @@ describe("opencode run (non-interactive subprocess)", () => {
           },
         })
         expect(first.exitCode).toBe(0)
-        yield* llm.push(
+        yield* llm.pushMatch(
+          (hit) => {
+            const body = hit.body as Body
+            return body.messages?.at(-1)?.role === "user" && lastText(body).includes("quota rejection")
+          },
           raw({
             chunks: [
               { error: { message: "Free usage limit reached", type: "quota_exceeded", code: "FreeUsageLimitError" } },
@@ -74,6 +89,13 @@ describe("opencode run (non-interactive subprocess)", () => {
         expect(result.exitCode).not.toBe(0)
         expect(result.stderr).toContain("Free usage limit reached")
         expect(result.durationMs).toBeLessThan(20_000)
+        const quotaRequests = (yield* llm.hits).filter((hit) => {
+          const body = hit.body as Body
+          return body.messages?.at(-1)?.role === "user" && lastText(body).includes("quota rejection")
+        })
+        expect(quotaRequests).toHaveLength(1)
+        expect(yield* llm.misses).toEqual([])
+        expect(yield* llm.pending).toBe(0)
       }),
     30_000,
   )
