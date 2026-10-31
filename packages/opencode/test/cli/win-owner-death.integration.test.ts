@@ -90,17 +90,18 @@ const VERIFY_BUDGET_MS = 20_000
  * Timeout for the stall test only. The phases are ceilings, not durations, so
  * the honest arithmetic is by case rather than a single sum:
  *
- *   identity wait      15_000  always consumed in full - that is the stall
- *   probe phase        ~3_000  nominal; ceiling PROBE_BUDGET_MS   (15_000)
- *   verify phase       ~2_000  nominal; ceiling VERIFY_BUDGET_MS  (20_000)
- *   reapTree in try    ~1_000  nominal; ceiling CLEANUP_BUDGET_MS (5_000)
- *   reapTree in finally    ~0  owner.exited is already settled and every PID
- *                              is already dead, so it returns at once
+ *   identity wait       15_000  always consumed in full - that is the stall
+ *   probe phase         ~3_000  nominal; ceiling PROBE_BUDGET_MS   (15_000)
+ *   owner exit          ~1_000  nominal; ceiling PROBE_BUDGET_MS   (15_000)
+ *   verify phase        ~2_000  nominal; ceiling VERIFY_BUDGET_MS  (20_000)
+ *   reapTree in try     ~1_000  nominal; ceiling CLEANUP_BUDGET_MS  (5_000)
+ *   reapTree in finally     ~0  owner.exited is already settled and every PID
+ *                               is already dead, so it returns at once
  *
- * nominal ~21s; worst single-phase-failure case 15 + 3 + 20 + 5 = 43s, which
- * fits. The one path that does not fit is pathological - the probe phase AND
- * the verify phase both exhausting their ceilings, 15 + 15 + 20 + 5 = 55s -
- * and there this timeout fires and the test fails loudly rather than hanging.
+ * nominal ~22s, comfortably inside. The all-ceilings path does NOT fit -
+ * 15 + 15 + 15 + 20 + 5 = 70s - and there this timeout fires and the test
+ * fails loudly rather than hanging. The phases are independent ceilings, so
+ * this is a ceiling sum rather than a reachable duration.
  * Nothing in this file changes the package default (`--timeout 30000` in
  * `packages/opencode/package.json`).
  */
@@ -242,13 +243,20 @@ function tasklistHasPid(pid: number, deadline: number) {
   // which would time out and read as "tasklist never answered" rather than "the
   // caller's budget was already gone".
   if (deadline <= Date.now()) throw new Error(`tasklist for PID ${pid}: deadline already expired`)
-  const result = Bun.spawnSync(["tasklist", "/FI", `PID eq ${pid}`, "/NH", "/FO", "CSV"], {
-    timeout: Math.max(1, Math.min(TASKLIST_TIMEOUT_MS, deadline - Date.now())),
-  })
+  const allowance = Math.max(1, Math.min(TASKLIST_TIMEOUT_MS, deadline - Date.now()))
+  const started = Date.now()
+  const result = Bun.spawnSync(["tasklist", "/FI", `PID eq ${pid}`, "/NH", "/FO", "CSV"], { timeout: allowance })
+  const took = Date.now() - started
   if (result.exitedDueToTimeout) {
-    throw new Error(`tasklist did not answer for PID ${pid} within the remaining budget`)
+    throw new Error(`tasklist did not answer for PID ${pid} within ${allowance}ms (ran ${took}ms)`)
   }
-  return result.stdout.toString().includes(`"${pid}"`)
+  const present = result.stdout.toString().includes(`"${pid}"`)
+  // Measurement, not decoration. `tasklist` walks the entire process table and
+  // its duration on a loaded runner sits right at this ceiling, so allowance
+  // and duration have to be in the failure message - without them the next
+  // timeout is as undiagnosable as the last one.
+  console.error(`(#442) tasklist pid=${pid} allowance=${allowance}ms took=${took}ms present=${present}`)
+  return present
 }
 
 /** Is something still accepting connections on this port? A dead port refuses. */
@@ -493,9 +501,11 @@ describe("Windows owner death (#442)", () => {
         expect(await acceptsConnections(report.workerPort)).toBe(true)
         expect(await acceptsConnections(report.grandchildPort)).toBe(true)
 
-        // The force kill: one PID, no cooperation, no tree walk.
+        // The force kill: one PID, no cooperation, no tree walk. Its exit gets
+        // its own deadline so a slow `tasklist` above cannot starve it.
         terminateProcess(owner.pid, "owner")
-        await bounded(owner.exited, "the owner never exited after TerminateProcess", probeDeadline)
+        const ownerExitDeadline = Date.now() + PROBE_BUDGET_MS
+        await bounded(owner.exited, "the owner never exited after TerminateProcess", ownerExitDeadline)
 
         // Fresh deadline for the verification phase, same reasoning.
         const verifyDeadline = Date.now() + VERIFY_BUDGET_MS
@@ -608,6 +618,10 @@ describe("Windows owner death (#442)", () => {
         // `STALL_BUDGET_MS` by design, so reusing `deadline` would hand
         // `tasklistHasPid` a 1ms allowance (it clamps a negative remainder to 1)
         // and `bounded` a 0ms one, failing both spuriously.
+        // `PROBE_BUDGET_MS`, not `VERIFY_BUDGET_MS`: `tasklistHasPid` clamps a
+        // single invocation to `TASKLIST_TIMEOUT_MS`, so a larger phase budget
+        // cannot widen the first call - it would only add slack for a second
+        // one. Widening it here would be a no-op dressed up as a fix.
         const probeDeadline = Date.now() + PROBE_BUDGET_MS
 
         // Pre-kill liveness, captured BEFORE the kill so that "gone afterwards"
@@ -623,10 +637,13 @@ describe("Windows owner death (#442)", () => {
           workerPort === undefined ? Promise.resolve(false) : acceptsConnections(workerPort),
         )
 
-        // Owner death must still take the half-built tree down.
+        // Owner death must still take the half-built tree down. Its exit gets
+        // its OWN deadline: sharing one with the probes above let a slow
+        // `tasklist` starve it.
         terminateProcess(owner.pid, "owner")
+        const ownerExitDeadline = Date.now() + PROBE_BUDGET_MS
         const ownerExited = await probeAsync(() =>
-          bounded(owner.exited, "the owner never exited after TerminateProcess", probeDeadline).then(() => true),
+          bounded(owner.exited, "the owner never exited after TerminateProcess", ownerExitDeadline).then(() => true),
         )
 
         const verifyDeadline = Date.now() + VERIFY_BUDGET_MS
