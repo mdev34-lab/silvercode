@@ -9,13 +9,11 @@ const ENTRIES: {
   value: Level
   title: string
   description: string
-  details: string[]
 }[] = [
   {
     value: "fast",
     title: "Fast",
-    description: "no review ritual",
-    details: ["Inline self-check and syntax/smoke validation, delivered with an honest unreviewed label"],
+    description: "Reliable workhorse for everyday tasks",
   },
   {
     value: "medium",
@@ -23,14 +21,12 @@ const ENTRIES: {
     // No "· default" here: on home the persisted selection decides the
     // default now, so a static claim on one row would contradict it. The
     // cursor and the footer carry that meaning instead.
-    description: "up to 2 review passes",
-    details: ["Independent review for code changes; only blocking findings force another pass, then an honest status"],
+    description: "Smarter agent for more demanding work",
   },
   {
     value: "thorough",
     title: "Thorough",
-    description: "review until clean",
-    details: ["Structured review contract with severity-driven convergence and full validation gates, no pass cap"],
+    description: "Deep, meticulous work on complex tasks from start to finish",
   },
 ]
 
@@ -54,7 +50,6 @@ export function DialogAgentEffort() {
           </>
         ),
         description: entry.description,
-        details: entry.details,
         onSelect: () => {
           dialog.clear()
           local.effort.set(entry.value)
