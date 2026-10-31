@@ -1384,6 +1384,7 @@ const layer = Layer.effect(
         let structured: unknown
         let step = 0
         let finishNudges = 0
+        let resumeAttempts = 0
         const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
 
         while (true) {
@@ -1685,6 +1686,7 @@ const layer = Layer.effect(
               assistantMessage: msg,
               sessionID,
               model,
+              resumeAttempt: resumeAttempts,
             })
             .pipe(Effect.onInterrupt(() => finalizeInterruptedAssistant))
 
@@ -1815,6 +1817,12 @@ const layer = Layer.effect(
               model,
               toolChoice: format.type === "json_schema" ? "required" : undefined,
             })
+
+            if (handle.resuming) {
+              resumeAttempts++
+              // The next loop reloads persisted parts and builds a NEW request.
+              return "continue" as const
+            }
 
             if (structured !== undefined) {
               handle.message.structured = structured
