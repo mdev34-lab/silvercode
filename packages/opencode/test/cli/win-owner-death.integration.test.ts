@@ -314,6 +314,40 @@ function requireDefined<T>(value: T | undefined, what: string): T {
 }
 
 /**
+ * `until` as a boolean: false on a missed bound instead of throwing, so one
+ * failed phase cannot skip the assertions that come after it.
+ */
+async function settled(condition: () => boolean | Promise<boolean>, deadline: number): Promise<boolean> {
+  for (;;) {
+    if (Date.now() >= deadline) return false
+    if (await condition()) return true
+    await Bun.sleep(POLL_MS)
+  }
+}
+
+/**
+ * Run a probe without letting it throw. A probe that throws yields its message,
+ * which then fails the assertion consuming it - so a wedged probe is reported
+ * loudly and is never silently read as "absent".
+ */
+function probe<T>(run: () => T): T | string {
+  try {
+    return run()
+  } catch (error) {
+    return error instanceof Error ? error.message : String(error)
+  }
+}
+
+/** `probe` for async probes. */
+async function probeAsync<T>(run: () => Promise<T>): Promise<T | string> {
+  try {
+    return await run()
+  } catch (error) {
+    return error instanceof Error ? error.message : String(error)
+  }
+}
+
+/**
  * IPC handler shared by both tests: folds every identity message into `seen`
  * and `spawned` in arrival order and forwards `log:` lines. One handler rather
  * than two copies, so the tests cannot drift on the property under review.
@@ -501,80 +535,133 @@ describe("Windows owner death (#442)", () => {
       })
 
       try {
-        // The bounded failure path under test. `ready` is suppressed by the
+        // The bounded failure path under test: `ready` is suppressed by the
         // fixture, so this must reject at the deadline instead of hanging or
         // resolving.
-        await expect(bounded(treeReady, "the worker never reported its identity", deadline)).rejects.toThrow(
-          "the worker never reported its identity",
-        )
-        expect(readyArrived).toBe(false)
+        //
+        // The outcome is CAPTURED, not asserted inline. Asserting here - the
+        // first statement of the `try` - means any rejection of any kind throws
+        // straight out of the test, skipping every assertion below and leaving
+        // the "leaves nothing behind" property completely unverified. So:
+        // capture the outcome, kill, verify, clean up, and only then assert.
+        let identityRejectedWith: string | undefined
+        try {
+          await bounded(treeReady, "the worker never reported its identity", deadline)
+        } catch (error) {
+          identityRejectedWith = error instanceof Error ? error.message : String(error)
+        }
 
-        // Anti-vacuous-pass guards. The bound must have fired because the tree
-        // reached the stall and stopped reporting, not because startup was too
-        // slow to report anything. Incremental capture is what makes this
-        // knowable at all: under the old `ready`-carries-everything protocol
-        // `seen` would be empty here and nothing could be asserted.
-        expect(seen.workerPid).toBeGreaterThan(0)
-        expect(seen.grandchildPid).toBeGreaterThan(0)
-        // `child-port` is exactly the message that never arrives.
-        expect(seen.grandchildPort).toBeUndefined()
+        // Snapshot what arrived, without throwing. The tree may have stalled at
+        // any point and the assertions still have to run.
+        const workerPid = seen.workerPid
+        const workerPort = seen.workerPort
+        const grandchildPid = seen.grandchildPid
+        const grandchildPort = seen.grandchildPort
+        const spawnedPids = [...spawned]
 
-        // `expect` does not narrow, so take the captured values once here and
-        // use these locals below. `completeReport` is deliberately not called:
-        // it would reject the missing `grandchildPort`, which is the point.
-        const workerPid = requireDefined(seen.workerPid, "worker pid")
-        const workerPort = requireDefined(seen.workerPort, "worker port")
-        const grandchildPid = requireDefined(seen.grandchildPid, "grandchild pid")
-        // Both identities arrived, and in creation order.
-        expect(spawned).toEqual([workerPid, grandchildPid])
-
-        // Every phase from here on runs on a FRESH deadline. The identity wait
-        // above consumed `STALL_BUDGET_MS` by design, so reusing `deadline`
-        // would hand `tasklistHasPid` a 1ms allowance (it clamps a negative
-        // remainder to 1) and `bounded` a 0ms one, failing both spuriously.
+        // Every phase below runs on a FRESH deadline. The identity wait consumed
+        // `STALL_BUDGET_MS` by design, so reusing `deadline` would hand
+        // `tasklistHasPid` a 1ms allowance (it clamps a negative remainder to 1)
+        // and `bounded` a 0ms one, failing both spuriously.
         const probeDeadline = Date.now() + STALL_PROBE_MS
 
-        // The stall is in the fixture, not in the job: adoption still
-        // succeeded, so what follows exercises owner-death cleanup on a
-        // half-built tree rather than on one that failed to bind at all.
-        expect(ownerLog.join("\n")).not.toContain("(#442)")
-
-        // Pre-kill liveness, so "gone afterwards" means something.
-        expect(pidExists(workerPid)).toBe(true)
-        expect(pidExists(grandchildPid)).toBe(true)
-        expect(tasklistHasPid(workerPid, probeDeadline)).toBe(true)
-        expect(tasklistHasPid(grandchildPid, probeDeadline)).toBe(true)
-        expect(await acceptsConnections(workerPort)).toBe(true)
+        // Pre-kill liveness, captured BEFORE the kill so that "gone afterwards"
+        // means something. A wedged probe yields its message rather than being
+        // read as "absent", and the assertion consuming it then fails loudly.
+        const preKillWorker = probe(() => workerPid !== undefined && pidExists(workerPid))
+        const preKillGrandchild = probe(() => grandchildPid !== undefined && pidExists(grandchildPid))
+        const preKillWorkerTasklist = probe(() => workerPid !== undefined && tasklistHasPid(workerPid, probeDeadline))
+        const preKillGrandchildTasklist = probe(
+          () => grandchildPid !== undefined && tasklistHasPid(grandchildPid, probeDeadline),
+        )
+        const preKillWorkerPort = await probeAsync(() =>
+          workerPort === undefined ? Promise.resolve(false) : acceptsConnections(workerPort),
+        )
 
         // Owner death must still take the half-built tree down.
         terminateProcess(owner.pid, "owner")
-        await bounded(owner.exited, "the owner never exited after TerminateProcess", probeDeadline)
+        const ownerExited = await probeAsync(() =>
+          bounded(owner.exited, "the owner never exited after TerminateProcess", probeDeadline).then(() => true),
+        )
 
         const verifyDeadline = Date.now() + STALL_VERIFY_MS
-        // `until` throws on a missed bound, so the bare await is the assertion.
-        await until(() => !pidExists(workerPid), `worker pid ${workerPid} still exists`, verifyDeadline)
-        await until(() => !pidExists(grandchildPid), `grandchild pid ${grandchildPid} still exists`, verifyDeadline)
-        // Second, independent look at the same two PIDs.
-        expect(tasklistHasPid(workerPid, verifyDeadline)).toBe(false)
-        expect(tasklistHasPid(grandchildPid, verifyDeadline)).toBe(false)
-
-        // The worker's port is known, so its release is probed directly. The
-        // grandchild's port is unknowable here (`child-port` is the message
-        // that never arrives), so its release rests on its PID ceasing to
-        // exist above - a dead process holds no port.
-        await until(
-          async () => !(await acceptsConnections(workerPort)),
-          "worker still accepts connections on its port",
-          verifyDeadline,
+        const workerGone = await probeAsync(() =>
+          workerPid === undefined ? Promise.resolve(false) : settled(() => !pidExists(workerPid), verifyDeadline),
         )
-        expect(await bounded(canBind(workerPort), "worker port bind probe never answered", verifyDeadline)).toBe(true)
+        const grandchildGone = await probeAsync(() =>
+          grandchildPid === undefined
+            ? Promise.resolve(false)
+            : settled(() => !pidExists(grandchildPid), verifyDeadline),
+        )
+        const workerTasklistGone = probe(() => workerPid !== undefined && !tasklistHasPid(workerPid, verifyDeadline))
+        const grandchildTasklistGone = probe(
+          () => grandchildPid !== undefined && !tasklistHasPid(grandchildPid, verifyDeadline),
+        )
+        // The worker's port is known, so its release is probed directly. The
+        // grandchild's port is unknowable here (`child-port` is the message that
+        // never arrives), so its release rests on its PID ceasing to exist above
+        // - a dead process holds no port.
+        const workerPortClosed = await probeAsync(() =>
+          workerPort === undefined
+            ? Promise.resolve(false)
+            : settled(async () => !(await acceptsConnections(workerPort)), verifyDeadline),
+        )
+        const workerPortRebindable = await probeAsync(() =>
+          workerPort === undefined
+            ? Promise.resolve(false)
+            : bounded(canBind(workerPort), "worker port bind probe never answered", verifyDeadline),
+        )
 
-        // Last statement in `try`: the survivor check is an assertion of this
-        // test, not teardown. The `finally` below is a safety net only, so it
-        // can never mask the failure that actually threw.
+        // Cleanup runs before the assertions, not after them, so that no failed
+        // assertion can leave a live process on the runner.
         await reapTree(spawned, owner, CLEANUP_BUDGET_MS)
-        expect(spawned.filter((pid) => pidExists(pid))).toEqual([])
+        const survivors = spawnedPids.filter((pid) => pidExists(pid))
+
+        // The safety property first: whatever else is wrong, the half-built tree
+        // must be gone and its port released.
+        expect(survivors).toEqual([])
+        expect(workerGone).toBe(true)
+        expect(grandchildGone).toBe(true)
+        expect(workerTasklistGone).toBe(true)
+        expect(grandchildTasklistGone).toBe(true)
+        expect(workerPortClosed).toBe(true)
+        expect(workerPortRebindable).toBe(true)
+
+        // Then the bounded-failure property itself, and the guards that keep it
+        // from passing vacuously: the bound must have fired because the tree
+        // reached the stall and stopped reporting, not because startup was too
+        // slow to report anything. Incremental capture is what makes this
+        // knowable at all - under the old `ready`-carries-everything protocol
+        // `seen` would be empty here and nothing could be asserted.
+        expect(identityRejectedWith).toBe("the worker never reported its identity")
+        expect(readyArrived).toBe(false)
+        expect(ownerExited).toBe(true)
+        expect(workerPid).toBeGreaterThan(0)
+        expect(grandchildPid).toBeGreaterThan(0)
+        // `child-port` is exactly the message that never arrives.
+        expect(grandchildPort).toBeUndefined()
+        // Both identities arrived, and in creation order. `requireDefined` only
+        // narrows for the type checker here: the two assertions above have
+        // already failed if either PID is missing.
+        expect(spawnedPids).toEqual([
+          requireDefined(workerPid, "worker pid"),
+          requireDefined(grandchildPid, "grandchild pid"),
+        ])
+
+        // The stall is in the fixture, not in the job: adoption still succeeded,
+        // so the cleanup above really did exercise owner death on a half-built
+        // tree rather than on one that failed to bind at all.
+        expect(ownerLog.join("\n")).not.toContain("(#442)")
+
+        // Pre-kill liveness, so the "gone" results above meant something.
+        expect(preKillWorker).toBe(true)
+        expect(preKillGrandchild).toBe(true)
+        expect(preKillWorkerTasklist).toBe(true)
+        expect(preKillGrandchildTasklist).toBe(true)
+        expect(preKillWorkerPort).toBe(true)
       } finally {
+        // Safety net only: the survivor assertion above is the real check, and
+        // keeping it out of `finally` means it can never mask a real failure.
         await reapTree(spawned, owner, CLEANUP_BUDGET_MS)
       }
     },
