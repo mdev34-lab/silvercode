@@ -44,5 +44,11 @@ worker.onmessage = (event) => {
   if (typeof event.data === "string") process.send?.(event.data)
 }
 
+// Positive control for the log channel. The adopter only logs on failure, so a
+// clean run produces no `log:` messages at all - which would let the test's
+// "(#442)"-free assertion pass vacuously if IPC forwarding were broken. The
+// test asserts this sentinel arrived, so an empty log is a failure, not a pass.
+process.send?.("log:owner-log-channel-ok")
+
 // Hold the job handle open until the test force-kills this process.
 setInterval(() => {}, 1000)
