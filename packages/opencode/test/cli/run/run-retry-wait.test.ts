@@ -1,5 +1,6 @@
 import { describe, expect } from "bun:test"
 import { Effect } from "effect"
+import { createHash } from "node:crypto"
 import { writeFile } from "node:fs/promises"
 import path from "node:path"
 import { cliIt } from "../../lib/cli-process"
@@ -31,6 +32,24 @@ const conversationKey = (body: Body) => {
   const user = body.messages?.find((message) => message.role === "user")
   if (!system || !user) return undefined
   return JSON.stringify([body.model, contentText(system.content), contentText(user.content)])
+}
+const digest = (value: string) => createHash("sha256").update(value).digest("hex").slice(0, 16)
+const stringTriple = (value: unknown): value is [string, string, string] =>
+  Array.isArray(value) && value.length === 3 && value.every((part) => typeof part === "string")
+const expectedChildKey = (key: string | undefined) => {
+  if (!key) return { captured: false }
+  const parsed: unknown = JSON.parse(key)
+  if (!stringTriple(parsed)) return { captured: true, malformed: true, keySha256: digest(key) }
+  const [model, system, firstUser] = parsed
+  return {
+    captured: true,
+    route: "/v1/chat/completions",
+    model,
+    keySha256: digest(key),
+    system: { length: system.length, sha256: digest(system) },
+    firstUser: { length: firstUser.length, sha256: digest(firstUser), preview: firstUser.slice(0, 180) },
+    requestMessageIdsAreNotPartOfThisKey: true,
+  }
 }
 const lastText = (body: Body) => {
   const content = body.messages?.at(-1)?.content
@@ -67,6 +86,7 @@ const withCliOutputOnFailure = <A>(
   label: string,
   result: { exitCode: number; stdout: string; stderr: string; durationMs: number },
   assert: () => A,
+  diagnostics: () => string,
 ): A => {
   try {
     return assert()
@@ -76,7 +96,8 @@ const withCliOutputOnFailure = <A>(
     console.error(
       `[${label}] child exit=${result.exitCode} duration=${result.durationMs}ms\n` +
         `[${label}] child stdout tail:\n${tail(result.stdout) || "<empty>"}\n` +
-        `[${label}] child stderr tail:\n${tail(result.stderr) || "<empty>"}`,
+        `[${label}] child stderr tail:\n${tail(result.stderr) || "<empty>"}\n` +
+        `[${label}] mock request diagnostics:\n${diagnostics()}`,
     )
     throw error
   }
@@ -212,6 +233,35 @@ describe("headless run provider retry delay (#555)", () => {
       const misses = yield* llm.misses
       const pending = yield* llm.pending
       const childWaitHits = hits.filter(childRetryRequest)
+      const requestDiagnostics = () => JSON.stringify({
+        counts: {
+          hits: hits.length,
+          misses: misses.length,
+          pending: pending,
+          pendingDefinition: "queued one-shot responses only; bounded repeats are tracked separately",
+          childRetryConversationHits: childWaitHits.length,
+        },
+        childRetryRequestFilter: {
+          armed: childConversationKey !== undefined,
+          conditions: [
+            "route === /v1/chat/completions",
+            "body.model === local-quota-test",
+            "body.messages first system content + first user content + model produce the captured key",
+          ],
+          expectedKey: expectedChildKey(childConversationKey),
+        },
+        misses: misses.map((miss, index) => ({
+          miss: index + 1,
+          route: miss.request.route,
+          phase: miss.request.phase,
+          model: miss.request.model,
+          messageCount: miss.request.messageCount,
+          finalRole: miss.request.finalRole,
+          identifiers: miss.request.identifiers,
+          actualKeyComponents: miss.request.keys,
+          body: miss.body,
+        })),
+      }, null, 2)
       withCliOutputOnFailure("background child retry wait", result, () => {
         expect(result.exitCode).toBe(0)
         expect(result.stdout).toContain("ROOT_FINAL")
@@ -225,7 +275,7 @@ describe("headless run provider retry delay (#555)", () => {
         expect(childWaitHits.length).toBeLessThanOrEqual(SessionRetry.RETRY_MAX_RETRIES + 1)
         expect(misses).toEqual([])
         expect(pending).toBe(0)
-      })
+      }, requestDiagnostics)
     }), 90_000)
 
   cliIt.live("fails fast instead of hanging when Zen quota reset exceeds the headless retry window", ({ llm, opencode }) =>
