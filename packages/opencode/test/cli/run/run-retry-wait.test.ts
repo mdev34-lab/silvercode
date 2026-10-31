@@ -1,6 +1,5 @@
 import { describe, expect } from "bun:test"
 import { Effect } from "effect"
-import { createHash } from "node:crypto"
 import { writeFile } from "node:fs/promises"
 import path from "node:path"
 import { cliIt } from "../../lib/cli-process"
@@ -27,30 +26,7 @@ const contentText = (content: unknown) => {
       .join("\n")
   return content === undefined ? "" : JSON.stringify(content)
 }
-const conversationKey = (body: Body) => {
-  const system = body.messages?.find((message) => message.role === "system")
-  const user = body.messages?.find((message) => message.role === "user")
-  if (!system || !user) return undefined
-  return JSON.stringify([body.model, contentText(system.content), contentText(user.content)])
-}
-const digest = (value: string) => createHash("sha256").update(value).digest("hex").slice(0, 16)
-const stringTriple = (value: unknown): value is [string, string, string] =>
-  Array.isArray(value) && value.length === 3 && value.every((part) => typeof part === "string")
-const expectedChildKey = (key: string | undefined) => {
-  if (!key) return { captured: false }
-  const parsed: unknown = JSON.parse(key)
-  if (!stringTriple(parsed)) return { captured: true, malformed: true, keySha256: digest(key) }
-  const [model, system, firstUser] = parsed
-  return {
-    captured: true,
-    route: "/v1/chat/completions",
-    model,
-    keySha256: digest(key),
-    system: { length: system.length, sha256: digest(system) },
-    firstUser: { length: firstUser.length, sha256: digest(firstUser), preview: firstUser.slice(0, 180) },
-    requestMessageIdsAreNotPartOfThisKey: true,
-  }
-}
+const childTaskPrompt = "Research CHILD_WAIT_INPUT"
 const lastText = (body: Body) => {
   const content = body.messages?.at(-1)?.content
   if (typeof content === "string") return content
@@ -184,40 +160,31 @@ describe("headless run provider retry delay (#555)", () => {
       yield* llm.push(reply().text("init").tool("finish", { reason: "success", result: "ok" }).stop())
       const first = yield* opencode.run("Research the initial session report", { model: "opencode/local-quota-test", env, timeoutMs: 20_000 })
       expect(first.exitCode).toBe(0)
-      // Retries may append assistant/tool messages after the stable user turn.
+      // Retries may append assistant/tool messages after the stable first user turn.
       const opened = (body: Body, text: string) => lastUserText(body).includes(text)
       const followed = (body: Body, text: string) => body.messages?.at(-1)?.role === "tool" && JSON.stringify(body).includes(text)
-      const childConversation = (hit: RequestHit) => {
+      const childRequest = (hit: RequestHit) => {
         const body = hit.body as Body
-        if (hit.url.pathname !== "/v1/chat/completions" || body.model !== "local-quota-test") return undefined
-        return conversationKey(body)
-      }
-      let childConversationKey: string | undefined
-      const childQuotaRequest = (hit: RequestHit) => {
-        const body = hit.body as Body
-        const key = childConversation(hit)
-        if (!key || !opened(body, "CHILD_WAIT_INPUT")) return false
-        childConversationKey = key
-        return true
-      }
-      const childRetryRequest = (hit: RequestHit) => {
-        return childConversationKey !== undefined && childConversation(hit) === childConversationKey
+        if (hit.url.pathname !== "/v1/chat/completions" || body.model !== "local-quota-test") return false
+        const firstUser = body.messages?.find((message) => message.role === "user")
+        return firstUser !== undefined && contentText(firstUser.content).startsWith(childTaskPrompt)
       }
       yield* llm.pushMatch((hit) => opened(hit.body as Body, "Research the child wait report"), reply().tool("task", {
-        description: "child wait probe", prompt: "Research CHILD_WAIT_INPUT", subagent_type: "general", background: true,
+        description: "child wait probe", prompt: childTaskPrompt, subagent_type: "general", background: true,
       }))
       yield* llm.pushMatch((hit) => followed(hit.body as Body, "child wait probe"), reply().tool("finish", {
         reason: "waiting_for_subagent", result: "Root awaits child",
       }))
-      // Capture the child model route and its original system/user turn when the
-      // quota response is selected. Retries can grow the transcript, while title
-      // generation and parent polling stay outside this child-response phase.
-      yield* llm.pushMatch(childQuotaRequest,
+      // Identify the child by the test-controlled task prompt, not by whichever
+      // conversation happens to arrive when the 429 matcher is first selected.
+      // The first user turn is stable across retries even as the transcript grows;
+      // route/model plus this exact prompt prefix exclude root and auxiliary calls.
+      yield* llm.pushMatch(childRequest,
         httpError(429, { error: { message: "Free usage limit reached CHILD_RAW_SECRET", type: "quota_exceeded", code: "FreeUsageLimitError" } }, { "retry-after": "12" }))
-      // The first child response is the 429 above; reuse the recovery response
-      // only for that same child conversation, bounded by the production retry cap.
+      // Reuse the recovery response only for that stable child identity, bounded
+      // by the production retry cap.
       yield* llm.pushMatchRepeat(
-        childRetryRequest,
+        childRequest,
         reply().tool("finish", { reason: "success", result: envelope("child done") }).stop(),
         SessionRetry.RETRY_MAX_RETRIES,
       )
@@ -232,23 +199,28 @@ describe("headless run provider retry delay (#555)", () => {
       const hits = yield* llm.hits
       const misses = yield* llm.misses
       const pending = yield* llm.pending
-      const childWaitHits = hits.filter(childRetryRequest)
+      const childRequestHits = hits.filter(childRequest)
       const requestDiagnostics = () => JSON.stringify({
         counts: {
           hits: hits.length,
           misses: misses.length,
           pending: pending,
           pendingDefinition: "queued one-shot responses only; bounded repeats are tracked separately",
-          childRetryConversationHits: childWaitHits.length,
+          childRetryRequestHits: childRequestHits.length,
         },
         childRetryRequestFilter: {
-          armed: childConversationKey !== undefined,
+          identity: "stable test-controlled content; no runtime conversation capture",
           conditions: [
             "route === /v1/chat/completions",
             "body.model === local-quota-test",
-            "body.messages first system content + first user content + model produce the captured key",
+            `first role=user message content starts with ${JSON.stringify(childTaskPrompt)}`,
           ],
-          expectedKey: expectedChildKey(childConversationKey),
+          stableKey: {
+            route: "/v1/chat/completions",
+            model: "local-quota-test",
+            firstUserStartsWith: childTaskPrompt,
+            systemPromptAndRequestMessageIdsAreNotPartOfThisFilter: true,
+          },
         },
         misses: misses.map((miss, index) => ({
           miss: index + 1,
@@ -271,8 +243,8 @@ describe("headless run provider retry delay (#555)", () => {
         // Count the initial 429 plus retries, bounded by the unchanged production cap.
         // The repeated terminal response prevents extra attempts from falling through
         // to TestLLMServer's default "ok" stream under runner load.
-        expect(childWaitHits.length).toBeGreaterThanOrEqual(2)
-        expect(childWaitHits.length).toBeLessThanOrEqual(SessionRetry.RETRY_MAX_RETRIES + 1)
+        expect(childRequestHits.length).toBeGreaterThanOrEqual(2)
+        expect(childRequestHits.length).toBeLessThanOrEqual(SessionRetry.RETRY_MAX_RETRIES + 1)
         expect(misses).toEqual([])
         expect(pending).toBe(0)
       }, requestDiagnostics)

@@ -701,14 +701,19 @@ function requestPhase(hit: Hit, messages: unknown[]): string {
   const last = messages.at(-1)
   const lastRole = isRecord(last) ? last.role : undefined
   const users = messages.filter((entry): entry is Record<string, unknown> => isRecord(entry) && entry.role === "user")
+  const firstUserText = contentText(users[0]?.content)
   const lastUserText = contentText(users.at(-1)?.content)
   const serialized = JSON.stringify(hit.body)
+  // This is a pure per-request label, not a mutable session/arrival-order phase.
+  // A child marker found only in prior transcript content does not mean the
+  // current request came from the child agent.
   if (isTitleRequest(hit.body)) return "automatic-title"
+  if (firstUserText.includes("CHILD_WAIT_INPUT")) return "child-task-conversation"
   if (lastRole === "tool" && serialized.includes("child wait probe")) return "root-child-waiting-poll"
   if (lastUserText.includes("child done") || lastUserText.includes("task_result")) return "child-result-return"
   if (lastUserText.includes("Research the child wait report")) return "root-child-prompt"
   if (lastUserText.includes("CHILD_WAIT_INPUT")) return "child-wait-attempt"
-  if (serialized.includes("CHILD_WAIT_INPUT")) return "child-wait-context"
+  if (serialized.includes("CHILD_WAIT_INPUT")) return "contains-child-marker-context"
   return "other-model-or-auxiliary"
 }
 
