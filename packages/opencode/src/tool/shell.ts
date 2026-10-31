@@ -639,7 +639,10 @@ export const ShellTool = Tool.define(
                     }),
                   ),
                 ),
-              ).pipe(Effect.andThen(publish(last)), Effect.ensuring(markOutputProcessed))
+              ).pipe(
+                Effect.andThen(() => publish(last)),
+                Effect.ensuring(markOutputProcessed),
+              )
             }
 
             commitChunk(chunk, size)

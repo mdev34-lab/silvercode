@@ -112,8 +112,9 @@ const jobID = (result: RunResult) => String((result.metadata as { jobId?: string
 /** Liveness of the whole process group the shell tool spawned for a job. */
 const groupAlive = (pid: number) => {
   try {
-    // A negative pid addresses the group the detached child leads.
-    process.kill(-pid, 0)
+    // A negative pid addresses the group the detached child leads on POSIX;
+    // Windows spawns non-detached and checks the leader pid directly.
+    process.kill(process.platform === "win32" ? pid : -pid, 0)
     return true
   } catch {
     return false
@@ -130,11 +131,14 @@ const deadGroup = Effect.fnUntraced(function* (pid: number) {
 
 const unique = () => path.join(os.tmpdir(), `shell-background-${Math.random().toString(36).slice(2)}.log`)
 
-const bin = `"${process.execPath.replaceAll("\\", "/")}"`
-const evalarg = (text: string) => (Shell.name(Shell.acceptable()) === "cmd" ? `"${text}"` : `'${text}'`)
-const script = (text: string) => {
-  const line = `${bin} -e ${evalarg(text)}`
-  return ["pwsh", "powershell"].includes(Shell.name(Shell.acceptable())) ? `& ${line}` : line
+const quote = (text: string) => `"${text}"`
+const bin = () => quote(process.execPath.replaceAll("\\", "/"))
+const sh = () => Shell.name(Shell.acceptable())
+const evalarg = (text: string) => (sh() === "cmd" ? quote(text) : `'${text}'`)
+const script = (text: string, ...args: string[]) => {
+  const tail = args.map((item) => quote(item.replaceAll("\\", "/"))).join(" ")
+  const line = `${bin()} -e ${evalarg(text)}${tail ? ` ${tail}` : ""}`
+  return ["pwsh", "powershell"].includes(sh()) ? `& ${line}` : line
 }
 
 describe("tool.shell automatic backgrounding", () => {
@@ -164,10 +168,11 @@ describe("tool.shell automatic backgrounding", () => {
         const jobs = yield* BackgroundJob.Service
         const notifications: Prompt[] = []
         const trace = unique()
-        const result = yield* run(
-          { command: `printf 'start\n' | tee -a ${trace}; sleep 2; printf 'finish\n' | tee -a ${trace}` },
-          context(notifications),
+        const commandline = script(
+          "const fs=process.getBuiltinModule(/node:fs/.source),f=Bun.argv[1],w=(s)=>{fs.appendFileSync(f,s+String.fromCharCode(10));process.stdout.write(s+String.fromCharCode(10))};w(/start/.source);setTimeout(()=>w(/finish/.source),2000)",
+          trace,
         )
+        const result = yield* run({ command: commandline }, context(notifications))
 
         expect(result.output).toContain('state="running"')
         expect(result.output).toContain("moved to the background")
@@ -223,8 +228,15 @@ describe("tool.shell automatic backgrounding", () => {
     "status and list return immediately with partial output while the command runs",
     () =>
       Effect.gen(function* () {
+        const jobs = yield* BackgroundJob.Service
         const result = yield* run({ command: "echo partial_marker; sleep 20" }, context())
         const id = jobID(result)
+
+        yield* pollWithTimeout(
+          Effect.sync(() => (ShellBackground.get(jobs, id)?.snapshot().output.includes("partial_marker") ? true : undefined)),
+          "the background command did not flush partial_marker",
+          "10 seconds",
+        )
 
         const started = Date.now()
         const status = yield* manage({ action: "status", job_id: id }, context(undefined, "call_status"))
