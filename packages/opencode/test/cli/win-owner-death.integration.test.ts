@@ -29,10 +29,8 @@ import { fileURLToPath } from "node:url"
  * can end it, and the test asserts the production adopter logged no job failure
  * — a worker that died for some other reason cannot read as coverage.
  *
- * Every wait draws on one shared deadline, and each subprocess and probe
- * operation carries its own bound, so the budget is a wall-clock cap rather
- * than a retry cap: a slow or wedged probe fails the test instead of quietly
- * succeeding past it. The identities of the spawned tree arrive incrementally,
+ * Waits use bounded, independent phase or per-call deadlines. A slow or
+ * wedged probe fails the test instead of quietly succeeding past its bound. The identities of the spawned tree arrive incrementally,
  * so the cleanup reaps whatever was created even when startup never finished.
  *
  * Windows-only: Job Objects have no counterpart elsewhere, and every other
@@ -42,16 +40,11 @@ import { fileURLToPath } from "node:url"
 const fixture = (name: string) => fileURLToPath(new URL(`../fixture/${name}`, import.meta.url))
 
 /**
- * One wall clock for the whole test, and a hard one: every wait and every
- * subprocess or probe operation below is bounded by it, so it caps wall time
- * rather than retries.
- *
- * Worst case is this budget plus one in-flight probe (at most the 2s socket
- * timeout below) plus the cleanup budget: 40 + 2 + 5 = 47s, inside this test's
- * own `TEST_TIMEOUT_MS`. The package's `--timeout` is left untouched; only this
- * test's per-test timeout is raised, because a healthy run needs seconds but a
- * loaded Windows runner needs room for three cold `bun` starts (owner, worker,
- * grandchild) and four `tasklist` calls.
+ * Startup has its own wall-clock budget. The happy path also has up to four
+ * 15s liveness attempts, two 2s socket probes, a 15s owner exit, 20s
+ * verification and 5s cleanup: 40 + 60 + 4 + 15 + 20 + 5 = 144s of
+ * independent ceilings, not a reachable duration guaranteed to fit the 50s
+ * test timeout. That timeout fails loudly if the phases run too long.
  */
 const BUDGET_MS = 40_000
 
@@ -61,7 +54,7 @@ const CLEANUP_BUDGET_MS = 5_000
 /** Cap on one `tasklist` invocation, so a wedged probe cannot outlive the budget. */
 const TASKLIST_TIMEOUT_MS = 15_000
 
-/** This test's own timeout: the budget, one in-flight probe, and cleanup. */
+/** This test's own timeout, which may cut off the sum of phase ceilings. */
 const TEST_TIMEOUT_MS = 50_000
 
 /**
@@ -91,15 +84,15 @@ const VERIFY_BUDGET_MS = 20_000
  * the honest arithmetic is by case rather than a single sum:
  *
  *   identity wait       15_000  always consumed in full - that is the stall
- *   probe phase         ~3_000  nominal; ceiling PROBE_BUDGET_MS   (15_000)
+ *   liveness probes     ~3_000  nominal; four per-call ceilings  (60_000)
+ *   socket probe             bounded by its 2s timeout              (2_000)
  *   owner exit          ~1_000  nominal; ceiling PROBE_BUDGET_MS   (15_000)
  *   verify phase        ~2_000  nominal; ceiling VERIFY_BUDGET_MS  (20_000)
  *   reapTree in try     ~1_000  nominal; ceiling CLEANUP_BUDGET_MS  (5_000)
- *   reapTree in finally     ~0  owner.exited is already settled and every PID
- *                               is already dead, so it returns at once
+ *   reapTree in finally     ~0  nominal; ceiling CLEANUP_BUDGET_MS  (5_000)
  *
  * nominal ~22s, comfortably inside. The all-ceilings path does NOT fit -
- * 15 + 15 + 15 + 20 + 5 = 70s - and there this timeout fires and the test
+ * 15 + 60 + 2 + 15 + 20 + 5 + 5 = 122s (including both reaps) - and there this timeout fires and the test
  * fails loudly rather than hanging. The phases are independent ceilings, so
  * this is a ceiling sum rather than a reachable duration.
  * Nothing in this file changes the package default (`--timeout 30000` in
@@ -248,15 +241,29 @@ function tasklistHasPid(pid: number, deadline: number) {
   const result = Bun.spawnSync(["tasklist", "/FI", `PID eq ${pid}`, "/NH", "/FO", "CSV"], { timeout: allowance })
   const took = Date.now() - started
   if (result.exitedDueToTimeout) {
-    throw new Error(`tasklist did not answer for PID ${pid} within ${allowance}ms (ran ${took}ms)`)
+    throw new Error(
+      `tasklist reported timeout for PID ${pid} (allowance ${allowance}ms, ran ${took}ms, exit ${result.exitCode}, signal ${result.signalCode})`,
+    )
   }
+  if (result.exitCode !== 0)
+    throw new Error(`tasklist for PID ${pid} exited ${result.exitCode}: ${result.stderr.toString()}`)
   const present = result.stdout.toString().includes(`"${pid}"`)
   // Measurement, not decoration. `tasklist` walks the entire process table and
   // its duration on a loaded runner sits right at this ceiling, so allowance
   // and duration have to be in the failure message - without them the next
   // timeout is as undiagnosable as the last one.
-  console.error(`(#442) tasklist pid=${pid} allowance=${allowance}ms took=${took}ms present=${present}`)
+  console.error(`(#442 probe) tasklist pid=${pid} allowance=${allowance}ms took=${took}ms present=${present}`)
   return present
+}
+
+/** Retry only a positive liveness observation; absence probes must never retry. */
+function tasklistConfirmsAlive(pid: number, query = tasklistHasPid) {
+  try {
+    if (query(pid, Date.now() + PROBE_BUDGET_MS)) return true
+  } catch (error) {
+    console.error(`(#442 probe) first liveness attempt failed for PID ${pid}: ${String(error)}`)
+  }
+  return query(pid, Date.now() + PROBE_BUDGET_MS)
 }
 
 /** Is something still accepting connections on this port? A dead port refuses. */
@@ -271,7 +278,7 @@ function acceptsConnections(port: number): Promise<boolean> {
       resolve(value)
     }
     // Bounded: a filtered (not refused) port must not stall the phase. This is
-    // also the "one in-flight probe" term in the budget arithmetic above.
+    // Each invocation contributes up to 2s to the ceiling arithmetic above.
     socket.setTimeout(2000, () => done(false))
     socket.once("connect", () => done(true))
     socket.once("error", () => done(false))
@@ -458,6 +465,7 @@ describe("Windows owner death (#442)", () => {
       // startup stopped.
       const seen: Partial<Report> = {}
       const spawned: number[] = []
+      const confirmedDead = new Set<number>()
       let resolveReady!: () => void
       const treeReady = new Promise<void>((resolve) => {
         resolveReady = resolve
@@ -486,18 +494,12 @@ describe("Windows owner death (#442)", () => {
         // a process that happened to die.
         expect(ownerLog.join("\n")).not.toContain("(#442)")
 
-        // Fresh deadline for the probe phase. `deadline` was sized for reaching
-        // `ready`, and reusing it here would hand `tasklistHasPid` a 1ms
-        // allowance and `bounded` a 0ms one once that budget is spent - the same
-        // consumed-deadline class the stall test already guards against.
-        const probeDeadline = Date.now() + PROBE_BUDGET_MS
-
         // Negative control. "Gone afterwards" only means something if the tree
         // was observably alive and holding both ports immediately beforehand.
         expect(pidExists(report.workerPid)).toBe(true)
         expect(pidExists(report.grandchildPid)).toBe(true)
-        expect(tasklistHasPid(report.workerPid, probeDeadline)).toBe(true)
-        expect(tasklistHasPid(report.grandchildPid, probeDeadline)).toBe(true)
+        expect(tasklistConfirmsAlive(report.workerPid)).toBe(true)
+        expect(tasklistConfirmsAlive(report.grandchildPid)).toBe(true)
         expect(await acceptsConnections(report.workerPort)).toBe(true)
         expect(await acceptsConnections(report.grandchildPort)).toBe(true)
 
@@ -518,6 +520,8 @@ describe("Windows owner death (#442)", () => {
           survived("worker child", report.grandchildPid),
           verifyDeadline,
         )
+        confirmedDead.add(report.workerPid)
+        confirmedDead.add(report.grandchildPid)
         // Same conclusion from the process list, not just from OpenProcess.
         expect(tasklistHasPid(report.workerPid, verifyDeadline)).toBe(false)
         expect(tasklistHasPid(report.grandchildPid, verifyDeadline)).toBe(false)
@@ -551,7 +555,7 @@ describe("Windows owner death (#442)", () => {
           ),
         ).toBe(true)
       } finally {
-        await reapTree(spawned, owner, CLEANUP_BUDGET_MS)
+        await reapTree(spawned, owner, CLEANUP_BUDGET_MS, confirmedDead)
       }
     },
     TEST_TIMEOUT_MS,
@@ -564,6 +568,7 @@ describe("Windows owner death (#442)", () => {
       const ownerLog: string[] = []
       const seen: Partial<Report> = {}
       const spawned: number[] = []
+      const confirmedDead = new Set<number>()
       let resolveReady!: () => void
       // Set only from the IPC `ready` branch, never from the promise executor:
       // an executor runs synchronously at construction, so flagging readiness
@@ -614,24 +619,16 @@ describe("Windows owner death (#442)", () => {
         const grandchildPort = seen.grandchildPort
         const spawnedPids = [...spawned]
 
-        // Every phase below runs on a FRESH deadline. The identity wait consumed
-        // `STALL_BUDGET_MS` by design, so reusing `deadline` would hand
-        // `tasklistHasPid` a 1ms allowance (it clamps a negative remainder to 1)
-        // and `bounded` a 0ms one, failing both spuriously.
-        // `PROBE_BUDGET_MS`, not `VERIFY_BUDGET_MS`: `tasklistHasPid` clamps a
-        // single invocation to `TASKLIST_TIMEOUT_MS`, so a larger phase budget
-        // cannot widen the first call - it would only add slack for a second
-        // one. Widening it here would be a no-op dressed up as a fix.
-        const probeDeadline = Date.now() + PROBE_BUDGET_MS
-
+        // Each liveness attempt has a fresh deadline; the identity wait spent
+        // its own budget. Absence checks below remain single observations.
         // Pre-kill liveness, captured BEFORE the kill so that "gone afterwards"
         // means something. A wedged probe yields its message rather than being
         // read as "absent", and the assertion consuming it then fails loudly.
         const preKillWorker = probe(() => workerPid !== undefined && pidExists(workerPid))
         const preKillGrandchild = probe(() => grandchildPid !== undefined && pidExists(grandchildPid))
-        const preKillWorkerTasklist = probe(() => workerPid !== undefined && tasklistHasPid(workerPid, probeDeadline))
+        const preKillWorkerTasklist = probe(() => workerPid !== undefined && tasklistConfirmsAlive(workerPid))
         const preKillGrandchildTasklist = probe(
-          () => grandchildPid !== undefined && tasklistHasPid(grandchildPid, probeDeadline),
+          () => grandchildPid !== undefined && tasklistConfirmsAlive(grandchildPid),
         )
         const preKillWorkerPort = await probeAsync(() =>
           workerPort === undefined ? Promise.resolve(false) : acceptsConnections(workerPort),
@@ -681,7 +678,6 @@ describe("Windows owner death (#442)", () => {
         // PID-recycling guard, shared with `reapTree`: a PID already proven dead may
         // have been reused, so `pidExists` on its own would report a false
         // survivor. Only PIDs not confirmed gone can count against this test.
-        const confirmedDead = new Set<number>()
         if (workerPid !== undefined && workerGone === true) confirmedDead.add(workerPid)
         if (grandchildPid !== undefined && grandchildGone === true) confirmedDead.add(grandchildPid)
         const survivors = spawnedPids.filter((pid) => !confirmedDead.has(pid) && pidExists(pid))
@@ -735,9 +731,37 @@ describe("Windows owner death (#442)", () => {
       } finally {
         // Safety net only: the survivor assertion above is the real check, and
         // keeping it out of `finally` means it can never mask a real failure.
-        await reapTree(spawned, owner, CLEANUP_BUDGET_MS)
+        await reapTree(spawned, owner, CLEANUP_BUDGET_MS, confirmedDead)
       }
     },
     STALL_TEST_TIMEOUT_MS,
   )
+})
+
+describe("tasklist liveness retry", () => {
+  test("retries a negative observation once", () => {
+    let calls = 0
+    expect(tasklistConfirmsAlive(1, () => ++calls === 2)).toBe(true)
+    expect(calls).toBe(2)
+  })
+  test("does not turn repeated negative observations into success", () => {
+    let calls = 0
+    expect(
+      tasklistConfirmsAlive(1, () => {
+        calls++
+        return false
+      }),
+    ).toBe(false)
+    expect(calls).toBe(2)
+  })
+  test("retries a failed observation but propagates a second failure", () => {
+    let calls = 0
+    expect(() =>
+      tasklistConfirmsAlive(1, () => {
+        calls++
+        throw new Error("probe failure")
+      }),
+    ).toThrow("probe failure")
+    expect(calls).toBe(2)
+  })
 })
