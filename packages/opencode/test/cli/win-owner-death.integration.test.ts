@@ -81,18 +81,18 @@ const STALL_BUDGET_MS = 15_000
  * negative remainder to a 1ms allowance and throw, and `bounded` would clamp it
  * to 0ms and reject before the owner had time to die.
  */
-const STALL_PROBE_MS = 15_000
+const PROBE_BUDGET_MS = 15_000
 
 /** Fresh budget for the post-kill verification phase, same reasoning. */
-const STALL_VERIFY_MS = 20_000
+const VERIFY_BUDGET_MS = 20_000
 
 /**
  * Timeout for the stall test only. The phases are ceilings, not durations, so
  * the honest arithmetic is by case rather than a single sum:
  *
  *   identity wait      15_000  always consumed in full - that is the stall
- *   probe phase        ~3_000  nominal; ceiling STALL_PROBE_MS   (15_000)
- *   verify phase       ~2_000  nominal; ceiling STALL_VERIFY_MS  (20_000)
+ *   probe phase        ~3_000  nominal; ceiling PROBE_BUDGET_MS   (15_000)
+ *   verify phase       ~2_000  nominal; ceiling VERIFY_BUDGET_MS  (20_000)
  *   reapTree in try    ~1_000  nominal; ceiling CLEANUP_BUDGET_MS (5_000)
  *   reapTree in finally    ~0  owner.exited is already settled and every PID
  *                              is already dead, so it returns at once
@@ -478,38 +478,51 @@ describe("Windows owner death (#442)", () => {
         // a process that happened to die.
         expect(ownerLog.join("\n")).not.toContain("(#442)")
 
+        // Fresh deadline for the probe phase. `deadline` was sized for reaching
+        // `ready`, and reusing it here would hand `tasklistHasPid` a 1ms
+        // allowance and `bounded` a 0ms one once that budget is spent - the same
+        // consumed-deadline class the stall test already guards against.
+        const probeDeadline = Date.now() + PROBE_BUDGET_MS
+
         // Negative control. "Gone afterwards" only means something if the tree
         // was observably alive and holding both ports immediately beforehand.
         expect(pidExists(report.workerPid)).toBe(true)
         expect(pidExists(report.grandchildPid)).toBe(true)
-        expect(tasklistHasPid(report.workerPid, deadline)).toBe(true)
-        expect(tasklistHasPid(report.grandchildPid, deadline)).toBe(true)
+        expect(tasklistHasPid(report.workerPid, probeDeadline)).toBe(true)
+        expect(tasklistHasPid(report.grandchildPid, probeDeadline)).toBe(true)
         expect(await acceptsConnections(report.workerPort)).toBe(true)
         expect(await acceptsConnections(report.grandchildPort)).toBe(true)
 
         // The force kill: one PID, no cooperation, no tree walk.
         terminateProcess(owner.pid, "owner")
-        await bounded(owner.exited, "the owner never exited after TerminateProcess", deadline)
+        await bounded(owner.exited, "the owner never exited after TerminateProcess", probeDeadline)
+
+        // Fresh deadline for the verification phase, same reasoning.
+        const verifyDeadline = Date.now() + VERIFY_BUDGET_MS
 
         const survived = (what: string, pid: number) =>
           `${what} ${pid} outlived its force-killed owner (#442)\nowner log:\n${ownerLog.join("\n") || "(empty)"}`
-        await until(() => !pidExists(report.workerPid), survived("worker", report.workerPid), deadline)
-        await until(() => !pidExists(report.grandchildPid), survived("worker child", report.grandchildPid), deadline)
+        await until(() => !pidExists(report.workerPid), survived("worker", report.workerPid), verifyDeadline)
+        await until(
+          () => !pidExists(report.grandchildPid),
+          survived("worker child", report.grandchildPid),
+          verifyDeadline,
+        )
         // Same conclusion from the process list, not just from OpenProcess.
-        expect(tasklistHasPid(report.workerPid, deadline)).toBe(false)
-        expect(tasklistHasPid(report.grandchildPid, deadline)).toBe(false)
+        expect(tasklistHasPid(report.workerPid, verifyDeadline)).toBe(false)
+        expect(tasklistHasPid(report.grandchildPid, verifyDeadline)).toBe(false)
 
         const held = (what: string, port: number) =>
           `${what} port ${port} is still held after the owner was force-killed (#442)\nowner log:\n${ownerLog.join("\n") || "(empty)"}`
         await until(
           async () => !(await acceptsConnections(report.workerPort)),
           held("worker", report.workerPort),
-          deadline,
+          verifyDeadline,
         )
         await until(
           async () => !(await acceptsConnections(report.grandchildPort)),
           held("worker child", report.grandchildPort),
-          deadline,
+          verifyDeadline,
         )
         // Released, not merely refused: a fresh listener can take both over.
         // The probe has no deadline of its own, so it is bounded like the rest.
@@ -517,14 +530,14 @@ describe("Windows owner death (#442)", () => {
           await bounded(
             canBind(report.workerPort),
             `worker port ${report.workerPort} bind probe never answered`,
-            deadline,
+            verifyDeadline,
           ),
         ).toBe(true)
         expect(
           await bounded(
             canBind(report.grandchildPort),
             `worker child port ${report.grandchildPort} bind probe never answered`,
-            deadline,
+            verifyDeadline,
           ),
         ).toBe(true)
       } finally {
@@ -595,7 +608,7 @@ describe("Windows owner death (#442)", () => {
         // `STALL_BUDGET_MS` by design, so reusing `deadline` would hand
         // `tasklistHasPid` a 1ms allowance (it clamps a negative remainder to 1)
         // and `bounded` a 0ms one, failing both spuriously.
-        const probeDeadline = Date.now() + STALL_PROBE_MS
+        const probeDeadline = Date.now() + PROBE_BUDGET_MS
 
         // Pre-kill liveness, captured BEFORE the kill so that "gone afterwards"
         // means something. A wedged probe yields its message rather than being
@@ -616,7 +629,7 @@ describe("Windows owner death (#442)", () => {
           bounded(owner.exited, "the owner never exited after TerminateProcess", probeDeadline).then(() => true),
         )
 
-        const verifyDeadline = Date.now() + STALL_VERIFY_MS
+        const verifyDeadline = Date.now() + VERIFY_BUDGET_MS
         const workerGone = await probeAsync(() =>
           workerPid === undefined ? Promise.resolve(false) : settled(() => !pidExists(workerPid), verifyDeadline),
         )
