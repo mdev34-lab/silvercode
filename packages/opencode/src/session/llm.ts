@@ -52,77 +52,162 @@ function isJsonParseFailure(error: unknown): boolean {
   )
 }
 
-// Index of the `"` that closes the string literal starting at `from`, or undefined
-// when the fragment ends first (the value was cut off, so it does not exist).
-function endOfStringLiteral(raw: string, from: number): number | undefined {
-  for (let index = from; index < raw.length; index++) {
+type StringRead = { ok: true; value: string; next: number } | { ok: false; reason: "truncated" | "invalid" }
+
+// Reads one JSON string literal whose opening quote sits at `from`. A fragment that ends
+// inside the literal is `truncated` (the value never finished arriving); a literal that
+// closes but does not decode is `invalid`. Neither is a value we may report.
+function readStringLiteral(raw: string, from: number): StringRead {
+  for (let index = from + 1; index < raw.length; index++) {
     const char = raw[index]
     if (char === "\\") {
       index += 1
       continue
     }
-    if (char === '"') return index
+    if (char !== '"') continue
+    try {
+      return { ok: true, value: JSON.parse(raw.slice(from, index + 1)), next: index + 1 }
+    } catch {
+      return { ok: false, reason: "invalid" }
+    }
   }
-  return undefined
+  return { ok: false, reason: "truncated" }
+}
+
+type ValueSkip = { ok: true; next: number; truncated: boolean } | { ok: false; reason: "invalid" }
+
+const JSON_TOKEN = /^(?:-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?|true|false|null)$/
+
+// Skips a non-string JSON value starting at `from`, tracking nesting and string literals
+// so a `}` or `,` inside a nested string can never be mistaken for structure.
+function skipValue(raw: string, from: number): ValueSkip {
+  const char = raw[from]
+  if (char === '"') {
+    const literal = readStringLiteral(raw, from)
+    if (!literal.ok) {
+      return literal.reason === "truncated" ? { ok: true, next: raw.length, truncated: true } : { ok: false, reason: "invalid" }
+    }
+    return { ok: true, next: literal.next, truncated: false }
+  }
+  if (char === "{" || char === "[") {
+    let depth = 0
+    let index = from
+    while (index < raw.length) {
+      const current = raw[index]
+      if (current === '"') {
+        const literal = readStringLiteral(raw, index)
+        if (!literal.ok) {
+          return literal.reason === "truncated"
+            ? { ok: true, next: raw.length, truncated: true }
+            : { ok: false, reason: "invalid" }
+        }
+        index = literal.next
+        continue
+      }
+      if (current === "{" || current === "[") depth += 1
+      else if (current === "}" || current === "]") {
+        depth -= 1
+        if (depth === 0) return { ok: true, next: index + 1, truncated: false }
+      }
+      index += 1
+    }
+    return { ok: true, next: raw.length, truncated: true }
+  }
+  let index = from
+  while (index < raw.length && !/[\s,}\]]/.test(raw[index])) index += 1
+  const token = raw.slice(from, index)
+  if (index >= raw.length) {
+    // A literal cut off at the end is unknown, not a token we can validate - and it is
+    // not the value we are looking for either, so the scan simply stops here.
+    return { ok: true, next: raw.length, truncated: true }
+  }
+  if (!JSON_TOKEN.test(token)) return { ok: false, reason: "invalid" }
+  return { ok: true, next: index, truncated: false }
 }
 
 /**
- * Tolerant prefix parse of one top-level string argument out of a possibly truncated
- * JSON object. Scans the fragment character by character (so a `"filePath":` that only
- * appears inside some other string value is never mistaken for the key), and decodes a
- * value only when its closing quote actually arrived. Anything that never completed -
- * an unterminated value, a bad escape, a key whose value never started - yields
- * `undefined` instead of a guess.
+ * Tolerant prefix parse of one top-level string member out of a possibly truncated JSON
+ * object. The fragment must be a structural prefix of a single object: members are read
+ * in order as `"key": value` with real separators, so key-shaped text inside a string, a
+ * nested value, or a top-level array is never mistaken for the member. A duplicate of the
+ * requested key makes the target ambiguous - a complete payload could resolve it to a
+ * different value - so it yields nothing rather than a guess, and a value is returned
+ * only when its closing quote actually arrived.
  */
 export function salvageStringArgument(raw: string, key: string): string | undefined {
-  let depth = 0
   let index = 0
-
-  while (index < raw.length) {
-    const char = raw[index]
-
-    if (char === '"') {
-      const end = endOfStringLiteral(raw, index + 1)
-      // The fragment ended inside a string literal: whatever follows is unknowable.
-      if (end === undefined) return undefined
-
-      if (depth === 1) {
-        let cursor = end + 1
-        while (cursor < raw.length && /\s/.test(raw[cursor])) cursor++
-        if (raw[cursor] === ":") {
-          let name: unknown
-          try {
-            name = JSON.parse(raw.slice(index, end + 1))
-          } catch {
-            name = undefined
-          }
-          if (name === key) {
-            cursor += 1
-            while (cursor < raw.length && /\s/.test(raw[cursor])) cursor++
-            if (raw[cursor] !== '"') return undefined
-            const valueEnd = endOfStringLiteral(raw, cursor + 1)
-            if (valueEnd === undefined) return undefined
-            try {
-              const value = JSON.parse(raw.slice(cursor, valueEnd + 1))
-              if (typeof value === "string" && value.length > 0) return value
-            } catch {
-              // Undecodable literal: report nothing rather than a mangled path.
-            }
-            return undefined
-          }
-        }
-      }
-
-      index = end + 1
-      continue
-    }
-
-    if (char === "{" || char === "[") depth++
-    else if (char === "}" || char === "]") depth--
-    index++
+  const skipWhitespace = () => {
+    while (index < raw.length && /\s/.test(raw[index])) index += 1
   }
 
-  return undefined
+  skipWhitespace()
+  // Anything but an object start cannot carry this member meaningfully; a leading `[`
+  // can still contain the key shape textually, which is exactly the mistake to avoid.
+  if (raw[index] !== "{") return undefined
+  index += 1
+
+  let found: string | undefined
+  let seen = false
+
+  while (true) {
+    skipWhitespace()
+    // A fragment ending at a member boundary is a valid prefix: keep what was completed.
+    if (index >= raw.length) break
+    if (raw[index] === "}") break
+    if (raw[index] !== '"') return undefined
+
+    const name = readStringLiteral(raw, index)
+    if (!name.ok) return undefined
+    index = name.next
+    skipWhitespace()
+    // Truncated between a key and its colon: the member's value is simply unknown, and
+    // nothing after it can exist, so the members read so far stay trustworthy.
+    if (index >= raw.length) break
+    if (raw[index] !== ":") return undefined
+    index += 1
+    skipWhitespace()
+
+    const target = name.value === key
+    if (target) {
+      if (seen) return undefined
+      seen = true
+    }
+    // The fragment ended between a member's key and its value: unknown, but a member we
+    // never needed, so the members already read stay valid.
+    if (index >= raw.length) {
+      if (target) return undefined
+      break
+    }
+
+    if (raw[index] === '"' && target) {
+      const value = readStringLiteral(raw, index)
+      if (!value.ok) return undefined
+      if (value.value.length === 0) return undefined
+      found = value.value
+      index = value.next
+    } else {
+      const value = skipValue(raw, index)
+      if (!value.ok) return undefined
+      index = value.next
+      // The wanted member exists but its value is not a complete string, or it was cut
+      // off: there is nothing recoverable and a later duplicate could still change it.
+      if (target) return undefined
+      if (value.truncated) break
+    }
+
+    skipWhitespace()
+    if (index >= raw.length) break
+    if (raw[index] === ",") {
+      index += 1
+      continue
+    }
+    if (raw[index] === "}") break
+    // No separator between members: the fragment is not a prefix of well-formed JSON,
+    // so its structure cannot be trusted.
+    return undefined
+  }
+
+  return found
 }
 
 /**
@@ -167,9 +252,9 @@ export function repairToolCallMessage(error: unknown, recovery?: TruncatedWriteR
   }
   return [
     ...head,
-    `Recovered from the partial arguments: the write call that failed to parse targeted "${recovery.filePath}". No file content arrived before the cut, so no content was recovered and none is assumed.`,
-    `That call did not execute, so this specific write wrote no file and changed nothing on disk. This is a statement about this one call only: earlier tool calls in this session may already have run and had effects, which this repair cannot see.`,
-    `Re-issue the write for "${recovery.filePath}" in smaller chunks instead: first send a write call whose content is only the first chunk of the file, then send follow-up calls that append the remaining chunks to the same file, keeping every single call well within the output budget.`,
+    `Recovered from the partial arguments: the write call that failed to parse targeted "${recovery.filePath}". The file content for that call is not recovered - whatever content did or did not arrive in the fragment is unknown - so no content is assumed and none is inferred.`,
+    `That call did not execute, so this specific write call wrote nothing and changed nothing on disk. This is a statement about this one call only: earlier tool calls in this session may already have run and had effects, including on this same path, which this repair cannot see.`,
+    `Continue by inspecting "${recovery.filePath}" first: check whether it exists and what it currently holds. If it does not exist, send one write call whose content is only the first chunk of the file. Then append the remaining chunks with edit calls whose oldString is a unique tail of the content already on disk and whose newString is that same tail followed by the next chunk. If the path already exists, do not start over with write - write replaces the entire file and would discard what is already there and anything earlier calls wrote - append the remaining chunks with those same edit calls instead, or write the complete content in one call if it fits. Keep every single call well within the output budget.`,
   ].join(" ")
 }
 
