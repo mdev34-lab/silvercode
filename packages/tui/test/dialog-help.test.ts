@@ -1,3 +1,4 @@
+import { AgentEffort } from "@opencode-ai/schema/agent-effort"
 import { expect, test } from "bun:test"
 import { HELP_SECTIONS, pad } from "../src/ui/help-content"
 
@@ -40,4 +41,11 @@ test("command column padding keeps the table aligned", () => {
   // Longest documented command should be `/sessions` (9 chars); padding adds
   // spaces up to the column width.
   expect(pad("/sessions")).toBe("/sessions" + " ".repeat(3))
+})
+
+
+test("effort help enumerates every selectable schema level", () => {
+  const effort = HELP_SECTIONS.flatMap((section) => section.commands).find((row) => row.command === "/effort")
+  expect(effort).toBeDefined()
+  for (const level of AgentEffort.levels) expect(effort!.desc).toContain(level)
 })

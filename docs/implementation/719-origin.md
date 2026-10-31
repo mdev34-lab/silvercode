@@ -24,7 +24,7 @@ IDs and full requirements to slices. Incomplete origin requires the reviewer to
 say "verified against available origin" and forbids full completion certification.
 This is reviewer instruction, not a new machine-enforced verdict schema.
 
-## Verification (increment 1)
+## Initial-head verification (4a07af6b; exposure gap repaired below)
 
 - Bun 1.3.14: core effort/report tests 117/117, three consecutive runs;
   opencode task/finish/origin tests 179/179, three consecutive runs.
@@ -37,3 +37,13 @@ This is reviewer instruction, not a new machine-enforced verdict schema.
 - No workflow, timeout, assertion, or budget weakening. The three-slice bound is
   reviewer process guidance, not a new runtime quota. Incomplete-origin wording
   is reviewer guidance, not a new envelope parser/schema field.
+
+
+## Exposure follow-up
+
+The design-owner qualification established that schema extension already exposes
+Ultra through the TUI cycle. The old exclusion was therefore unsafe, not merely
+a deferred cosmetic change. Option (b) now completes the total utility maps and
+selectable row without changing #717's first-three-row copy. See
+[the full consumer matrix](719-effort-consumers.md). Full opencode and TUI package
+typechecks now pass locally; the old TUI-map blocker above is historical.

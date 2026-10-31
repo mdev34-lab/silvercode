@@ -50,7 +50,7 @@ export const HELP_SECTIONS: HelpSection[] = [
     title: "System",
     commands: [
       { command: "/variants", desc: "Switch model variants, when supported" },
-      { command: "/effort", desc: "Agent effort: review rigor (fast, medium, thorough)" },
+      { command: "/effort", desc: "Agent effort: review rigor (fast, medium, thorough, ultra)" },
       { command: "/mcps", desc: "Toggle MCP servers" },
       { command: "/themes", desc: "Switch the terminal theme" },
       { command: "/status", desc: "View system status info" },
