@@ -123,6 +123,10 @@ const EFFORT_PROCESS: Record<AgentEffort.Level, string> = {
     "## Agent effort: medium (review passes: at most 2, validation gate: standard)",
     'For work that changes files, an independent synchronous review is expected before finish (without one, finish delivers the result labelled UNREVIEWED, never approved) (`subagent_type: "review"`, `background: false`) when a reviewer can run. Only blocking findings (Critical/Important, or a Needs-fixes report with no findings) or work landed after the last review need another pass, bounded by two; minor findings are logged. After the budget, finish delivers with an honest exhausted/findings-open status. A Review with blocking findings holds finish back until fixed. Declare standard validation evidence (relevant tests) on finish.',
   ].join("\n\n"),
+  ultra: [
+    "## Agent effort: ultra (review passes: until clean, validation gate: full)",
+    "Aim for clean current independent review, without a pass cap. Known blocking findings hold finish; missing review is labelled UNREVIEWED, never approved. Declare tests, typecheck and parity as applicable. On large diffs Review may fan out up to 3 disjoint slices, subject to the configured depth cap (review-to-review has a floor of 2). Ultra review dispatch attaches selected root origin verbatim with declared gaps: provide origin_message_ids for the request and relevant corrections in multi-message sessions; carry those IDs into slice dispatches. Incomplete origin cannot certify full completion.",
+  ].join("\n\n"),
   thorough: [
     "## Agent effort: thorough (review passes: until clean, validation gate: full)",
     "Aim for a clean, current independent review: fix blocking findings and re-review; any write after an approval needs a fresh pass. No pass cap. Without one (or if the reviewer cannot run), finish delivers the result labelled UNREVIEWED, never approved; known blocking findings hold finish back until fixed. Declare full validation evidence (tests, typecheck, parity as applicable) on finish.",
