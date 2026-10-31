@@ -12,8 +12,8 @@ import { cliIt } from "../../lib/cli-process"
 import { raw, reply } from "../../lib/llm-server"
 
 type Body = { messages?: { role?: string; content?: unknown }[] }
-const lastText = (body: Body) => {
-  const content = body.messages?.at(-1)?.content
+const lastUserText = (body: Body) => {
+  const content = [...(body.messages ?? [])].reverse().find((message) => message.role === "user")?.content
   if (typeof content === "string") return content
   if (Array.isArray(content))
     return content
@@ -52,13 +52,14 @@ describe("opencode run (non-interactive subprocess)", () => {
           },
         })
         expect(first.exitCode).toBe(0)
-        // Keep this provider response stable across the initial request and any
-        // retries of the same continued-session prompt. Extra attempts must not
-        // fall through to the mock server's default successful "ok" stream.
+        // Keep this provider response stable across retries of the same continued-session
+        // prompt. Match the latest user turn, not the final message: a retry may append
+        // assistant/tool messages after the prompt. Extra attempts must not fall through
+        // to the mock server's default successful "ok" stream.
         yield* llm.pushMatchRepeat(
           (hit) => {
             const body = hit.body as Body
-            return body.messages?.at(-1)?.role === "user" && lastText(body).includes("quota rejection")
+            return lastUserText(body).includes("quota rejection")
           },
           raw({
             chunks: [
@@ -96,7 +97,7 @@ describe("opencode run (non-interactive subprocess)", () => {
         expect(result.durationMs).toBeLessThan(20_000)
         const quotaRequests = (yield* llm.hits).filter((hit) => {
           const body = hit.body as Body
-          return body.messages?.at(-1)?.role === "user" && lastText(body).includes("quota rejection")
+          return lastUserText(body).includes("quota rejection")
         })
         expect(quotaRequests.length).toBeGreaterThanOrEqual(1)
         expect(quotaRequests.length).toBeLessThanOrEqual(SessionRetry.RETRY_MAX_RETRIES + 1)

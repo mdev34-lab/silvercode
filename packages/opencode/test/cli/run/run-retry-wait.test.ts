@@ -23,6 +23,15 @@ const lastText = (body: Body) => {
   if (Array.isArray(content)) return content.map((part) => part?.text ?? "").join("\n")
   return ""
 }
+const lastUserText = (body: Body) => {
+  const content = [...(body.messages ?? [])].reverse().find((message) => message.role === "user")?.content
+  if (typeof content === "string") return content
+  if (Array.isArray(content))
+    return content
+      .map((part) => (part && typeof part === "object" && "text" in part ? String(part.text ?? "") : ""))
+      .join("\n")
+  return ""
+}
 const envelope = (text: string) => `<silvercode-result>${text}</silvercode-result>`
 const quota = { error: { message: "Free usage limit reached", type: "quota_exceeded", code: "FreeUsageLimitError" } }
 const config = (url: string) => ({
@@ -120,7 +129,8 @@ describe("headless run provider retry delay (#555)", () => {
       yield* llm.push(reply().text("init").tool("finish", { reason: "success", result: "ok" }).stop())
       const first = yield* opencode.run("Research the initial session report", { model: "opencode/local-quota-test", env, timeoutMs: 20_000 })
       expect(first.exitCode).toBe(0)
-      const opened = (body: Body, text: string) => body.messages?.at(-1)?.role === "user" && lastText(body).includes(text)
+      // Retries may append assistant/tool messages after the stable user turn.
+      const opened = (body: Body, text: string) => lastUserText(body).includes(text)
       const followed = (body: Body, text: string) => body.messages?.at(-1)?.role === "tool" && JSON.stringify(body).includes(text)
       yield* llm.pushMatch((hit) => opened(hit.body as Body, "Research the child wait report"), reply().tool("task", {
         description: "child wait probe", prompt: "Research CHILD_WAIT_INPUT", subagent_type: "general", background: true,
