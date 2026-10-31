@@ -1,4 +1,4 @@
-import { Effect, Fiber, Stream } from "effect"
+import { Deferred, Effect, Exit, Fiber, Scope, Stream } from "effect"
 import os from "os"
 import { createWriteStream } from "node:fs"
 import * as Tool from "./tool"
@@ -23,6 +23,11 @@ import { ChildProcess } from "effect/unstable/process"
 import { ChildProcessSpawner } from "effect/unstable/process/ChildProcessSpawner"
 import { ShellPrompt, type Parameters } from "./shell/prompt"
 import { BashArity } from "@/permission/arity"
+import { BackgroundJob } from "@/background/job"
+import { ShellBackground } from "./shell/background"
+import { Identifier } from "@/id/id"
+import { EffectBridge } from "@/effect/bridge"
+import type { TaskPromptOps } from "./task"
 
 export { Parameters } from "./shell/prompt"
 
@@ -346,6 +351,20 @@ const parser = lazy(async () => {
   return { bash, ps }
 })
 
+/**
+ * The tool result shape for both endings: a command that finished inline and a
+ * command that was promoted to the background. Declaring it keeps the two
+ * branches assignable to one result type.
+ */
+type Metadata = {
+  output: string
+  exit?: number | null
+  truncated: boolean
+  outputPath?: string
+  background?: boolean
+  jobId?: string
+}
+
 export const ShellTool = Tool.define(
   ShellID.ToolID,
   Effect.gen(function* () {
@@ -355,7 +374,12 @@ export const ShellTool = Tool.define(
     const trunc = yield* Truncate.Service
     const plugin = yield* Plugin.Service
     const flags = yield* RuntimeFlags.Service
-    const defaultTimeoutMs = flags.bashDefaultTimeoutMs ?? 2 * 60 * 1000
+    const background = yield* BackgroundJob.Service
+    // The inline window for a command the caller did not bound. The older
+    // bashDefaultTimeoutMs knob was "how long to let a command run inline", so
+    // it is honored as the threshold when the new flag is unset; an explicit
+    // threshold wins, and the default window is 5 minutes (#726).
+    const backgroundThresholdMs = flags.bashBackgroundThresholdMs ?? flags.bashDefaultTimeoutMs ?? 5 * 60 * 1000
 
     const cygpath = Effect.fn("ShellTool.cygpath")(function* (shell: string, text: string) {
       const lines = yield* spawner
@@ -442,7 +466,14 @@ export const ShellTool = Tool.define(
         command: string
         cwd: string
         env: NodeJS.ProcessEnv
+        /** Hard deadline in milliseconds. */
         timeout: number
+        /**
+         * False when the deadline is the tool's own window rather than a value
+         * the caller passed. Only that case is eligible for promotion: an
+         * explicit timeout is a caller-set deadline and keeps kill semantics.
+         */
+        explicitTimeout: boolean
       },
       ctx: Tool.Context,
     ) {
@@ -461,7 +492,44 @@ export const ShellTool = Tool.define(
       let expired = false
       let aborted = false
       let signaled: string | undefined
+      let exitCode: number | null | undefined
+      // Set at the threshold. From then on the tool call is over and this run
+      // belongs to the background job, so it must stop publishing to the call.
+      let promoted = false
       const meta: string[] = []
+      // Live control of the child, filled in at spawn. The background handle and
+      // the management tool read the latest value, so a cancel is always aimed
+      // at the process that is actually running.
+      const control: { kill: Effect.Effect<void>; pid: number | undefined } = {
+        kill: Effect.void,
+        pid: undefined,
+      }
+      // Producer-owned metadata for the background job, created at promotion.
+      // The registry retains this object, so late evidence stays visible to the
+      // job list without a second channel.
+      let live: Record<string, unknown> | undefined
+      const promotion = yield* Deferred.make<void>()
+      // The child runs in a scope of its own rather than the tool call's: on
+      // promotion its fiber is handed to the background job instead of being
+      // interrupted when this call returns. Every other ending closes the scope
+      // explicitly, so nothing outlives the call by accident.
+      const childScope = yield* Scope.make()
+      let handedOff = false
+      // After promotion the tool part is finished; progress goes to the job
+      // record instead of a completed call's metadata.
+      const publish = (text: string) => (promoted ? Effect.void : ctx.metadata({ metadata: { output: text } }))
+
+      /** What the command has emitted so far, bounded by the same limits the inline result uses. */
+      const snapshot = (): ShellBackground.Snapshot => {
+        const end = tail(list.map((item) => item.text).join(""), limits.maxLines, limits.maxBytes)
+        return {
+          output: end.text,
+          truncated: cut || end.cut,
+          ...(file && !spillError ? { outputPath: file } : {}),
+          ...(exitCode !== undefined ? { exit: exitCode } : {}),
+          ...(signaled ? { signal: signaled } : {}),
+        }
+      }
 
       const markOutputProcessed = Effect.sync(() => {
         processing = false
@@ -499,7 +567,7 @@ export const ShellTool = Tool.define(
         },
       })
 
-      const code: number | null = yield* Effect.scoped(
+      const execute = Effect.scoped(
         Effect.gen(function* () {
           yield* Effect.addFinalizer(closeSink)
           const decoder = shellOutputDecoder(input.shell)
@@ -508,6 +576,10 @@ export const ShellTool = Tool.define(
             yield* Effect.logWarning(decoder.warning)
           }
           const handle = yield* spawner.spawn(cmd(input.shell, input.command, input.cwd, input.env))
+          control.pid = handle.pid
+          // The same escalation the inline path uses for timeout and abort:
+          // SIGTERM to the process group, SIGKILL after three seconds.
+          control.kill = handle.kill({ forceKillAfter: "3 seconds" }).pipe(Effect.ignore)
           // A heavy command (build, headless browser, busy loop) at normal
           // priority can starve the TUI of CPU time until the screen stops
           // rendering. Run tool commands below normal priority; children
@@ -516,9 +588,7 @@ export const ShellTool = Tool.define(
             os.setPriority(handle.pid, os.constants.priority.PRIORITY_BELOW_NORMAL)
           } catch {}
 
-          const append = (chunk: string) => {
-            processing = true
-            const size = Buffer.byteLength(chunk, "utf-8")
+          const commitChunk = (chunk: string, size: number) => {
             list.push({ text: chunk, size })
             used += size
             while (used > keep && list.length > 1) {
@@ -527,15 +597,28 @@ export const ShellTool = Tool.define(
               used -= item.size
               cut = true
             }
-
             last = preview(last + chunk)
+            // The job record keeps a live, bounded preview so listing jobs does
+            // not have to reach into a finished tool call's metadata.
+            if (promoted && live) live.output = last
+          }
+
+          const append = (chunk: string) => {
+            processing = true
+            const size = Buffer.byteLength(chunk, "utf-8")
 
             if (file) {
               sink?.write(chunk)
-            } else {
-              full += chunk
-              if (Buffer.byteLength(full, "utf-8") > limits.maxBytes) {
-                return trunc.write(full).pipe(
+              commitChunk(chunk, size)
+              return publish(last).pipe(Effect.ensuring(markOutputProcessed))
+            }
+
+            full += chunk
+            if (Buffer.byteLength(full, "utf-8") > limits.maxBytes || full.split("\n").length > limits.maxLines) {
+              // Spill before publishing the chunk into `list` so a concurrent
+              // live `snapshot()` never observes `truncated: true` without `outputPath`.
+              return Effect.uninterruptible(
+                trunc.write(full).pipe(
                   Effect.andThen((next) =>
                     Effect.sync(() => {
                       file = next
@@ -552,27 +635,18 @@ export const ShellTool = Tool.define(
                         stream.destroy()
                       })
                       full = ""
+                      commitChunk(chunk, size)
                     }),
                   ),
-                  Effect.andThen(
-                    ctx.metadata({
-                      metadata: {
-                        output: last,
-                      },
-                    }),
-                  ),
-                  Effect.ensuring(markOutputProcessed),
-                )
-              }
+                ),
+              ).pipe(
+                Effect.andThen(() => publish(last)),
+                Effect.ensuring(markOutputProcessed),
+              )
             }
 
-            return ctx
-              .metadata({
-                metadata: {
-                  output: last,
-                },
-              })
-              .pipe(Effect.ensuring(markOutputProcessed))
+            commitChunk(chunk, size)
+            return publish(last).pipe(Effect.ensuring(markOutputProcessed))
           }
           const output = yield* Stream.runForEach(Stream.map(handle.all, decoder.decode), append).pipe(
             // Abort, timeout, and idle cutoff can close the scope before the input
@@ -588,7 +662,29 @@ export const ShellTool = Tool.define(
             return Effect.sync(() => ctx.abort.removeEventListener("abort", handler))
           })
 
-          const timeout = Effect.sleep(`${input.timeout + 100} millis`)
+          // An explicit timeout is a caller-set deadline and keeps kill
+          // semantics. Without one the command is never killed for running
+          // long: it is promoted to a background job at the threshold instead,
+          // so the legacy default window cannot cut a long command short.
+          const deadline = !input.explicitTimeout
+            ? Effect.never
+            : Effect.sleep(`${input.timeout + 100} millis`).pipe(
+                Effect.map(() => ({ kind: "timeout" as const, code: null, signal: undefined })),
+              )
+
+          // Promotion keeps the same child alive: the signal is a receipt for
+          // the tool call, and this fiber goes on waiting for the real exit.
+          const threshold = input.explicitTimeout
+            ? Effect.never
+            : Effect.sleep(`${backgroundThresholdMs} millis`).pipe(
+                Effect.andThen(
+                  Effect.sync(() => {
+                    promoted = true
+                  }),
+                ),
+                Effect.andThen(Deferred.succeed(promotion, void 0)),
+                Effect.andThen(Effect.never),
+              )
 
           // A child killed by an external signal fails `exitCode` by design
           // ("Process interrupted due to receipt of signal"). That is a normal
@@ -609,14 +705,23 @@ export const ShellTool = Tool.define(
           )
           const exit = yield* Effect.raceAll([
             exited,
-            abort.pipe(Effect.map(() => ({ kind: "abort" as const, code: null, signal: undefined }))),
-            timeout.pipe(Effect.map(() => ({ kind: "timeout" as const, code: null, signal: undefined }))),
+            abort.pipe(
+              Effect.andThen(
+                Effect.suspend(() =>
+                  promoted
+                    ? Effect.never
+                    : Effect.succeed({ kind: "abort" as const, code: null, signal: undefined }),
+                ),
+              ),
+            ),
+            deadline,
+            threshold,
           ])
 
           // The kill can lose the race against the child exiting on its own
           // (ESRCH on POSIX, "not found" from taskkill on Windows): the wanted
           // end state already holds, so tolerate the failure.
-          const kill = handle.kill({ forceKillAfter: "3 seconds" }).pipe(Effect.ignore)
+          const kill = control.kill
           if (exit.kind === "abort") {
             aborted = true
             yield* kill
@@ -644,7 +749,8 @@ export const ShellTool = Tool.define(
             yield* Effect.raceAll([Fiber.join(output).pipe(Effect.ignore), settle])
           }
 
-          return exit.kind === "exit" ? exit.code : null
+          exitCode = exit.kind === "exit" ? exit.code : null
+          return exitCode
         }),
       ).pipe(
         Effect.mapError(
@@ -652,52 +758,215 @@ export const ShellTool = Tool.define(
         ),
       )
 
-      if (expired) {
-        meta.push(
-          `shell tool terminated command after exceeding timeout ${input.timeout} ms. If this command is expected to take longer and is not waiting for interactive input, retry with a larger timeout value in milliseconds.`,
-        )
-      }
-      if (aborted) meta.push("User aborted the command")
-      if (spillError) {
-        meta.push(
-          `Could not save the full output to a file (${spillError.message}). The output below may be incomplete.`,
-        )
-        file = ""
-      }
-      if (signaled) meta.push(`Command was terminated by signal ${signaled}`)
-      const raw = list.map((item) => item.text).join("")
-      const end = tail(raw, limits.maxLines, limits.maxBytes)
-      if (end.cut) cut = true
-      if (!file && end.cut && !spillError) {
-        file = yield* trunc.write(raw)
-      }
+      /**
+       * The result for a finished command. The inline path and the background
+       * job both render through it, so exit code, truncation and the spill file
+       * are reported identically however the command ended up running.
+       */
+      const format = Effect.fnUntraced(function* (code: number | null) {
+        if (expired) {
+          meta.push(
+            `shell tool terminated command after exceeding timeout ${input.timeout} ms. If this command is expected to take longer and is not waiting for interactive input, retry with a larger timeout value in milliseconds.`,
+          )
+        }
+        if (aborted) meta.push("User aborted the command")
+        if (spillError) {
+          meta.push(
+            `Could not save the full output to a file (${spillError.message}). The output below may be incomplete.`,
+          )
+          file = ""
+        }
+        if (signaled) meta.push(`Command was terminated by signal ${signaled}`)
+        const raw = list.map((item) => item.text).join("")
+        const end = tail(raw, limits.maxLines, limits.maxBytes)
+        if (end.cut) cut = true
+        if (!file && end.cut && !spillError) {
+          file = yield* trunc.write(raw)
+        }
 
-      let output = end.text
-      if (!output) output = "(no output)"
+        let output = end.text
+        if (!output) output = "(no output)"
 
-      if (cut && file) {
-        output = `...output truncated...\n\nFull output saved to: ${file}\n\n` + output
-      }
+        if (cut && file) {
+          output = `...output truncated...\n\nFull output saved to: ${file}\n\n` + output
+        }
 
-      // Capture the user-visible preview before appending protocol metadata.
-      // metadata.output is rendered verbatim in the TUI, so <shell_metadata>
-      // must never appear there. The model-facing `output` field retains the
-      // full block so recovery/retry hints reach the model unchanged.
-      const tuiPreview = last || preview(output)
+        // Capture the user-visible preview before appending protocol metadata.
+        // metadata.output is rendered verbatim in the TUI, so <shell_metadata>
+        // must never appear there. The model-facing `output` field retains the
+        // full block so recovery/retry hints reach the model unchanged.
+        const tuiPreview = last || preview(output)
 
-      if (meta.length > 0) {
-        output += "\n\n<shell_metadata>\n" + meta.join("\n") + "\n</shell_metadata>"
-      }
-      return {
-        title: input.command,
-        metadata: {
-          output: tuiPreview,
-          exit: code,
+        if (meta.length > 0) {
+          output += "\n\n<shell_metadata>\n" + meta.join("\n") + "\n</shell_metadata>"
+        }
+        return {
+          code,
+          output,
+          tuiPreview,
           truncated: cut,
           ...(cut && file ? { outputPath: file } : {}),
-        },
-        output,
-      }
+        }
+      })
+
+      /**
+       * Delivers the terminal envelope for a backgrounded command through the
+       * same background-result path the task tool uses: wait on the job, then
+       * prompt the owning session with a synthetic part. A teardown cancel keeps
+       * its receipt but suppresses the wake, so a session that is stopping is
+       * not resurrected (#413).
+       *
+       * Delivery is forked on the host runtime rather than into this tool call's
+       * scope: the receipt must arrive after the call - and possibly the turn -
+       * that launched the command has ended.
+       */
+      const notify = Effect.fn("ShellTool.notifyBackgroundResult")(function* (jobID: string) {
+        const ops = ctx.extra?.promptOps as TaskPromptOps | undefined
+        if (!ops) return
+        const bridge = yield* EffectBridge.make()
+        const deliver = Effect.gen(function* () {
+          const result = yield* background.wait({ id: jobID })
+          const info = result.info
+          if (!info) return
+          const state =
+            info.status === "completed" ? "completed" : info.status === "cancelled" ? "cancelled" : "error"
+          // A teardown cancel is delivered silently: the row resolves without a
+          // turn, so the session being torn down is not woken by it.
+          const silent = info.cancelledByTeardown === true
+          const text =
+            info.status === "completed"
+              ? (info.output ?? "")
+              : info.status === "cancelled"
+                ? (info.output ?? ShellBackground.CANCELLED_TEXT)
+                : (info.error ?? "")
+          yield* ops.prompt({
+            sessionID: ctx.sessionID,
+            noReply: silent,
+            agent: ctx.agent,
+            parts: [
+              {
+                type: "text",
+                synthetic: true,
+                text: ShellBackground.renderResult({ id: jobID, command: input.command, state, text }),
+                ...(silent ? { metadata: { backgroundNoReply: true } } : {}),
+              },
+            ],
+          })
+        }).pipe(
+          Effect.catchCause((cause) =>
+            Effect.logWarning(`shell background notification failed: ${String(cause)}`),
+          ),
+        )
+        yield* Effect.sync(() => {
+          bridge.fork(deliver)
+        })
+      })
+
+      // The child is supervised in its own fiber and scope so that promotion can
+      // hand it over without interrupting it. If this call is interrupted before
+      // the handoff, the child must not outlive it unseen: closing this scope
+      // runs the spawner escalation and kills the same process tree the inline
+      // path would.
+      const supervised = Effect.gen(function* () {
+        const fiber = yield* execute.pipe(Effect.forkIn(childScope, { startImmediately: true }))
+        const first = yield* Effect.raceFirst(
+          Fiber.await(fiber).pipe(Effect.map((exit) => ({ kind: "done" as const, exit }))),
+          Deferred.await(promotion).pipe(Effect.map(() => ({ kind: "promoted" as const }))),
+        )
+
+        if (first.kind === "done") {
+          yield* Scope.close(childScope, Exit.void).pipe(Effect.ignore)
+          const code = Exit.isSuccess(first.exit) ? first.exit.value : yield* Effect.failCause(first.exit.cause)
+          const result = yield* format(code)
+          const settled: Tool.ExecuteResult<Metadata> = {
+            title: input.command,
+            metadata: {
+              output: result.tuiPreview,
+              exit: code,
+              truncated: result.truncated,
+              ...(result.outputPath ? { outputPath: result.outputPath } : {}),
+            },
+            output: result.output,
+          }
+          return settled
+        }
+
+        // Promotion. The job owns the child from here: the same process, the same
+        // output fiber, no kill and no re-execution.
+        handedOff = true
+        const jobID = Identifier.ascending("job")
+        const metadata: Record<string, unknown> = {
+          sessionId: ctx.sessionID,
+          command: input.command,
+          cwd: input.cwd,
+          ...(control.pid !== undefined ? { pid: control.pid } : {}),
+          // This job only exists once promoted, so it starts as background work
+          // rather than going through promote() from a foreground job.
+          background: true,
+        }
+        live = metadata
+        const unregister = ShellBackground.register(background, {
+          id: jobID,
+          command: input.command,
+          sessionID: ctx.sessionID,
+          startedAt: Date.now(),
+          ...(control.pid !== undefined ? { pid: control.pid } : {}),
+          snapshot,
+          kill: () => control.kill,
+        })
+        const info = yield* background.start({
+          id: jobID,
+          type: ShellBackground.TYPE,
+          title: input.command,
+          metadata,
+          run: Effect.gen(function* () {
+            const exit = yield* Fiber.await(fiber)
+            if (Exit.isFailure(exit)) return yield* Effect.failCause(exit.cause)
+            // The registry has no exit-code field, and the job list already
+            // carries this metadata object: record the outcome where it can be
+            // read without re-parsing the envelope.
+            if (exit.value !== null) metadata.exit = exit.value
+            const formatted = yield* format(exit.value)
+            metadata.truncated = formatted.truncated
+            if (formatted.outputPath) metadata.outputPath = formatted.outputPath
+            return formatted.output
+          }).pipe(
+            // Cancellation and teardown close the job scope; closing the child's
+            // scope with it interrupts the supervisor and runs the spawner's
+            // escalation, so the process tree dies with the registry entry.
+            Effect.ensuring(Scope.close(childScope, Exit.void).pipe(Effect.ignore)),
+            Effect.ensuring(Effect.sync(unregister)),
+          ),
+        })
+
+        yield* notify(info.id).pipe(Effect.ignore)
+
+        const view = snapshot()
+        const started: Tool.ExecuteResult<Metadata> = {
+          title: input.command,
+          metadata: {
+            // Same rule as the inline result: the TUI preview never carries the
+            // protocol envelope.
+            output: last || preview(view.output),
+            background: true,
+            jobId: info.id,
+            truncated: view.truncated,
+            ...(view.outputPath ? { outputPath: view.outputPath } : {}),
+          },
+          output: ShellBackground.renderRunning({
+            id: info.id,
+            command: input.command,
+            thresholdMs: backgroundThresholdMs,
+            output: view.output,
+          }),
+        }
+        return started
+      })
+      return yield* supervised.pipe(
+        Effect.onInterrupt(() =>
+          handedOff ? Effect.void : Scope.close(childScope, Exit.void).pipe(Effect.ignore),
+        ),
+      )
     })
 
     return () =>
@@ -706,7 +975,7 @@ export const ShellTool = Tool.define(
         const shell = Shell.acceptable(cfg.shell)
         const name = Shell.name(shell)
         const limits = yield* trunc.limits()
-        const prompt = ShellPrompt.render(name, process.platform, limits, defaultTimeoutMs)
+        const prompt = ShellPrompt.render(name, process.platform, limits, backgroundThresholdMs)
         yield* Effect.logInfo("shell tool using shell", { shell })
 
         return {
@@ -721,7 +990,8 @@ export const ShellTool = Tool.define(
               if (params.timeout !== undefined && params.timeout < 0) {
                 throw new Error(`Invalid timeout value: ${params.timeout}. Timeout must be a positive number.`)
               }
-              const timeout = params.timeout ?? defaultTimeoutMs
+              const explicitTimeout = params.timeout !== undefined
+              const timeout = params.timeout ?? backgroundThresholdMs
               const ps = Shell.ps(shell)
               yield* Effect.scoped(
                 Effect.gen(function* () {
@@ -741,6 +1011,7 @@ export const ShellTool = Tool.define(
                   cwd,
                   env: yield* shellEnv(ctx, cwd),
                   timeout,
+                  explicitTimeout,
                 },
                 ctx,
               )

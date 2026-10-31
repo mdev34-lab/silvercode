@@ -1,0 +1,8 @@
+Inspect and control shell commands that kept running in the background. A command without an explicit timeout is moved here automatically after it outlives the inline window; it is not killed and not restarted, so this tool is how you see what it did and how you stop it.
+
+Usage notes:
+- `action: "list"` shows the background commands this session owns (id, status, elapsed, command). No `job_id` needed.
+- `action: "status"` returns the current status and the partial output captured so far for one command. It never waits for the command to finish.
+- `action: "output"` returns the output captured so far for one command (bounded; when it was too large the rest is saved to a file named in the result). Also never waits.
+- `action: "cancel"` kills the command's process tree and records it as cancelled. Use it only when the work is no longer wanted.
+- You are notified automatically when a backgrounded command finishes; do not poll in a loop, and do not re-run the command while it is still running.
