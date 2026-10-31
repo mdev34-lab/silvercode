@@ -1,3 +1,5 @@
+import { reviewDepthLimit } from "./review-depth"
+import { reviewOrigin } from "./review-origin"
 import { ownerOrNone as workflowOwner, ancestry as workflowAncestry, knownDepth as workflowKnownDepth, route as workRoute } from "@/session/work-flow"
 import { WorkFlow } from "@opencode-ai/core/work-flow"
 import { sessionAgent } from "../session/session-agent"
@@ -114,6 +116,9 @@ const BaseParameterFields = {
   subagent_type: Schema.String.annotate({ description: SUBAGENT_TYPE_FALLBACK }),
   task_id: Schema.optional(Schema.String).annotate({
     description: "Resume a previous subagent session by its task_id",
+  }),
+  origin_message_ids: Schema.optional(Schema.Array(Schema.String)).annotate({
+    description: "Ultra review only: root user message IDs for the request and all relevant corrections. Pass the same IDs to slice reviewers. Never select unrelated private topics. Omission in multi-message histories declares missing origin.",
   }),
   command: Schema.optional(Schema.String).annotate({ description: "Triggering command" }),
 }
@@ -241,13 +246,7 @@ export const TaskTool = Tool.define(
       const depth = Option.isSome(lineage)
         ? lineage.value.depth
         : yield* workflowKnownDepth(ctx.sessionID).pipe(Effect.provideService(Session.Service, sessions))
-      if (depth >= (cfg.subagent_depth ?? 1)) {
-        return yield* Effect.fail(
-          new Error(
-            `Subagent depth limit reached (${cfg.subagent_depth ?? 1}). Increase "subagent_depth" to allow nested subagents.`,
-          ),
-        )
-      }
+
 
       // The agent that owns this session, read from the session itself.
       //
@@ -290,6 +289,19 @@ export const TaskTool = Tool.define(
       // resolved name. The requested name still keys the permission prompt
       // below, so rules and grants written against a specialist keep applying.
       const subagentType = resolveReviewer(params.subagent_type)
+      const dispatchEffort = AgentEffort.resolve(
+        readAgentEffort(parent.metadata) ?? (Option.isSome(lineage) ? readAgentEffort(lineage.value.owner.metadata) : undefined),
+        AgentEffort.resolve(typeof cfg.agent?.effort === "string" ? cfg.agent.effort : undefined),
+      )
+      const depthLimit = reviewDepthLimit(cfg.subagent_depth, dispatchEffort, yield* parentAgentOf, subagentType)
+      if (depth >= depthLimit)
+        return yield* Effect.fail(new Error(`Subagent depth limit reached (${depthLimit}). Increase "subagent_depth" to allow nested subagents.`))
+      const origin = dispatchEffort === "ultra" && isReviewAgent(subagentType)
+        ? reviewOrigin(Option.isSome(lineage) ? lineage.value.owner.id : undefined,
+            Option.isSome(lineage) ? yield* sessions.messages({ sessionID: lineage.value.owner.id }).pipe(Effect.catchIf(NotFoundError.isInstance, () => Effect.succeed([]))) : [],
+            params.origin_message_ids)
+        : undefined
+
 
       const next = yield* agent.get(subagentType)
       if (!next) {
@@ -632,6 +644,7 @@ export const TaskTool = Tool.define(
           agent: next.name,
           parts: [
             ...parts,
+            ...(origin ? [{ type: "text" as const, text: origin }] : []),
             {
               type: "text",
               text: isReviewAgent(next.name)

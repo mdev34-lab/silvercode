@@ -3,7 +3,7 @@ export * as AgentEffort from "./agent-effort"
 import { Schema } from "effect"
 
 /** Ordered agent-effort levels: least to most process. */
-export const levels = ["fast", "medium", "thorough"] as const
+export const levels = ["fast", "medium", "thorough", "ultra"] as const
 
 export type Level = (typeof levels)[number]
 
