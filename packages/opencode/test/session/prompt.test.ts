@@ -9,7 +9,7 @@ import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { eq } from "drizzle-orm"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { expect } from "bun:test"
-import { Cause, Deferred, Duration, Effect, Exit, Fiber, Layer, Schema } from "effect"
+import { Cause, Deferred, Duration, Effect, Exit, Fiber, Layer, Schema, Stream, Queue } from "effect"
 import path from "path"
 import { fileURLToPath } from "url"
 import { readdir, readFile } from "node:fs/promises"
@@ -56,7 +56,11 @@ import { Truncate } from "@/tool/truncate"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { Ripgrep } from "@opencode-ai/core/ripgrep"
 import { Format } from "../../src/format"
-import { TestInstance } from "../fixture/fixture"
+import * as TestClock from "effect/testing/TestClock"
+import { LLMEvent } from "@opencode-ai/llm"
+import { ProviderError } from "@/provider/error"
+import { SessionRetry } from "@/session/retry"
+import { provideTmpdirInstance, TestInstance } from "../fixture/fixture"
 import { awaitWithTimeout, pollWithTimeout, testEffect } from "../lib/effect"
 import { reply, TestLLMServer } from "../lib/llm-server"
 import { RuntimeFlags } from "@/effect/runtime-flags"
@@ -6300,3 +6304,132 @@ it.instance(
   10_000,
 )
 
+// No network: count a simulated side effect, persist its result, then die.
+for (const scenario of ["completed", "missing", "bound", "abort"] as const) {
+  const requests: LLM.StreamInput[] = []
+  let executions = 0
+  const simulated = Layer.succeed(
+    LLM.Service,
+    LLM.Service.of({
+      stream: (input) => {
+        if (input.agent.name !== "work")
+          return Stream.make(
+            LLMEvent.stepStart({ index: 0 }),
+            LLMEvent.stepFinish({ index: 0, reason: "stop" }),
+            LLMEvent.finish({ reason: "stop" }),
+          )
+        requests.push(input)
+        const index = requests.length
+        if (index > 1 && scenario !== "bound")
+          return Stream.make(
+            LLMEvent.stepStart({ index: 0 }),
+            LLMEvent.textStart({ id: "answer" }),
+            LLMEvent.textDelta({ id: "answer", text: "recovered" }),
+            LLMEvent.textEnd({ id: "answer" }),
+            LLMEvent.stepFinish({ index: 0, reason: "stop" }),
+            LLMEvent.finish({ reason: "stop" }),
+          )
+        const id = `execution-${index}`
+        return Stream.make(
+          LLMEvent.stepStart({ index: 0 }),
+          LLMEvent.toolCall({ id, name: "probe", input: { index } }),
+        ).pipe(
+          Stream.concat(
+            Stream.fromEffect(
+              Effect.sync(() => {
+                executions++
+                return LLMEvent.toolResult({ id, name: "probe", result: { type: "text", value: `persisted-${index}` } })
+              }),
+            ),
+          ),
+          Stream.concat(
+            scenario === "missing"
+              ? Stream.make(LLMEvent.toolCall({ id: "unfinished", name: "probe", input: { pending: true } }))
+              : Stream.empty,
+          ),
+          Stream.concat(Stream.fail(new ProviderError.ResponseStreamError("simulated transport death"))),
+        )
+      },
+    }),
+  )
+  const simulatedTest = testEffect(
+    LayerNode.compile(promptRoot, [
+      [SessionSummary.node, summary],
+      [LSP.node, lsp],
+      [MCP.node, makeMcp()],
+      [RuntimeFlags.node, runtimeFlags],
+      [LLM.node, simulated],
+    ]),
+  )
+  simulatedTest.effect(`replay-safe stream resumption: ${scenario}`, () =>
+    provideTmpdirInstance(
+      () =>
+        Effect.gen(function* () {
+          requests.length = 0
+          executions = 0
+          const sessions = yield* Session.Service
+          const prompt = yield* SessionPrompt.Service
+          const events = yield* EventV2Bridge.Service
+          const chat = yield* sessions.create({ permission: [{ permission: "*", pattern: "*", action: "allow" }] })
+          yield* user(chat.id, "run once")
+          const pending = yield* Queue.unbounded<void>()
+          const attempts: number[] = []
+          const idle = yield* Deferred.make<void>()
+          const off = yield* events.listen((event) =>
+            Effect.gen(function* () {
+              if (event.type !== SessionStatus.Event.Status.type) return
+              const properties = event.data as typeof SessionStatus.Event.Status.data.Type
+              if (properties.sessionID !== chat.id) return
+              if (properties.status.type === "idle") yield* Deferred.succeed(idle, undefined)
+              if (properties.status.type !== "retry") return
+              attempts.push(properties.status.attempt)
+              yield* Queue.offer(pending, undefined)
+            }),
+          )
+          yield* Effect.addFinalizer(() => off)
+          const run = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+          if (scenario === "missing") {
+            yield* Deferred.await(idle)
+            yield* TestClock.adjust("1 second")
+          }
+          if (scenario !== "missing") {
+            const count = scenario === "bound" ? SessionRetry.RETRY_MAX_RETRIES : 1
+            for (let i = 0; i < count; i++) {
+              yield* Queue.take(pending)
+              if (scenario === "abort") {
+                yield* prompt.cancel(chat.id)
+                yield* TestClock.adjust("1 hour")
+                expect(requests.length).toBe(1)
+                expect(executions).toBe(1)
+                expect((yield* (yield* SessionStatus.Service).get(chat.id)).type).toBe("idle")
+                return
+              }
+              yield* TestClock.adjust("40 seconds")
+            }
+          }
+          const result = yield* Fiber.join(run)
+          const expected = scenario === "bound" ? SessionRetry.RETRY_MAX_RETRIES + 1 : scenario === "completed" ? 2 : 1
+          expect(requests.length).toBe(expected)
+          expect(executions).toBe(scenario === "completed" ? 1 : expected)
+          expect(attempts).toEqual(scenario === "missing" ? [] : Array.from({ length: expected - 1 }, (_, i) => i + 1))
+          for (let i = 1; i < requests.length; i++) {
+            const history = JSON.stringify(requests[i].messages)
+            for (let j = 1; j <= i; j++) expect(history).toContain(`persisted-${j}`)
+            expect(requests[i]).not.toBe(requests[i - 1])
+          }
+          expect(result.info.role).toBe("assistant")
+          if (result.info.role !== "assistant") throw new Error("expected assistant")
+          if (scenario === "completed") expect(result.info.error).toBeUndefined()
+          else expect(JSON.stringify(result.info.error)).toContain("ProviderStreamInterruptedAfterToolCallError")
+          const parts = (yield* sessions.messages({ sessionID: chat.id })).flatMap((m) => m.parts)
+          expect(parts.filter((p) => p.type === "tool" && p.state.status === "completed").length).toBe(executions)
+          if (scenario === "missing") {
+            expect(
+              parts.some((p) => p.type === "tool" && p.callID === "unfinished" && p.state.status === "error"),
+            ).toBe(true)
+          }
+        }),
+      { config: cfg },
+    ),
+  )
+}
