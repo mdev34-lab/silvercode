@@ -6300,3 +6300,136 @@ it.instance(
   10_000,
 )
 
+// ---------------------------------------------------------------------------
+// Issue #738: repetition-guard recovery at the run-loop level
+// ---------------------------------------------------------------------------
+
+// A non-periodic fragment above MIN_UNIT_CHARS so the guard confirms it at its
+// full length; a small prefix streams first so some text is persisted before
+// the guard aborts.
+const RECOVERY_PREFIX = "Here is the persisted prefix: "
+const RECOVERY_FRAGMENT = "x".repeat(59) + "y"
+
+it.instance(
+  "repetition-guard recovery injects one synthetic recovery message and continues the turn",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({
+        title: "Pinned",
+        agent: "work",
+        model: { providerID: ref.providerID, id: ref.modelID },
+      })
+
+      // First response streams persisted text, then loops until the guard trips.
+      const loopReply = reply()
+        .text(RECOVERY_PREFIX)
+        .text(RECOVERY_FRAGMENT)
+        .text(RECOVERY_FRAGMENT)
+        .text(RECOVERY_FRAGMENT)
+        .text(RECOVERY_FRAGMENT)
+      // Second response cooperates and completes the turn.
+      const normalReply = reply()
+        .text("The model recovered and continued with the task.")
+        .stop()
+
+      yield* llm.push(loopReply, normalReply)
+      yield* user(chat.id, "please do the task")
+
+      const result = yield* prompt.loop({ sessionID: chat.id })
+      expect(result.info.role).toBe("assistant")
+
+      const messages = yield* sessions.messages({ sessionID: chat.id })
+      const assistantMessages = messages.filter((m) => m.info.role === "assistant")
+      const userMessages = messages.filter((m) => m.info.role === "user")
+
+      // The aborted generation kept its persisted partial text and surfaced the error.
+      const first = assistantMessages[0]
+      expect(first).toBeDefined()
+      if (first && first.info.role === "assistant") {
+        const persisted = first.parts
+          .filter((p) => p.type === "text")
+          .map((p) => (typeof p.text === "string" ? p.text : ""))
+          .join("")
+        expect(persisted).toContain(RECOVERY_PREFIX)
+        expect(first.info.error).toBeDefined()
+      }
+
+      // Exactly one synthetic recovery user message, with the repeated-fragment
+      // detail and an honest account of what happened (never "nothing happened").
+      const recoveries = userMessages.filter((m) =>
+        m.parts.some((p) => p.type === "text" && p.synthetic === true),
+      )
+      expect(recoveries).toHaveLength(1)
+      const recoveryText = recoveries
+        .flatMap((m) =>
+          m.parts.filter((p) => p.type === "text").map((p) => p.text),
+        )
+        .join("")
+      expect(recoveryText).toContain("cut off by the repetition guard")
+      expect(recoveryText).toContain(`${RECOVERY_FRAGMENT.length}-character fragment`)
+      expect(recoveryText).toContain("preserved in the transcript")
+      expect(recoveryText).toContain("Do not repeat that fragment")
+      expect(recoveryText).toContain("emit the pending tool call")
+
+      // The recovery generation completed without a second guard trip and with no
+      // tool activity, so the doom-loop detector (3 identical completed tool calls)
+      // can never be satisfied by a single recovery.
+      const last = assistantMessages[assistantMessages.length - 1]
+      expect(last).toBeDefined()
+      if (last && last.info.role === "assistant") expect(last.info.error).toBeUndefined()
+      expect(
+        assistantMessages.flatMap((m) => m.parts.filter((p) => p.type === "tool")).length,
+      ).toBe(0)
+    }),
+  { config: cfg },
+)
+
+it.instance(
+  "repetition-guard recovery: a second guard trip terminates with the error surfaced",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({
+        title: "Pinned",
+        agent: "work",
+        model: { providerID: ref.providerID, id: ref.modelID },
+      })
+
+      const loopReply = reply()
+        .text(RECOVERY_PREFIX)
+        .text(RECOVERY_FRAGMENT)
+        .text(RECOVERY_FRAGMENT)
+        .text(RECOVERY_FRAGMENT)
+        .text(RECOVERY_FRAGMENT)
+
+      // Both responses loop: one recovery is allowed, the second trip must stop.
+      yield* llm.push(loopReply, loopReply)
+      yield* user(chat.id, "please do the task")
+
+      const result = yield* prompt.loop({ sessionID: chat.id })
+      expect(result.info.role).toBe("assistant")
+
+      const messages = yield* sessions.messages({ sessionID: chat.id })
+      const assistantMessages = messages.filter((m) => m.info.role === "assistant")
+      const userMessages = messages.filter((m) => m.info.role === "user")
+
+      // Exactly one recovery was attempted; the turn did not loop forever.
+      expect(assistantMessages).toHaveLength(2)
+      expect(
+        userMessages.filter((m) =>
+          m.parts.some((p) => p.type === "text" && p.synthetic === true),
+        ).length,
+      ).toBe(1)
+      // The second trip surfaces the error and stops deterministically.
+      const last = assistantMessages[assistantMessages.length - 1]
+      expect(last).toBeDefined()
+      if (last && last.info.role === "assistant") expect(last.info.error).toBeDefined()
+    }),
+  { config: cfg },
+)
+
