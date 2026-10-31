@@ -33,6 +33,81 @@ import { Usage, type LLMEvent } from "@opencode-ai/llm"
 import { createGenerationClock } from "./generation-metrics"
 
 const DOOM_LOOP_THRESHOLD = 3
+// The guard needs one execution per earlier generation step, and steps can be
+// separated by tool-less assistant messages (a text-only step) or by synthetic user
+// nudges, so a fixed message count would let those hide the evidence. Walk history
+// instead in small pages, newest-first, under a hard bound so a long turn cannot turn
+// the guard into a session scan; in the common case the first page is enough.
+const DOOM_LOOP_HISTORY_PAGE = 8
+const DOOM_LOOP_HISTORY_PAGES = 8
+// Earlier messages cannot change while a message generates, so one read serves every
+// step inside it. Dropping an entry costs one read, never evidence.
+const DOOM_LOOP_MEMO_LIMIT = 256
+
+type ToolExecution = {
+  readonly part: SessionV1.ToolPart
+  readonly step: string
+}
+
+type HistoryPage = {
+  items: SessionV1.WithParts[]
+  more: boolean
+  cursor?: string
+}
+
+// A generation step is one model response: a new assistant message, or a later step
+// inside one message. Everything a model fanned out in a single response shares a
+// step, so a parallel batch of identical calls is one step no matter how many calls
+// it carries, and only a repeat across steps can be a loop.
+const stepOf = (parts: readonly SessionV1.Part[], index: number) =>
+  parts.slice(0, index + 1).filter((part) => part.type === "step-start").length
+
+// Executions that can count as evidence: calls that actually ran to an outcome.
+// `pending`/`running` calls have none, and `invalid` is the repair placeholder
+// `llm.ts`'s experimental_repairToolCall substitutes for a call it could not run
+// (its input tells the model to retry the real tool), never an execution itself.
+// The check is the placeholder's registered tool name, which is the only handle the
+// part carries; it is deliberately literal, so a real tool would have to be named
+// `invalid` to be exempted.
+const toolExecutions = (messageID: SessionV1.Info["id"], parts: readonly SessionV1.Part[]) =>
+  parts.flatMap((part, index): ToolExecution[] => {
+    if (part.type !== "tool" || part.tool === "invalid") return []
+    if (part.state.status !== "completed" && part.state.status !== "error") return []
+    return [{ part, step: `${messageID}:${stepOf(parts, index)}` }]
+  })
+
+// Evidence is one representative per generation step, newest step first, so a loop
+// that repeats an identical failing batch still supplies one step per repetition: a
+// window counted in calls lets the second call of one batch displace the step before
+// it, and such a loop can then never trip the guard. The representative is the step's
+// newest execution, so a step where the model got the call to succeed is progress
+// even when an earlier call in the same batch failed.
+const collectSteps = (
+  into: ToolExecution[],
+  seen: Set<string>,
+  executions: readonly ToolExecution[],
+  want: number,
+) => {
+  for (let index = executions.length - 1; index >= 0 && into.length < want; index--) {
+    const execution = executions[index]
+    if (!execution || seen.has(execution.step)) continue
+    seen.add(execution.step)
+    into.push(execution)
+  }
+}
+
+const repeatedFailure = (execution: ToolExecution, name: string, input: Record<string, unknown>) =>
+  execution.part.state.status === "error" &&
+  execution.part.tool === name &&
+  JSON.stringify(execution.part.state.input) === JSON.stringify(input)
+
+// A nudge the loop injects when the model stops without finishing or a review stalls
+// arrives as a user message whose parts are all synthetic. It is not the user talking,
+// so it must not end the evidence walk: the stagnation path is exactly where a stuck
+// loop lives.
+const syntheticUser = (message: SessionV1.WithParts) =>
+  message.parts.length > 0 && message.parts.every((part) => "synthetic" in part && part.synthetic)
+
 export type Result = "compact" | "stop" | "continue"
 
 export interface Handle {
@@ -82,6 +157,8 @@ interface ProcessorContext extends Input {
   reasoningMap: Record<string, SessionV1.ReasoningPart>
   // Time of the last reasoning delta per part, so a thought ends when the model stopped thinking, not when the next chunk arrived.
   reasoningLast: Record<string, number>
+  // Generation steps that already triggered the doom-loop ask, so one batch asks once.
+  doomLoopAsked: Set<string>
 }
 
 type StreamEvent = LLMEvent
@@ -106,6 +183,71 @@ const layer = Layer.effect(
     const flags = yield* RuntimeFlags.Service
     const database = yield* Database.Service
 
+    // Earlier-message evidence for one assistant message cannot change while that
+    // message generates, and the guard only ever needs the newest earlier steps, so
+    // the first tool call of the message pays for the read and later calls reuse it.
+    // Process-wide and dropped wholesale when it grows: a lost entry costs a read.
+    const evidenceMemo = new Map<string, readonly ToolExecution[]>()
+
+    // Earlier steps of this turn, oldest first: one representative per step, newest
+    // step first while walking. The current message is skipped because the caller
+    // already read its own parts.
+    const priorEvidence = Effect.fn("SessionProcessor.priorEvidence")(function* (input: {
+      sessionID: SessionID
+      assistantMessageID: SessionV1.Info["id"]
+      want: number
+    }) {
+      const key = `${input.sessionID}:${input.assistantMessageID}`
+      const cached = evidenceMemo.get(key)
+      if (cached) return cached
+
+      const evidence: ToolExecution[] = []
+      const seen = new Set<string>()
+      const settle = () => {
+        const ordered = [...evidence].reverse()
+        if (evidenceMemo.size >= DOOM_LOOP_MEMO_LIMIT) evidenceMemo.clear()
+        evidenceMemo.set(key, ordered)
+        return ordered
+      }
+
+      let before: string | undefined
+      for (let page = 0; page < DOOM_LOOP_HISTORY_PAGES; page++) {
+        const result = yield* MessageV2.page({
+          sessionID: input.sessionID,
+          limit: DOOM_LOOP_HISTORY_PAGE,
+          before,
+        }).pipe(
+          Effect.provideService(Database.Service, database),
+          // A session removed mid-stream is expected. Any other failure is logged and
+          // treated the same way: the guard asks the user before a repeat, so it must
+          // not invent an ask out of an unreadable history, and a read error must not
+          // kill a live turn. Either way the local evidence still applies.
+          Effect.catchTag("NotFoundError", () => Effect.succeed<HistoryPage>({ items: [], more: false })),
+          Effect.catchCause((cause) =>
+            Effect.logWarning("doom loop guard could not read earlier steps", {
+              sessionID: input.sessionID,
+              messageID: input.assistantMessageID,
+              cause: Cause.pretty(cause),
+            }).pipe(Effect.as<HistoryPage>({ items: [], more: false })),
+          ),
+        )
+        // A page arrives oldest-first; the walk goes newest-first.
+        for (let index = result.items.length - 1; index >= 0; index--) {
+          const message = result.items[index]
+          if (!message || message.info.id === input.assistantMessageID) continue
+          if (message.info.role === "user") {
+            if (syntheticUser(message)) continue
+            return settle()
+          }
+          collectSteps(evidence, seen, toolExecutions(message.info.id, message.parts), input.want)
+          if (evidence.length >= input.want) return settle()
+        }
+        if (!result.more || !result.cursor) break
+        before = result.cursor
+      }
+      return settle()
+    })
+
     const create = Effect.fn("SessionProcessor.create")(function* (input: Input) {
       // Pre-capture snapshot before the LLM stream starts. The AI SDK
       // may execute tools internally before emitting start-step events,
@@ -123,6 +265,7 @@ const layer = Layer.effect(
         currentText: undefined,
         reasoningMap: {},
         reasoningLast: {},
+        doomLoopAsked: new Set(),
       }
       let aborted = false
       // Set from every step-finish event. A stream that ends with no
@@ -440,21 +583,59 @@ const layer = Layer.effect(
             const parts = yield* MessageV2.parts(ctx.assistantMessage.id).pipe(
               Effect.provideService(Database.Service, database),
             )
-            const recentParts = parts.slice(-DOOM_LOOP_THRESHOLD)
+
+            // Doom-loop guard (#186): ask before the model retries a call that keeps
+            // failing the same way. Only real evidence of a stuck loop counts (#725):
+            // executions that ran and failed, in generation steps of their own. A
+            // completed call, a call that never ran, and the `invalid` repair
+            // placeholder are all excluded; a single parallel batch is one generation
+            // step, so N identical calls fanned out together are not a loop.
+            if (value.name === "invalid") return
+            const currentPartID = ctx.toolcalls[value.id]?.partID
+            const index = parts.findIndex((part) => part.id === currentPartID)
+            if (index < 0) {
+              // The call was just registered, so its part has to be here. If it is
+              // not, skip the ask instead of failing a live stream, and log it: the
+              // call went unaudited.
+              yield* Effect.logWarning("doom loop guard could not locate the current tool part", {
+                sessionID: ctx.sessionID,
+                messageID: ctx.assistantMessage.id,
+                partID: currentPartID,
+                tool: value.name,
+              })
+              return
+            }
+
+            // The step already answered (or was already judged) once; a batch of
+            // identical calls in it must not ask again for the same decision.
+            const currentStep = `${ctx.assistantMessage.id}:${stepOf(parts, index)}`
+            if (ctx.doomLoopAsked.has(currentStep)) return
+
+            const want = DOOM_LOOP_THRESHOLD - 1
+            const evidence: ToolExecution[] = []
+            const seen = new Set([currentStep])
+            collectSteps(evidence, seen, toolExecutions(ctx.assistantMessage.id, parts.slice(0, index)), want)
+            if (evidence.length < want) {
+              collectSteps(
+                evidence,
+                seen,
+                yield* priorEvidence({
+                  sessionID: ctx.sessionID,
+                  assistantMessageID: ctx.assistantMessage.id,
+                  want,
+                }),
+                want,
+              )
+            }
 
             if (
-              recentParts.length !== DOOM_LOOP_THRESHOLD ||
-              !recentParts.every(
-                (part) =>
-                  part.type === "tool" &&
-                  part.tool === value.name &&
-                  part.state.status !== "pending" &&
-                  JSON.stringify(part.state.input) === JSON.stringify(input),
-              )
+              evidence.length !== want ||
+              !evidence.every((execution) => repeatedFailure(execution, value.name, input))
             ) {
               return
             }
 
+            ctx.doomLoopAsked.add(currentStep)
             const agent = yield* agents.get(ctx.assistantMessage.agent)
             // Unlike a tool permission this ask runs inside the event stream, not inside a
             // tool, so a failure here halts the turn instead of failing one tool call. That
