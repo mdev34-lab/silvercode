@@ -72,7 +72,7 @@ const TEST_TIMEOUT_MS = 50_000
  * assertions below fail loudly rather than reporting a stall that never
  * happened.
  */
-const STALL_BUDGET_MS = 40_000
+const STALL_BUDGET_MS = 15_000
 
 /**
  * Fresh budget for the probes that run after the identity wait. That wait ends
@@ -87,13 +87,24 @@ const STALL_PROBE_MS = 15_000
 const STALL_VERIFY_MS = 20_000
 
 /**
- * Timeout for the stall test only. Worst case is the identity wait plus every
- * phase that follows it, each on its own fresh budget:
- * 40_000 + 15_000 + 20_000 + CLEANUP_BUDGET_MS (5_000) = 80_000, with margin
- * left over. Nothing in this file changes the package default
- * (`--timeout 30000` in `packages/opencode/package.json`).
+ * Timeout for the stall test only. The phases are ceilings, not durations, so
+ * the honest arithmetic is by case rather than a single sum:
+ *
+ *   identity wait      15_000  always consumed in full - that is the stall
+ *   probe phase        ~3_000  nominal; ceiling STALL_PROBE_MS   (15_000)
+ *   verify phase       ~2_000  nominal; ceiling STALL_VERIFY_MS  (20_000)
+ *   reapTree in try    ~1_000  nominal; ceiling CLEANUP_BUDGET_MS (5_000)
+ *   reapTree in finally    ~0  owner.exited is already settled and every PID
+ *                              is already dead, so it returns at once
+ *
+ * nominal ~21s; worst single-phase-failure case 15 + 3 + 20 + 5 = 43s, which
+ * fits. The one path that does not fit is pathological - the probe phase AND
+ * the verify phase both exhausting their ceilings, 15 + 15 + 20 + 5 = 55s -
+ * and there this timeout fires and the test fails loudly rather than hanging.
+ * Nothing in this file changes the package default (`--timeout 30000` in
+ * `packages/opencode/package.json`).
  */
-const STALL_TEST_TIMEOUT_MS = 90_000
+const STALL_TEST_TIMEOUT_MS = 45_000
 
 /** Poll interval for the OS-settling races below (process teardown, port release). */
 const POLL_MS = 50
@@ -227,6 +238,10 @@ function terminateProcess(pid: number, what: string) {
  * under test.
  */
 function tasklistHasPid(pid: number, deadline: number) {
+  // Same reasoning as `bounded`: a spent deadline clamps to a 1ms allowance,
+  // which would time out and read as "tasklist never answered" rather than "the
+  // caller's budget was already gone".
+  if (deadline <= Date.now()) throw new Error(`tasklist for PID ${pid}: deadline already expired`)
   const result = Bun.spawnSync(["tasklist", "/FI", `PID eq ${pid}`, "/NH", "/FO", "CSV"], {
     timeout: Math.max(1, Math.min(TASKLIST_TIMEOUT_MS, deadline - Date.now())),
   })
@@ -291,6 +306,10 @@ async function until(condition: () => boolean | Promise<boolean>, what: string, 
 
 /** Bound a promise that has no deadline of its own, so a miss fails fast. */
 async function bounded<T>(promise: Promise<T>, what: string, deadline: number): Promise<T> {
+  // A spent deadline must not be clamped to a 0ms allowance: that turns "the
+  // caller's budget was already gone" into a misleading "the thing never
+  // happened". Fail distinctly so the arithmetic bug is visible.
+  if (deadline <= Date.now()) throw new Error(`${what}: deadline already expired`)
   let timer: ReturnType<typeof setTimeout> | undefined
   const timeout = new Promise<never>((_, reject) => {
     timer = setTimeout(() => reject(new Error(what)), Math.max(0, deadline - Date.now()))
@@ -390,9 +409,19 @@ function identityIpc(seen: Partial<Report>, spawned: number[], ownerLog: string[
  * runner needs. A missed bound is swallowed - cleanup must not replace the
  * failure the test actually threw.
  */
-async function reapTree(spawned: number[], owner: Bun.Subprocess, budgetMs: number): Promise<void> {
+async function reapTree(
+  spawned: number[],
+  owner: Bun.Subprocess,
+  budgetMs: number,
+  confirmedDead: ReadonlySet<number> = new Set(),
+): Promise<void> {
   const cleanupDeadline = Date.now() + budgetMs
   for (const pid of spawned) {
+    // PID-recycling guard: a PID this test already proved dead may since have
+    // been reused by an unrelated process, and signalling it would kill
+    // something the runner needs. Only PIDs not already confirmed gone are
+    // candidates, and only if they are still alive.
+    if (confirmedDead.has(pid)) continue
     try {
       if (pidExists(pid)) terminateProcess(pid, "leftover")
     } catch {}
@@ -440,6 +469,9 @@ describe("Windows owner death (#442)", () => {
         await bounded(treeReady, "the worker never reported its identity", deadline)
         const report = completeReport(seen)
 
+        // Positive control: the log channel really delivered something, so the
+        // assertion after it cannot pass vacuously on an empty log.
+        expect(ownerLog).toContain("owner-log-channel-ok")
         // The binding was really in place: the production adopter tags every
         // creation/assignment/FFI failure with "(#442)", so a clean log means
         // the worker was genuinely under the kill-on-close job and not merely
@@ -612,10 +644,18 @@ describe("Windows owner death (#442)", () => {
             : bounded(canBind(workerPort), "worker port bind probe never answered", verifyDeadline),
         )
 
-        // Cleanup runs before the assertions, not after them, so that no failed
-        // assertion can leave a live process on the runner.
-        await reapTree(spawned, owner, CLEANUP_BUDGET_MS)
-        const survivors = spawnedPids.filter((pid) => pidExists(pid))
+        // Survivors are computed BEFORE the manual reap, so this asserts the
+        // job took the tree down rather than that our own cleanup did. Cleanup
+        // still runs before the assertions, so no failed assertion can leave a
+        // live process on the runner.
+        // PID-recycling guard, shared with `reapTree`: a PID already proven dead may
+        // have been reused, so `pidExists` on its own would report a false
+        // survivor. Only PIDs not confirmed gone can count against this test.
+        const confirmedDead = new Set<number>()
+        if (workerPid !== undefined && workerGone === true) confirmedDead.add(workerPid)
+        if (grandchildPid !== undefined && grandchildGone === true) confirmedDead.add(grandchildPid)
+        const survivors = spawnedPids.filter((pid) => !confirmedDead.has(pid) && pidExists(pid))
+        await reapTree(spawned, owner, CLEANUP_BUDGET_MS, confirmedDead)
 
         // The safety property first: whatever else is wrong, the half-built tree
         // must be gone and its port released.
@@ -648,6 +688,9 @@ describe("Windows owner death (#442)", () => {
           requireDefined(grandchildPid, "grandchild pid"),
         ])
 
+        // Positive control: the log channel really delivered something, so the
+        // assertion after it cannot pass vacuously on an empty log.
+        expect(ownerLog).toContain("owner-log-channel-ok")
         // The stall is in the fixture, not in the job: adoption still succeeded,
         // so the cleanup above really did exercise owner death on a half-built
         // tree rather than on one that failed to bind at all.
