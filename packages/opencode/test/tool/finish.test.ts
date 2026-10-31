@@ -1981,3 +1981,42 @@ it.instance("ultra top reviewer cannot borrow a slice tool envelope; owns last c
   expect(parsed.ok).toBe(true)
   if (parsed.ok) expect(parsed.report.assessment).toBe("needs-fixes")
 }))
+
+it.instance("finish inherits root ultra only when the child has no persisted effort, otherwise honors child/config", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const root = yield* sessions.create({ title: "ultra root" })
+    yield* sessions.setMetadata({ sessionID: root.id, metadata: withAgentEffort({}, "ultra") })
+    const { chat, assistant } = yield* seedSession("review child without effort", "review", root.id)
+    expect((yield* sessions.get(chat.id)).metadata?.agentEffort).toBeUndefined()
+    yield* addToolPart(chat.id, assistant.id, "edit")
+    const def = yield* (yield* FinishTool).init()
+    const finish = () => def.execute(
+      { reason: "success", result: reviewEnvelope(REVIEW_APPROVED) },
+      reviewCtx(chat.id, assistant.id),
+    )
+
+    // No child selection: root ultra wins over configured medium and enables the floor.
+    const inherited = yield* finish()
+    expect(inherited.metadata.review).toMatchObject({ effort: "ultra", termination: "unreviewed" })
+    expect(inherited.metadata.review?.maxIterations).toBeUndefined()
+    expect(inherited.metadata.review?.unavailable).toBeUndefined()
+
+    // A persisted child selection must win even when the root is ultra.
+    yield* sessions.setMetadata({ sessionID: chat.id, metadata: withAgentEffort({}, "medium") })
+    const overridden = yield* finish()
+    expect(overridden.metadata.review).toMatchObject({
+      effort: "medium", maxIterations: 2, unavailable: "subagent-depth", termination: "review-pending",
+    })
+
+    // This fallback is deliberately ultra-only: with no child effort and a thorough
+    // root, finish retains its existing configured-medium fallback.
+    yield* sessions.setMetadata({ sessionID: chat.id, metadata: {} })
+    yield* sessions.setMetadata({ sessionID: root.id, metadata: withAgentEffort({}, "thorough") })
+    const configured = yield* finish()
+    expect(configured.metadata.review).toMatchObject({
+      effort: "medium", maxIterations: 2, unavailable: "subagent-depth", termination: "review-pending",
+    })
+  }),
+  { config: { agent: { effort: "medium" } } },
+)
