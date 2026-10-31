@@ -16,7 +16,22 @@ import { httpError, reply } from "../../lib/llm-server"
 // wait still exceeds the same 10s notice threshold and keeps its production
 // delay values, ordering and recovery assertions — only the wall-clock cost
 // shrinks (59s of explicit waits → 12s real + ~4.7s controlled).
-type Body = { messages?: { role?: string; content?: unknown }[] }
+type Body = { model?: string; messages?: { role?: string; content?: unknown }[] }
+type RequestHit = { url: URL; body: Record<string, unknown> }
+const contentText = (content: unknown) => {
+  if (typeof content === "string") return content
+  if (Array.isArray(content))
+    return content
+      .map((part) => (part && typeof part === "object" && "text" in part ? String(part.text ?? "") : ""))
+      .join("\n")
+  return content === undefined ? "" : JSON.stringify(content)
+}
+const conversationKey = (body: Body) => {
+  const system = body.messages?.find((message) => message.role === "system")
+  const user = body.messages?.find((message) => message.role === "user")
+  if (!system || !user) return undefined
+  return JSON.stringify([body.model, contentText(system.content), contentText(user.content)])
+}
 const lastText = (body: Body) => {
   const content = body.messages?.at(-1)?.content
   if (typeof content === "string") return content
@@ -151,18 +166,37 @@ describe("headless run provider retry delay (#555)", () => {
       // Retries may append assistant/tool messages after the stable user turn.
       const opened = (body: Body, text: string) => lastUserText(body).includes(text)
       const followed = (body: Body, text: string) => body.messages?.at(-1)?.role === "tool" && JSON.stringify(body).includes(text)
+      const childConversation = (hit: RequestHit) => {
+        const body = hit.body as Body
+        if (hit.url.pathname !== "/v1/chat/completions" || body.model !== "local-quota-test") return undefined
+        return conversationKey(body)
+      }
+      let childConversationKey: string | undefined
+      const childQuotaRequest = (hit: RequestHit) => {
+        const body = hit.body as Body
+        const key = childConversation(hit)
+        if (!key || !opened(body, "CHILD_WAIT_INPUT")) return false
+        childConversationKey = key
+        return true
+      }
+      const childRetryRequest = (hit: RequestHit) => {
+        return childConversationKey !== undefined && childConversation(hit) === childConversationKey
+      }
       yield* llm.pushMatch((hit) => opened(hit.body as Body, "Research the child wait report"), reply().tool("task", {
         description: "child wait probe", prompt: "Research CHILD_WAIT_INPUT", subagent_type: "general", background: true,
       }))
       yield* llm.pushMatch((hit) => followed(hit.body as Body, "child wait probe"), reply().tool("finish", {
         reason: "waiting_for_subagent", result: "Root awaits child",
       }))
-      yield* llm.pushMatch((hit) => opened(hit.body as Body, "CHILD_WAIT_INPUT"),
+      // Capture the child model route and its original system/user turn when the
+      // quota response is selected. Retries can grow the transcript, while title
+      // generation and parent polling stay outside this child-response phase.
+      yield* llm.pushMatch(childQuotaRequest,
         httpError(429, { error: { message: "Free usage limit reached CHILD_RAW_SECRET", type: "quota_exceeded", code: "FreeUsageLimitError" } }, { "retry-after": "12" }))
       // The first child response is the 429 above; reuse the recovery response
-      // for any further retry attempts within the production retry cap.
+      // only for that same child conversation, bounded by the production retry cap.
       yield* llm.pushMatchRepeat(
-        (hit) => opened(hit.body as Body, "CHILD_WAIT_INPUT"),
+        childRetryRequest,
         reply().tool("finish", { reason: "success", result: envelope("child done") }).stop(),
         SessionRetry.RETRY_MAX_RETRIES,
       )
@@ -177,7 +211,7 @@ describe("headless run provider retry delay (#555)", () => {
       const hits = yield* llm.hits
       const misses = yield* llm.misses
       const pending = yield* llm.pending
-      const childWaitHits = hits.filter((hit) => opened(hit.body as Body, "CHILD_WAIT_INPUT"))
+      const childWaitHits = hits.filter(childRetryRequest)
       withCliOutputOnFailure("background child retry wait", result, () => {
         expect(result.exitCode).toBe(0)
         expect(result.stdout).toContain("ROOT_FINAL")
