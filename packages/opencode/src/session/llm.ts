@@ -35,22 +35,141 @@ import { RepetitionGuard } from "./llm/repetition-guard"
 import { SystemPrompt } from "./system"
 import { ToolCatalog } from "@/tool/catalog"
 
+// A truncated `write` call is recoverable in a narrow, honest sense: the file path
+// is usually emitted before the (large) content body, so a prefix of the arguments
+// can name the target even though the payload never parsed. Only the path is
+// salvaged - never a partial body - and nothing here reconstructs the call.
+export type TruncatedWriteRecovery = {
+  tool: "write"
+  filePath: string
+}
+
+function isJsonParseFailure(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error)
+  const cause = error instanceof Error && error.cause instanceof Error ? error.cause.message : ""
+  return /json parse|unterminated|unexpected end of json|unexpected end of input|syntaxerror/i.test(
+    `${message} ${cause}`,
+  )
+}
+
+// Index of the `"` that closes the string literal starting at `from`, or undefined
+// when the fragment ends first (the value was cut off, so it does not exist).
+function endOfStringLiteral(raw: string, from: number): number | undefined {
+  for (let index = from; index < raw.length; index++) {
+    const char = raw[index]
+    if (char === "\\") {
+      index += 1
+      continue
+    }
+    if (char === '"') return index
+  }
+  return undefined
+}
+
+/**
+ * Tolerant prefix parse of one top-level string argument out of a possibly truncated
+ * JSON object. Scans the fragment character by character (so a `"filePath":` that only
+ * appears inside some other string value is never mistaken for the key), and decodes a
+ * value only when its closing quote actually arrived. Anything that never completed -
+ * an unterminated value, a bad escape, a key whose value never started - yields
+ * `undefined` instead of a guess.
+ */
+export function salvageStringArgument(raw: string, key: string): string | undefined {
+  let depth = 0
+  let index = 0
+
+  while (index < raw.length) {
+    const char = raw[index]
+
+    if (char === '"') {
+      const end = endOfStringLiteral(raw, index + 1)
+      // The fragment ended inside a string literal: whatever follows is unknowable.
+      if (end === undefined) return undefined
+
+      if (depth === 1) {
+        let cursor = end + 1
+        while (cursor < raw.length && /\s/.test(raw[cursor])) cursor++
+        if (raw[cursor] === ":") {
+          let name: unknown
+          try {
+            name = JSON.parse(raw.slice(index, end + 1))
+          } catch {
+            name = undefined
+          }
+          if (name === key) {
+            cursor += 1
+            while (cursor < raw.length && /\s/.test(raw[cursor])) cursor++
+            if (raw[cursor] !== '"') return undefined
+            const valueEnd = endOfStringLiteral(raw, cursor + 1)
+            if (valueEnd === undefined) return undefined
+            try {
+              const value = JSON.parse(raw.slice(cursor, valueEnd + 1))
+              if (typeof value === "string" && value.length > 0) return value
+            } catch {
+              // Undecodable literal: report nothing rather than a mangled path.
+            }
+            return undefined
+          }
+        }
+      }
+
+      index = end + 1
+      continue
+    }
+
+    if (char === "{" || char === "[") depth++
+    else if (char === "}" || char === "]") depth--
+    index++
+  }
+
+  return undefined
+}
+
+/**
+ * What can be honestly said about a failed `write` call: the target path, when the
+ * prefix carried a complete `filePath` value. Only the `write` tool is handled - its
+ * two arguments are independent, so a path alone is meaningful - and only when the
+ * raw arguments genuinely failed to parse (a schema rejection of well-formed JSON is
+ * a different failure with a different message).
+ */
+export function truncatedWriteRecovery(toolName: string, rawArguments: unknown): TruncatedWriteRecovery | undefined {
+  if (toolName.toLowerCase() !== "write") return undefined
+  if (typeof rawArguments !== "string" || rawArguments.length === 0) return undefined
+  try {
+    JSON.parse(rawArguments)
+    return undefined
+  } catch {
+    // Expected: the fragment did not parse, which is why the repair hook is running.
+  }
+  const filePath = salvageStringArgument(rawArguments, "filePath")
+  if (!filePath) return undefined
+  return { tool: "write", filePath }
+}
+
 // A tool call whose arguments never parsed as JSON is almost always a response
 // cut off at the output-token limit mid-payload (or genuinely malformed JSON).
 // Name the likely cause and the recovery instead of relaying the bare parser
 // error, so the model retries with smaller arguments instead of improvising
 // chunking schemes. A nudge only: the model remains free to retry the same call.
-export function repairToolCallMessage(error: unknown): string {
+// With a recovery, the nudge becomes a guided continuation for that one path.
+export function repairToolCallMessage(error: unknown, recovery?: TruncatedWriteRecovery): string {
   const message = error instanceof Error ? error.message : String(error)
-  const cause = error instanceof Error && error.cause instanceof Error ? error.cause.message : ""
-  const combined = `${message} ${cause}`
-  if (!/json parse|unterminated|unexpected end of json|unexpected end of input|syntaxerror/i.test(combined)) {
-    return message
-  }
-  return [
+  if (!isJsonParseFailure(error)) return message
+  const head = [
     `The tool-call arguments were not valid JSON (${message}).`,
     "This usually means the response was cut off at the output-token limit while the arguments were being generated.",
-    "Retry with smaller arguments. When writing a large file, split the content across several smaller tool calls or append it in chunks instead of sending one large payload, and keep each individual tool call well within the output budget.",
+  ]
+  if (!recovery) {
+    return [
+      ...head,
+      "Retry with smaller arguments. When writing a large file, split the content across several smaller tool calls or append it in chunks instead of sending one large payload, and keep each individual tool call well within the output budget.",
+    ].join(" ")
+  }
+  return [
+    ...head,
+    `Recovered from the partial arguments: the write call that failed to parse targeted "${recovery.filePath}". No file content arrived before the cut, so no content was recovered and none is assumed.`,
+    `That call did not execute, so this specific write wrote no file and changed nothing on disk. This is a statement about this one call only: earlier tool calls in this session may already have run and had effects, which this repair cannot see.`,
+    `Re-issue the write for "${recovery.filePath}" in smaller chunks instead: first send a write call whose content is only the first chunk of the file, then send follow-up calls that append the remaining chunks to the same file, keeping every single call well within the output budget.`,
   ].join(" ")
 }
 
@@ -386,11 +505,17 @@ const live: Layer.Layer<
                 }
               }
             }
+            // Known to this request, a truncated write call can name its target from
+            // the raw fragment. The call itself still never executed: it is routed to
+            // `invalid` exactly as before, now with a guided continuation.
+            const recovery = Object.hasOwn(prepared.tools, failed.toolCall.toolName)
+              ? truncatedWriteRecovery(failed.toolCall.toolName, failed.toolCall.input)
+              : undefined
             return {
               ...failed.toolCall,
               input: JSON.stringify({
                 tool: failed.toolCall.toolName,
-                error: repairToolCallMessage(failed.error),
+                error: repairToolCallMessage(failed.error, recovery),
               }),
               toolName: "invalid",
             }

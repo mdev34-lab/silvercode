@@ -1708,6 +1708,96 @@ withMcpTools.instance(
   20_000,
 )
 
+it.instance(
+  "a truncated write call becomes a guided continuation without tripping the doom-loop guard",
+  () =>
+    Effect.gen(function* () {
+      // `doom_loop` denied: the guard firing would deny the ask and halt this turn, so a
+      // turn that completes is itself evidence it never fired. Everything else stays
+      // allowed so the write actually executes.
+      const { dir, llm } = yield* useServerConfig((url) => ({
+        ...providerCfg(url),
+        permission: { "*": "allow", doom_loop: "deny" },
+      }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+
+      const session = yield* sessions.create({
+        title: "Truncated write",
+        permission: [
+          { permission: "*", pattern: "*", action: "allow" },
+          { permission: "doom_loop", pattern: "*", action: "deny" },
+        ],
+      })
+      yield* prompt.prompt({
+        sessionID: session.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "write the report" }],
+      })
+
+      const target = path.join(dir, "report.md")
+      const first = "# Report\n\nline one\n"
+      const full = "# Report\n\nline one\nline two\n"
+
+      // Step 1: a write call whose arguments are cut off inside `content` - the path
+      // arrived complete, the body never did.
+      yield* llm.toolRaw("write", `{"filePath":${JSON.stringify(target)},"content":"# Report\\n\\nline one\\nline two`)
+      // Step 2: the model follows the recovery instruction - first chunk, then the rest.
+      yield* llm.tool("write", { filePath: target, content: first })
+      yield* llm.tool("write", { filePath: target, content: full })
+      yield* llm.text("done")
+
+      // A doom_loop denial would fail the turn here; the completed loop is the first half
+      // of the guard check.
+      const result = yield* prompt.loop({ sessionID: session.id })
+      expect(result.info.role).toBe("assistant")
+
+      const parts = (yield* sessions.messages({ sessionID: session.id })).flatMap((message) => message.parts)
+      const repaired = parts.find((part) => part.type === "tool" && part.tool === "invalid")
+      expect(repaired?.type).toBe("tool")
+      if (repaired?.type !== "tool" || repaired.state.status !== "completed") throw new Error("expected a completed repair")
+      expect(repaired.state.input).toMatchObject({ tool: "write" })
+      expect(repaired.state.output).toContain(target)
+      expect(repaired.state.output).toContain("did not execute")
+      expect(repaired.state.output).toContain("wrote no file")
+      expect(repaired.state.output).toContain("first chunk")
+      expect(repaired.state.output).toContain("append")
+      // the fragment's unfinished body is never presented as recovered content: the
+      // only echo of the raw text is the provider/parser error inside the parenthetical
+      const recovered = repaired.state.output.slice(repaired.state.output.indexOf("Recovered from the partial arguments:"))
+      expect(recovered).not.toContain("line two")
+      expect(recovered).not.toContain("Report")
+
+      // the guided retry actually executed: the file exists with the content the model sent
+      expect(yield* Effect.promise(() => readFile(target, "utf8"))).toBe(full)
+
+      // The guard's real failure definition (`processor.ts` DOOM_LOOP_THRESHOLD = 3): a
+      // window of three consecutive tool parts inside one assistant message with the same
+      // tool name and byte-identical input. A single truncated call contributes exactly
+      // one `invalid` placeholder, and its guided retry is a differently named `write`
+      // call carrying different input, so the pair cannot fill such a window.
+      const executions = parts.filter(
+        (part): part is SessionV1.ToolPart => part.type === "tool" && part.state.status !== "pending",
+      )
+      expect(executions.filter((part) => part.tool === "invalid")).toHaveLength(1)
+      for (const messageID of new Set(executions.map((part) => part.messageID))) {
+        const owned = executions.filter((part) => part.messageID === messageID)
+        for (let index = 0; index + 3 <= owned.length; index++) {
+          const window = owned.slice(index, index + 3)
+          const identical =
+            window.every((part) => part.tool === window[0]?.tool) &&
+            window.every((part) => JSON.stringify(part.state.input) === JSON.stringify(window[0]?.state.input))
+          expect(identical).toBe(false)
+        }
+      }
+      // And the guard was live during the run: had it fired, its `doom_loop` ask would
+      // have been denied and this turn would have failed instead of finishing.
+      expect(parts.some((part) => part.type === "text" && part.text === "done")).toBe(true)
+    }),
+  20_000,
+)
+
 withMcpTools.instance(
   "an MCP tool discovered by tool_search is callable on the next step",
   () =>
