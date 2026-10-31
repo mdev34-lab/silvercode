@@ -240,11 +240,5 @@ let adopter: ReturnType<typeof createOwnerJobAdopter> | undefined
 export function adoptWorkerProcess(pid: number | undefined, log: (message: string) => void) {
   if (process.platform !== "win32") return
   adopter ??= createOwnerJobAdopter()
-  // MUTATION CONTROL - temporary, reverted in the next commit. The binding call
-  // is deliberately skipped so the owner-death tests must go red on their
-  // survivor assertion. If they still pass with the job disabled, they are not
-  // actually proving job coverage.
-  void adopter
-  void pid
-  void log
+  adopter(pid, log)
 }
