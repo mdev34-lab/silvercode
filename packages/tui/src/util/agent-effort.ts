@@ -12,6 +12,7 @@ const COUPLED_THINKING: Record<Level, string> = {
   fast: "low",
   medium: "medium",
   thorough: "high",
+  ultra: "high",
 }
 
 /** Narrow for the open metadata/config records read from untrusted input. */
@@ -23,7 +24,7 @@ function isLevel(value: unknown): value is Level {
   return AgentEffort.levels.includes(value as Level)
 }
 
-/** Cycles fast → medium → thorough → fast for the local effort dial. */
+/** Cycles fast → medium → thorough → ultra → fast for the local effort dial. */
 export function nextLevel(level: Level): Level {
   const index = AgentEffort.levels.indexOf(level)
   // The shared resolver is the agreed fallback contract: a valid level always
@@ -103,7 +104,7 @@ export function mergeEffortMetadata(current: unknown, level: Level): Record<stri
   return { ...base, ...effortRecord(level) }
 }
 
-// Effort hues: fast is green, medium is orange, thorough is red. Each level
+// Effort hues: fast is green, medium is orange, thorough is red, ultra is purple. Each level
 // keeps two variants so the hue stays legible on both dark and light surfaces
 // (the level names are always rendered next to the color, so the levels never
 // depend on color alone).
@@ -111,6 +112,7 @@ const TONES: Record<Level, { dark: string; light: string }> = {
   fast: { dark: "#3fb950", light: "#116329" },
   medium: { dark: "#f0883e", light: "#9a3412" },
   thorough: { dark: "#f85149", light: "#b3121f" },
+  ultra: { dark: "#bc8cff", light: "#8250df" },
 }
 
 function luminance(color: RGBA) {

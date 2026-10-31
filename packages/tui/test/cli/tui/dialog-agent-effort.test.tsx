@@ -141,7 +141,7 @@ async function mountEffort(input: {
   model: string
   children: () => JSX.Element
   agentVariant?: string
-  configEffort?: "fast" | null
+  configEffort?: "fast" | "ultra" | null
   // Hold every session.update PATCH until the test releases it.
   gated?: boolean
   // Reuse a state directory (restart coverage); a fresh tmpdir is created otherwise.
@@ -166,7 +166,7 @@ async function mountEffort(input: {
   const gates: Array<(outcome: "ok" | "fail") => void> = []
 
   const calls = createFetch((url) => {
-    if (url.pathname === "/config") return json(input.configEffort === null ? {} : { agent: { effort: "fast" } })
+    if (url.pathname === "/config") return json(input.configEffort === null ? {} : { agent: { effort: input.configEffort ?? "fast" } })
     if (url.pathname === "/config/providers") return json(providersPayload())
     if (url.pathname === "/agent") return json(agentsPayload(input.agentVariant, agentModel))
     if (url.pathname === "/api/agent") {
@@ -382,7 +382,7 @@ async function fileJson(file: string, level?: string): Promise<unknown> {
 }
 
 describe("agent effort selector", () => {
-  test("renders three levels with process meanings and the session's selection", async () => {
+  test("renders four levels with process meanings and the session's selection", async () => {
     const harness = await mountEffort({
       route: { type: "session", sessionID: SESSION_THOROUGH },
       model: "test-provider/variant-model",
@@ -394,6 +394,7 @@ describe("agent effort selector", () => {
       expect(frame).toContain("Fast")
       expect(frame).toContain("Medium")
       expect(frame).toContain("Thorough")
+      expect(frame).toContain("Ultra")
       expect(frame).toContain("no review ritual")
       expect(frame).toContain("up to 2 review passes")
       expect(frame).toContain("review until clean")
@@ -467,7 +468,8 @@ describe("agent effort selector", () => {
       expect((await chipHex(harness.app, "Fast")).bg).toBe("#3fb950")
       expect((await chipHex(harness.app, "Medium")).bg).toBe("#f0883e")
       expect((await chipHex(harness.app, "Thorough")).bg).toBe("#f85149")
-      for (const label of ["Fast", "Medium", "Thorough"]) expect((await chipHex(harness.app, label)).fg).toBe("#000000")
+      expect((await chipHex(harness.app, "Ultra")).bg).toBe("#bc8cff")
+      for (const label of ["Fast", "Medium", "Thorough", "Ultra"]) expect((await chipHex(harness.app, label)).fg).toBe("#000000")
 
       const frame = await frameWhere(harness.app, () => true, "settled dialog")
       expect(frame).toContain("Fast")
@@ -976,4 +978,66 @@ describe("agent effort selector", () => {
       await harness.dispose()
     }
   })
+})
+
+
+test("Ultra row selects and persists with the approved purple chip and high thinking", async () => {
+  const harness = await mountEffort({
+    route: { type: "session", sessionID: SESSION_THOROUGH },
+    model: "test-provider/variant-model", children: () => <DialogAgentEffort />,
+  })
+  try {
+    const frame = await frameWhere(harness.app, (f) => f.includes("Ultra"), "ultra row")
+    expect(frame).toContain("Our most powerful mode yet. Overkill for most users.")
+    expect((await chipHex(harness.app, "Ultra")).bg).toBe("#bc8cff")
+    harness.app.mockInput.pressArrow("down")
+    harness.app.mockInput.pressEnter()
+    await waitUntil(() => harness.local.effort.current() === "ultra")
+    await waitUntil(() => harness.updates.length === 1)
+    expect(harness.updates[0].body.metadata).toEqual({ agentEffort: "ultra", task: "keep-me" })
+    expect(harness.local.model.variant.current()).toBe("high")
+
+  } finally {
+    await harness.dispose()
+  }
+})
+
+
+test("configured Ultra renders the approved purple prompt indicator and leaves config inheritance intact", async () => {
+  const harness = await mountEffort({
+    route: { type: "home" }, configEffort: "ultra",
+    model: "test-provider/variant-model", children: () => <Prompt />,
+  })
+  try {
+    const frame = await frameWhere(harness.app, (f) => f.includes("ultra"), "ultra prompt indicator")
+    expect(frame).toContain("ultra")
+    expect(harness.local.effort.current()).toBe("ultra")
+    expect(harness.local.effort.newSessionMetadata()).toBeUndefined()
+    const spans = await captureSpans(harness.app)
+    const indicator = spans.lines.flatMap((line) => line.spans).find((span) => span.text.includes("ultra"))
+    expect(indicator).toBeDefined()
+    expect(hexOf(indicator!.fg)).toBe("#bc8cff")
+  } finally {
+    await harness.dispose()
+  }
+})
+
+
+test("Ultra home selection persists across restart and seeds new sessions", async () => {
+  const shared = await tmpdir()
+  try {
+    const first = await mountEffort({ route: { type: "home" }, model: "test-provider/plain-model", state: shared.path, children: () => <Prompt /> })
+    try {
+      await frameWhere(first.app, (f) => f.includes("PlainModel"), "home prompt")
+      first.local.effort.set("ultra")
+      expect(await fileJson(`${shared.path}/effort.json`, "ultra")).toEqual({ agentEffort: "ultra" })
+      expect(first.local.effort.newSessionMetadata()).toEqual({ agentEffort: "ultra" })
+    } finally { await first.dispose() }
+    const restarted = await mountEffort({ route: { type: "home" }, model: "test-provider/plain-model", state: shared.path, children: () => <Prompt /> })
+    try {
+      await frameWhere(restarted.app, (f) => f.includes("ultra"), "restored ultra")
+      expect(restarted.local.effort.current()).toBe("ultra")
+      expect(restarted.local.effort.newSessionMetadata()).toEqual({ agentEffort: "ultra" })
+    } finally { await restarted.dispose() }
+  } finally { await shared[Symbol.asyncDispose]() }
 })

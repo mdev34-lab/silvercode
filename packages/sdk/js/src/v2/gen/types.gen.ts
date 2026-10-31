@@ -3900,7 +3900,7 @@ export type ConfigV2ReferenceLocal = {
   hidden?: boolean
 }
 
-export type AgentEffortLevel = "fast" | "medium" | "thorough"
+export type AgentEffortLevel = "fast" | "medium" | "thorough" | "ultra"
 
 export type PolicyEffect = "allow" | "deny"
 

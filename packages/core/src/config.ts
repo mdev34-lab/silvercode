@@ -43,7 +43,7 @@ export class Info extends Schema.Class<Info>("Config.Info")({
   }),
   agent: Schema.Struct({
     effort: AgentEffort.Level.pipe(Schema.optional).annotate({
-      description: "Default agent effort policy (fast | medium | thorough) when no session-scoped selection exists",
+      description: "Default agent effort policy (fast | medium | thorough | ultra) when no session-scoped selection exists",
     }),
   })
     .pipe(Schema.optional)
