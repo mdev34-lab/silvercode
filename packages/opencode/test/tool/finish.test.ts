@@ -1947,7 +1947,10 @@ it.instance("uncertain read-only Work can finish without forcing a scope questio
 }))
 
 for (const [effort, caller, depth, cap, available] of [
-  ["ultra", "review", 1, 1, true], ["ultra", "review", 2, 1, false],
+  ["ultra", "review", 1, 0, false],
+  ["ultra", "review", 1, 2, true], ["ultra", "review", 2, 2, false],
+  ["ultra", "code-review", 1, undefined, true],
+  ["ultra", "review", 1, undefined, true], ["ultra", "review", 1, 1, false], ["ultra", "review", 2, undefined, false],
   ["ultra", "review", 3, 4, true], ["ultra", "review", 4, 4, false],
   ["ultra", "general", 1, 1, false], ["medium", "review", 1, 1, false],
   ["thorough", "review", 1, 1, false],
@@ -1961,7 +1964,7 @@ for (const [effort, caller, depth, cap, available] of [
     yield* addToolPart(chat.id, assistant.id, "edit")
     const tool = yield* FinishTool
     const def = yield* tool.init()
-    const result = yield* def.execute({ reason: "success", result: caller === "review" ? reviewEnvelope(REVIEW_APPROVED) : "Implemented" }, workCtx(chat.id, assistant.id, undefined, caller))
+    const result = yield* def.execute({ reason: "success", result: (caller === "review" || caller === "code-review") ? reviewEnvelope(REVIEW_APPROVED) : "Implemented" }, workCtx(chat.id, assistant.id, undefined, caller))
     expect(result.metadata.review?.unavailable).toBe(available ? undefined : "subagent-depth")
     expect(result.metadata.review?.termination).toBe(available ? "unreviewed" : "review-pending")
   }), { config: { subagent_depth: cap } })

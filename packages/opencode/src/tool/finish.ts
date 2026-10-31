@@ -300,13 +300,17 @@ export const FinishTool = Tool.define(
           const session = yield* sessions
             .get(ctx.sessionID)
             .pipe(Effect.catchIf(NotFoundError.isInstance, () => Effect.succeed(undefined)))
-          // Effective level: session-persisted selection, then configured
-          // default, then medium. The model never supplies a level here —
+          // Effective level: session selection, then root-ultra inheritance for
+          // an unset child, then configured default, then medium. The model never
+          // supplies a level here —
           // finish must not accept a model-selected effort or pass budget.
           const configEffort = typeof cfg.agent?.effort === "string" ? cfg.agent.effort : undefined
-          const lineage = yield* workflowAncestry(ctx.sessionID).pipe(Effect.provideService(Session.Service, sessions))
+          const selectedEffort = readAgentEffort(session?.metadata)
+          const lineage = selectedEffort === undefined && session?.parentID
+            ? yield* workflowAncestry(ctx.sessionID).pipe(Effect.provideService(Session.Service, sessions))
+            : Option.none()
           const effort = AgentEffort.resolve(
-            readAgentEffort(session?.metadata) ?? (Option.isSome(lineage) && readAgentEffort(lineage.value.owner.metadata) === "ultra" ? "ultra" : undefined),
+            selectedEffort ?? (Option.isSome(lineage) && readAgentEffort(lineage.value.owner.metadata) === "ultra" ? "ultra" : undefined),
             AgentEffort.resolve(configEffort),
           )
           const reviewState = reviewLoopState(messages, { effort })

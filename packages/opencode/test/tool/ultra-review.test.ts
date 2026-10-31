@@ -1,3 +1,4 @@
+import REVIEW_PROMPT from "../../src/agent/prompt/review.txt"
 import { MessageID, SessionID, PartID } from "../../src/session/schema"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { ProviderV2 } from "@opencode-ai/core/provider"
@@ -15,12 +16,15 @@ function message(id: string, text: string, sessionID = "root") {
 
 test("depth matrix: dispatch and availability share floor, never ceiling", () => {
   for (const effort of ["fast", "medium", "thorough", "ultra"] as const) {
-    for (const configured of [undefined, 1, 2, 4]) {
-      for (const caller of ["review", "code", undefined]) {
+    for (const configured of [undefined, 0, 1, 2, 4]) {
+      for (const caller of ["review", "code-review", "code", undefined]) {
         for (const target of ["review", "general"]) {
           const expected =
-            effort === "ultra" && caller === "review" && target === "review"
-              ? Math.max(configured ?? 1, 2)
+            configured === undefined &&
+            effort === "ultra" &&
+            (caller === "review" || caller === "code-review") &&
+            target === "review"
+              ? 2
               : (configured ?? 1)
           const limit = reviewDepthLimit(configured, effort, caller, target)
           expect(limit).toBe(expected)
@@ -188,4 +192,11 @@ test("missing origin always declares gaps, including a missing ID alongside a so
   expect(cases[2]).toContain("Selected root user message unavailable: missing")
   expect(cases[2]).not.toContain("UNSELECTED")
   expect(cases[3]).toContain("Selected root user message unavailable: missing")
+})
+
+test("slice instructions pass IDs instead of origin text and require synchronous envelopes", () => {
+  expect(REVIEW_PROMPT).toContain("origin_message_ids; the origin record is attached for you (do not paste it again)")
+  expect(REVIEW_PROMPT).toContain("Dispatch slices synchronously with `background: false`")
+  expect(REVIEW_PROMPT).toContain("parseable envelope before synthesizing your final report")
+  expect(REVIEW_PROMPT).not.toContain("Give each full requirements, the origin record")
 })

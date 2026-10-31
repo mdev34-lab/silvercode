@@ -4573,7 +4573,10 @@ it.instance("Code after a truncated Think output runs (guidance only)",()=>Effec
 }),{config:{tool_output:{max_bytes:300,max_lines:20}}})
 
 for (const [effort, caller, depth, cap, allowed] of [
-  ["ultra", "review", 1, 1, true], ["ultra", "review", 2, 1, false],
+  ["ultra", "review", 0, 0, false], ["ultra", "review", 1, 0, false],
+  ["ultra", "review", 1, 2, true], ["ultra", "review", 2, 2, false],
+  ["ultra", "code-review", 1, undefined, true],
+  ["ultra", "review", 1, undefined, true], ["ultra", "review", 1, 1, false], ["ultra", "review", 2, undefined, false],
   ["ultra", "review", 3, 4, true], ["ultra", "review", 4, 4, false],
   ["ultra", "general", 1, 1, false], ["medium", "review", 1, 1, false],
   ["thorough", "review", 1, 1, false],
@@ -4581,6 +4584,7 @@ for (const [effort, caller, depth, cap, allowed] of [
   it.instance(`ultra dispatch matrix ${effort}/${caller}/${depth}/${cap}`, () => Effect.gen(function* () {
     const sessions = yield* Session.Service
     const { chat, assistant } = yield* seed()
+    if (depth === 0) yield* sessions.setAgentModel({ sessionID: chat.id, agent: caller, model: { id: ref.modelID, providerID: ref.providerID }, time: assistant.time.created })
     let current = chat
     for (let i = 0; i < depth; i++) current = yield* sessions.create({ parentID: current.id, agent: caller })
     yield* sessions.setMetadata({ sessionID: current.id, metadata: withAgentEffort({}, effort) })
@@ -4589,7 +4593,7 @@ for (const [effort, caller, depth, cap, allowed] of [
     const ops = reviewRunOps([`${REVIEW_ANALYSIS}\n${reviewEnvelope()}`])
     const tool = yield* TaskTool
     const def = yield* tool.init()
-    const exit = yield* def.execute({ description: "review slice", prompt: "Review this unit", subagent_type: "review" }, {
+    const exit = yield* def.execute({ description: "review slice", prompt: "Review this unit", subagent_type: "review", origin_message_ids: [assistant.parentID], background: false }, {
       sessionID: current.id, messageID: nested.id, agent: caller,
       abort: new AbortController().signal, messages: [], metadata: () => Effect.void, ask: () => Effect.void,
       extra: { promptOps: { ...ops, prompt: (input: SessionPrompt.PromptInput) => {
@@ -4602,6 +4606,7 @@ for (const [effort, caller, depth, cap, allowed] of [
       expect(exit.value.output).toContain("<silvercode-review>")
       expect(origin).toContain("Root session " + chat.id)
       expect(origin).toContain("Research the requested information")
+      expect(origin.match(/## Ultra origin record/g)).toHaveLength(1)
     }
   }), { config: { ...FOREGROUND, subagent_depth: cap } })
 }
@@ -4625,4 +4630,46 @@ for (const [effort, target] of [["medium", "review"], ["thorough", "review"], ["
     })
     expect(prompt).not.toContain("Ultra origin record")
   }), { config: FOREGROUND })
+}
+
+for (const [effort, target, depth, cap] of [
+  ["ultra", "review", 0, 0], ["ultra", "review", 1, 0],
+  ["ultra", "review", 1, 1], ["ultra", "review", 2, undefined], ["ultra", "general", 1, 1],
+  ["medium", "review", 1, 1], ["thorough", "review", 1, 1],
+  ["ultra", "review", 4, 4],
+] as const) {
+  it.instance(`depth refuses before unreadable caller lookup ${effort}/${target}/${depth}/${cap}`, () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const { chat, assistant } = yield* seed()
+      let current = chat
+      for (let i = 0; i < depth; i++) current = yield* sessions.create({ parentID: current.id })
+      yield* sessions.setMetadata({ sessionID: current.id, metadata: withAgentEffort({}, effort) })
+      let reads = 0
+      let asked = false
+      const unreadable = Session.Service.of({
+        ...sessions,
+        messages: () => {
+          reads++
+          return Effect.fail(new NotFoundError({ message: "caller messages unavailable" }))
+        },
+      })
+      const exit = yield* Effect.gen(function* () {
+        const def = yield* (yield* TaskTool).init()
+        return yield* def.execute({ description: "review", prompt: "review", subagent_type: target }, {
+          sessionID: current.id, messageID: assistant.id, agent: "review", messages: [],
+          abort: new AbortController().signal, metadata: () => Effect.void,
+          ask: () => Effect.sync(() => { asked = true }), extra: { promptOps: stubOps() },
+        })
+      }).pipe(Effect.provideService(Session.Service, unreadable), Effect.exit)
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isFailure(exit)) {
+        expect(Cause.pretty(exit.cause)).toContain(`Subagent depth limit reached (${cap ?? 2})`)
+        expect(Cause.pretty(exit.cause)).not.toContain("Cannot resolve which reviewer to dispatch")
+      }
+      expect(reads).toBe(0)
+      expect(asked).toBe(false)
+      expect(yield* sessions.children(current.id)).toHaveLength(0)
+    }), { config: { subagent_depth: cap } },
+  )
 }

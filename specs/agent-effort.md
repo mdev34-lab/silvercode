@@ -27,7 +27,7 @@ delivered. There are four levels and two pass/validation switches; Ultra also ad
   its unreviewed writes to its parent as `review-pending`. Neither status is
   approval.
 
-- **`ultra`** shares thorough's pass budget and validation gate, adding a review→review depth floor of two and verbatim root-origin anchoring with declared gaps; on large diffs, the top reviewer may delegate up to three disjoint slices and retains the canonical verdict.
+- **`ultra`** shares thorough's pass budget and validation gate, lifting only unset (legacy-default-1) review→review depth to two (explicit `0` lockdown and every other configured limit are preserved) and verbatim root-origin anchoring with declared gaps; on large diffs, the top reviewer may delegate up to three disjoint slices and retains the canonical verdict.
 
 ## Configuration
 

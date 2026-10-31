@@ -454,19 +454,26 @@ it.instance(
 
 // Activation: a fresh session does not carry the Review Loop policy; the
 // request right after the first file write does (and keeps the effort block).
-for (const effort of ["medium", "ultra"] as const) {
+for (const [selected, ownerEffort, effort] of [
+  ["medium", undefined, "medium"], ["ultra", undefined, "ultra"],
+  [undefined, "ultra", "ultra"], ["medium", "ultra", "medium"],
+  [undefined, "thorough", "medium"],
+] as const) {
   it.instance(
-    `review policy appears on the request after the session's first file write (${effort})`,
+    `review policy appears on the request after the session's first file write (${selected ?? "unset"}/${ownerEffort ?? "root"} -> ${effort})`,
     () =>
       Effect.gen(function* () {
         const { llm, dir } = yield* useServerConfig
         const prompt = yield* SessionPrompt.Service
         const sessions = yield* Session.Service
+        const owner = ownerEffort ? yield* sessions.create({ title: "owner", metadata: { agentEffort: ownerEffort } }) : undefined
         const chat = yield* sessions.create({
           title: "Pinned",
-          metadata: { agentEffort: effort },
+          ...(owner ? { parentID: owner.id } : {}),
+          ...(selected ? { metadata: { agentEffort: selected } } : {}),
           permission: [{ permission: "*", pattern: "*", action: "allow" }],
         })
+        expect((yield* sessions.get(chat.id)).metadata?.agentEffort).toBe(selected)
         yield* llm.tool("write", { filePath: `${dir}/first-write.txt`, content: "hello" })
         yield* llm.hang
         yield* user(chat.id, "Write a report in first-write.txt")

@@ -14,8 +14,9 @@ first-message append, or whole-history fallback is used.
 | (d) corrections | select request and correction IDs; sorted by store order, not caller order | omitted relevant steerings cannot be detected; always declare that uncertainty for multi-message histories |
 | (e) compaction | surviving selected original text only; summaries never substituted | compaction and unavailable originals declared, never full certification |
 
-An explicit selection is a relevance assertion by the dispatcher, not proof of
-completeness. A message containing multiple topics cannot be safely split into
+Origin selection is structural only for the automatic path; explicit selection
+is a dispatcher assertion, not structurally proven relevance or completeness.
+Explicit IDs have no count cap or semantic-relevance validation. A message containing multiple topics cannot be safely split into
 verbatim requirements automatically: select only messages appropriate to the unit,
 or omit them and report the gap. This does not claim semantic relevance detection.
 Root records are the only authority. Missing ancestry yields no origin, never a
@@ -77,3 +78,12 @@ Snapshot follow-up local verification: origin/parameters 71 tests and 16 snapsho
 passed in three consecutive runs; broader opencode scope 259/259; core 118/118,
 TUI 66/66, SDK 6/6. Full workspace typecheck passed all 17 tasks after the fix.
 Scoped oxlint exited 0 (existing-style fixture assertion warnings retained).
+
+
+## Slice dispatch instructions (replacement PR)
+
+Pass the same `origin_message_ids`; the task tool attaches the origin record for
+you. Do not paste the record into each slice prompt a second time. Slices receive
+full requirements plus their disjoint diff, run synchronously (`background: false`),
+and must return a parseable envelope before the top reviewer synthesizes its own
+canonical report. These are process instructions, not new runtime quota controls.

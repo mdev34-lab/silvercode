@@ -17,7 +17,7 @@ acceptance.
 | Core pass limit / validation gate | Until-clean/full; fast/medium/thorough unchanged | core policy tests |
 | Core review loop budget | Medium alone bounded; ultra uses existing until-clean path, not a new budget | policy/report tests and ultra task/finish integration tests |
 | Session metadata reader/writer and child persistence | Shared schema decoder accepts ultra; task stamps inherited effective effort before execution | opencode ultra dispatch/finish matrices; TUI session persistence integration |
-| Task depth / finish availability and #233 | One helper applies ultra review→review floor only, preserves config >2; other nesting/handoff unchanged | paired real-tool matrices + existing writing-child handoff tests |
+| Task depth / finish availability and #233 | One helper lifts only unset (legacy-default-1) ultra review→review depth to 2, preserves explicit 0 and all other limits; other nesting/handoff unchanged | paired real-tool matrices + existing writing-child handoff tests |
 | Task/finish Work routing advice | Existing thorough-specific non-programming General advice is not expanded; other workflow/complexity routing is unchanged. Ultra's new behavior in this increment is review depth/origin, not a new non-programming dispatch policy | existing task/finish routing regression suites plus ultra tool matrices |
 | Prompt `EFFORT_PROCESS[effort]` | Total four-key map; ultra actual behavior only | `review-delegation` post-write prompt tests for medium and ultra |
 | TUI `metadataLevel`, `configLevel`, `resolveEffort`, `defaultLevel`, metadata merge | Accept ultra from each precedence tier, preserve unrelated metadata | utility all-schema-level matrix; local context tests |

@@ -140,8 +140,11 @@ Envelope rules:
 The no-subagents rule has this named exception ONLY when the dispatching session's
 inherited effort is ultra. If the diff is too large for one reliable pass, you MAY
 use task to dispatch up to 3 review slice reviewers, with disjoint file/module
-sets. Give each full requirements, the origin record (and the same root
-origin_message_ids), and its slice diff. The depth cap still applies; a default
+sets. Give each full requirements and its slice diff; pass the same
+origin_message_ids; the origin record is attached for you (do not paste it again).
+Dispatch slices synchronously with `background: false` and wait for each slice's
+parseable envelope before synthesizing your final report; do not fire-and-forget.
+The depth cap still applies; a default
 depth-2 slice cannot delegate further. Do not override effort to evade it.
 
 Slice envelopes are evidence, not verdicts. The top reviewer retains spec
