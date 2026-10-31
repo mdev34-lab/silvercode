@@ -33,6 +33,39 @@ import { Usage, type LLMEvent } from "@opencode-ai/llm"
 import { createGenerationClock } from "./generation-metrics"
 
 const DOOM_LOOP_THRESHOLD = 3
+// The guard only needs the executions immediately before the call it is judging.
+// They normally sit in the previous assistant messages of the same turn; reading a
+// few of them back keeps that bound independent of session length.
+const DOOM_LOOP_HISTORY = 6
+
+type ToolExecution = {
+  readonly part: SessionV1.ToolPart
+  readonly step: string
+}
+
+// A generation step is one model response: a new assistant message, or a later step
+// inside one message. Everything a model fanned out in a single response shares a
+// step, so a parallel batch of identical calls is one step no matter how many calls
+// it carries, and only a repeat across steps can be a loop.
+const stepOf = (parts: readonly SessionV1.Part[], index: number) =>
+  parts.slice(0, index + 1).filter((part) => part.type === "step-start").length
+
+// Executions that can count as evidence: calls that actually ran to an outcome.
+// `pending`/`running` calls have none, and `invalid` is the repair placeholder
+// `llm.ts`'s experimental_repairToolCall substitutes for a call it could not run
+// (its input tells the model to retry the real tool), never an execution itself.
+const toolExecutions = (messageID: SessionV1.Info["id"], parts: readonly SessionV1.Part[]) =>
+  parts.flatMap((part, index): ToolExecution[] => {
+    if (part.type !== "tool" || part.tool === "invalid") return []
+    if (part.state.status !== "completed" && part.state.status !== "error") return []
+    return [{ part, step: `${messageID}:${stepOf(parts, index)}` }]
+  })
+
+const repeatedFailure = (execution: ToolExecution, name: string, input: Record<string, unknown>) =>
+  execution.part.state.status === "error" &&
+  execution.part.tool === name &&
+  JSON.stringify(execution.part.state.input) === JSON.stringify(input)
+
 export type Result = "compact" | "stop" | "continue"
 
 export interface Handle {
@@ -440,17 +473,49 @@ const layer = Layer.effect(
             const parts = yield* MessageV2.parts(ctx.assistantMessage.id).pipe(
               Effect.provideService(Database.Service, database),
             )
-            const recentParts = parts.slice(-DOOM_LOOP_THRESHOLD)
+
+            // Doom-loop guard (#186): ask before the model retries a call that keeps
+            // failing the same way. Only real evidence of a stuck loop counts (#725):
+            // executions that ran and failed, in generation steps of their own. A
+            // completed call, a call that never ran, and the `invalid` repair
+            // placeholder are all excluded; a single parallel batch is one generation
+            // step, so N identical calls fanned out together are not a loop.
+            if (value.name === "invalid") return
+            const currentPartID = ctx.toolcalls[value.id]?.partID
+            const index = parts.findIndex((part) => part.id === currentPartID)
+            if (index < 0) return
+
+            const local = toolExecutions(ctx.assistantMessage.id, parts.slice(0, index))
+            // The execution right before this call is the only one that can be the
+            // previous failure: if it is not an identical failure, the streak is
+            // already broken and no earlier call can extend it.
+            const previous = local.at(-1)
+            if (local.length === 1 && previous && !repeatedFailure(previous, value.name, input)) return
+            const history =
+              local.length >= DOOM_LOOP_THRESHOLD - 1
+                ? []
+                : yield* session
+                    .messages({ sessionID: ctx.assistantMessage.sessionID, limit: DOOM_LOOP_HISTORY })
+                    .pipe(Effect.catchCause(() => Effect.succeed([] as SessionV1.WithParts[])))
+            // Earlier messages of this turn, oldest first, up to the user message that
+            // started it: a new user turn is progress, not a loop.
+            const prior: ToolExecution[] = []
+            for (const message of [...history].reverse()) {
+              if (message.info.role === "user") break
+              prior.unshift(...toolExecutions(message.info.id, message.parts))
+              if (prior.length >= DOOM_LOOP_THRESHOLD - 1) break
+            }
+            const recentExecutions = [...prior, ...local].slice(-(DOOM_LOOP_THRESHOLD - 1))
+
+            const steps = new Set([
+              ...recentExecutions.map((execution) => execution.step),
+              `${ctx.assistantMessage.id}:${stepOf(parts, index)}`,
+            ])
 
             if (
-              recentParts.length !== DOOM_LOOP_THRESHOLD ||
-              !recentParts.every(
-                (part) =>
-                  part.type === "tool" &&
-                  part.tool === value.name &&
-                  part.state.status !== "pending" &&
-                  JSON.stringify(part.state.input) === JSON.stringify(input),
-              )
+              recentExecutions.length !== DOOM_LOOP_THRESHOLD - 1 ||
+              !recentExecutions.every((execution) => repeatedFailure(execution, value.name, input)) ||
+              steps.size !== DOOM_LOOP_THRESHOLD
             ) {
               return
             }
