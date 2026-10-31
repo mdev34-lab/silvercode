@@ -58,3 +58,31 @@ blocked Actions/blob-storage hosts, and annotations contain no test names. Neith
 - Three consecutive scoped runs: core 118/118, opencode 193/193, TUI
   66/66, SDK 6/6. Every added/changed test file is included.
 - No workflow edits, GitHub comments, weakened assertions, timeouts, or budgets.
+
+## Coordinator-provided CI evidence for abbb5def
+
+Run **41166738438**, Linux and Windows: the deterministic failure belonging to
+this PR was `tool parameters > JSON Schema (wire shape) > task` (0.38ms Linux,
+0.54ms Windows), caused by the intentional `origin_message_ids` wire property and
+ultra effort enum not yet being reflected in the snapshot. That snapshot is now
+updated, and an additional test pins the optional string-array wire contract.
+This is an intended wire-surface addition, not a silent snapshot refresh.
+
+The coordinator also supplied Linux-only unrelated failures:
+- `reply - always persists approval and resolves` (1.5s), permission-countdown family;
+- `headless run provider retry delay (#555)` (6.6s);
+- `Zen quota SSE rejection` (4.4s).
+
+Per the supplied evidence, that family reproduces repo-wide on any base since
+approximately 20:18Z, including byte-identical-to-base trees; repair is in flight
+in #718. Those files were not changed or chased here. This evidence supersedes
+any earlier uncertainty about the abbb5def job failure names; it does not rewrite
+the older 4a07af6b attribution above.
+
+## TUI overlap guard
+
+This snapshot/origin-test follow-up makes **no TUI changes**. Relative to the
+original base, the existing first-three-row selector copy strings and details
+remain byte-for-byte unchanged. The only new row is the approved Ultra text;
+help-content changes only add ultra to the level enumeration. #717 retains
+ownership of the Fast/Medium/Thorough purpose-led copy.
