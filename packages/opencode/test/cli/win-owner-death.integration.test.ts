@@ -313,8 +313,8 @@ function acceptsConnections(port: number): Promise<boolean> {
       socket.destroy()
       resolve(value)
     }
-    // Bounded: a filtered (not refused) port must not stall the phase. This is
-    // Each invocation contributes up to 2s to the ceiling arithmetic above.
+    // A filtered (not refused) port must not stall the phase. Each invocation
+    // contributes up to 2s to the ceiling arithmetic above.
     socket.setTimeout(2000, () => done(false))
     socket.once("connect", () => done(true))
     socket.once("error", () => done(false))
@@ -818,6 +818,32 @@ describe("tasklist probe contract", () => {
   test("absence is a single observation, even if a retry would hide a survivor", () => {
     let calls = 0
     expect(tasklistObserveForAbsence(123, 100, () => ++calls === 1)).toBe(true)
+    expect(calls).toBe(1)
+  })
+
+  test("absence is not retried when a second observation would find a survivor", () => {
+    let calls = 0
+    expect(tasklistObserveForAbsence(123, 100, () => ++calls === 2)).toBe(false)
+    expect(calls).toBe(1)
+  })
+
+  test("a tasklist timeout throws with its allowance and elapsed time, never absence", () => {
+    let time = 1
+    let calls = 0
+    const run: TasklistRunner = () => {
+      calls++
+      time += 3
+      return {
+        exitedDueToTimeout: true,
+        exitCode: null,
+        signalCode: "SIGTERM",
+        stdout: Buffer.alloc(0),
+        stderr: Buffer.alloc(0),
+      }
+    }
+    expect(() => tasklistHasPid(123, 100, run, () => time)).toThrow(
+      "tasklist reported timeout for PID 123 (allowance 99ms, ran 3ms, exit null, signal SIGTERM)",
+    )
     expect(calls).toBe(1)
   })
 
