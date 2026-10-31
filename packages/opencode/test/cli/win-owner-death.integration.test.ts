@@ -65,20 +65,35 @@ const TASKLIST_TIMEOUT_MS = 15_000
 const TEST_TIMEOUT_MS = 50_000
 
 /**
- * Budget for the stall test. Shorter than `BUDGET_MS` because the only thing it
- * waits for is the bound itself: `ready` is suppressed, so the promise never
- * settles and the whole budget is always consumed. Long enough for the owner,
- * worker and grandchild to genuinely start first - the assertions below fail
- * loudly if they did not, which is what keeps this test from passing vacuously.
+ * Budget for the stall test's identity wait. The whole budget is always
+ * consumed, because `ready` is suppressed and the promise never settles. It has
+ * to be generous enough for the owner, worker and grandchild to genuinely start
+ * before the bound fires: if startup is slower than this, the anti-vacuous-pass
+ * assertions below fail loudly rather than reporting a stall that never
+ * happened.
  */
-const STALL_BUDGET_MS = 15_000
+const STALL_BUDGET_MS = 40_000
 
 /**
- * Timeout for the stall test only: `STALL_BUDGET_MS` plus verification and
- * cleanup headroom. Nothing in this file changes the package default
+ * Fresh budget for the probes that run after the identity wait. That wait ends
+ * by consuming `STALL_BUDGET_MS`, so the original deadline is already in the
+ * past at that point and must not be reused: `tasklistHasPid` would clamp a
+ * negative remainder to a 1ms allowance and throw, and `bounded` would clamp it
+ * to 0ms and reject before the owner had time to die.
+ */
+const STALL_PROBE_MS = 15_000
+
+/** Fresh budget for the post-kill verification phase, same reasoning. */
+const STALL_VERIFY_MS = 20_000
+
+/**
+ * Timeout for the stall test only. Worst case is the identity wait plus every
+ * phase that follows it, each on its own fresh budget:
+ * 40_000 + 15_000 + 20_000 + CLEANUP_BUDGET_MS (5_000) = 80_000, with margin
+ * left over. Nothing in this file changes the package default
  * (`--timeout 30000` in `packages/opencode/package.json`).
  */
-const STALL_TEST_TIMEOUT_MS = 35_000
+const STALL_TEST_TIMEOUT_MS = 90_000
 
 /** Poll interval for the OS-settling races below (process teardown, port release). */
 const POLL_MS = 50
@@ -513,6 +528,12 @@ describe("Windows owner death (#442)", () => {
         // Both identities arrived, and in creation order.
         expect(spawned).toEqual([workerPid, grandchildPid])
 
+        // Every phase from here on runs on a FRESH deadline. The identity wait
+        // above consumed `STALL_BUDGET_MS` by design, so reusing `deadline`
+        // would hand `tasklistHasPid` a 1ms allowance (it clamps a negative
+        // remainder to 1) and `bounded` a 0ms one, failing both spuriously.
+        const probeDeadline = Date.now() + STALL_PROBE_MS
+
         // The stall is in the fixture, not in the job: adoption still
         // succeeded, so what follows exercises owner-death cleanup on a
         // half-built tree rather than on one that failed to bind at all.
@@ -521,15 +542,15 @@ describe("Windows owner death (#442)", () => {
         // Pre-kill liveness, so "gone afterwards" means something.
         expect(pidExists(workerPid)).toBe(true)
         expect(pidExists(grandchildPid)).toBe(true)
-        expect(tasklistHasPid(workerPid, deadline)).toBe(true)
-        expect(tasklistHasPid(grandchildPid, deadline)).toBe(true)
+        expect(tasklistHasPid(workerPid, probeDeadline)).toBe(true)
+        expect(tasklistHasPid(grandchildPid, probeDeadline)).toBe(true)
         expect(await acceptsConnections(workerPort)).toBe(true)
 
         // Owner death must still take the half-built tree down.
         terminateProcess(owner.pid, "owner")
-        await bounded(owner.exited, "the owner never exited after TerminateProcess", deadline)
+        await bounded(owner.exited, "the owner never exited after TerminateProcess", probeDeadline)
 
-        const verifyDeadline = Date.now() + STALL_BUDGET_MS
+        const verifyDeadline = Date.now() + STALL_VERIFY_MS
         // `until` throws on a missed bound, so the bare await is the assertion.
         await until(() => !pidExists(workerPid), `worker pid ${workerPid} still exists`, verifyDeadline)
         await until(() => !pidExists(grandchildPid), `grandchild pid ${grandchildPid} still exists`, verifyDeadline)
