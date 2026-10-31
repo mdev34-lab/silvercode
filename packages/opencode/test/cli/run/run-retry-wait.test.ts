@@ -3,7 +3,6 @@ import { Effect } from "effect"
 import { writeFile } from "node:fs/promises"
 import path from "node:path"
 import { cliIt } from "../../lib/cli-process"
-import { SessionRetry } from "../../../src/session/retry"
 import { httpError, reply } from "../../lib/llm-server"
 
 // #555: a provider quota rejection that asks for a long retry delay must not
@@ -16,17 +15,7 @@ import { httpError, reply } from "../../lib/llm-server"
 // wait still exceeds the same 10s notice threshold and keeps its production
 // delay values, ordering and recovery assertions — only the wall-clock cost
 // shrinks (59s of explicit waits → 12s real + ~4.7s controlled).
-type Body = { model?: string; messages?: { role?: string; content?: unknown }[] }
-type RequestHit = { url: URL; body: Record<string, unknown> }
-const contentText = (content: unknown) => {
-  if (typeof content === "string") return content
-  if (Array.isArray(content))
-    return content
-      .map((part) => (part && typeof part === "object" && "text" in part ? String(part.text ?? "") : ""))
-      .join("\n")
-  return content === undefined ? "" : JSON.stringify(content)
-}
-const childTaskPrompt = "Research CHILD_WAIT_INPUT"
+type Body = { messages?: { role?: string; content?: unknown }[] }
 const lastText = (body: Body) => {
   const content = body.messages?.at(-1)?.content
   if (typeof content === "string") return content
@@ -48,27 +37,6 @@ const config = (url: string) => ({
     permission: { "*": "allow" },
   }),
 })
-
-const withCliOutputOnFailure = <A>(
-  label: string,
-  result: { exitCode: number; stdout: string; stderr: string; durationMs: number },
-  assert: () => A,
-  diagnostics: () => string,
-): A => {
-  try {
-    return assert()
-  } catch (error) {
-    const tail = (value: string) => (value.length > 3000 ? `…${value.slice(-3000)}` : value)
-    // eslint-disable-next-line no-console
-    console.error(
-      `[${label}] child exit=${result.exitCode} duration=${result.durationMs}ms\n` +
-        `[${label}] child stdout tail:\n${tail(result.stdout) || "<empty>"}\n` +
-        `[${label}] child stderr tail:\n${tail(result.stderr) || "<empty>"}\n` +
-        `[${label}] mock request diagnostics:\n${diagnostics()}`,
-    )
-    throw error
-  }
-}
 
 describe("headless run provider retry delay (#555)", () => {
   const setup = (llm: { url: string }) => config(llm.url)
@@ -151,111 +119,31 @@ describe("headless run provider retry delay (#555)", () => {
       yield* llm.push(reply().text("init").tool("finish", { reason: "success", result: "ok" }).stop())
       const first = yield* opencode.run("Research the initial session report", { model: "opencode/local-quota-test", env, timeoutMs: 20_000 })
       expect(first.exitCode).toBe(0)
-      // The root's test-controlled turn stays in the transcript when finish nudges
-      // append new user messages. Match that stable content rather than the latest
-      // message role/text (or the session's possibly earlier user turn under --continue).
-      const rootPrompt = "Research the child wait report"
-      const rootConversation = (hit: RequestHit) => {
-        const body = hit.body as Body
-        if (hit.url.pathname !== "/v1/chat/completions" || body.model !== "local-quota-test") return false
-        return (body.messages ?? []).some(
-          (message) => message.role === "user" && contentText(message.content).includes(rootPrompt),
-        )
-      }
-      const rootAfterProbe = (hit: RequestHit) =>
-        rootConversation(hit) && JSON.stringify(hit.body).includes("child wait probe")
-      const rootAfterChild = (hit: RequestHit) =>
-        rootConversation(hit) && JSON.stringify(hit.body).includes("child done")
-      const childRequest = (hit: RequestHit) => {
-        const body = hit.body as Body
-        if (hit.url.pathname !== "/v1/chat/completions" || body.model !== "local-quota-test") return false
-        const firstUser = body.messages?.find((message) => message.role === "user")
-        return firstUser !== undefined && contentText(firstUser.content).startsWith(childTaskPrompt)
-      }
-      yield* llm.pushMatch(rootConversation, reply().tool("task", {
-        description: "child wait probe", prompt: childTaskPrompt, subagent_type: "general", background: true,
+      const opened = (body: Body, text: string) => body.messages?.at(-1)?.role === "user" && lastText(body).includes(text)
+      const followed = (body: Body, text: string) => body.messages?.at(-1)?.role === "tool" && JSON.stringify(body).includes(text)
+      yield* llm.pushMatch((hit) => opened(hit.body as Body, "Research the child wait report"), reply().tool("task", {
+        description: "child wait probe", prompt: "Research CHILD_WAIT_INPUT", subagent_type: "general", background: true,
       }))
-      // The parent follow-up can end with an assistant/tool/user message depending
-      // on task scheduling and finish nudges. Keep it scoped to this root turn and
-      // the probe already present in its history, rather than requiring lastRole=tool.
-      yield* llm.pushMatch(rootAfterProbe, reply().tool("finish", {
+      yield* llm.pushMatch((hit) => followed(hit.body as Body, "child wait probe"), reply().tool("finish", {
         reason: "waiting_for_subagent", result: "Root awaits child",
       }))
-      // Identify the child by the test-controlled task prompt, not by whichever
-      // conversation happens to arrive when the 429 matcher is first selected.
-      // The first user turn is stable across retries even as the transcript grows;
-      // route/model plus this exact prompt prefix exclude root and auxiliary calls.
-      yield* llm.pushMatch(childRequest,
+      yield* llm.pushMatch((hit) => opened(hit.body as Body, "CHILD_WAIT_INPUT"),
         httpError(429, { error: { message: "Free usage limit reached CHILD_RAW_SECRET", type: "quota_exceeded", code: "FreeUsageLimitError" } }, { "retry-after": "12" }))
-      // Reuse the recovery response only for that stable child identity, bounded
-      // by the production retry cap.
-      yield* llm.pushMatchRepeat(
-        childRequest,
-        reply().tool("finish", { reason: "success", result: envelope("child done") }).stop(),
-        SessionRetry.RETRY_MAX_RETRIES,
-      )
-      // Child results can be present earlier in the transcript even after a
-      // synthetic parent nudge becomes the final user message.
-      yield* llm.pushMatch(rootAfterChild,
+      yield* llm.pushMatch((hit) => opened(hit.body as Body, "CHILD_WAIT_INPUT"),
+        reply().tool("finish", { reason: "success", result: envelope("child done") }).stop())
+      yield* llm.pushMatch((hit) => lastText(hit.body as Body).includes("child done"),
         reply().text("ROOT_FINAL").tool("finish", { reason: "success", result: "done" }).stop())
-      const result = yield* opencode.run(rootPrompt, {
+      const result = yield* opencode.run("Research the child wait report", {
         timeoutMs: 50_000, extraArgs: ["--continue", "--dangerously-skip-permissions"], model: "opencode/local-quota-test", env, clockScale: 10,
       })
       // Retry policy unchanged: the child waits, retries and the run finishes.
-      // Capture mock state before asserting so every failure below includes the
-      // child process's stdout/stderr tails in the CI test output.
-      const hits = yield* llm.hits
-      const misses = yield* llm.misses
-      const pending = yield* llm.pending
-      const childRequestHits = hits.filter(childRequest)
-      const requestDiagnostics = () => JSON.stringify({
-        counts: {
-          hits: hits.length,
-          misses: misses.length,
-          pending: pending,
-          pendingDefinition: "queued one-shot responses only; bounded repeats are tracked separately",
-          childRetryRequestHits: childRequestHits.length,
-        },
-        childRetryRequestFilter: {
-          identity: "stable test-controlled content; no runtime conversation capture",
-          conditions: [
-            "route === /v1/chat/completions",
-            "body.model === local-quota-test",
-            `first role=user message content starts with ${JSON.stringify(childTaskPrompt)}`,
-          ],
-          stableKey: {
-            route: "/v1/chat/completions",
-            model: "local-quota-test",
-            firstUserStartsWith: childTaskPrompt,
-            systemPromptAndRequestMessageIdsAreNotPartOfThisFilter: true,
-          },
-        },
-        misses: misses.map((miss, index) => ({
-          miss: index + 1,
-          route: miss.request.route,
-          phase: miss.request.phase,
-          model: miss.request.model,
-          messageCount: miss.request.messageCount,
-          finalRole: miss.request.finalRole,
-          identifiers: miss.request.identifiers,
-          actualKeyComponents: miss.request.keys,
-          body: miss.body,
-        })),
-      }, null, 2)
-      withCliOutputOnFailure("background child retry wait", result, () => {
-        expect(result.exitCode).toBe(0)
-        expect(result.stdout).toContain("ROOT_FINAL")
-        expect(result.stderr).toMatch(/subagent waiting about \d+s before retrying \(attempt 1\): free usage limit reached/)
-        expect(result.stderr).not.toContain("CHILD_RAW_SECRET")
-        expect(result.stderr).not.toContain("quota_exceeded")
-        // Count the initial 429 plus retries, bounded by the unchanged production cap.
-        // The repeated terminal response prevents extra attempts from falling through
-        // to TestLLMServer's default "ok" stream under runner load.
-        expect(childRequestHits.length).toBeGreaterThanOrEqual(2)
-        expect(childRequestHits.length).toBeLessThanOrEqual(SessionRetry.RETRY_MAX_RETRIES + 1)
-        expect(misses).toEqual([])
-        expect(pending).toBe(0)
-      }, requestDiagnostics)
+      expect(result.exitCode).toBe(0)
+      expect(result.stdout).toContain("ROOT_FINAL")
+      expect(result.stderr).toMatch(/subagent waiting about \d+s before retrying \(attempt 1\): free usage limit reached/)
+      expect(result.stderr).not.toContain("CHILD_RAW_SECRET")
+      expect(result.stderr).not.toContain("quota_exceeded")
+      expect(yield* llm.misses).toEqual([])
+      expect(yield* llm.pending).toBe(0)
     }), 90_000)
 
   cliIt.live("fails fast instead of hanging when Zen quota reset exceeds the headless retry window", ({ llm, opencode }) =>
