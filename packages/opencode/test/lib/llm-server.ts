@@ -27,6 +27,12 @@ type Queue = {
   match?: Match
 }
 
+type RepeatedMatch = {
+  item: Item
+  match: Match
+  remaining: number
+}
+
 type Wait = {
   count: number
   ready: Deferred.Deferred<void>
@@ -677,6 +683,8 @@ namespace TestLLMServer {
     readonly url: string
     readonly push: (...input: (Item | Reply)[]) => Effect.Effect<void>
     readonly pushMatch: (match: Match, ...input: (Item | Reply)[]) => Effect.Effect<void>
+    /** Reuse one scripted response for a bounded number of matching attempts. */
+    readonly pushMatchRepeat: (match: Match, input: Item | Reply, maxUses: number) => Effect.Effect<void>
     readonly textMatch: (match: Match, value: string, opts?: { usage?: Usage }) => Effect.Effect<void>
     readonly toolMatch: (match: Match, name: string, input: unknown) => Effect.Effect<void>
     readonly text: (value: string, opts?: { usage?: Usage }) => Effect.Effect<void>
@@ -707,6 +715,7 @@ export class TestLLMServer extends Context.Service<TestLLMServer, TestLLMServer.
 
       let hits: Hit[] = []
       let list: Queue[] = []
+      let repeated: RepeatedMatch[] = []
       let waits: Wait[] = []
       let misses: Miss[] = []
 
@@ -718,6 +727,13 @@ export class TestLLMServer extends Context.Service<TestLLMServer, TestLLMServer.
         list = [...list, ...input.map((value) => ({ item: item(value), match }))]
       }
 
+      const queueMatchRepeat = (match: Match, input: Item | Reply, maxUses: number) => {
+        if (!Number.isSafeInteger(maxUses) || maxUses < 1) {
+          throw new RangeError("maxUses must be a positive safe integer")
+        }
+        repeated = [...repeated, { item: item(input), match, remaining: maxUses }]
+      }
+
       const notify = Effect.fnUntraced(function* () {
         const ready = waits.filter((item) => hits.length >= item.count)
         if (!ready.length) return
@@ -727,10 +743,24 @@ export class TestLLMServer extends Context.Service<TestLLMServer, TestLLMServer.
 
       const pull = (hit: Hit) => {
         const index = list.findIndex((entry) => !entry.match || entry.match(hit))
-        if (index === -1) return
-        const first = list[index]
-        list = [...list.slice(0, index), ...list.slice(index + 1)]
-        return first.item
+        if (index !== -1) {
+          const first = list[index]
+          list = [...list.slice(0, index), ...list.slice(index + 1)]
+          return first.item
+        }
+
+        const repeatIndex = repeated.findIndex((entry) => entry.match(hit))
+        if (repeatIndex === -1) return
+        const entry = repeated[repeatIndex]
+        repeated =
+          entry.remaining === 1
+            ? [...repeated.slice(0, repeatIndex), ...repeated.slice(repeatIndex + 1)]
+            : [
+                ...repeated.slice(0, repeatIndex),
+                { ...entry, remaining: entry.remaining - 1 },
+                ...repeated.slice(repeatIndex + 1),
+              ]
+        return entry.item
       }
 
       const handle = Effect.fn("TestLLMServer.handle")(function* (mode: "chat" | "responses") {
@@ -784,6 +814,13 @@ export class TestLLMServer extends Context.Service<TestLLMServer, TestLLMServer.
         pushMatch: Effect.fn("TestLLMServer.pushMatch")(function* (match: Match, ...input: (Item | Reply)[]) {
           queueMatch(match, ...input)
         }),
+        pushMatchRepeat: Effect.fn("TestLLMServer.pushMatchRepeat")(function* (
+          match: Match,
+          input: Item | Reply,
+          maxUses: number,
+        ) {
+          queueMatchRepeat(match, input, maxUses)
+        }),
         textMatch: Effect.fn("TestLLMServer.textMatch")(function* (
           match: Match,
           value: string,
@@ -835,6 +872,7 @@ export class TestLLMServer extends Context.Service<TestLLMServer, TestLLMServer.
         reset: Effect.sync(() => {
           hits = []
           list = []
+          repeated = []
           waits = []
           misses = []
         }),

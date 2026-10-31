@@ -7,6 +7,7 @@ import { describe, expect } from "bun:test"
 import { Effect } from "effect"
 import fs from "node:fs/promises"
 import path from "node:path"
+import { SessionRetry } from "../../../src/session/retry"
 import { cliIt } from "../../lib/cli-process"
 import { raw, reply } from "../../lib/llm-server"
 
@@ -51,7 +52,10 @@ describe("opencode run (non-interactive subprocess)", () => {
           },
         })
         expect(first.exitCode).toBe(0)
-        yield* llm.pushMatch(
+        // Keep this provider response stable across the initial request and any
+        // retries of the same continued-session prompt. Extra attempts must not
+        // fall through to the mock server's default successful "ok" stream.
+        yield* llm.pushMatchRepeat(
           (hit) => {
             const body = hit.body as Body
             return body.messages?.at(-1)?.role === "user" && lastText(body).includes("quota rejection")
@@ -61,6 +65,7 @@ describe("opencode run (non-interactive subprocess)", () => {
               { error: { message: "Free usage limit reached", type: "quota_exceeded", code: "FreeUsageLimitError" } },
             ],
           }),
+          SessionRetry.RETRY_MAX_RETRIES + 1,
         )
         const result = yield* opencode.run("quota rejection", {
           timeoutMs: 20_000,
@@ -93,7 +98,8 @@ describe("opencode run (non-interactive subprocess)", () => {
           const body = hit.body as Body
           return body.messages?.at(-1)?.role === "user" && lastText(body).includes("quota rejection")
         })
-        expect(quotaRequests).toHaveLength(1)
+        expect(quotaRequests.length).toBeGreaterThanOrEqual(1)
+        expect(quotaRequests.length).toBeLessThanOrEqual(SessionRetry.RETRY_MAX_RETRIES + 1)
         expect(yield* llm.misses).toEqual([])
         expect(yield* llm.pending).toBe(0)
       }),

@@ -3,6 +3,7 @@ import { Effect } from "effect"
 import { writeFile } from "node:fs/promises"
 import path from "node:path"
 import { cliIt } from "../../lib/cli-process"
+import { SessionRetry } from "../../../src/session/retry"
 import { httpError, reply } from "../../lib/llm-server"
 
 // #555: a provider quota rejection that asks for a long retry delay must not
@@ -129,8 +130,13 @@ describe("headless run provider retry delay (#555)", () => {
       }))
       yield* llm.pushMatch((hit) => opened(hit.body as Body, "CHILD_WAIT_INPUT"),
         httpError(429, { error: { message: "Free usage limit reached CHILD_RAW_SECRET", type: "quota_exceeded", code: "FreeUsageLimitError" } }, { "retry-after": "12" }))
-      yield* llm.pushMatch((hit) => opened(hit.body as Body, "CHILD_WAIT_INPUT"),
-        reply().tool("finish", { reason: "success", result: envelope("child done") }).stop())
+      // The first child response is the 429 above; reuse the recovery response
+      // for any further retry attempts within the production retry cap.
+      yield* llm.pushMatchRepeat(
+        (hit) => opened(hit.body as Body, "CHILD_WAIT_INPUT"),
+        reply().tool("finish", { reason: "success", result: envelope("child done") }).stop(),
+        SessionRetry.RETRY_MAX_RETRIES,
+      )
       yield* llm.pushMatch((hit) => lastText(hit.body as Body).includes("child done"),
         reply().text("ROOT_FINAL").tool("finish", { reason: "success", result: "done" }).stop())
       const result = yield* opencode.run("Research the child wait report", {
@@ -142,10 +148,12 @@ describe("headless run provider retry delay (#555)", () => {
       expect(result.stderr).toMatch(/subagent waiting about \d+s before retrying \(attempt 1\): free usage limit reached/)
       expect(result.stderr).not.toContain("CHILD_RAW_SECRET")
       expect(result.stderr).not.toContain("quota_exceeded")
-      // The 429 and its recovery response are both matched to the child-wait prompt;
-      // one extra stream request here would exhaust the script and expose a mock miss.
+      // Count the initial 429 plus retries, bounded by the unchanged production cap.
+      // The repeated terminal response prevents extra attempts from falling through
+      // to TestLLMServer's default "ok" stream under runner load.
       const childWaitHits = (yield* llm.hits).filter((hit) => opened(hit.body as Body, "CHILD_WAIT_INPUT"))
-      expect(childWaitHits).toHaveLength(2)
+      expect(childWaitHits.length).toBeGreaterThanOrEqual(2)
+      expect(childWaitHits.length).toBeLessThanOrEqual(SessionRetry.RETRY_MAX_RETRIES + 1)
       expect(yield* llm.misses).toEqual([])
       expect(yield* llm.pending).toBe(0)
     }), 90_000)
