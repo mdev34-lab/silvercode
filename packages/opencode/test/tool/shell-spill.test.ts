@@ -15,6 +15,7 @@ import { Plugin } from "../../src/plugin"
 import { testEffect } from "../lib/effect"
 import { Tool } from "@/tool/tool"
 import { RuntimeFlags } from "@/effect/runtime-flags"
+import { BackgroundJob } from "@/background/job"
 
 // A Truncate service whose spill file can never be opened: write() "succeeds"
 // with a path inside a directory that does not exist, so the shell tool's
@@ -32,7 +33,15 @@ const brokenTruncate = Layer.succeed(
 
 const shellLayer = Layer.mergeAll(
   LayerNode.compile(
-    LayerNode.group([CrossSpawnSpawner.node, FSUtil.node, Plugin.node, Config.node, Agent.node, RuntimeFlags.node]),
+    LayerNode.group([
+      CrossSpawnSpawner.node,
+      FSUtil.node,
+      Plugin.node,
+      Config.node,
+      Agent.node,
+      BackgroundJob.node,
+      RuntimeFlags.node,
+    ]),
   ),
   testInstanceStoreLayer,
   brokenTruncate,
