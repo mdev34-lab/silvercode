@@ -58,8 +58,9 @@ import { Ripgrep } from "@opencode-ai/core/ripgrep"
 import { Format } from "../../src/format"
 import { TestInstance } from "../fixture/fixture"
 import { awaitWithTimeout, pollWithTimeout, testEffect } from "../lib/effect"
-import { reply, TestLLMServer } from "../lib/llm-server"
+import { httpError, raw, reply, TestLLMServer } from "../lib/llm-server"
 import { RuntimeFlags } from "@/effect/runtime-flags"
+import { RepetitionGuard } from "../../src/session/llm/repetition-guard"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { LocationServiceMap, locationServiceMapLayer } from "@opencode-ai/core/location-services"
@@ -6310,6 +6311,25 @@ it.instance(
 const RECOVERY_PREFIX = "Here is the persisted prefix: "
 const RECOVERY_FRAGMENT = "x".repeat(59) + "y"
 
+const loopingReply = () =>
+  reply()
+    .text(RECOVERY_PREFIX)
+    .text(RECOVERY_FRAGMENT)
+    .text(RECOVERY_FRAGMENT)
+    .text(RECOVERY_FRAGMENT)
+    .text(RECOVERY_FRAGMENT)
+
+// Recovery messages are identified by the runner's own lineage marker, not by
+// their text, so the tests cannot confuse them with other synthetic messages.
+const repetitionRecoveriesIn = (messages: SessionV1.WithParts[]) =>
+  messages.filter(
+    (message) =>
+      message.info.role === "user" &&
+      message.parts.some(
+        (part) => part.type === "text" && part.synthetic === true && part.metadata?.repetitionRecovery !== undefined,
+      ),
+  )
+
 it.instance(
   "repetition-guard recovery injects one synthetic recovery message and continues the turn",
   () =>
@@ -6323,27 +6343,16 @@ it.instance(
         model: { providerID: ref.providerID, id: ref.modelID },
       })
 
-      // First response streams persisted text, then loops until the guard trips.
-      const loopReply = reply()
-        .text(RECOVERY_PREFIX)
-        .text(RECOVERY_FRAGMENT)
-        .text(RECOVERY_FRAGMENT)
-        .text(RECOVERY_FRAGMENT)
-        .text(RECOVERY_FRAGMENT)
-      // Second response cooperates and completes the turn.
-      const normalReply = reply()
-        .text("The model recovered and continued with the task.")
-        .stop()
+      const normalReply = reply().text("The model recovered and continued with the task.").stop()
 
-      yield* llm.push(loopReply, normalReply)
-      yield* user(chat.id, "please do the task")
+      yield* llm.push(loopingReply(), normalReply)
+      const task = yield* user(chat.id, "please do the task")
 
       const result = yield* prompt.loop({ sessionID: chat.id })
       expect(result.info.role).toBe("assistant")
 
       const messages = yield* sessions.messages({ sessionID: chat.id })
       const assistantMessages = messages.filter((m) => m.info.role === "assistant")
-      const userMessages = messages.filter((m) => m.info.role === "user")
 
       // The aborted generation kept its persisted partial text and surfaced the error.
       const first = assistantMessages[0]
@@ -6359,20 +6368,33 @@ it.instance(
 
       // Exactly one synthetic recovery user message, with the repeated-fragment
       // detail and an honest account of what happened (never "nothing happened").
-      const recoveries = userMessages.filter((m) =>
-        m.parts.some((p) => p.type === "text" && p.synthetic === true),
-      )
+      const recoveries = repetitionRecoveriesIn(messages)
       expect(recoveries).toHaveLength(1)
-      const recoveryText = recoveries
-        .flatMap((m) =>
-          m.parts.filter((p) => p.type === "text").map((p) => p.text),
-        )
-        .join("")
-      expect(recoveryText).toContain("cut off by the repetition guard")
-      expect(recoveryText).toContain(`${RECOVERY_FRAGMENT.length}-character fragment`)
-      expect(recoveryText).toContain("preserved in the transcript")
-      expect(recoveryText).toContain("Do not repeat that fragment")
-      expect(recoveryText).toContain("emit the pending tool call")
+      const recovery = recoveries[0]!
+      const recoveryPart = recovery.parts[0]!
+      expect(recoveryPart.type).toBe("text")
+      if (recoveryPart.type === "text") {
+        expect(recoveryPart.text).toContain("cut off by the repetition guard")
+        expect(recoveryPart.text).toContain(`${RECOVERY_FRAGMENT.length}-character fragment`)
+        expect(recoveryPart.text).toContain("preserved in the transcript")
+        expect(recoveryPart.text).toContain("Do not repeat that fragment")
+        expect(recoveryPart.text).toContain("emit the pending tool call")
+        // Recognised continuation lineage: the recovery belongs to the prompt it
+        // resumes, so provenance/subagent success and the budget can follow it.
+        expect(recoveryPart.metadata?.repetitionRecovery).toEqual({ promptID: task.id, attempt: 1 })
+      }
+
+      // Exactly two model requests: the aborted generation and the one recovery.
+      expect(yield* llm.calls).toBe(2)
+      expect(yield* llm.pending).toBe(0)
+      expect(yield* llm.misses).toEqual([])
+
+      // The errored generation's persisted text stays visible to the recovery
+      // request instead of being erased by the errored-assistant conversion
+      // filter. Only transcript state is replayed; nothing is re-executed.
+      const inputs = turnInputs(yield* llm.inputs)
+      expect(inputs).toHaveLength(2)
+      expect(JSON.stringify(inputs[1])).toContain(RECOVERY_PREFIX)
 
       // The recovery generation completed without a second guard trip and with no
       // tool activity, so the doom-loop detector (3 identical completed tool calls)
@@ -6380,9 +6402,7 @@ it.instance(
       const last = assistantMessages[assistantMessages.length - 1]
       expect(last).toBeDefined()
       if (last && last.info.role === "assistant") expect(last.info.error).toBeUndefined()
-      expect(
-        assistantMessages.flatMap((m) => m.parts.filter((p) => p.type === "tool")).length,
-      ).toBe(0)
+      expect(assistantMessages.flatMap((m) => m.parts.filter((p) => p.type === "tool")).length).toBe(0)
     }),
   { config: cfg },
 )
@@ -6400,15 +6420,8 @@ it.instance(
         model: { providerID: ref.providerID, id: ref.modelID },
       })
 
-      const loopReply = reply()
-        .text(RECOVERY_PREFIX)
-        .text(RECOVERY_FRAGMENT)
-        .text(RECOVERY_FRAGMENT)
-        .text(RECOVERY_FRAGMENT)
-        .text(RECOVERY_FRAGMENT)
-
       // Both responses loop: one recovery is allowed, the second trip must stop.
-      yield* llm.push(loopReply, loopReply)
+      yield* llm.push(loopingReply(), loopingReply())
       yield* user(chat.id, "please do the task")
 
       const result = yield* prompt.loop({ sessionID: chat.id })
@@ -6416,20 +6429,233 @@ it.instance(
 
       const messages = yield* sessions.messages({ sessionID: chat.id })
       const assistantMessages = messages.filter((m) => m.info.role === "assistant")
-      const userMessages = messages.filter((m) => m.info.role === "user")
 
       // Exactly one recovery was attempted; the turn did not loop forever.
       expect(assistantMessages).toHaveLength(2)
-      expect(
-        userMessages.filter((m) =>
-          m.parts.some((p) => p.type === "text" && p.synthetic === true),
-        ).length,
-      ).toBe(1)
-      // The second trip surfaces the error and stops deterministically.
+      expect(repetitionRecoveriesIn(messages)).toHaveLength(1)
+      // The second trip surfaces the error and stops deterministically, without
+      // asking the model a third time.
+      expect(yield* llm.calls).toBe(2)
+      expect(yield* llm.pending).toBe(0)
       const last = assistantMessages[assistantMessages.length - 1]
       expect(last).toBeDefined()
-      if (last && last.info.role === "assistant") expect(last.info.error).toBeDefined()
+      if (last && last.info.role === "assistant") {
+        expect(last.info.error).toBeDefined()
+        expect(RepetitionGuard.isStoredError(last.info.error)).toBe(true)
+      }
     }),
   { config: cfg },
 )
 
+it.instance(
+  "repetition-guard recovery: a prompt queued while the guard is tripping cannot reset the budget",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const gate = yield* Deferred.make<void>()
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({
+        title: "Pinned",
+        agent: "work",
+        model: { providerID: ref.providerID, id: ref.modelID },
+      })
+
+      // The first generation stays open until the queued prompt is persisted,
+      // so the queued message lands before the first guard trip and the run's
+      // last user message is the synthetic recovery when the run ends.
+      yield* llm.push(loopingReply().wait(deferredAsPromise(gate)), loopingReply())
+
+      const primary = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          agent: "work",
+          model: ref,
+          parts: [{ type: "text", text: "please do the task" }],
+        })
+        .pipe(Effect.forkChild)
+      yield* llm.wait(1)
+      yield* waitForBusy(chat.id)
+
+      const queuedID = MessageID.ascending()
+      const queued = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          messageID: queuedID,
+          agent: "work",
+          model: ref,
+          parts: [{ type: "text", text: "queued while the guard was recovering" }],
+        })
+        .pipe(Effect.forkChild)
+      yield* pollWithTimeout(
+        sessions
+          .messages({ sessionID: chat.id })
+          .pipe(
+            Effect.map((msgs) =>
+              msgs.some((msg) => msg.info.role === "user" && msg.info.id === queuedID) ? true : undefined,
+            ),
+          ),
+        "timed out waiting for the queued prompt to save",
+      )
+
+      yield* Deferred.succeed(gate, void 0)
+
+      const [exitPrimary, exitQueued] = yield* Effect.all([Fiber.await(primary), Fiber.await(queued)])
+      expect(Exit.isSuccess(exitPrimary)).toBe(true)
+      expect(Exit.isSuccess(exitQueued)).toBe(true)
+
+      // The joined run re-entered through a fresh runLoop. The budget follows the
+      // persisted continuation lineage (and the terminal guard trip ends it), so
+      // there is no third request and no second recovery.
+      expect(yield* llm.calls).toBe(2)
+      expect(yield* llm.pending).toBe(0)
+      expect(yield* llm.misses).toEqual([])
+
+      const messages = yield* sessions.messages({ sessionID: chat.id })
+      expect(repetitionRecoveriesIn(messages)).toHaveLength(1)
+      const assistantMessages = messages.filter((m) => m.info.role === "assistant")
+      expect(assistantMessages).toHaveLength(2)
+      const last = assistantMessages[assistantMessages.length - 1]
+      if (last && last.info.role === "assistant") expect(RepetitionGuard.isStoredError(last.info.error)).toBe(true)
+    }),
+  { config: cfg },
+  20_000,
+)
+
+// OpenAI-compatible SSE chunk, matching the shape the provider adapter parses.
+const sseChunk = (delta: Record<string, unknown>, finish?: string) => ({
+  id: "chatcmpl-test",
+  object: "chat.completion.chunk",
+  choices: [{ delta, ...(finish ? { finish_reason: finish } : {}) }],
+})
+
+it.instance(
+  "repetition-guard recovery keeps a completed tool call visible in the recovery request",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({
+        title: "Pinned",
+        agent: "work",
+        model: { providerID: ref.providerID, id: ref.modelID },
+      })
+      const callID = "call_guard_tool"
+      const toolDone = yield* Deferred.make<void>()
+      // Head: the tool call streams and completes. Tail (after the gate): the
+      // same generation loops and trips the guard.
+      yield* llm.push(
+        raw({
+          head: [
+            sseChunk({ role: "assistant" }),
+            sseChunk({
+              tool_calls: [{ index: 0, id: callID, type: "function", function: { name: "bash", arguments: "" } }],
+            }),
+            sseChunk({
+              tool_calls: [
+                {
+                  index: 0,
+                  function: {
+                    arguments: JSON.stringify({ command: "printf 'TOOL_MARKER_CONTENT\\n'", description: "write marker" }),
+                  },
+                },
+              ],
+            }),
+          ],
+          wait: deferredAsPromise(toolDone),
+          tail: [
+            sseChunk({ content: RECOVERY_PREFIX }),
+            sseChunk({ content: RECOVERY_FRAGMENT }),
+            sseChunk({ content: RECOVERY_FRAGMENT }),
+            sseChunk({ content: RECOVERY_FRAGMENT }),
+            sseChunk({ content: RECOVERY_FRAGMENT }),
+            sseChunk({}, "tool_calls"),
+          ],
+        }),
+        reply().text("The model recovered with the tool result in hand.").stop(),
+      )
+
+      yield* user(chat.id, "please run the marker command")
+      const fiber = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+      yield* llm.wait(1)
+
+      // Wait for the completed bash tool call before opening the gate, so the
+      // part is settled before the guard aborts the stream (the reported shape).
+      yield* pollWithTimeout(
+        sessions.messages({ sessionID: chat.id }).pipe(
+          Effect.map((msgs) => {
+            const part = msgs.flatMap((m) => m.parts).find((candidate) => candidate.type === "tool")
+            return part && part.type === "tool" && part.state.status === "completed" ? true : undefined
+          }),
+        ),
+        "timed out waiting for the guard-trip tool call to complete",
+      )
+      yield* Deferred.succeed(toolDone, void 0)
+      yield* Fiber.join(fiber)
+
+      // The aborted generation's tool call executed exactly once and stayed the
+      // only call in the transcript.
+      const messages = yield* sessions.messages({ sessionID: chat.id })
+      const toolParts = messages.flatMap((m) => m.parts.filter((p) => p.type === "tool"))
+      expect(toolParts).toHaveLength(1)
+      expect(toolParts[0]?.state.status).toBe("completed")
+
+      // The recovery request sees the completed call and its recorded output,
+      // instead of the errored-assistant filter erasing the generation and
+      // letting the model re-issue a finished call.
+      expect(yield* llm.calls).toBe(2)
+      const inputs = turnInputs(yield* llm.inputs)
+      expect(inputs).toHaveLength(2)
+      const recoveryRequest = JSON.stringify(inputs[1])
+      expect(recoveryRequest).toContain(callID)
+      expect(recoveryRequest).toContain("TOOL_MARKER_CONTENT")
+      expect(yield* llm.misses).toEqual([])
+    }),
+  { config: cfg },
+  20_000,
+)
+
+it.instance(
+  "repetition-guard recovery: an HTTP 400 that quotes the guard text is not a guard trip",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({
+        title: "Pinned",
+        agent: "work",
+        model: { providerID: ref.providerID, id: ref.modelID },
+      })
+
+      // A provider rejection whose message quotes the guard text must not be
+      // mistaken for the harness's own abort (typed identity, not text match).
+      yield* llm.push(
+        httpError(400, {
+          error: {
+            message: `${RepetitionGuard.REPETITION_MESSAGE}: the model streamed the same 96-character fragment 3 times in a row`,
+            type: "invalid_request_error",
+            code: "invalid_request_error",
+          },
+        }),
+      )
+      yield* user(chat.id, "please do the task")
+
+      const result = yield* prompt.loop({ sessionID: chat.id })
+      expect(result.info.role).toBe("assistant")
+      if (result.info.role === "assistant") {
+        expect(result.info.error?.name).toBe("APIError")
+        expect(RepetitionGuard.isStoredError(result.info.error)).toBe(false)
+      }
+
+      // No recovery request, no synthetic recovery message: the failure is
+      // surfaced once as the provider reported it.
+      const messages = yield* sessions.messages({ sessionID: chat.id })
+      expect(repetitionRecoveriesIn(messages)).toHaveLength(0)
+      expect(messages.filter((m) => m.info.role === "assistant")).toHaveLength(1)
+      expect(yield* llm.calls).toBe(1)
+    }),
+  { config: cfg },
+  20_000,
+)

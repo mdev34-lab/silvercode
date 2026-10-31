@@ -47,6 +47,7 @@ import { SessionStatus } from "./status"
 import { isRecord } from "@/util/record"
 import { LLM } from "./llm"
 import { RepetitionGuard } from "./llm/repetition-guard"
+import { REPETITION_RECOVERY, repetitionRecoveryPromptID } from "./subagent-result"
 import { Shell } from "@opencode-ai/core/shell"
 import { ShellID } from "@/tool/shell/id"
 import { FSUtil } from "@opencode-ai/core/fs-util"
@@ -106,23 +107,27 @@ const MAX_FINISH_NUDGES = 3
 
 // Issue #738: after the repetition guard trips a generation, the run loop
 // injects one synthetic recovery user message and lets the model try again
-// with the guard still armed. A second trip surfaces the error and stops.
-// Budget 1 is provably safe: at most two guarded generations run per turn,
-// and the guard's own abort is the deterministic backstop, so no recovery
-// loop can iterate forever.
+// with the guard still armed. Budget 1 means at most two guarded generations
+// per prompt lineage, and the guard's own abort is the deterministic backstop.
+//
+// The budget is derived from the persisted continuation lineage rather than a
+// runLoop-local counter. A queued prompt joins the active run, and when that run
+// ends its caller re-enters through a fresh runLoop: a local counter starts over
+// there and hands the same prompt a second recovery (a third request and another
+// trip away from the original prompt). Counting the recovery messages anchored
+// to the same prompt keeps the budget run-wide, and still gives a genuinely new
+// user prompt its own turn.
 const REPETITION_RECOVERY_MAX = 1
 
-// Detects that `handle.message.error` is the parsed RepetitionDetectedError.
-// The guard's own message text and the retry exclusion are untouched; this is
-// read-only detection only. The parsed error keeps REPETITION_MESSAGE in
-// data.message (see MessageV2.fromError / retry.ts:180).
-function isRepetitionGuardError(error: SessionV1.Assistant["error"] | undefined): boolean {
-  const message =
-    error !== undefined && isRecord(error.data) && typeof error.data.message === "string"
-      ? error.data.message
-      : undefined
-  return typeof message === "string" && message.includes(RepetitionGuard.REPETITION_MESSAGE)
+// The prompt a turn belongs to: a real user message anchors the lineage, and a
+// repetition recovery points back at the anchor it continues.
+const repetitionRecoveryLineage = (messages: readonly SessionV1.WithParts[], userID: string) => {
+  const message = messages.findLast((candidate) => candidate.info.id === userID)
+  return (message && repetitionRecoveryPromptID(message)) ?? userID
 }
+
+const repetitionRecoveries = (messages: readonly SessionV1.WithParts[], promptID: string) =>
+  messages.filter((message) => repetitionRecoveryPromptID(message) === promptID).length
 
 // Extracts the repeated-fragment detail from a repetition-guard error message,
 // e.g. "the model streamed the same 96-character fragment 3 times in a row ...".
@@ -1432,9 +1437,6 @@ const layer = Layer.effect(
         let structured: unknown
         let step = 0
         let finishNudges = 0
-        // Issue #738: bounded repetition-guard recoveries this turn. Reset
-        // each runLoop invocation (a new user prompt starts a fresh turn).
-        let repetitionRecoveries = 0
         const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
 
         while (true) {
@@ -1448,6 +1450,31 @@ const layer = Layer.effect(
           const { user: lastUser, assistant: lastAssistant, finished: lastFinished, tasks } = MessageV2.latest(msgs)
 
           if (!lastUser) throw new Error("No user message found in stream. This should never happen.")
+
+          // Issue #738: a repetition recovery whose own generation tripped the
+          // guard is terminal. The recovery slot for its prompt lineage is
+          // spent, so a later run (a queued caller re-entering the loop) must
+          // not generate for that synthetic message again. Without this, the
+          // surfaced second trip would be followed by a third request for the
+          // same continued prompt.
+          const recoveryMessage = msgs.findLast((message) => message.info.id === lastUser.id)
+          const recoveryLineage = recoveryMessage && repetitionRecoveryPromptID(recoveryMessage)
+          if (
+            recoveryLineage !== undefined &&
+            msgs.some(
+              (message) =>
+                message.info.role === "assistant" &&
+                message.info.parentID === lastUser.id &&
+                RepetitionGuard.isStoredError(message.info.error),
+            )
+          ) {
+            yield* Effect.logWarning("repetition recovery already tripped the guard; ending the run", {
+              "session.id": sessionID,
+              messageID: lastUser.id,
+              promptID: recoveryLineage,
+            })
+            break
+          }
 
           // Snapshot the effective model/variant for this turn. A selection
           // that changed mid-task takes effect here, when the turn starts,
@@ -1901,18 +1928,18 @@ const layer = Layer.effect(
             if (result === "stop") {
               // Issue #738: bounded repetition-guard recovery. A tripped guard
               // leaves the partial text persisted and the error on the
-              // assistant message; once per turn, inject a synthetic recovery
-              // user message and let the model try again with the guard still
-              // armed. A second trip terminates with the error surfaced.
-              if (
-                repetitionRecoveries < REPETITION_RECOVERY_MAX &&
-                isRepetitionGuardError(handle.message.error)
-              ) {
-                repetitionRecoveries++
+              // assistant message; once per prompt lineage, inject a synthetic
+              // recovery user message and let the model try again with the
+              // guard still armed. A second trip terminates with the error
+              // surfaced.
+              const lineage = repetitionRecoveryLineage(msgs, lastUser.id)
+              const recoveries = repetitionRecoveries(msgs, lineage)
+              if (recoveries < REPETITION_RECOVERY_MAX && RepetitionGuard.isStoredError(handle.message.error)) {
                 const detail = repetitionGuardDetail(handle.message.error)
                 yield* Effect.logWarning("repetition guard tripped; recovering once with a synthetic continuation", {
                   "session.id": sessionID,
                   messageID: handle.message.id,
+                  promptID: lineage,
                   detail,
                 })
                 const recovery: SessionV1.User = {
@@ -1931,6 +1958,10 @@ const layer = Layer.effect(
                   type: "text",
                   text: repetitionRecoveryMessage(detail),
                   synthetic: true,
+                  // Recognised as the runner's own continuation of `lineage`
+                  // by subagent-result (provenance/success) and by the budget
+                  // above, so re-entering the loop cannot restart it.
+                  metadata: { [REPETITION_RECOVERY]: { promptID: lineage, attempt: recoveries + 1 } },
                 } satisfies SessionV1.TextPart)
                 return "continue" as const
               }
@@ -2036,6 +2067,12 @@ const layer = Layer.effect(
           runLoop(input.sessionID).pipe(Effect.ensuring(settleOrphanedParts(input.sessionID))),
         )
         last = result
+        // Issue #738: a run that ends on an unrecovered guard trip is terminal
+        // for every caller, including a queued prompt that joined it. Re-entering
+        // would start a fresh runLoop with a fresh budget and generate once more
+        // for the same continuation - the third request the old local counter
+        // allowed after a reset. The surfaced error is the end of the turn.
+        if (result.info.role === "assistant" && RepetitionGuard.isStoredError(result.info.error)) return result
         if (!input.messageID || (result.info.role === "assistant" && result.info.parentID === input.messageID))
           return result
         // Checked before every other re-entry path: once the run this caller joined was
