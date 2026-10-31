@@ -46,6 +46,7 @@ import { Permission } from "@/permission"
 import { SessionStatus } from "./status"
 import { isRecord } from "@/util/record"
 import { LLM } from "./llm"
+import { RepetitionGuard } from "./llm/repetition-guard"
 import { Shell } from "@opencode-ai/core/shell"
 import { ShellID } from "@/tool/shell/id"
 import { FSUtil } from "@opencode-ai/core/fs-util"
@@ -102,6 +103,53 @@ const MAX_MCP_RESOURCE_BLOB_BYTES = 10 * 1024 * 1024
 // model that ignores every nudge cannot keep one prompt alive forever. The
 // counter is per runLoop invocation and is not persisted across re-prompts.
 const MAX_FINISH_NUDGES = 3
+
+// Issue #738: after the repetition guard trips a generation, the run loop
+// injects one synthetic recovery user message and lets the model try again
+// with the guard still armed. A second trip surfaces the error and stops.
+// Budget 1 is provably safe: at most two guarded generations run per turn,
+// and the guard's own abort is the deterministic backstop, so no recovery
+// loop can iterate forever.
+const REPETITION_RECOVERY_MAX = 1
+
+// Detects that `handle.message.error` is the parsed RepetitionDetectedError.
+// The guard's own message text and the retry exclusion are untouched; this is
+// read-only detection only. The parsed error keeps REPETITION_MESSAGE in
+// data.message (see MessageV2.fromError / retry.ts:180).
+function isRepetitionGuardError(error: SessionV1.Assistant["error"] | undefined): boolean {
+  const message =
+    error !== undefined && isRecord(error.data) && typeof error.data.message === "string"
+      ? error.data.message
+      : undefined
+  return typeof message === "string" && message.includes(RepetitionGuard.REPETITION_MESSAGE)
+}
+
+// Extracts the repeated-fragment detail from a repetition-guard error message,
+// e.g. "the model streamed the same 96-character fragment 3 times in a row ...".
+// Falls back to the whole message if the expected prefix is absent.
+function repetitionGuardDetail(error: SessionV1.Assistant["error"] | undefined): string {
+  const message =
+    error !== undefined && isRecord(error.data) && typeof error.data.message === "string"
+      ? error.data.message
+      : undefined
+  if (typeof message !== "string") return ""
+  const prefix = `${RepetitionGuard.REPETITION_MESSAGE}: `
+  return message.startsWith(prefix) ? message.slice(prefix.length) : message
+}
+
+// Synthetic user message injected after a guard trip. It claims only what is
+// known: the repeated text was discarded and prior persisted state stands. It
+// never says "nothing happened" - tool calls earlier in the aborted
+// generation may have executed.
+function repetitionRecoveryMessage(detail: string): string {
+  return [
+    `The previous assistant response was cut off by the repetition guard: ${detail}`,
+    "",
+    "The text produced before the cutoff is preserved in the transcript; the repeated fragment was discarded.",
+    "Do not repeat that fragment. Proceed with the task: emit the pending tool call, or continue with different, shorter output.",
+  ].join("\n")
+}
+
 const SUPPORTED_MCP_RESOURCE_ATTACHMENT_MIMES = new Set([
   "application/pdf",
   "image/gif",
@@ -1384,6 +1432,9 @@ const layer = Layer.effect(
         let structured: unknown
         let step = 0
         let finishNudges = 0
+        // Issue #738: bounded repetition-guard recoveries this turn. Reset
+        // each runLoop invocation (a new user prompt starts a fresh turn).
+        let repetitionRecoveries = 0
         const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
 
         while (true) {
@@ -1847,7 +1898,44 @@ const layer = Layer.effect(
               }
             }
 
-            if (result === "stop") return "break" as const
+            if (result === "stop") {
+              // Issue #738: bounded repetition-guard recovery. A tripped guard
+              // leaves the partial text persisted and the error on the
+              // assistant message; once per turn, inject a synthetic recovery
+              // user message and let the model try again with the guard still
+              // armed. A second trip terminates with the error surfaced.
+              if (
+                repetitionRecoveries < REPETITION_RECOVERY_MAX &&
+                isRepetitionGuardError(handle.message.error)
+              ) {
+                repetitionRecoveries++
+                const detail = repetitionGuardDetail(handle.message.error)
+                yield* Effect.logWarning("repetition guard tripped; recovering once with a synthetic continuation", {
+                  "session.id": sessionID,
+                  messageID: handle.message.id,
+                  detail,
+                })
+                const recovery: SessionV1.User = {
+                  id: MessageID.ascending(),
+                  sessionID,
+                  role: "user",
+                  agent: lastUser.agent,
+                  model: selection,
+                  time: { created: Date.now() },
+                }
+                yield* sessions.updateMessage(recovery)
+                yield* sessions.updatePart({
+                  id: PartID.ascending(),
+                  messageID: recovery.id,
+                  sessionID,
+                  type: "text",
+                  text: repetitionRecoveryMessage(detail),
+                  synthetic: true,
+                } satisfies SessionV1.TextPart)
+                return "continue" as const
+              }
+              return "break" as const
+            }
             if (result === "compact") {
               // Compaction runs as the next provider task, so it samples the
               // selection now instead of using this turn's snapshot: a change
