@@ -28,7 +28,7 @@ import { DialogProvider } from "../../../src/ui/dialog"
 import { LocationProvider } from "../../../src/context/location"
 import { OPENCODE_BASE_MODE, OpencodeKeymapProvider, registerOpencodeKeymap, useBindings } from "../../../src/keymap"
 import { ActivityGroup, AssistantMessageRow, SessionContext } from "../../../src/routes/session"
-import { computeActivityGroups, resolveActivityExpanded, toggleActivityOverride } from "../../../src/util/activity"
+import { computeActivityGroups, computeActivitySubGroups, resolveActivityExpanded, toggleActivityOverride } from "../../../src/util/activity"
 import { captureFrame, waitFor, waitUntil } from "../../fixture/frame"
 
 const SESSION = "ses_activity_ui"
@@ -1606,7 +1606,7 @@ describe("activity group TUI", () => {
     }
   })
 
-  test("splits a mixed run into per-kind blocks in first-appearance order", async () => {
+  test("splits a mixed run into per-kind blocks in chronological order", async () => {
     const { app, sync } = await mountActivity({ height: 30 })
     try {
       const m1 = assistant("m1", at(1))
@@ -1619,24 +1619,88 @@ describe("activity group TUI", () => {
       await waitFrame(app, (frame: string) => frame.includes("Working... 1 tool call"))
 
       const frame = await frameOf(app)
-      // Interleaved kinds merge: the two reads share one Explored block, and
-      // the webfetch call lands in the unchanged misc Working block.
-      expect(countOf(frame, "Exploring files...")).toBe(1)
+      // A kind change closes the block: the second read opens its own Explored
+      // block instead of joining the first one.
       expect(countOf(frame, "Running command...")).toBe(1)
+      expect(countOf(frame, "Exploring files...")).toBe(2)
       expect(countOf(frame, "Editing files...")).toBe(1)
       expect(frame).toContain("Working... 1 tool call")
-      expect(rowOf(frame, "Running command...")).toBeLessThan(rowOf(frame, "Exploring files..."))
-      expect(rowOf(frame, "Exploring files...")).toBeLessThan(rowOf(frame, "Editing files..."))
-      expect(rowOf(frame, "Editing files...")).toBeLessThan(rowOf(frame, "Working... 1 tool call"))
+      expect(rowOf(frame, "Running command...")).toBeLessThan(rowOfNth(frame, "Exploring files...", 1))
+      expect(rowOfNth(frame, "Exploring files...", 1)).toBeLessThan(rowOf(frame, "Editing files..."))
+      expect(rowOf(frame, "Editing files...")).toBeLessThan(rowOfNth(frame, "Exploring files...", 2))
+      expect(rowOfNth(frame, "Exploring files...", 2)).toBeLessThan(rowOf(frame, "Working... 1 tool call"))
+
+      // Sub-block ids are occurrence indexed, so the two explore blocks differ
+      // and earlier blocks keep their ids when the run grows.
+      const rows = (sync.data.message[SESSION] ?? []).map((message) => ({
+        message,
+        parts: sync.data.part[message.id] ?? [],
+      }))
+      const group = [...computeActivityGroups(rows).byID.values()][0]!
+      const subs = computeActivitySubGroups(group)
+      expect(subs.map((sub) => [sub.kind, sub.id])).toEqual([
+        ["bash", `${group.id}:bash:1`],
+        ["explore", `${group.id}:explore:1`],
+        ["edit", `${group.id}:edit:1`],
+        ["explore", `${group.id}:explore:2`],
+        ["misc", `${group.id}:misc:1`],
+      ])
 
       // Each block expands to exactly its own native rows.
-      await app.mockMouse.click(5, rowOf(frame, "Exploring files..."))
+      await app.mockMouse.click(5, rowOfNth(frame, "Exploring files...", 1))
       await waitFrame(app, (f: string) => f.includes(readRow("src/a.ts")))
       const expanded = await frameOf(app)
       expect(expanded).toContain(readRow("src/a.ts"))
-      expect(expanded).toContain(readRow("src/c.ts"))
+      expect(expanded).not.toContain(readRow("src/c.ts"))
       expect(expanded).not.toContain("bun test")
       expect(expanded).not.toContain("example.com")
+    } finally {
+      app.renderer.destroy()
+    }
+  })
+
+  test("opens a new Edited block after a command: Edited -> Ran -> Edited(new)", async () => {
+    const { app, sync } = await mountActivity({ height: 30 })
+    try {
+      const m1 = assistant("m1", at(1))
+      const settled = (tool: string, input: Record<string, unknown>, start: number, end: number): ToolPart =>
+        completed(toolPart(m1.id, tool, input, { status: "running", input, time: { start } }), start, end)
+      seed(sync, [
+        {
+          message: m1,
+          parts: [
+            settled("write", { filePath: "src/a.ts" }, 1000, 1100),
+            settled("bash", { command: "ls" }, 1100, 1200),
+            settled("write", { filePath: "src/b.ts" }, 1200, 1300),
+          ],
+        },
+      ])
+      await waitFrame(app, (frame: string) => frame.includes("Edited 1 file") && frame.includes("Ran 1 command"))
+
+      const frame = await frameOf(app)
+      // On-screen chronological order: Edited, Ran, Edited(new) — the second
+      // write opens a new block instead of joining the one above the command.
+      expect(countOf(frame, "Edited 1 file")).toBe(2)
+      expect(countOf(frame, "Ran 1 command")).toBe(1)
+      expect(rowOf(frame, "Edited 1 file")).toBeLessThan(rowOf(frame, "Ran 1 command"))
+      expect(rowOf(frame, "Ran 1 command")).toBeLessThan(rowOfNth(frame, "Edited 1 file", 2))
+      expect(frame).not.toContain(readRow("src/a.ts"))
+      expect(frame).not.toContain("ls")
+
+      // The two Edited blocks are distinct sub-blocks: edit:1, bash:1, edit:2.
+      const groupRows = (sync.data.message[SESSION] ?? []).map((message) => ({
+        message,
+        parts: sync.data.part[message.id] ?? [],
+      }))
+      const group = [...computeActivityGroups(groupRows).byID.values()][0]!
+      const subs = computeActivitySubGroups(group)
+      expect(subs.map((sub) => sub.kind)).toEqual(["edit", "bash", "edit"])
+      expect(subs.map((sub) => sub.id)).toEqual([
+        `${group.id}:edit:1`,
+        `${group.id}:bash:1`,
+        `${group.id}:edit:2`,
+      ])
+      expect(new Set(subs.map((sub) => sub.id)).size).toBe(3)
     } finally {
       app.renderer.destroy()
     }
