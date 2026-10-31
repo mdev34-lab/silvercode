@@ -11,15 +11,10 @@ import { SessionRetry } from "../../../src/session/retry"
 import { cliIt } from "../../lib/cli-process"
 import { raw, reply } from "../../lib/llm-server"
 
-type Body = { messages?: { role?: string; content?: unknown }[] }
-const lastUserText = (body: Body) => {
-  const content = [...(body.messages ?? [])].reverse().find((message) => message.role === "user")?.content
-  if (typeof content === "string") return content
-  if (Array.isArray(content))
-    return content
-      .map((part) => (part && typeof part === "object" && "text" in part ? String(part.text ?? "") : ""))
-      .join("\n")
-  return ""
+const isModelAttempt = (hit: { url: URL; body: Record<string, unknown> }) => {
+  const route = hit.url.pathname
+  const titleRequest = JSON.stringify(hit.body).includes("Generate a title for this conversation")
+  return !titleRequest && (route === "/v1/chat/completions" || route === "/v1/responses")
 }
 
 describe("opencode run (non-interactive subprocess)", () => {
@@ -52,19 +47,26 @@ describe("opencode run (non-interactive subprocess)", () => {
           },
         })
         expect(first.exitCode).toBe(0)
-        // Keep this provider response stable across retries of the same continued-session
-        // prompt. Match the latest user turn, not the final message: a retry may append
-        // assistant/tool messages after the prompt. Extra attempts must not fall through
-        // to the mock server's default successful "ok" stream.
+        expect(first.stdout).toContain("initial session response")
+        const initialHits = yield* llm.hits
+        expect(initialHits.filter(isModelAttempt)).toHaveLength(1)
+        expect(yield* llm.misses).toEqual([])
+        expect(yield* llm.pending).toBe(0)
+
+        const continuationStart = initialHits.length
+        let quotaResponses = 0
+        // Arm the quota script only after the first session has completed. The title
+        // request is handled separately by TestLLMServer; every non-title model request
+        // after this point belongs to the continued-session phase, including retries.
+        // Match that phase/attempt route rather than user-message position: continuation
+        // retries may transform or append messages, but must not fall through to "ok".
         yield* llm.pushMatchRepeat(
-          (hit) => {
-            const body = hit.body as Body
-            return lastUserText(body).includes("quota rejection")
-          },
+          isModelAttempt,
           raw({
             chunks: [
               { error: { message: "Free usage limit reached", type: "quota_exceeded", code: "FreeUsageLimitError" } },
             ],
+            onSend: () => quotaResponses++,
           }),
           SessionRetry.RETRY_MAX_RETRIES + 1,
         )
@@ -92,17 +94,17 @@ describe("opencode run (non-interactive subprocess)", () => {
             }),
           },
         })
+        const continuationAttempts = (yield* llm.hits).slice(continuationStart).filter(isModelAttempt)
+        expect(continuationAttempts.length).toBeGreaterThanOrEqual(1)
+        expect(continuationAttempts.length).toBeLessThanOrEqual(SessionRetry.RETRY_MAX_RETRIES + 1)
+        // Verify the script actually answered every model attempt in this phase; this
+        // fails before the exit-code check if a request fell through to the success default.
+        expect(quotaResponses).toBe(continuationAttempts.length)
+        expect(yield* llm.misses).toEqual([])
+        expect(yield* llm.pending).toBe(0)
         expect(result.exitCode).not.toBe(0)
         expect(result.stderr).toContain("Free usage limit reached")
         expect(result.durationMs).toBeLessThan(20_000)
-        const quotaRequests = (yield* llm.hits).filter((hit) => {
-          const body = hit.body as Body
-          return lastUserText(body).includes("quota rejection")
-        })
-        expect(quotaRequests.length).toBeGreaterThanOrEqual(1)
-        expect(quotaRequests.length).toBeLessThanOrEqual(SessionRetry.RETRY_MAX_RETRIES + 1)
-        expect(yield* llm.misses).toEqual([])
-        expect(yield* llm.pending).toBe(0)
       }),
     30_000,
   )

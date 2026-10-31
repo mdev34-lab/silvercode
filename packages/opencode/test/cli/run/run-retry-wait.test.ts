@@ -48,6 +48,25 @@ const config = (url: string) => ({
   }),
 })
 
+const withCliOutputOnFailure = <A>(
+  label: string,
+  result: { exitCode: number; stdout: string; stderr: string; durationMs: number },
+  assert: () => A,
+): A => {
+  try {
+    return assert()
+  } catch (error) {
+    const tail = (value: string) => (value.length > 3000 ? `…${value.slice(-3000)}` : value)
+    // eslint-disable-next-line no-console
+    console.error(
+      `[${label}] child exit=${result.exitCode} duration=${result.durationMs}ms\n` +
+        `[${label}] child stdout tail:\n${tail(result.stdout) || "<empty>"}\n` +
+        `[${label}] child stderr tail:\n${tail(result.stderr) || "<empty>"}`,
+    )
+    throw error
+  }
+}
+
 describe("headless run provider retry delay (#555)", () => {
   const setup = (llm: { url: string }) => config(llm.url)
 
@@ -153,19 +172,26 @@ describe("headless run provider retry delay (#555)", () => {
         timeoutMs: 50_000, extraArgs: ["--continue", "--dangerously-skip-permissions"], model: "opencode/local-quota-test", env, clockScale: 10,
       })
       // Retry policy unchanged: the child waits, retries and the run finishes.
-      expect(result.exitCode).toBe(0)
-      expect(result.stdout).toContain("ROOT_FINAL")
-      expect(result.stderr).toMatch(/subagent waiting about \d+s before retrying \(attempt 1\): free usage limit reached/)
-      expect(result.stderr).not.toContain("CHILD_RAW_SECRET")
-      expect(result.stderr).not.toContain("quota_exceeded")
-      // Count the initial 429 plus retries, bounded by the unchanged production cap.
-      // The repeated terminal response prevents extra attempts from falling through
-      // to TestLLMServer's default "ok" stream under runner load.
-      const childWaitHits = (yield* llm.hits).filter((hit) => opened(hit.body as Body, "CHILD_WAIT_INPUT"))
-      expect(childWaitHits.length).toBeGreaterThanOrEqual(2)
-      expect(childWaitHits.length).toBeLessThanOrEqual(SessionRetry.RETRY_MAX_RETRIES + 1)
-      expect(yield* llm.misses).toEqual([])
-      expect(yield* llm.pending).toBe(0)
+      // Capture mock state before asserting so every failure below includes the
+      // child process's stdout/stderr tails in the CI test output.
+      const hits = yield* llm.hits
+      const misses = yield* llm.misses
+      const pending = yield* llm.pending
+      const childWaitHits = hits.filter((hit) => opened(hit.body as Body, "CHILD_WAIT_INPUT"))
+      withCliOutputOnFailure("background child retry wait", result, () => {
+        expect(result.exitCode).toBe(0)
+        expect(result.stdout).toContain("ROOT_FINAL")
+        expect(result.stderr).toMatch(/subagent waiting about \d+s before retrying \(attempt 1\): free usage limit reached/)
+        expect(result.stderr).not.toContain("CHILD_RAW_SECRET")
+        expect(result.stderr).not.toContain("quota_exceeded")
+        // Count the initial 429 plus retries, bounded by the unchanged production cap.
+        // The repeated terminal response prevents extra attempts from falling through
+        // to TestLLMServer's default "ok" stream under runner load.
+        expect(childWaitHits.length).toBeGreaterThanOrEqual(2)
+        expect(childWaitHits.length).toBeLessThanOrEqual(SessionRetry.RETRY_MAX_RETRIES + 1)
+        expect(misses).toEqual([])
+        expect(pending).toBe(0)
+      })
     }), 90_000)
 
   cliIt.live("fails fast instead of hanging when Zen quota reset exceeds the headless retry window", ({ llm, opencode }) =>
