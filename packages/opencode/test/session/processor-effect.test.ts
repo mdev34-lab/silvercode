@@ -17,6 +17,7 @@ import { Provider } from "@/provider/provider"
 import { Session } from "@/session/session"
 import { LLM } from "../../src/session/llm"
 import { MessageV2 } from "../../src/session/message-v2"
+import { Permission } from "../../src/permission"
 import { SessionProcessor } from "../../src/session/processor"
 import { MessageID, PartID, SessionID } from "../../src/session/schema"
 import { SessionStatus } from "../../src/session/status"
@@ -1754,4 +1755,511 @@ itNonHeadlessOverride.live(
       { config: (url) => providerCfg(url) },
     ),
   { timeout: 15000 },
+)
+
+// ---------------------------------------------------------------------------
+// Doom-loop guard (#725)
+// ---------------------------------------------------------------------------
+
+// The permission stub records every ask instead of waiting on the real prompt, so a
+// test can assert exactly when the guard fires. The LLM stub replays one scripted
+// model response per `process` call.
+const doomEnv = (asks: PermissionV1.AskInput[], script: LLMEvent[][]) =>
+  LayerNode.compile(root, [
+    ...replacements,
+    [
+      Permission.node,
+      Layer.succeed(
+        Permission.Service,
+        Permission.Service.of({
+          ask: (input) => Effect.sync(() => void asks.push(input)),
+          reply: () => Effect.void,
+          list: () => Effect.succeed([]),
+          denies: () => Effect.succeed(false),
+        }),
+      ),
+    ],
+    [
+      LLM.node,
+      Layer.succeed(
+        LLM.Service,
+        LLM.Service.of({
+          stream: () => Stream.fromIterable(script.shift() ?? []),
+        }),
+      ),
+    ],
+  ])
+
+const doomCall = (id: string, name: string, input: Record<string, unknown>, outcome: "error" | "completed") => [
+  LLMEvent.toolInputStart({ id, name }),
+  LLMEvent.toolInputEnd({ id, name }),
+  LLMEvent.toolCall({ id, name, input }),
+  outcome === "completed"
+    ? LLMEvent.toolResult({
+        id,
+        name,
+        result: { type: "json", value: { output: "ok", title: name, metadata: {} } },
+      })
+    : LLMEvent.toolError({ id, name, message: "boom" }),
+]
+
+// The synthetic nudge the loop injects when the model stops without finishing (or a
+// review stalls): a user message whose only part is synthetic text.
+const syntheticNudge = Effect.fn("TestSession.syntheticNudge")(function* (sessionID: SessionID, text: string) {
+  const session = yield* Session.Service
+  const msg = yield* session.updateMessage({
+    id: MessageID.ascending(),
+    role: "user",
+    sessionID,
+    agent: "work",
+    model: ref,
+    time: { created: Date.now() },
+  })
+  yield* session.updatePart({
+    id: PartID.ascending(),
+    messageID: msg.id,
+    sessionID,
+    type: "text",
+    text,
+    synthetic: true,
+  })
+  return msg
+})
+
+// One user turn. Each `send` runs one scripted model response as its own assistant
+// message, which is the generation step the guard reads back for repeats.
+const doomTurn = (dir: string) =>
+  Effect.gen(function* () {
+    const { processors, session, provider } = yield* boot()
+    const chat = yield* session.create({})
+    const parent = yield* user(chat.id, "look it up")
+    const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+    const send = Effect.fnUntraced(function* () {
+      const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+      const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
+      yield* handle.process({
+        user: parent as SessionV1.User,
+        sessionID: chat.id,
+        model: mdl,
+        agent: agent(),
+        system: [],
+        messages: [{ role: "user", content: "look it up" }],
+        tools: {},
+      })
+      return msg
+    })
+    return { send, sessionID: chat.id, parent: parent.id }
+  })
+
+const lookup = { query: "same" }
+
+const batchAsks: PermissionV1.AskInput[] = []
+const itDoomBatch = testEffect(
+  doomEnv(batchAsks, [
+    [
+      LLMEvent.stepStart({ index: 0 }),
+      ...doomCall("batch-1", "lookup", lookup, "error"),
+      ...doomCall("batch-2", "lookup", lookup, "error"),
+      ...doomCall("batch-3", "lookup", lookup, "error"),
+      LLMEvent.stepFinish({ index: 0, reason: "tool-calls" }),
+      LLMEvent.finish({ reason: "tool-calls" }),
+    ],
+  ]),
+)
+
+itDoomBatch.live(
+  "session.processor doom loop ignores identical calls fanned out in one batch",
+  () =>
+    provideTmpdirInstance(
+      (dir) =>
+        Effect.gen(function* () {
+          const { send } = yield* doomTurn(dir)
+          const msg = yield* send()
+
+          const calls = (yield* MessageV2.parts(msg.id)).filter((part) => part.type === "tool")
+          expect(calls).toHaveLength(3)
+          expect(calls.every((part) => part.type === "tool" && part.state.status === "error")).toBe(true)
+          expect(batchAsks).toHaveLength(0)
+        }),
+      { config: cfg },
+    ),
+  { timeout: 15000 },
+)
+
+// A loop can also repeat the same failing *batch*: N identical calls per step, the
+// same batch in every step after it. Counting evidence in call slots lets the second
+// call of a step displace the step before it, so a loop in this shape never trips the
+// guard; one representative per generation step keeps every repetition countable, and
+// the step is judged once so a batch does not ask N times.
+const batchLoopAsks: PermissionV1.AskInput[] = []
+const wideBatchAsks: PermissionV1.AskInput[] = []
+const doomBatchLoop =
+  (size: number, asks: PermissionV1.AskInput[]) =>
+  (dir: string) =>
+    Effect.gen(function* () {
+      const { send } = yield* doomTurn(dir)
+
+      const first = yield* send()
+      const second = yield* send()
+      for (const msg of [first, second]) {
+        const calls = (yield* MessageV2.parts(msg.id)).filter((part) => part.type === "tool")
+        expect(calls).toHaveLength(size)
+        expect(calls.every((part) => part.type === "tool" && part.state.status === "error")).toBe(true)
+      }
+      expect(asks).toHaveLength(0)
+
+      // The third identical batch is the loop: two earlier steps of evidence, each
+      // carrying the same failing call, in a generation step of its own.
+      yield* send()
+      expect(asks).toHaveLength(1)
+      expect(asks[0]).toMatchObject({
+        permission: "doom_loop",
+        patterns: ["lookup"],
+        metadata: { tool: "lookup", input: lookup },
+      })
+    })
+
+// One model response per step, each fanned out as an identical failing batch.
+const batchLoopScript = (size: number) =>
+  Array.from({ length: 3 }, (_, step) => [
+    LLMEvent.stepStart({ index: 0 }),
+    ...Array.from({ length: size }, (_, call) => doomCall(`loop-${size}-${step}-${call}`, "lookup", lookup, "error")).flat(),
+    LLMEvent.stepFinish({ index: 0, reason: "tool-calls" }),
+    LLMEvent.finish({ reason: "tool-calls" }),
+  ])
+
+const itDoomBatchLoop = testEffect(doomEnv(batchLoopAsks, batchLoopScript(2)))
+
+itDoomBatchLoop.live(
+  "session.processor doom loop trips on an identical failing batch of 2 repeated across steps",
+  () => provideTmpdirInstance(doomBatchLoop(2, batchLoopAsks), { config: cfg }),
+  { timeout: 20000 },
+)
+
+const itDoomWideBatch = testEffect(doomEnv(wideBatchAsks, batchLoopScript(3)))
+
+itDoomWideBatch.live(
+  "session.processor doom loop trips on an identical failing batch of 3 repeated across steps",
+  () => provideTmpdirInstance(doomBatchLoop(3, wideBatchAsks), { config: cfg }),
+  { timeout: 20000 },
+)
+
+const successAsks: PermissionV1.AskInput[] = []
+const itDoomSuccess = testEffect(
+  doomEnv(
+    successAsks,
+    Array.from({ length: 3 }, (_, index) => [
+      LLMEvent.stepStart({ index: 0 }),
+      ...doomCall(`ok-${index}`, "lookup", lookup, "completed"),
+      LLMEvent.stepFinish({ index: 0, reason: "tool-calls" }),
+      LLMEvent.finish({ reason: "tool-calls" }),
+    ]),
+  ),
+)
+
+itDoomSuccess.live(
+  "session.processor doom loop ignores identical calls that all succeed across steps",
+  () =>
+    provideTmpdirInstance(
+      (dir) =>
+        Effect.gen(function* () {
+          const { send } = yield* doomTurn(dir)
+
+          const first = yield* send()
+          yield* send()
+          yield* send()
+
+          const calls = (yield* MessageV2.parts(first.id)).filter((part) => part.type === "tool")
+          expect(calls.every((part) => part.type === "tool" && part.state.status === "completed")).toBe(true)
+          expect(successAsks).toHaveLength(0)
+        }),
+      { config: cfg },
+    ),
+  { timeout: 20000 },
+)
+
+// FINISH_NUDGE/REVIEW_STAGNATION_NUDGE arrive as synthetic user messages. They are the
+// loop talking to itself, and the stagnation path is exactly where a stuck loop lives,
+// so they must not end the evidence walk the way a real user message does.
+const nudgeAsks: PermissionV1.AskInput[] = []
+const itDoomNudge = testEffect(
+  doomEnv(
+    nudgeAsks,
+    Array.from({ length: 3 }, (_, index) => [
+      LLMEvent.stepStart({ index: 0 }),
+      ...doomCall(`nudge-${index}`, "lookup", lookup, "error"),
+      LLMEvent.stepFinish({ index: 0, reason: "tool-calls" }),
+      LLMEvent.finish({ reason: "tool-calls" }),
+    ]),
+  ),
+)
+
+itDoomNudge.live(
+  "session.processor doom loop keeps its streak across synthetic user nudges",
+  () =>
+    provideTmpdirInstance(
+      (dir) =>
+        Effect.gen(function* () {
+          const { send, sessionID } = yield* doomTurn(dir)
+
+          yield* send() // lookup fails
+          yield* send() // lookup fails again, in its own step
+          expect(nudgeAsks).toHaveLength(0)
+
+          // The loop nudges the model to finish: a synthetic user message, not progress.
+          yield* syntheticNudge(sessionID, "Finish the task with the finish tool.")
+          yield* send()
+          expect(nudgeAsks).toHaveLength(1)
+          expect(nudgeAsks[0]).toMatchObject({ permission: "doom_loop", patterns: ["lookup"] })
+        }),
+      { config: cfg },
+    ),
+  { timeout: 20000 },
+)
+
+// A model response with no tool call at all: an assistant message of its own, with no
+// execution to count as evidence either way.
+const idleAssistant = Effect.fn("TestSession.idleAssistant")(function* (
+  sessionID: SessionID,
+  parentID: MessageID,
+  root: string,
+  text: string,
+) {
+  const session = yield* Session.Service
+  const msg = yield* assistant(sessionID, parentID, root)
+  yield* session.updatePart({
+    id: PartID.ascending(),
+    messageID: msg.id,
+    sessionID,
+    type: "text",
+    text,
+  })
+  return msg
+})
+
+// A fixed message window lets tool-less assistant messages push the failing steps out
+// of view; the walk has to keep looking until it has the steps or reaches the user.
+const historyAsks: PermissionV1.AskInput[] = []
+const itDoomHistory = testEffect(
+  doomEnv(
+    historyAsks,
+    Array.from({ length: 3 }, (_, index) => [
+      LLMEvent.stepStart({ index: 0 }),
+      ...doomCall(`history-${index}`, "lookup", lookup, "error"),
+      LLMEvent.stepFinish({ index: 0, reason: "tool-calls" }),
+      LLMEvent.finish({ reason: "tool-calls" }),
+    ]),
+  ),
+)
+
+itDoomHistory.live(
+  "session.processor doom loop finds its evidence past tool-less assistant messages",
+  () =>
+    provideTmpdirInstance(
+      (dir) =>
+        Effect.gen(function* () {
+          const { send, sessionID, parent } = yield* doomTurn(dir)
+
+          yield* send() // lookup fails
+          yield* send() // lookup fails again, in its own step
+          expect(historyAsks).toHaveLength(0)
+
+          // More tool-less responses than the old fixed window carried.
+          for (let index = 0; index < 6; index++) {
+            yield* idleAssistant(sessionID, parent, dir, `thinking out loud ${index}`)
+          }
+
+          yield* send()
+          expect(historyAsks).toHaveLength(1)
+          expect(historyAsks[0]).toMatchObject({ permission: "doom_loop", patterns: ["lookup"] })
+        }),
+      { config: cfg },
+    ),
+  { timeout: 25000 },
+)
+
+const repeatAsks: PermissionV1.AskInput[] = []
+const itDoomRepeat = testEffect(
+  doomEnv(
+    repeatAsks,
+    Array.from({ length: 3 }, (_, index) => [
+      LLMEvent.stepStart({ index: 0 }),
+      ...doomCall(`repeat-${index}`, "lookup", lookup, "error"),
+      LLMEvent.stepFinish({ index: 0, reason: "tool-calls" }),
+      LLMEvent.finish({ reason: "tool-calls" }),
+    ]),
+  ),
+)
+
+itDoomRepeat.live(
+  "session.processor doom loop asks once the same failing call repeats across steps",
+  () =>
+    provideTmpdirInstance(
+      (dir) =>
+        Effect.gen(function* () {
+          const { send } = yield* doomTurn(dir)
+
+          yield* send()
+          yield* send()
+          expect(repeatAsks).toHaveLength(0)
+
+          yield* send()
+          expect(repeatAsks).toHaveLength(1)
+          expect(repeatAsks[0]).toMatchObject({
+            permission: "doom_loop",
+            patterns: ["lookup"],
+            metadata: { tool: "lookup", input: lookup },
+          })
+        }),
+      { config: cfg },
+    ),
+  { timeout: 15000 },
+)
+
+// The placeholder `experimental_repairToolCall` substitutes when a deferred tool was
+// called before its catalog entry was loaded: it never ran, it tells the model to
+// retry the real tool, and its input is identical every time it appears.
+const deferredRepair = { tool: "websearch", error: "websearch exists and has been loaded — call it again" }
+const otherDeferredRepair = { tool: "codesearch", error: "codesearch exists and has been loaded — call it again" }
+
+const repairAsks: PermissionV1.AskInput[] = []
+const itDoomRepair = testEffect(
+  doomEnv(repairAsks, [
+    [
+      // The reported shape: identical repair placeholders back to back in one response.
+      LLMEvent.stepStart({ index: 0 }),
+      ...doomCall("repair-1", "invalid", deferredRepair, "error"),
+      ...doomCall("repair-2", "invalid", deferredRepair, "error"),
+      ...doomCall("repair-3", "invalid", deferredRepair, "error"),
+      LLMEvent.stepFinish({ index: 0, reason: "tool-calls" }),
+      // ... and the same placeholder repeated across responses, which only the
+      // placeholder exclusion keeps out of the failure streak.
+      LLMEvent.stepStart({ index: 1 }),
+      ...doomCall("repair-4", "invalid", otherDeferredRepair, "error"),
+      LLMEvent.stepFinish({ index: 1, reason: "tool-calls" }),
+      LLMEvent.stepStart({ index: 2 }),
+      ...doomCall("repair-5", "invalid", otherDeferredRepair, "error"),
+      LLMEvent.stepFinish({ index: 2, reason: "tool-calls" }),
+      LLMEvent.stepStart({ index: 3 }),
+      ...doomCall("repair-6", "invalid", otherDeferredRepair, "error"),
+      LLMEvent.stepFinish({ index: 3, reason: "tool-calls" }),
+      // The instructed retry: now that the tool is loaded it runs, and it fails.
+      LLMEvent.stepStart({ index: 4 }),
+      ...doomCall("retry", "websearch", lookup, "error"),
+      LLMEvent.stepFinish({ index: 4, reason: "tool-calls" }),
+      LLMEvent.finish({ reason: "tool-calls" }),
+    ],
+  ]),
+)
+
+itDoomRepair.live(
+  "session.processor doom loop ignores deferred-tool repair placeholders and their instructed retry",
+  () =>
+    provideTmpdirInstance(
+      (dir) =>
+        Effect.gen(function* () {
+          const { send } = yield* doomTurn(dir)
+          const msg = yield* send()
+
+          const calls = (yield* MessageV2.parts(msg.id)).filter((part) => part.type === "tool")
+          expect(calls.filter((part) => part.type === "tool" && part.tool === "invalid")).toHaveLength(6)
+          expect(calls.filter((part) => part.type === "tool" && part.tool === "websearch")).toHaveLength(1)
+          expect(repairAsks).toHaveLength(0)
+        }),
+      { config: cfg },
+    ),
+  { timeout: 15000 },
+)
+
+// A repair placeholder between two real failures is not an attempt at the tool, so it
+// must neither count as a failure nor break the streak of a genuine loop.
+const placeholderAsks: PermissionV1.AskInput[] = []
+const itDoomPlaceholder = testEffect(
+  doomEnv(placeholderAsks, [
+    [
+      LLMEvent.stepStart({ index: 0 }),
+      ...doomCall("real-1", "lookup", lookup, "error"),
+      LLMEvent.stepFinish({ index: 0, reason: "tool-calls" }),
+      LLMEvent.finish({ reason: "tool-calls" }),
+    ],
+    [
+      LLMEvent.stepStart({ index: 0 }),
+      ...doomCall("repair", "invalid", deferredRepair, "error"),
+      LLMEvent.stepFinish({ index: 0, reason: "tool-calls" }),
+      LLMEvent.finish({ reason: "tool-calls" }),
+    ],
+    [
+      LLMEvent.stepStart({ index: 0 }),
+      ...doomCall("real-2", "lookup", lookup, "error"),
+      LLMEvent.stepFinish({ index: 0, reason: "tool-calls" }),
+      LLMEvent.finish({ reason: "tool-calls" }),
+    ],
+    [
+      LLMEvent.stepStart({ index: 0 }),
+      ...doomCall("real-3", "lookup", lookup, "error"),
+      LLMEvent.stepFinish({ index: 0, reason: "tool-calls" }),
+      LLMEvent.finish({ reason: "tool-calls" }),
+    ],
+  ]),
+)
+
+itDoomPlaceholder.live(
+  "session.processor doom loop skips repair placeholders in a real failure streak",
+  () =>
+    provideTmpdirInstance(
+      (dir) =>
+        Effect.gen(function* () {
+          const { send } = yield* doomTurn(dir)
+
+          yield* send() // lookup fails
+          yield* send() // deferred-tool repair placeholder, not an attempt at lookup
+          yield* send() // lookup fails again
+          expect(placeholderAsks).toHaveLength(0)
+
+          // The two real failures before this call are in separate steps; the
+          // placeholder between them is not evidence either way.
+          yield* send()
+          expect(placeholderAsks).toHaveLength(1)
+          expect(placeholderAsks[0]).toMatchObject({ permission: "doom_loop", patterns: ["lookup"] })
+        }),
+      { config: cfg },
+    ),
+  { timeout: 20000 },
+)
+
+const mixedAsks: PermissionV1.AskInput[] = []
+const itDoomMixed = testEffect(
+  doomEnv(
+    mixedAsks,
+    (["error", "completed", "error", "error", "error"] as const).map((outcome, index) => [
+      LLMEvent.stepStart({ index: 0 }),
+      ...doomCall(`mixed-${index}`, "lookup", lookup, outcome),
+      LLMEvent.stepFinish({ index: 0, reason: "tool-calls" }),
+      LLMEvent.finish({ reason: "tool-calls" }),
+    ]),
+  ),
+)
+
+itDoomMixed.live(
+  "session.processor doom loop counts only failures, so a success in between breaks the streak",
+  () =>
+    provideTmpdirInstance(
+      (dir) =>
+        Effect.gen(function* () {
+          const { send } = yield* doomTurn(dir)
+
+          yield* send() // error
+          yield* send() // completed: progress, not a failure to count
+          yield* send() // error
+          yield* send() // error
+          expect(mixedAsks).toHaveLength(0)
+
+          // The evidence is now the two failures right before this call, in separate steps.
+          yield* send()
+          expect(mixedAsks).toHaveLength(1)
+          expect(mixedAsks[0]).toMatchObject({ permission: "doom_loop", patterns: ["lookup"] })
+        }),
+      { config: cfg },
+    ),
+  { timeout: 20000 },
 )
