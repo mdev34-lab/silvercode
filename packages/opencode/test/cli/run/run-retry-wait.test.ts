@@ -33,15 +33,6 @@ const lastText = (body: Body) => {
   if (Array.isArray(content)) return content.map((part) => part?.text ?? "").join("\n")
   return ""
 }
-const lastUserText = (body: Body) => {
-  const content = [...(body.messages ?? [])].reverse().find((message) => message.role === "user")?.content
-  if (typeof content === "string") return content
-  if (Array.isArray(content))
-    return content
-      .map((part) => (part && typeof part === "object" && "text" in part ? String(part.text ?? "") : ""))
-      .join("\n")
-  return ""
-}
 const envelope = (text: string) => `<silvercode-result>${text}</silvercode-result>`
 const quota = { error: { message: "Free usage limit reached", type: "quota_exceeded", code: "FreeUsageLimitError" } }
 const config = (url: string) => ({
@@ -160,19 +151,34 @@ describe("headless run provider retry delay (#555)", () => {
       yield* llm.push(reply().text("init").tool("finish", { reason: "success", result: "ok" }).stop())
       const first = yield* opencode.run("Research the initial session report", { model: "opencode/local-quota-test", env, timeoutMs: 20_000 })
       expect(first.exitCode).toBe(0)
-      // Retries may append assistant/tool messages after the stable first user turn.
-      const opened = (body: Body, text: string) => lastUserText(body).includes(text)
-      const followed = (body: Body, text: string) => body.messages?.at(-1)?.role === "tool" && JSON.stringify(body).includes(text)
+      // The root's test-controlled turn stays in the transcript when finish nudges
+      // append new user messages. Match that stable content rather than the latest
+      // message role/text (or the session's possibly earlier user turn under --continue).
+      const rootPrompt = "Research the child wait report"
+      const rootConversation = (hit: RequestHit) => {
+        const body = hit.body as Body
+        if (hit.url.pathname !== "/v1/chat/completions" || body.model !== "local-quota-test") return false
+        return (body.messages ?? []).some(
+          (message) => message.role === "user" && contentText(message.content).includes(rootPrompt),
+        )
+      }
+      const rootAfterProbe = (hit: RequestHit) =>
+        rootConversation(hit) && JSON.stringify(hit.body).includes("child wait probe")
+      const rootAfterChild = (hit: RequestHit) =>
+        rootConversation(hit) && JSON.stringify(hit.body).includes("child done")
       const childRequest = (hit: RequestHit) => {
         const body = hit.body as Body
         if (hit.url.pathname !== "/v1/chat/completions" || body.model !== "local-quota-test") return false
         const firstUser = body.messages?.find((message) => message.role === "user")
         return firstUser !== undefined && contentText(firstUser.content).startsWith(childTaskPrompt)
       }
-      yield* llm.pushMatch((hit) => opened(hit.body as Body, "Research the child wait report"), reply().tool("task", {
+      yield* llm.pushMatch(rootConversation, reply().tool("task", {
         description: "child wait probe", prompt: childTaskPrompt, subagent_type: "general", background: true,
       }))
-      yield* llm.pushMatch((hit) => followed(hit.body as Body, "child wait probe"), reply().tool("finish", {
+      // The parent follow-up can end with an assistant/tool/user message depending
+      // on task scheduling and finish nudges. Keep it scoped to this root turn and
+      // the probe already present in its history, rather than requiring lastRole=tool.
+      yield* llm.pushMatch(rootAfterProbe, reply().tool("finish", {
         reason: "waiting_for_subagent", result: "Root awaits child",
       }))
       // Identify the child by the test-controlled task prompt, not by whichever
@@ -188,9 +194,11 @@ describe("headless run provider retry delay (#555)", () => {
         reply().tool("finish", { reason: "success", result: envelope("child done") }).stop(),
         SessionRetry.RETRY_MAX_RETRIES,
       )
-      yield* llm.pushMatch((hit) => lastText(hit.body as Body).includes("child done"),
+      // Child results can be present earlier in the transcript even after a
+      // synthetic parent nudge becomes the final user message.
+      yield* llm.pushMatch(rootAfterChild,
         reply().text("ROOT_FINAL").tool("finish", { reason: "success", result: "done" }).stop())
-      const result = yield* opencode.run("Research the child wait report", {
+      const result = yield* opencode.run(rootPrompt, {
         timeoutMs: 50_000, extraArgs: ["--continue", "--dangerously-skip-permissions"], model: "opencode/local-quota-test", env, clockScale: 10,
       })
       // Retry policy unchanged: the child waits, retries and the run finishes.
