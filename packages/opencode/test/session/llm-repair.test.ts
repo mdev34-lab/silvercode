@@ -134,6 +134,16 @@ describe("salvageStringArgument", () => {
     expect(salvageStringArgument(raw, "filePath")).toBeUndefined()
   })
 
+  test("returns undefined when the duplicate key is cut off before its colon", () => {
+    // The second key name arrived but its colon and value never did. A complete payload
+    // could still resolve the duplicate to a different value, so the first occurrence is
+    // not reported even though the fragment ends right after the repeated name.
+    expect(salvageStringArgument('{"filePath":"/tmp/first.md","filePath"', "filePath")).toBeUndefined()
+    expect(salvageStringArgument('{"filePath":"/tmp/first.md","filePath"}', "filePath")).toBeUndefined()
+    expect(salvageStringArgument('{"filePath":"/tmp/first.md","filePath":', "filePath")).toBeUndefined()
+    expect(salvageStringArgument('{"filePath":"/tmp/first.md","filePath"  ', "filePath")).toBeUndefined()
+  })
+
   test("returns undefined when the wanted key repeats even after an unrelated member", () => {
     const raw = '{"filePath":"/a.md","content":"one","filePath":"/b.md"'
     expect(salvageStringArgument(raw, "filePath")).toBeUndefined()
@@ -154,6 +164,23 @@ describe("salvageStringArgument", () => {
     expect(salvageStringArgument('{filePath:"/a.md","content":"x', "filePath")).toBeUndefined()
     // bare value where a key must be
     expect(salvageStringArgument('{"content":"x",123,"filePath":"/a.md"', "filePath")).toBeUndefined()
+  })
+
+  test("returns undefined for a malformed nested value with mismatched brackets", () => {
+    // `{]` and `[}` are not prefixes of well-formed JSON, so a fragment carrying them is
+    // refused even when the wanted key already completed earlier in the same object: the
+    // malformed member means the rest of the fragment cannot be trusted.
+    expect(salvageStringArgument('{"bad":{]', "filePath")).toBeUndefined()
+    expect(salvageStringArgument('{"filePath":"/tmp/a.md","bad":{]', "filePath")).toBeUndefined()
+    expect(salvageStringArgument('{"filePath":"/tmp/a.md","bad":[}', "filePath")).toBeUndefined()
+    expect(salvageStringArgument('{"filePath":"/tmp/a.md","bad":{"x":1]', "filePath")).toBeUndefined()
+  })
+
+  test("still recovers the wanted key when a later member is only truncated", () => {
+    // A nested value that simply never finished is a valid prefix; only a malformed one is
+    // refused, so a truncated later member must not discard an already-completed path.
+    expect(salvageStringArgument('{"filePath":"/tmp/a.md","bad":{"x":1', "filePath")).toBe("/tmp/a.md")
+    expect(salvageStringArgument('{"filePath":"/tmp/a.md","bad":[', "filePath")).toBe("/tmp/a.md")
   })
 
   test("ignores a nested filePath member and keeps only the top-level one", () => {
@@ -206,6 +233,15 @@ describe("truncatedWriteRecovery", () => {
     expect(
       truncatedWriteRecovery("write", '{"filePath":"/tmp/first.md","filePath":"/tmp/last.md","content":"unfinished'),
     ).toBeUndefined()
+  })
+
+  test("does not engage on a duplicate-key payload cut off before the second colon", () => {
+    expect(truncatedWriteRecovery("write", '{"filePath":"/tmp/first.md","filePath"')).toBeUndefined()
+  })
+
+  test("does not engage on a malformed nested payload", () => {
+    expect(truncatedWriteRecovery("write", '{"filePath":"/tmp/a.md","bad":{]')).toBeUndefined()
+    expect(truncatedWriteRecovery("write", '{"bad":{]')).toBeUndefined()
   })
 
   test("does not engage for non-string raw arguments", () => {

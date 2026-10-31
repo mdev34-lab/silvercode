@@ -90,8 +90,11 @@ function skipValue(raw: string, from: number): ValueSkip {
     return { ok: true, next: literal.next, truncated: false }
   }
   if (char === "{" || char === "[") {
-    let depth = 0
-    let index = from
+    // Track the opening brackets so a closing one only balances a value when it
+    // matches: `{]` and `[}` are not prefixes of well-formed JSON, and treating
+    // them as balanced would let a malformed fragment look like a completed one.
+    const open: string[] = [char]
+    let index = from + 1
     while (index < raw.length) {
       const current = raw[index]
       if (current === '"') {
@@ -104,10 +107,11 @@ function skipValue(raw: string, from: number): ValueSkip {
         index = literal.next
         continue
       }
-      if (current === "{" || current === "[") depth += 1
+      if (current === "{" || current === "[") open.push(current)
       else if (current === "}" || current === "]") {
-        depth -= 1
-        if (depth === 0) return { ok: true, next: index + 1, truncated: false }
+        if (open[open.length - 1] !== (current === "}" ? "{" : "[")) return { ok: false, reason: "invalid" }
+        open.pop()
+        if (open.length === 0) return { ok: true, next: index + 1, truncated: false }
       }
       index += 1
     }
@@ -159,6 +163,17 @@ export function salvageStringArgument(raw: string, key: string): string | undefi
     const name = readStringLiteral(raw, index)
     if (!name.ok) return undefined
     index = name.next
+
+    const target = name.value === key
+    // A repeated target key makes the target ambiguous even when the fragment ends
+    // before the second member's colon: a complete payload could still resolve the
+    // duplicate to a different value, so refuse rather than report the first. The check
+    // therefore happens as soon as the name is read, not after the colon.
+    if (target) {
+      if (seen) return undefined
+      seen = true
+    }
+
     skipWhitespace()
     // Truncated between a key and its colon: the member's value is simply unknown, and
     // nothing after it can exist, so the members read so far stay trustworthy.
@@ -167,11 +182,6 @@ export function salvageStringArgument(raw: string, key: string): string | undefi
     index += 1
     skipWhitespace()
 
-    const target = name.value === key
-    if (target) {
-      if (seen) return undefined
-      seen = true
-    }
     // The fragment ended between a member's key and its value: unknown, but a member we
     // never needed, so the members already read stay valid.
     if (index >= raw.length) {
