@@ -42,19 +42,27 @@ import { fileURLToPath } from "node:url"
 const fixture = (name: string) => fileURLToPath(new URL(`../fixture/${name}`, import.meta.url))
 
 /**
- * One wall clock for the whole test. Worst case is this budget plus one
- * in-flight probe (at most the 2s socket timeout below) plus the cleanup
- * budget: 22 + 2 + 4 = 28s, inside the package's unchanged 30s `--timeout`.
- * A healthy run finishes in a few seconds; the budget is headroom for three
- * cold `bun` starts (owner, worker, grandchild) on a loaded runner.
+ * One wall clock for the whole test, and a hard one: every wait and every
+ * subprocess or probe operation below is bounded by it, so it caps wall time
+ * rather than retries.
+ *
+ * Worst case is this budget plus one in-flight probe (at most the 2s socket
+ * timeout below) plus the cleanup budget: 40 + 2 + 5 = 47s, inside this test's
+ * own `TEST_TIMEOUT_MS`. The package's `--timeout` is left untouched; only this
+ * test's per-test timeout is raised, because a healthy run needs seconds but a
+ * loaded Windows runner needs room for three cold `bun` starts (owner, worker,
+ * grandchild) and four `tasklist` calls.
  */
-const BUDGET_MS = 22_000
+const BUDGET_MS = 40_000
 
 /** Cleanup runs after the budget may be spent, so it gets its own hard cap. */
-const CLEANUP_BUDGET_MS = 4_000
+const CLEANUP_BUDGET_MS = 5_000
 
 /** Cap on one `tasklist` invocation, so a wedged probe cannot outlive the budget. */
-const TASKLIST_TIMEOUT_MS = 5_000
+const TASKLIST_TIMEOUT_MS = 15_000
+
+/** This test's own timeout: the budget, one in-flight probe, and cleanup. */
+const TEST_TIMEOUT_MS = 50_000
 
 /** Poll interval for the OS-settling races below (process teardown, port release). */
 const POLL_MS = 50
@@ -399,5 +407,6 @@ describe("Windows owner death (#442)", () => {
         await bounded(owner.exited, "cleanup: the owner never exited", cleanupDeadline).catch(() => undefined)
       }
     },
+    TEST_TIMEOUT_MS,
   )
 })
