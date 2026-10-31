@@ -83,6 +83,7 @@ describe("continued nested session quota handling (#555)", () => {
           env,
           timeoutMs: 20_000,
         })
+        console.error("probe child output:", JSON.stringify({ exitCode: first.exitCode, stdout: first.stdout, stderr: first.stderr }))
         opencode.expectExit(first, 0)
 
         const grandchildStarted = gate()
@@ -178,6 +179,7 @@ describe("continued nested session quota handling (#555)", () => {
         // A parent can handle a child failure and finish its own turn. The CLI's
         // declared-failure exit policy is separate from whether the quota error
         // reaches the parent, so assert the delivered error and bounded exit.
+        console.error("probe child output:", JSON.stringify({ exitCode: result.exitCode, stdout: result.stdout, stderr: result.stderr }))
         expect(result.durationMs).toBeLessThan(25_000)
         expect(result.stdout + result.stderr).toContain("LOCAL_ROOT_QUOTA_SURFACED")
         const inputs = (yield* llm.inputs) as Body[]

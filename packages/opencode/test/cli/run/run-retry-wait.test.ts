@@ -118,6 +118,7 @@ describe("headless run provider retry delay (#555)", () => {
       }
       yield* llm.push(reply().text("init").tool("finish", { reason: "success", result: "ok" }).stop())
       const first = yield* opencode.run("Research the initial session report", { model: "opencode/local-quota-test", env, timeoutMs: 20_000 })
+      console.error("probe child output:", JSON.stringify({ exitCode: first.exitCode, stdout: first.stdout, stderr: first.stderr }))
       expect(first.exitCode).toBe(0)
       const opened = (body: Body, text: string) => body.messages?.at(-1)?.role === "user" && lastText(body).includes(text)
       const followed = (body: Body, text: string) => body.messages?.at(-1)?.role === "tool" && JSON.stringify(body).includes(text)
@@ -137,6 +138,7 @@ describe("headless run provider retry delay (#555)", () => {
         timeoutMs: 50_000, extraArgs: ["--continue", "--dangerously-skip-permissions"], model: "opencode/local-quota-test", env, clockScale: 10,
       })
       // Retry policy unchanged: the child waits, retries and the run finishes.
+      console.error("probe child output:", JSON.stringify({ exitCode: result.exitCode, stdout: result.stdout, stderr: result.stderr }))
       expect(result.exitCode).toBe(0)
       expect(result.stdout).toContain("ROOT_FINAL")
       expect(result.stderr).toMatch(/subagent waiting about \d+s before retrying \(attempt 1\): free usage limit reached/)
