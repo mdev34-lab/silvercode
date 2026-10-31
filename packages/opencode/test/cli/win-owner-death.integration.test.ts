@@ -330,12 +330,6 @@ describe("Windows owner death (#442)", () => {
         // a process that happened to die.
         expect(ownerLog.join("\n")).not.toContain("(#442)")
 
-        // TEMPORARY MUTATION CONTROL: this must FAIL on win32. It proves the
-        // gated body executes on the Windows runner and that its live PID
-        // inspection is load-bearing against the new identity protocol, since
-        // the job log cannot be read from this sandbox. Reverted right after.
-        expect(pidExists(report.grandchildPid)).toBe(false)
-
         // Negative control. "Gone afterwards" only means something if the tree
         // was observably alive and holding both ports immediately beforehand.
         expect(pidExists(report.workerPid)).toBe(true)
