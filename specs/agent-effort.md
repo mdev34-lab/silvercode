@@ -1,7 +1,7 @@
 # Agent effort
 
 The agent effort dial controls how much process a task gets before its result is
-delivered. There are exactly three levels and two switches — no other knobs.
+delivered. There are four levels and two pass/validation switches; Ultra also adds review delegation depth and origin anchoring.
 
 ## Levels
 
@@ -10,6 +10,7 @@ delivered. There are exactly three levels and two switches — no other knobs.
 | `fast`             | none required                | minimal         |
 | `medium` (default) | at least one; bounded by two | standard        |
 | `thorough`         | until-clean, no finite cap   | full            |
+| `ultra`            | until-clean, no finite cap   | full            |
 
 - **`fast`** delivers as soon as the work is done. No independent review is
   required; the delivery is honestly labelled `unreviewed` unless a review
@@ -25,6 +26,8 @@ delivered. There are exactly three levels and two switches — no other knobs.
   declared failure can deliver as `review-blocked`; a depth-limited child hands
   its unreviewed writes to its parent as `review-pending`. Neither status is
   approval.
+
+- **`ultra`** shares thorough's pass budget and validation gate, adding a review→review depth floor of two and verbatim root-origin anchoring with declared gaps; on large diffs, the top reviewer may delegate up to three disjoint slices and retains the canonical verdict.
 
 ## Configuration
 
@@ -57,6 +60,8 @@ For any given task the effective level is resolved in this order:
 4. the root session's persisted selection;
 5. the `agent.effort` configuration;
 6. `medium`.
+
+- This precedence applies to all four levels (`fast`, `medium`, `thorough`, `ultra`); the review-depth floor uses the dispatching session's effective effort, not a child override.
 
 The selection persists on the session (including forks, which copy the
 selection) and siblings stay independent: one child's level never leaks into
@@ -142,6 +147,6 @@ clean; the termination and stale/open fields carry that distinction. The old
 
 The older `review_loop.max_iterations` configuration remains readable by older
 tooling but does not override the effort policy: the pass budget belongs to
-the level (`medium` is two, `thorough` is until-clean). Legacy transcripts
+the level (`medium` is two; `thorough` and `ultra` are until-clean, with no finite pass cap). Legacy transcripts
 with the old nudge/cap metadata remain readable, but the old
 skip-on-repeat-finish behavior is gone.
