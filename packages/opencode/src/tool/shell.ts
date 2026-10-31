@@ -847,7 +847,15 @@ export const ShellTool = Tool.define(
               {
                 type: "text",
                 synthetic: true,
-                text: ShellBackground.renderResult({ id: jobID, command: input.command, state, text }),
+                text: ShellBackground.renderResult({
+                  id: jobID,
+                  command: input.command,
+                  state,
+                  text,
+                  ...(typeof info.metadata?.exit === "number" ? { exit: info.metadata.exit } : {}),
+                  truncated: info.metadata?.truncated === true,
+                  ...(typeof info.metadata?.outputPath === "string" ? { outputPath: info.metadata.outputPath } : {}),
+                }),
                 ...(silent ? { metadata: { backgroundNoReply: true } } : {}),
               },
             ],
@@ -927,14 +935,22 @@ export const ShellTool = Tool.define(
             // read without re-parsing the envelope.
             if (exit.value !== null) metadata.exit = exit.value
             const formatted = yield* format(exit.value)
-            metadata.truncated = formatted.truncated
-            if (formatted.outputPath) metadata.outputPath = formatted.outputPath
             return formatted.output
           }).pipe(
             // Cancellation and teardown close the job scope; closing the child's
             // scope with it interrupts the supervisor and runs the spawner's
             // escalation, so the process tree dies with the registry entry.
             Effect.ensuring(Scope.close(childScope, Exit.void).pipe(Effect.ignore)),
+            // The live handle is about to disappear. Persist the final bounded
+            // view on every terminal path, not only successful completion, so
+            // later status/output reads keep the spill path after cancel/error.
+            Effect.ensuring(
+              Effect.sync(() => {
+                const view = snapshot()
+                metadata.truncated = view.truncated
+                if (view.outputPath) metadata.outputPath = view.outputPath
+              }),
+            ),
             Effect.ensuring(Effect.sync(unregister)),
           ),
         })

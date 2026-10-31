@@ -118,7 +118,7 @@ export function renderResult(input: {
         ? `Background command cancelled: ${input.command}`
         : `Background command failed: ${input.command}`
   return [
-    `<shell_background job_id="${input.id}" state="${input.state}"${input.exit !== undefined && input.exit !== null ? ` exit="${input.exit}"` : ""}${input.signal ? ` signal="${input.signal}"` : ""}>`,
+    `<shell_background job_id="${input.id}" state="${input.state}"${input.exit !== undefined && input.exit !== null ? ` exit="${input.exit}"` : ""}${input.signal ? ` signal="${input.signal}"` : ""}${input.truncated ? ` truncated="true"` : ""}>`,
     `<summary>${summary}</summary>`,
     `<${tag}>`,
     input.text || "(no output)",

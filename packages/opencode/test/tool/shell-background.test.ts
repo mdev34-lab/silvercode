@@ -6,12 +6,9 @@ import os from "node:os"
 import path from "path"
 import { Config } from "@/config/config"
 import { ShellTool } from "../../src/tool/shell"
-import {
-  ShellBackground,
-  type Handle,
-} from "../../src/tool/shell/background"
+import { ShellBackground, type Handle } from "../../src/tool/shell/background"
 import { ShellBackgroundTool } from "../../src/tool/shell-background"
-import { provideInstance, testInstanceStoreLayer } from "../fixture/fixture"
+import { provideInstance, testInstanceStoreLayer, withTmpdirInstance } from "../fixture/fixture"
 import { Agent } from "../../src/agent/agent"
 import { Truncate } from "@/tool/truncate"
 import { SessionID, MessageID } from "../../src/session/schema"
@@ -66,8 +63,7 @@ type Prompt = { text: string; silent: boolean }
 function promptOps(notifications: Prompt[]) {
   return {
     cancel: () => Effect.void,
-    resolvePromptParts: (template: string) =>
-      Effect.succeed([{ type: "text" as const, text: template }] as never),
+    resolvePromptParts: (template: string) => Effect.succeed([{ type: "text" as const, text: template }] as never),
     prompt: (input: { noReply?: boolean; parts: readonly { type: string; text?: string }[] }) =>
       Effect.sync(() => {
         notifications.push({ text: input.parts[0]?.text ?? "", silent: input.noReply === true })
@@ -233,7 +229,9 @@ describe("tool.shell automatic backgrounding", () => {
         const id = jobID(result)
 
         yield* pollWithTimeout(
-          Effect.sync(() => (ShellBackground.get(jobs, id)?.snapshot().output.includes("partial_marker") ? true : undefined)),
+          Effect.sync(() =>
+            ShellBackground.get(jobs, id)?.snapshot().output.includes("partial_marker") ? true : undefined,
+          ),
           "the background command did not flush partial_marker",
           "10 seconds",
         )
@@ -266,10 +264,11 @@ describe("tool.shell automatic backgrounding", () => {
     () =>
       Effect.gen(function* () {
         const jobs = yield* BackgroundJob.Service
-        // Emit ~120 KB on a long first line followed by a 3,998-byte second line
-        // while staying alive: the snapshot keeps only the 3,998-byte tail (under
-        // both STATUS_OUTPUT_CHARS and Truncate.MAX_BYTES), while spilling the full
-        // stream to outputPath and marking snapshot.truncated = true.
+        // Emit ~120 KB on a long first line followed by a 3,998-byte second line.
+        // Pin the byte budget to the tail so the exact assertion cannot depend
+        // on where the OS splits stdout chunks: even one retained head byte or
+        // newline cannot fit beside the tail. The tail remains below
+        // STATUS_OUTPUT_CHARS, so status-window slicing is not involved here.
         const commandline = script(
           "process.stdout.write(/HEAD_/.source+/MARKER:/.source+/x/.source.repeat(118000)+String.fromCharCode(10)+/TAIL_/.source+/MARKER:/.source+/y/.source.repeat(3986));setInterval(Boolean,30000)",
         )
@@ -279,7 +278,7 @@ describe("tool.shell automatic backgrounding", () => {
         const snap = yield* pollWithTimeout(
           Effect.sync(() => {
             const current = ShellBackground.get(jobs, id)?.snapshot()
-            return current?.output.includes("TAIL_MARKER:") ? current : undefined
+            return current?.output.endsWith("TAIL_MARKER:" + "y".repeat(3986)) ? current : undefined
           }),
           "the background command did not flush its tail into the live snapshot",
           "10 seconds",
@@ -315,6 +314,166 @@ describe("tool.shell automatic backgrounding", () => {
         expect(Buffer.byteLength(saved, "utf8")).toBe(122_011)
         expect(saved.startsWith("HEAD_MARKER:")).toBe(true)
         expect(saved).toContain("TAIL_MARKER:")
+
+        // The live handle is gone after cancellation; settled reads must still
+        // report the truncation and the same spill path from job metadata.
+        for (const action of ["status", "output"] as const) {
+          const settled = yield* manage({ action, job_id: id }, context(undefined, `call_cancelled_${action}`))
+          expect(settled.metadata.truncated).toBe(true)
+          expect(settled.metadata.outputPath).toBe(snap.outputPath)
+          expect(settled.output).toContain('truncated="true"')
+          expect(settled.output).toContain(`<output_path>${snap.outputPath}</output_path>`)
+        }
+      }).pipe(
+        Effect.provide(RuntimeFlags.layer({ bashBackgroundThresholdMs: 100 })),
+        withTmpdirInstance({ config: { tool_output: { max_bytes: 3_998 } } }),
+      ),
+    40_000,
+  )
+
+  it.live(
+    "a rolling-buffer head fragment may share the live tail when both fit the byte budget",
+    () =>
+      Effect.gen(function* () {
+        const jobs = yield* BackgroundJob.Service
+        const gate = unique()
+        yield* Effect.addFinalizer(() => Effect.promise(() => fs.rm(gate, { force: true })))
+        // Force the boundary seen in the Windows failure: 74,468 bytes roll off,
+        // leaving a 43,544-byte head fragment + newline + 3,998-byte tail = 47,543.
+        // That is still below the default 51,200-byte snapshot budget, so the
+        // line-aware tail legitimately retains it. The exact-3,998 test above
+        // pins a smaller byte budget instead of depending on OS chunk sizes.
+        const commandline = script(
+          "const fs=process.getBuiltinModule(/node:fs/.source),gate=Bun.argv[1];process.stdout.write(/HEAD_/.source+/MARKER:/.source+/x/.source.repeat(74456));const wait=()=>{if(fs.existsSync(gate)){process.stdout.write(/x/.source.repeat(43544)+String.fromCharCode(10)+/TAIL_/.source+/MARKER:/.source+/y/.source.repeat(3986));setInterval(Boolean,30000)}else setTimeout(wait,10)};wait()",
+          gate,
+        )
+        const result = yield* run({ command: commandline }, context())
+        const id = jobID(result)
+
+        yield* pollWithTimeout(
+          Effect.sync(() => {
+            const current = ShellBackground.get(jobs, id)?.snapshot()
+            return current?.truncated && current.outputPath ? true : undefined
+          }),
+          "the first head chunk did not spill",
+          "10 seconds",
+        )
+        yield* Effect.promise(() => fs.writeFile(gate, "go"))
+        const snap = yield* pollWithTimeout(
+          Effect.sync(() => {
+            const current = ShellBackground.get(jobs, id)?.snapshot()
+            return current?.output.endsWith("TAIL_MARKER:" + "y".repeat(3986)) ? current : undefined
+          }),
+          "the gated tail did not reach the live snapshot",
+          "10 seconds",
+        )
+        expect(snap.truncated).toBe(true)
+        expect(snap.outputPath).toBeTruthy()
+        const liveBytes = Buffer.byteLength(snap.output, "utf8")
+        expect(liveBytes).toBeGreaterThanOrEqual(3_998)
+        expect(liveBytes).toBeLessThanOrEqual(Truncate.MAX_BYTES)
+        expect(snap.output).not.toContain("HEAD_MARKER:")
+        expect(snap.output.endsWith("TAIL_MARKER:" + "y".repeat(3986))).toBe(true)
+
+        yield* manage({ action: "cancel", job_id: id }, context(undefined, "call_cancel_fragment"))
+        yield* jobs.wait({ id, timeout: 10_000 })
+        const saved = yield* Effect.promise(() => fs.readFile(snap.outputPath!, "utf8"))
+        expect(Buffer.byteLength(saved, "utf8")).toBe(122_011)
+      }).pipe(
+        Effect.provide(RuntimeFlags.layer({ bashBackgroundThresholdMs: 100 })),
+        provideInstance(path.join(__dirname, "../..")),
+      ),
+    40_000,
+  )
+
+  it.live(
+    "settled completion and cancel retain truncation metadata after the live handle is gone",
+    () =>
+      Effect.gen(function* () {
+        const jobs = yield* BackgroundJob.Service
+        const notifications: Prompt[] = []
+        const gate = unique()
+        yield* Effect.addFinalizer(() => Effect.promise(() => fs.rm(gate, { force: true })))
+        const commandline = script(
+          "const fs=process.getBuiltinModule(/node:fs/.source),gate=Bun.argv[1];process.stdout.write(/HEAD_/.source+/MARKER:/.source+/x/.source.repeat(118000)+String.fromCharCode(10)+/TAIL_/.source+/MARKER:/.source+/y/.source.repeat(3986));const wait=()=>{if(!fs.existsSync(gate))setTimeout(wait,10)};wait()",
+          gate,
+        )
+        const result = yield* run({ command: commandline }, context(notifications))
+        const id = jobID(result)
+        const snap = yield* pollWithTimeout(
+          Effect.sync(() => {
+            const current = ShellBackground.get(jobs, id)?.snapshot()
+            return current?.output.endsWith("TAIL_MARKER:" + "y".repeat(3986)) ? current : undefined
+          }),
+          "the completing command did not flush its tail",
+          "10 seconds",
+        )
+        yield* Effect.promise(() => fs.writeFile(gate, "go"))
+        const waited = yield* jobs.wait({ id, timeout: 10_000 })
+        expect(waited.timedOut).toBe(false)
+        expect(waited.info?.status).toBe("completed")
+        expect(ShellBackground.get(jobs, id)).toBeUndefined()
+        expect(waited.info?.metadata?.truncated).toBe(true)
+        expect(waited.info?.metadata?.outputPath).toBe(snap.outputPath)
+
+        for (const action of ["status", "output", "cancel"] as const) {
+          const settled = yield* manage({ action, job_id: id }, context(undefined, `call_settled_${action}`))
+          expect(settled.metadata.truncated).toBe(true)
+          expect(settled.metadata.outputPath).toBe(snap.outputPath)
+          expect(settled.output).toContain('truncated="true"')
+          expect(settled.output).toContain(`<output_path>${snap.outputPath}</output_path>`)
+        }
+
+        const delivered = yield* pollWithTimeout(
+          Effect.sync(() => notifications[0]?.text),
+          "the settled completion did not notify its session",
+          "10 seconds",
+        )
+        expect(delivered).toContain('state="completed"')
+        expect(delivered).toContain('exit="0"')
+        expect(delivered).toContain('truncated="true"')
+        expect(delivered).toContain(`<output_path>${snap.outputPath}</output_path>`)
+      }).pipe(
+        Effect.provide(RuntimeFlags.layer({ bashBackgroundThresholdMs: 100 })),
+        withTmpdirInstance({ config: { tool_output: { max_bytes: 3_998 } } }),
+      ),
+    40_000,
+  )
+
+  it.live(
+    "status alone marks a 4,000-character window while output returns the full live tail",
+    () =>
+      Effect.gen(function* () {
+        const jobs = yield* BackgroundJob.Service
+        const text = "WINDOW_HEAD:" + "x".repeat(488) + "WINDOW_TAIL:" + "y".repeat(3988)
+        const commandline = script("process.stdout.write(Bun.argv[1]);setInterval(Boolean,30000)", text)
+        const result = yield* run({ command: commandline }, context())
+        const id = jobID(result)
+        const snap = yield* pollWithTimeout(
+          Effect.sync(() => {
+            const current = ShellBackground.get(jobs, id)?.snapshot()
+            return current?.output.includes("WINDOW_TAIL:") ? current : undefined
+          }),
+          "the status-window command did not flush",
+          "10 seconds",
+        )
+        expect(snap.truncated).toBe(false)
+        expect(snap.output).toBe(text)
+
+        const status = yield* manage({ action: "status", job_id: id }, context(undefined, "call_status_window"))
+        expect(status.metadata.truncated).toBe(true)
+        expect(status.output).toContain('truncated="true"')
+        const window = status.output.match(/<output>\n([\s\S]*?)\n<\/output>/)?.[1]
+        expect(window).toBe(text.slice(-4_000))
+        expect(window).toHaveLength(4_000)
+        expect(window).not.toContain("WINDOW_HEAD:")
+
+        const output = yield* manage({ action: "output", job_id: id }, context(undefined, "call_output_window"))
+        expect(output.metadata.truncated).toBe(false)
+        expect(output.output).toContain(text)
+        expect(output.output).not.toContain('truncated="true"')
+
+        yield* manage({ action: "cancel", job_id: id }, context(undefined, "call_cancel_window"))
       }).pipe(
         Effect.provide(RuntimeFlags.layer({ bashBackgroundThresholdMs: 100 })),
         provideInstance(path.join(__dirname, "../..")),
