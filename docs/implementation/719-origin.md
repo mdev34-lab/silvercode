@@ -47,3 +47,33 @@ a deferred cosmetic change. Option (b) now completes the total utility maps and
 selectable row without changing #717's first-three-row copy. See
 [the full consumer matrix](719-effort-consumers.md). Full opencode and TUI package
 typechecks now pass locally; the old TUI-map blocker above is historical.
+
+## Explicit wire contract and test coverage
+
+`task.origin_message_ids?: string[]` is intentionally part of the model-visible
+JSON Schema/wire API, not hidden runtime metadata. Dispatchers select original
+root user-message IDs and pass those IDs through task parameters to slice
+reviewers. It is optional (existing callers remain valid), rejects non-arrays
+and non-string items, and is consumed only for ultra review dispatches. The task
+wire schema also admits the `ultra` effort enum member. The parameters snapshot
+now records both intended changes; no other tool snapshot changed.
+
+Each origin qualification row has explicit coverage in
+`packages/opencode/test/tool/ultra-review.test.ts`:
+
+| Row | Test coverage |
+| --- | --- |
+| (a) fresh | `fresh origin includes sole root request verbatim with provenance` |
+| (b) multi-topic | `multi-topic selection ordered by root store, excludes unrelated topics and child records`; `no selection is not an indiscriminate dump or unconditional first-message append` |
+| (c) resumed | `resumed earlier unit spans a finish boundary without attaching an intervening private topic` uses a completed finish tool part between the selected earlier request and resume steering |
+| (d) corrections | `mid-work corrections retain root store order even when IDs are supplied backwards` checks request plus two corrections, exact text, provenance, and ordering |
+| (e) compaction | `compaction attaches surviving selected originals only; missing originals and summaries cannot certify completion` selects an unavailable original plus a surviving correction, excluding summary and unrelated survivor |
+| Missing origin | `missing origin always declares gaps, including a missing ID alongside a sole available user message` checks unknown root, empty history, missing-only/mixed IDs, and empty explicit selection; every case must be incomplete and forbid full certification |
+
+No runtime origin algorithm was changed for these tests: they strengthen and
+make explicit the documented conservative coverage contract.
+
+Snapshot follow-up local verification: origin/parameters 71 tests and 16 snapshots
+passed in three consecutive runs; broader opencode scope 259/259; core 118/118,
+TUI 66/66, SDK 6/6. Full workspace typecheck passed all 17 tasks after the fix.
+Scoped oxlint exited 0 (existing-style fixture assertion warnings retained).

@@ -1,3 +1,6 @@
+import { MessageID, SessionID, PartID } from "../../src/session/schema"
+import { ModelV2 } from "@opencode-ai/core/model"
+import { ProviderV2 } from "@opencode-ai/core/provider"
 import { expect, test } from "bun:test"
 import { reviewDepthLimit } from "../../src/tool/review-depth"
 import { reviewOrigin } from "../../src/tool/review-origin"
@@ -71,4 +74,118 @@ test("compaction and non-text or synthetic parts declare gaps; never substitute 
   expect(result).toContain("part 1 not included")
   expect(result).not.toContain("SUMMARY")
   expect(result).toContain("Origin state: incomplete")
+})
+
+test("mid-work corrections retain root store order even when IDs are supplied backwards", () => {
+  const result = reviewOrigin(
+    "root",
+    [
+      message("1", "REQUEST: change only the cache module\n  Preserve this whitespace."),
+      message("2", "CORRECTION: preserve the public API"),
+      message("3", "STEERING: also test empty input"),
+    ],
+    ["3", "2", "1"],
+  )
+  expect(result).toContain("REQUEST: change only the cache module\n  Preserve this whitespace.")
+  expect(result.indexOf("REQUEST:")).toBeLessThan(result.indexOf("CORRECTION:"))
+  expect(result.indexOf("CORRECTION:")).toBeLessThan(result.indexOf("STEERING:"))
+  for (const id of ["1", "2", "3"]) expect(result).toContain(`Root session root; user message ${id}; time ${id}`)
+  expect(result).toContain("Origin state: incomplete")
+  expect(result).toContain("Selection completeness is unverified")
+})
+
+test("resumed earlier unit spans a finish boundary without attaching an intervening private topic", () => {
+  const finish: SessionV1.WithParts = {
+    info: {
+      id: MessageID.make("msg_finish"),
+      sessionID: SessionID.make("ses_root"),
+      role: "assistant",
+      parentID: MessageID.make("msg_request"),
+      time: { created: 2 },
+      mode: "work",
+      agent: "work",
+      cost: 0,
+      path: { cwd: "/", root: "/" },
+      modelID: ModelV2.ID.make("test"),
+      providerID: ProviderV2.ID.make("test"),
+      tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+    },
+    parts: [
+      {
+        id: PartID.make("prt_finish"),
+        messageID: MessageID.make("msg_finish"),
+        sessionID: SessionID.make("ses_root"),
+        type: "tool",
+        tool: "finish",
+        callID: "finish-call",
+        state: {
+          status: "completed",
+          input: { reason: "success" },
+          output: "Delivered earlier unit",
+          title: "Finished",
+          metadata: {},
+          time: { start: 2, end: 3 },
+        },
+      },
+    ],
+  }
+  const result = reviewOrigin(
+    "ses_root",
+    [
+      message("1", "EARLIER REQUEST: repair cache invalidation", "ses_root"),
+      finish,
+      message("2", "UNRELATED PRIVATE TOPIC", "ses_root"),
+      message("3", "RESUME: keep that repair but preserve the old API", "ses_root"),
+    ],
+    ["3", "1"],
+  )
+  expect(result).toContain("EARLIER REQUEST: repair cache invalidation")
+  expect(result).toContain("RESUME: keep that repair but preserve the old API")
+  expect(result.indexOf("EARLIER REQUEST:")).toBeLessThan(result.indexOf("RESUME:"))
+  expect(result).not.toContain("UNRELATED PRIVATE TOPIC")
+  expect(result).not.toContain("Delivered earlier unit")
+  expect(result).toContain("Origin state: incomplete")
+  expect(result).toContain("verified against available origin")
+})
+
+test("compaction attaches surviving selected originals only; missing originals and summaries cannot certify completion", () => {
+  const compacted = {
+    info: { sessionID: "root", role: "user" },
+    parts: [{ type: "compaction" }, { type: "text", text: "COMPACTED SUMMARY IS NOT VERBATIM", synthetic: true }],
+  } as SessionV1.WithParts
+  const result = reviewOrigin(
+    "root",
+    [compacted, message("2", "SURVIVING CORRECTION: keep API compatibility"), message("3", "UNRELATED SURVIVOR")],
+    ["1", "2"],
+  )
+  expect(result).toContain("SURVIVING CORRECTION: keep API compatibility")
+  expect(result).not.toContain("COMPACTED SUMMARY IS NOT VERBATIM")
+  expect(result).not.toContain("UNRELATED SURVIVOR")
+  expect(result).toContain("Compaction present")
+  expect(result).toContain("Selected root user message unavailable: 1")
+  expect(result).toContain("Origin state: incomplete")
+  expect(result).not.toContain("Origin state: complete")
+  expect(result).toContain("Do not certify full completion")
+})
+
+test("missing origin always declares gaps, including a missing ID alongside a sole available user message", () => {
+  const cases = [
+    reviewOrigin(undefined, [message("1", "CHILD OR UNKNOWN")], ["1"]),
+    reviewOrigin("root", [], ["missing"]),
+    reviewOrigin("root", [message("1", "UNSELECTED")], ["missing"]),
+    reviewOrigin("root", [message("1", "UNSELECTED")], ["1", "missing"]),
+    reviewOrigin("root", [message("1", "UNSELECTED")], []),
+    reviewOrigin("root", []),
+  ]
+  for (const result of cases) {
+    expect(result).toContain("Gap:")
+    expect(result).toContain("Origin state: incomplete")
+    expect(result).not.toContain("Origin state: complete")
+    expect(result).toContain("verified against available origin")
+    expect(result).toContain("Do not certify full completion")
+  }
+  expect(cases[0]).not.toContain("CHILD OR UNKNOWN")
+  expect(cases[2]).toContain("Selected root user message unavailable: missing")
+  expect(cases[2]).not.toContain("UNSELECTED")
+  expect(cases[3]).toContain("Selected root user message unavailable: missing")
 })
