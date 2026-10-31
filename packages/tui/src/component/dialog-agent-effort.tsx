@@ -9,7 +9,7 @@ const ENTRIES: {
   value: Level
   title: string
   description: string
-  details: string[]
+  details?: string[]
 }[] = [
   {
     value: "fast",
@@ -32,6 +32,11 @@ const ENTRIES: {
     description: "review until clean",
     details: ["Structured review contract with severity-driven convergence and full validation gates, no pass cap"],
   },
+  {
+    value: "ultra",
+    title: "Ultra",
+    description: "Our most powerful mode yet. Overkill for most users.",
+  },
 ]
 
 export function DialogAgentEffort() {
@@ -42,7 +47,7 @@ export function DialogAgentEffort() {
   const options = createMemo(() =>
     ENTRIES.map((entry) => {
       // Level names always stay visible; the hue only reinforces them (fast
-      // green, medium orange, thorough red). It is painted as a filled chip so
+      // green, medium orange, thorough red, ultra purple). It is painted as a filled chip so
       // it keeps its contrast on both the panel and a highlighted row.
       const badge = effortBadge(entry.value, theme)
       return {
