@@ -17,6 +17,7 @@ import { Truncate } from "@/tool/truncate"
 import { SessionID, MessageID } from "../../src/session/schema"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { FSUtil } from "@opencode-ai/core/fs-util"
+import { Shell } from "@opencode-ai/core/shell"
 import { Plugin } from "../../src/plugin"
 import { testEffect, pollWithTimeout } from "../lib/effect"
 import { Tool } from "@/tool/tool"
@@ -129,6 +130,13 @@ const deadGroup = Effect.fnUntraced(function* (pid: number) {
 
 const unique = () => path.join(os.tmpdir(), `shell-background-${Math.random().toString(36).slice(2)}.log`)
 
+const bin = `"${process.execPath.replaceAll("\\", "/")}"`
+const evalarg = (text: string) => (Shell.name(Shell.acceptable()) === "cmd" ? `"${text}"` : `'${text}'`)
+const script = (text: string) => {
+  const line = `${bin} -e ${evalarg(text)}`
+  return ["pwsh", "powershell"].includes(Shell.name(Shell.acceptable())) ? `& ${line}` : line
+}
+
 describe("tool.shell automatic backgrounding", () => {
   // (a) No behavior change for commands that finish inside the window.
   it.live(
@@ -234,6 +242,67 @@ describe("tool.shell automatic backgrounding", () => {
         expect(output.output).toContain("partial_marker")
 
         yield* manage({ action: "cancel", job_id: id }, context(undefined, "call_cleanup"))
+      }).pipe(
+        Effect.provide(RuntimeFlags.layer({ bashBackgroundThresholdMs: 100 })),
+        provideInstance(path.join(__dirname, "../..")),
+      ),
+    40_000,
+  )
+
+  it.live(
+    "status and output propagate live snapshot truncation and saved outputPath when earlier output rolled off",
+    () =>
+      Effect.gen(function* () {
+        const jobs = yield* BackgroundJob.Service
+        // Emit ~120 KB on a long first line followed by a 3,998-byte second line
+        // while staying alive: the snapshot keeps only the 3,998-byte tail (under
+        // both STATUS_OUTPUT_CHARS and Truncate.MAX_BYTES), while spilling the full
+        // stream to outputPath and marking snapshot.truncated = true.
+        const commandline = script(
+          "process.stdout.write(/HEAD_/.source+/MARKER:/.source+/x/.source.repeat(118000)+String.fromCharCode(10)+/TAIL_/.source+/MARKER:/.source+/y/.source.repeat(3986));setInterval(Boolean,30000)",
+        )
+        const result = yield* run({ command: commandline }, context())
+        const id = jobID(result)
+
+        const snap = yield* pollWithTimeout(
+          Effect.sync(() => {
+            const current = ShellBackground.get(jobs, id)?.snapshot()
+            return current?.output.includes("TAIL_MARKER:") ? current : undefined
+          }),
+          "the background command did not flush its tail into the live snapshot",
+          "10 seconds",
+        )
+        expect(snap.truncated).toBe(true)
+        expect(snap.outputPath).toBeTruthy()
+        expect(Buffer.byteLength(snap.output, "utf8")).toBe(3_998)
+        expect(snap.output).not.toContain("HEAD_MARKER:")
+
+        const status = yield* manage({ action: "status", job_id: id }, context(undefined, "call_status_truncated"))
+        expect(status.metadata.truncated).toBe(true)
+        expect(status.metadata.outputPath).toBe(snap.outputPath)
+        expect(status.output).toContain('truncated="true"')
+        expect(status.output).toContain(`<output_path>${snap.outputPath}</output_path>`)
+        expect(status.output).toContain("TAIL_MARKER:")
+        expect(status.output).not.toContain("HEAD_MARKER:")
+
+        const output = yield* manage({ action: "output", job_id: id }, context(undefined, "call_output_truncated"))
+        expect(output.metadata.truncated).toBe(true)
+        expect(output.metadata.outputPath).toBe(snap.outputPath)
+        expect(output.output).toContain('truncated="true"')
+        expect(output.output).toContain(`<output_path>${snap.outputPath}</output_path>`)
+        expect(output.output).toContain("TAIL_MARKER:")
+        expect(output.output).not.toContain("HEAD_MARKER:")
+
+        const cancelled = yield* manage({ action: "cancel", job_id: id }, context(undefined, "call_cancel_truncated"))
+        expect(cancelled.metadata.truncated).toBe(true)
+        expect(cancelled.metadata.outputPath).toBe(snap.outputPath)
+
+        // Wait for the job's scope finalizer to close and flush the spill stream.
+        yield* jobs.wait({ id, timeout: 10_000 })
+        const saved = yield* Effect.promise(() => fs.readFile(snap.outputPath!, "utf8"))
+        expect(Buffer.byteLength(saved, "utf8")).toBe(122_011)
+        expect(saved.startsWith("HEAD_MARKER:")).toBe(true)
+        expect(saved).toContain("TAIL_MARKER:")
       }).pipe(
         Effect.provide(RuntimeFlags.layer({ bashBackgroundThresholdMs: 100 })),
         provideInstance(path.join(__dirname, "../..")),

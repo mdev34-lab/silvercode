@@ -35,12 +35,14 @@ function elapsed(job: BackgroundJob.Info) {
   return Math.max(0, end - job.started_at)
 }
 
-function attributes(job: BackgroundJob.Info, snapshot?: ShellBackground.Snapshot) {
+function attributes(job: BackgroundJob.Info, snapshot?: ShellBackground.Snapshot, truncated?: boolean) {
   const pid = job.metadata?.pid
   const exit = snapshot?.exit ?? job.metadata?.exit
-  return [typeof pid === "number" ? ` pid="${pid}"` : "", typeof exit === "number" ? ` exit="${exit}"` : ""].join(
-    "",
-  )
+  return [
+    typeof pid === "number" ? ` pid="${pid}"` : "",
+    typeof exit === "number" ? ` exit="${exit}"` : "",
+    truncated ? ` truncated="true"` : "",
+  ].join("")
 }
 
 function command(job: BackgroundJob.Info) {
@@ -52,10 +54,13 @@ function command(job: BackgroundJob.Info) {
  * terminal half is the registry entry. Reading either never waits on the
  * command, which is what lets an agent inspect a command mid-flight.
  */
-function read(background: BackgroundJob.Interface, job: BackgroundJob.Info) {
-  const snapshot = ShellBackground.get(background, job.id)?.snapshot()
-  if (job.status === "running") return { text: snapshot?.output ?? "", snapshot }
-  return { text: job.output ?? snapshot?.output ?? job.error ?? "", snapshot }
+function read(background: BackgroundJob.Interface, job: BackgroundJob.Info, fallback?: ShellBackground.Snapshot) {
+  const snapshot = ShellBackground.get(background, job.id)?.snapshot() ?? fallback
+  const truncated = Boolean(snapshot?.truncated) || job.metadata?.truncated === true
+  const outputPath =
+    snapshot?.outputPath ?? (typeof job.metadata?.outputPath === "string" ? job.metadata.outputPath : undefined)
+  if (job.status === "running") return { text: snapshot?.output ?? "", snapshot, truncated, outputPath }
+  return { text: job.output ?? snapshot?.output ?? job.error ?? "", snapshot, truncated, outputPath }
 }
 
 export const ShellBackgroundTool = Tool.define<
@@ -123,6 +128,7 @@ export const ShellBackgroundTool = Tool.define<
             // handle is read before the registry closes the job, because that
             // teardown also drops it from the live map.
             const handle = ShellBackground.get(background, job.id)
+            const snapshot = handle?.snapshot()
             const cancelled = yield* background.cancel(job.id)
             // Then kill the real process tree. The handle runs the same
             // SIGTERM-then-SIGKILL escalation the inline timeout path uses, so a
@@ -130,15 +136,17 @@ export const ShellBackgroundTool = Tool.define<
             if (handle) yield* handle.kill()
             const info = cancelled ?? job
             const state = info.status === "running" ? "cancelled" : info.status
-            const captured = read(background, info)
+            const captured = read(background, info, snapshot)
             const out = yield* bounded(captured.text)
+            const truncated = captured.truncated || out.truncated
+            const outputPath = captured.outputPath ?? out.outputPath
             return {
               title: `${state === "cancelled" ? "Cancelled" : state} ${command(info)}`,
               metadata: {
                 jobId: info.id,
                 status: state,
-                truncated: out.truncated,
-                ...(out.outputPath ? { outputPath: out.outputPath } : {}),
+                truncated,
+                ...(outputPath ? { outputPath } : {}),
               },
               output: ShellBackground.renderResult({
                 id: info.id,
@@ -146,28 +154,27 @@ export const ShellBackgroundTool = Tool.define<
                 state,
                 text: out.text || (state === "cancelled" ? ShellBackground.CANCELLED_TEXT : ""),
                 ...(captured.snapshot?.exit !== undefined ? { exit: captured.snapshot.exit } : {}),
-                truncated: out.truncated,
-                ...(out.outputPath ? { outputPath: out.outputPath } : {}),
+                truncated,
+                ...(outputPath ? { outputPath } : {}),
               }),
             }
           }
 
           const captured = read(background, job)
           const running = job.status === "running"
-          const out = yield* bounded(
-            params.action === "status" && captured.text.length > STATUS_OUTPUT_CHARS
-              ? captured.text.slice(-STATUS_OUTPUT_CHARS)
-              : captured.text,
-          )
+          const sliced = params.action === "status" && captured.text.length > STATUS_OUTPUT_CHARS
+          const out = yield* bounded(sliced ? captured.text.slice(-STATUS_OUTPUT_CHARS) : captured.text)
+          const truncated = captured.truncated || sliced || out.truncated
+          const outputPath = captured.outputPath ?? out.outputPath
           const head = [
-            `<shell_background job_id="${job.id}" state="${job.status}"${attributes(job, captured.snapshot)} elapsed_ms="${elapsed(job)}">`,
+            `<shell_background job_id="${job.id}" state="${job.status}"${attributes(job, captured.snapshot, truncated)} elapsed_ms="${elapsed(job)}">`,
             `<command>${command(job)}</command>`,
           ]
           const tail = [
             `<output>`,
             out.text || "(no output yet)",
             `</output>`,
-            ...(out.truncated && out.outputPath ? [`<output_path>${out.outputPath}</output_path>`] : []),
+            ...(truncated && outputPath ? [`<output_path>${outputPath}</output_path>`] : []),
             running
               ? `<note>The command is still running and this is the output captured so far. You will be notified when it finishes; action="cancel" job_id="${job.id}" kills it.</note>`
               : `<note>The command is no longer running.</note>`,
@@ -178,8 +185,8 @@ export const ShellBackgroundTool = Tool.define<
             metadata: {
               jobId: job.id,
               status: job.status,
-              truncated: out.truncated,
-              ...(out.outputPath ? { outputPath: out.outputPath } : {}),
+              truncated,
+              ...(outputPath ? { outputPath } : {}),
             },
             output: [...head, ...tail].join("\n"),
           }

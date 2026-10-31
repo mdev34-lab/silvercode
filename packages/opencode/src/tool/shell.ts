@@ -525,7 +525,7 @@ export const ShellTool = Tool.define(
         return {
           output: end.text,
           truncated: cut || end.cut,
-          ...(file ? { outputPath: file } : {}),
+          ...(file && !spillError ? { outputPath: file } : {}),
           ...(exitCode !== undefined ? { exit: exitCode } : {}),
           ...(signaled ? { signal: signaled } : {}),
         }
@@ -588,9 +588,7 @@ export const ShellTool = Tool.define(
             os.setPriority(handle.pid, os.constants.priority.PRIORITY_BELOW_NORMAL)
           } catch {}
 
-          const append = (chunk: string) => {
-            processing = true
-            const size = Buffer.byteLength(chunk, "utf-8")
+          const commitChunk = (chunk: string, size: number) => {
             list.push({ text: chunk, size })
             used += size
             while (used > keep && list.length > 1) {
@@ -599,15 +597,28 @@ export const ShellTool = Tool.define(
               used -= item.size
               cut = true
             }
-
             last = preview(last + chunk)
+            // The job record keeps a live, bounded preview so listing jobs does
+            // not have to reach into a finished tool call's metadata.
+            if (promoted && live) live.output = last
+          }
+
+          const append = (chunk: string) => {
+            processing = true
+            const size = Buffer.byteLength(chunk, "utf-8")
 
             if (file) {
               sink?.write(chunk)
-            } else {
-              full += chunk
-              if (Buffer.byteLength(full, "utf-8") > limits.maxBytes) {
-                return trunc.write(full).pipe(
+              commitChunk(chunk, size)
+              return publish(last).pipe(Effect.ensuring(markOutputProcessed))
+            }
+
+            full += chunk
+            if (Buffer.byteLength(full, "utf-8") > limits.maxBytes || full.split("\n").length > limits.maxLines) {
+              // Spill before publishing the chunk into `list` so a concurrent
+              // live `snapshot()` never observes `truncated: true` without `outputPath`.
+              return Effect.uninterruptible(
+                trunc.write(full).pipe(
                   Effect.andThen((next) =>
                     Effect.sync(() => {
                       file = next
@@ -624,17 +635,14 @@ export const ShellTool = Tool.define(
                         stream.destroy()
                       })
                       full = ""
+                      commitChunk(chunk, size)
                     }),
                   ),
-                  Effect.andThen(publish(last)),
-                  Effect.ensuring(markOutputProcessed),
-                )
-              }
+                ),
+              ).pipe(Effect.andThen(publish(last)), Effect.ensuring(markOutputProcessed))
             }
 
-            // The job record keeps a live, bounded preview so listing jobs does
-            // not have to reach into a finished tool call's metadata.
-            if (promoted && live) live.output = last
+            commitChunk(chunk, size)
             return publish(last).pipe(Effect.ensuring(markOutputProcessed))
           }
           const output = yield* Stream.runForEach(Stream.map(handle.all, decoder.decode), append).pipe(
@@ -915,7 +923,10 @@ export const ShellTool = Tool.define(
             // carries this metadata object: record the outcome where it can be
             // read without re-parsing the envelope.
             if (exit.value !== null) metadata.exit = exit.value
-            return (yield* format(exit.value)).output
+            const formatted = yield* format(exit.value)
+            metadata.truncated = formatted.truncated
+            if (formatted.outputPath) metadata.outputPath = formatted.outputPath
+            return formatted.output
           }).pipe(
             // Cancellation and teardown close the job scope; closing the child's
             // scope with it interrupts the supervisor and runs the spawner's
