@@ -238,8 +238,16 @@ const generationTarget = (
 // behind) is answered against the history as of that message: later prompts
 // belong to their own callers and must not be answered, or quoted, as this one.
 // A continuation of an already answered prompt keeps the full transcript.
-const generationView = (messages: SessionV1.WithParts[], target: UserMessage): SessionV1.WithParts[] => {
+const generationView = (
+  messages: SessionV1.WithParts[],
+  target: UserMessage,
+  continuation?: string,
+): SessionV1.WithParts[] => {
   if (!expectsReply(target) && repetitionRecoveryPromptID(target) === undefined) return messages
+  // The continuation this run injected continues the generation in progress, so
+  // it keeps the transcript even before an assistant answers it: a stored order
+  // that places the nudge early must not hide the answer it is nudging.
+  if (continuation !== undefined && target.info.id === continuation) return messages
   if (answered(messages, target.info.id)) return messages
   const index = messages.findLastIndex((message) => message.info.id === target.info.id)
   return index < 0 ? messages : messages.slice(0, index + 1)
@@ -1640,7 +1648,7 @@ const layer = Layer.effect(
           const liveWaiters = yield* InstanceState.use(callers, (registry) => waiters(registry, sessionID))
           const target = generationTarget(msgs, liveWaiters, inFlight?.message.id)
           if (!target) throw new Error("No user message found in stream. This should never happen.")
-          const view = generationView(msgs, target)
+          const view = generationView(msgs, target, inFlight?.message.id)
           const { assistant: lastAssistant, finished: lastFinished, tasks } = MessageV2.latest(view)
 
           const lastUser = target.info

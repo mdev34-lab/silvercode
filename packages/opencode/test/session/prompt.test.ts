@@ -7871,7 +7871,7 @@ it.instance("a finish nudge owns the next generation even when the stored transc
       Effect.gen(function* () {
         // Stepping the clock back once the first answer is on the wire stores
         // every later message before the assistant it belongs to.
-        yield* llm.push(reply().text("a").onSend(() => void (skew = -60_000)))
+        yield* llm.push(reply().text("FIRST_ANSWER_TEXT").onSend(() => void (skew = -60_000)))
         yield* llm.push(reply().text("b"))
         yield* llm.push(reply().text("c"))
         yield* llm.push(reply().text("d"))
@@ -7889,7 +7889,12 @@ it.instance("a finish nudge owns the next generation even when the stored transc
         // One request for the prompt and one for each nudge: the guard asked the
         // model every time it spent a nudge.
         expect(hits).toHaveLength(4)
-        expect(bodies.filter((body) => body.includes(FINISH_NUDGE_MARKER))).toHaveLength(3)
+        const nudgeBodies = bodies.filter((body) => body.includes(FINISH_NUDGE_MARKER))
+        expect(nudgeBodies).toHaveLength(3)
+        // Each nudge still continues the answer it follows: the injected
+        // continuation is where the run put it, not where the stored timestamp
+        // does.
+        for (const body of nudgeBodies) expect(body).toContain("FIRST_ANSWER_TEXT")
         // The budget itself is unchanged, so the turn still stops, bounded.
         expect(nudges).toHaveLength(3)
         expect(result.info.role).toBe("assistant")
