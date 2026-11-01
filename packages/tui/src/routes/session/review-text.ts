@@ -9,29 +9,13 @@ export function reviewText(message: AssistantMessage, parts: readonly Part[]) {
   const text = parts.filter((part): part is TextPart => part.type === "text" && !part.ignored && !part.synthetic)
   if (!text.length) return undefined
   const chunks = text.map((part) => part.text)
-  const joined = joinSplitTags(chunks)
+  const joined = chunks.join("\n")
   // Examples in fenced code and blockquotes are not protocol deliveries. On
   // ambiguity retain the original Markdown rather than manufacture a verdict.
   if (hasQuotedTag(joined)) return undefined
-  const delivery = ReviewReport.extract([joined])
+  const delivery = ReviewReport.extract(chunks)
   if (!delivery.ok) return undefined
   return { report: delivery.report, analysis: delivery.analysis, textPartIDs: text.map((part) => part.id) }
-}
-
-// The canonical extractor separates independent parts with newlines. A tag can
-// itself be split by streaming/part boundaries; only remove that separator when
-// the two sides together spell a complete protocol tag.
-function joinSplitTags(chunks: string[]) {
-  // Pick a delimiter absent from the source so no user text is lost.
-  let separator = "\u0000"
-  while (chunks.some((chunk) => chunk.includes(separator))) separator += "\u0000"
-  const tags = ReviewReport.TAGS.flatMap((tag) => [`<${tag}>`, `</${tag}>`])
-  let joined = chunks.join(separator)
-  for (const tag of tags) {
-    const pattern = tag.split("").map((char) => char.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join(`(?:${separator})*`)
-    joined = joined.replace(new RegExp(pattern, "g"), tag)
-  }
-  return joined.split(separator).join("\n")
 }
 
 function hasQuotedTag(text: string) {

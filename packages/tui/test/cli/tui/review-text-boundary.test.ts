@@ -10,16 +10,15 @@ function parts(...chunks: string[]): Part[] {
 }
 
 describe("review text presentation boundary", () => {
-  test("extracts a complete reviewer message across parts and split tags", () => {
-    const result = reviewText(message, parts("Synthetic analysis.", envelope.slice(0, 8), envelope.slice(8), "Afterward."))
+  test("extracts a complete reviewer message across parts", () => {
+    const result = reviewText(message, parts("Synthetic analysis.", envelope, "Afterward."))
     expect(result?.report).toEqual(report)
     expect(result?.analysis).toBe("Synthetic analysis.\n\nAfterward.")
-    expect(result?.textPartIDs).toEqual(["p0", "p1", "p2", "p3"])
+    expect(result?.textPartIDs).toEqual(["p0", "p1", "p2"])
   })
-  test("reassembles tags split across multiple boundaries", () => {
-    const result = reviewText(message, parts("Analysis", ...envelope.slice(0, 19).split(""), envelope.slice(19)))
-    expect(result?.report).toEqual(report)
-    expect(result?.analysis).toBe("Analysis")
+  test("does not repair tags split inside their spelling", () => {
+    expect(reviewText(message, parts(envelope.slice(0, 8), envelope.slice(8)))).toBeUndefined()
+    expect(reviewText(message, parts(...envelope.slice(0, 19).split(""), envelope.slice(19)))).toBeUndefined()
   })
   test("keeps streaming, failed, malformed and incomplete output as ordinary text", () => {
     expect(reviewText({ ...message, time: { created: 1 } }, parts(envelope))).toBeUndefined()
