@@ -7,8 +7,15 @@ import { describe, expect } from "bun:test"
 import { Effect } from "effect"
 import fs from "node:fs/promises"
 import path from "node:path"
-import { raw, reply } from "../../lib/llm-server"
+import { SessionRetry } from "../../../src/session/retry"
 import { cliIt } from "../../lib/cli-process"
+import { raw, reply } from "../../lib/llm-server"
+
+const isModelAttempt = (hit: { url: URL; body: Record<string, unknown> }) => {
+  const route = hit.url.pathname
+  const titleRequest = JSON.stringify(hit.body).includes("Generate a title for this conversation")
+  return !titleRequest && (route === "/v1/chat/completions" || route === "/v1/responses")
+}
 
 describe("opencode run (non-interactive subprocess)", () => {
   cliIt.live(
@@ -40,12 +47,28 @@ describe("opencode run (non-interactive subprocess)", () => {
           },
         })
         expect(first.exitCode).toBe(0)
-        yield* llm.push(
+        expect(first.stdout).toContain("initial session response")
+        const initialHits = yield* llm.hits
+        expect(initialHits.filter(isModelAttempt)).toHaveLength(1)
+        expect(yield* llm.misses).toEqual([])
+        expect(yield* llm.pending).toBe(0)
+
+        const continuationStart = initialHits.length
+        let quotaResponses = 0
+        // Arm the quota script only after the first session has completed. The title
+        // request is handled separately by TestLLMServer; every non-title model request
+        // after this point belongs to the continued-session phase, including retries.
+        // Match that phase/attempt route rather than user-message position: continuation
+        // retries may transform or append messages, but must not fall through to "ok".
+        yield* llm.pushMatchRepeat(
+          isModelAttempt,
           raw({
             chunks: [
               { error: { message: "Free usage limit reached", type: "quota_exceeded", code: "FreeUsageLimitError" } },
             ],
+            onSend: () => quotaResponses++,
           }),
+          SessionRetry.RETRY_MAX_RETRIES + 1,
         )
         const result = yield* opencode.run("quota rejection", {
           timeoutMs: 20_000,
@@ -71,6 +94,14 @@ describe("opencode run (non-interactive subprocess)", () => {
             }),
           },
         })
+        const continuationAttempts = (yield* llm.hits).slice(continuationStart).filter(isModelAttempt)
+        expect(continuationAttempts.length).toBeGreaterThanOrEqual(1)
+        expect(continuationAttempts.length).toBeLessThanOrEqual(SessionRetry.RETRY_MAX_RETRIES + 1)
+        // Verify the script actually answered every model attempt in this phase; this
+        // fails before the exit-code check if a request fell through to the success default.
+        expect(quotaResponses).toBe(continuationAttempts.length)
+        expect(yield* llm.misses).toEqual([])
+        expect(yield* llm.pending).toBe(0)
         expect(result.exitCode).not.toBe(0)
         expect(result.stderr).toContain("Free usage limit reached")
         expect(result.durationMs).toBeLessThan(20_000)
