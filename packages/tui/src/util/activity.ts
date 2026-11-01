@@ -188,6 +188,7 @@ export function summarizeActivity(parts: readonly ToolPart[]): ActivitySummary {
   return { count: parts.length, working, failed, denied, interrupted, durationMs }
 }
 
+
 export type ActivityKind = "explore" | "shell" | "edit" | "misc"
 
 // Working-block kinds, keyed by tool id. Everything not listed here (web
@@ -232,7 +233,9 @@ export type ActivitySubGroup = {
 // streamed updates never remount earlier sub-blocks or reset their collapse
 // state (which is keyed on the same id).
 export function computeActivitySubGroups(group: ActivityGroup): ActivitySubGroup[] {
-  const toolKinds = group.parts.map((item) => (item.part.type === "tool" ? activityKindOf(item.part.tool) : undefined))
+  const toolKinds = group.parts.map((item) =>
+    item.part.type === "tool" ? activityKindOf(item.part.tool) : undefined,
+  )
   // Resolve reasoning to the kind of the tool call that follows it (that is
   // the action it plans); trailing reasoning joins the previous tool's block.
   const nextTool: (ActivityKind | undefined)[] = new Array(group.parts.length)
@@ -350,26 +353,14 @@ export function typedActivityHeader(
     const main = summary.working
       ? `Exploring files...${suffix}`
       : `Explored ${targetCount} file${targetCount === 1 ? "" : "s"}${suffix}`
-    const note = summary.working
-      ? undefined
-      : summary.interrupted
-        ? "interrupted"
-        : summary.denied
-          ? "denied"
-          : undefined
+    const note = summary.working ? undefined : summary.interrupted ? "interrupted" : summary.denied ? "denied" : undefined
     return { marker, main, failed, note }
   }
   if (kind === "shell") {
     const main = summary.working
       ? `Running command...${suffix}`
       : `Ran ${summary.count} command${summary.count === 1 ? "" : "s"}${suffix}`
-    const note = summary.working
-      ? undefined
-      : summary.interrupted
-        ? "interrupted"
-        : summary.denied
-          ? "denied"
-          : undefined
+    const note = summary.working ? undefined : summary.interrupted ? "interrupted" : summary.denied ? "denied" : undefined
     return { marker, main, failed, note }
   }
   const main = summary.working
@@ -415,12 +406,7 @@ export function activityHeader(
   const calls = `${summary.count} tool call${summary.count === 1 ? "" : "s"}`
   const failed = summary.failed > 0 ? `${summary.failed} failed` : undefined
   if (summary.working) {
-    return {
-      marker,
-      main: `Working... ${calls}${options.duration ? ` · ${options.duration}` : ""}`,
-      failed,
-      note: undefined,
-    }
+    return { marker, main: `Working... ${calls}${options.duration ? ` · ${options.duration}` : ""}`, failed, note: undefined }
   }
   const main = options.duration ? `Worked for ${options.duration} · ${calls}` : calls
   const note = summary.interrupted ? "interrupted" : summary.denied ? "denied" : undefined
