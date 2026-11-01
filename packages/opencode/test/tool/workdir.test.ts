@@ -1,6 +1,6 @@
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
-import { afterEach, describe, expect } from "bun:test"
+import { afterEach, describe, expect, test } from "bun:test"
 import { Cause, Effect, Exit, Layer } from "effect"
 import path from "path"
 import { Agent } from "../../src/agent/agent"
@@ -53,6 +53,12 @@ const toolLayer = () =>
   )
 
 const it = testEffect(Layer.mergeAll(toolLayer(), testInstanceStoreLayer))
+
+// Platform-gated controls report as skipped on the other runner instead of
+// passing vacuously, so "this has not run here" is visible in the result.
+const windowsOnly = process.platform === "win32" ? it.live : it.live.skip
+const posixOnly = process.platform === "win32" ? it.live.skip : it.live
+const posixOnlyInstance = process.platform === "win32" ? it.instance.skip : it.instance
 
 const base = {
   sessionID: SessionID.make("ses_test"),
@@ -169,11 +175,10 @@ describe("session workdir selection", () => {
     30_000,
   )
 
-  it.live(
+  posixOnly(
     "canonicalizes a folder reached through a symlink to its real target",
     () =>
       Effect.gen(function* () {
-        if (process.platform === "win32") return
         const project = yield* tmpdirScoped()
         const external = yield* tmpdirScoped()
         yield* Effect.promise(() =>
@@ -186,6 +191,84 @@ describe("session workdir selection", () => {
         // The selection is recorded where it really points. Storing the
         // internal-looking name instead would let every path under it be read as
         // if it were inside the project.
+        expect(resolved).toBe(external)
+        expect(FSUtil.contains(project, resolved)).toBe(false)
+      }),
+    30_000,
+  )
+})
+
+describe("a folder request is read by the platform's rules", () => {
+  test("a relative, an absolute and a traversed spelling are told apart", () => {
+    expect(Workdir.classify("child")).toBe("relative")
+    expect(Workdir.classify("../child")).toBe("relative")
+    expect(Workdir.classify(path.join("/srv", "project", "child"))).toBe("absolute")
+  })
+
+  test("Windows spellings are read by the same rules on any runner", () => {
+    // Absolute, and a UNC path names its own target rather than leaning on the
+    // process, so both may be used as they are.
+    expect(Workdir.classify("C:\\projects\\child", "win32")).toBe("absolute")
+    expect(Workdir.classify("C:/projects/child", "win32")).toBe("absolute")
+    expect(Workdir.classify("\\\\server\\share\\child", "win32")).toBe("absolute")
+    // `C:child` follows that drive's current directory and `\child` follows the
+    // process's current drive: neither names a folder the caller asked for.
+    expect(Workdir.classify("C:child", "win32")).toBe("process-relative")
+    expect(Workdir.classify("\\child", "win32")).toBe("process-relative")
+    expect(Workdir.classify("child", "win32")).toBe("relative")
+  })
+
+  test("a case difference is the same folder on Windows and a different one elsewhere", () => {
+    expect(Workdir.same("C:\\Projects\\Child", "c:\\projects\\child", "win32")).toBe(true)
+    expect(Workdir.same("/srv/Project", "/srv/project", "linux")).toBe(false)
+    expect(Workdir.same("/srv/project", "/srv/project", "linux")).toBe(true)
+  })
+
+  test("~ expands to the home directory and nothing else is expanded", () => {
+    expect(Workdir.expand("~/child", "/home/user")).toBe("/home/user/child")
+    expect(Workdir.expand("~", "/home/user")).toBe("/home/user")
+    expect(Workdir.expand("~other/child", "/home/user")).toBe("~other/child")
+    expect(Workdir.expand("child/~/x", "/home/user")).toBe("child/~/x")
+  })
+
+  windowsOnly(
+    "refuses a drive-relative or drive-rooted request instead of resolving it from the process",
+    () =>
+      Effect.gen(function* () {
+        const project = yield* tmpdirScoped()
+        const fs = yield* FSUtil.Service
+        // `C:` for the drive the temp folder is on.
+        const drive = (project.match(/^[A-Za-z]:/) ?? [""])[0]
+
+        const driveRelative = yield* settle(Workdir.resolve({ fs, requested: `${drive}child`, base: project }))
+        const driveRooted = yield* settle(
+          Workdir.resolve({ fs, requested: `\\${path.basename(project)}`, base: project }),
+        )
+
+        // Both would otherwise be resolved from state the caller never named.
+        expect(driveRelative.ok).toBe(false)
+        expect(driveRelative.error).toContain("must be an absolute path")
+        expect(driveRooted.ok).toBe(false)
+        expect(driveRooted.error).toContain("must be an absolute path")
+      }),
+    30_000,
+  )
+
+  windowsOnly(
+    "records a folder reached through a junction as its real target",
+    () =>
+      Effect.gen(function* () {
+        const project = yield* tmpdirScoped()
+        const external = yield* tmpdirScoped()
+        // A junction is what a Windows user actually finds on disk; a directory
+        // symlink needs a privilege the runner may not have.
+        yield* Effect.promise(() =>
+          import("fs/promises").then((fs) => fs.symlink(external, path.join(project, "link"), "junction")),
+        )
+
+        const fs = yield* FSUtil.Service
+        const resolved = yield* Workdir.resolve({ fs, requested: "link", base: project })
+
         expect(resolved).toBe(external)
         expect(FSUtil.contains(project, resolved)).toBe(false)
       }),
@@ -269,9 +352,8 @@ describe("tool working folder", () => {
     }),
   )
 
-  it.instance("a folder whose symlink target is outside the project still asks", () =>
+  posixOnlyInstance("a folder whose symlink target is outside the project still asks", () =>
     Effect.gen(function* () {
-      if (process.platform === "win32") return
       const test = yield* TestInstance
       const outer = yield* tmpdirScoped()
       yield* put(path.join(outer, "secret.txt"), "secret")

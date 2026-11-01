@@ -454,4 +454,77 @@ describe("tool.task working folder", () => {
       }),
     { config: { ...FOREGROUND, subagent_depth: 2 } },
   )
+
+  it.instance(
+    "a relative request resolves from the caller's folder, not the project it was dispatched from",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const outer = yield* mkdir(
+          path.join(path.dirname(test.directory), `outside-${Math.random().toString(36).slice(2)}`),
+        )
+        const nested = yield* mkdir(path.join(outer, "nested"))
+        // A caller that already works elsewhere: the same relative request has to
+        // mean the same thing from here as it would from the project session.
+        const { chat, assistant } = yield* seed(outer)
+        const sessions = yield* Session.Service
+
+        const child = yield* dispatch({ sessionID: chat.id, messageID: assistant.id, directory: "nested" })
+        const spawned = yield* sessions.get(SessionID.make(String(child.metadata.sessionId)))
+
+        expect(Workdir.read(spawned.metadata)).toBe(nested)
+        // It resolved from the caller's folder, not from the project directory.
+        expect(FSUtil.contains(test.directory, nested)).toBe(false)
+
+        yield* Effect.promise(() => import("fs/promises").then((fs) => fs.rm(outer, { recursive: true, force: true })))
+      }),
+    { config: FOREGROUND },
+  )
+
+  it.instance(
+    "a resume compares the folder by the rules of the platform it runs on",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const folder = yield* mkdir(path.join(test.directory, "CaseFolder"))
+        const { chat, assistant } = yield* seed()
+        const sessions = yield* Session.Service
+
+        const first = yield* dispatch({ sessionID: chat.id, messageID: assistant.id, directory: folder })
+        const id = SessionID.make(String(first.metadata.sessionId))
+
+        // Whether a respelling reaches the same folder is the file system's
+        // answer, not ours: Windows - and any case-insensitive volume - resolves
+        // it to one folder, while a case-sensitive volume names a second one.
+        const insensitive = yield* Effect.promise(() =>
+          import("fs/promises").then((fs) =>
+            fs.stat(path.join(test.directory, "casefolder")).then(
+              () => true,
+              () => false,
+            ),
+          ),
+        )
+        if (!insensitive) yield* mkdir(path.join(test.directory, "casefolder"))
+
+        const respelled = yield* Effect.exit(
+          dispatch({
+            sessionID: chat.id,
+            messageID: assistant.id,
+            taskID: first.metadata.sessionId,
+            directory: path.join(test.directory, "casefolder"),
+          }),
+        )
+
+        // Either way the task keeps the folder it was created in, so a case
+        // difference can neither move a conversation nor be refused twice.
+        expect(Workdir.read((yield* sessions.get(id)).metadata)).toBe(folder)
+        if (insensitive) {
+          expect(respelled._tag).toBe("Success")
+        } else {
+          expect(respelled._tag).toBe("Failure")
+          expect(failure(respelled)).toContain("already works in")
+        }
+      }),
+    { config: FOREGROUND },
+  )
 })

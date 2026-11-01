@@ -38,17 +38,48 @@ export function of(session: { metadata?: Record<string, unknown>; directory: str
   return read(session.metadata) ?? session.directory
 }
 
-/** Windows compares paths case-insensitively; every other platform compares them exactly. */
-export function same(a: string, b: string) {
-  return process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b
+/** The platform whose path rules decide what a request means. */
+export type Platform = NodeJS.Platform
+
+/**
+ * Windows compares paths case-insensitively, so the same folder respelled with
+ * different case is still the same folder and a resume may keep it. Every other
+ * platform compares them exactly, where a case difference names a different
+ * folder (or no folder at all) and the resume is refused.
+ */
+export function same(a: string, b: string, platform: Platform = process.platform) {
+  return platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b
 }
 
 // The user's home shorthand, and only that: `$HOME` and deeper shell expansion
 // stay in the shell, where quoting decides what the caller meant.
 const Home = /^~(?=$|[\\/])/
 
-export function expand(directory: string) {
-  return Home.test(directory) ? os.homedir() + directory.slice(1) : directory
+export function expand(directory: string, home: string = os.homedir()) {
+  return Home.test(directory) ? home + directory.slice(1) : directory
+}
+
+/**
+ * What a request names, in the terms the platform decides with.
+ *
+ * `absolute` names its own target, including a Windows UNC path
+ * (`\\server\share\folder`), which is why those can be used as they are.
+ * `relative` is resolved from the session's folder. `process-relative` names a
+ * location that depends on state nobody asked about - `C:folder` follows that
+ * drive's current directory and `\folder` follows the process's current drive -
+ * so it is refused rather than silently resolved from somewhere else.
+ *
+ * The platform is a parameter so both rule sets can be exercised on either
+ * runner: the Linux leg proves the Windows spellings without a Windows machine,
+ * and the Windows leg still proves the real thing.
+ */
+export type Spelling = "absolute" | "relative" | "process-relative"
+
+export function classify(requested: string, platform: Platform = process.platform): Spelling {
+  if (platform !== "win32") return path.posix.isAbsolute(requested) ? "absolute" : "relative"
+  if (/^[A-Za-z]:(?![\\/])/.test(requested)) return "process-relative"
+  if (/^[\\/](?![\\/])/.test(requested)) return "process-relative"
+  return path.win32.isAbsolute(requested) ? "absolute" : "relative"
 }
 
 /**
@@ -65,13 +96,15 @@ export const resolve = Effect.fn("Workdir.resolve")(function* (input: {
   if (requested.length === 0) {
     return yield* Effect.fail(new Error("The working folder cannot be empty."))
   }
-  // `C:folder` is relative to that drive's own current directory, which is not a
-  // folder the caller named: resolving it against the session's folder would land
+  // `C:folder` is relative to that drive's own current directory and `\folder`
+  // is rooted on the process's current drive; neither names a folder the caller
+  // asked for, so resolving either against the session's folder would land
   // somewhere nobody asked for.
-  if (process.platform === "win32" && /^[A-Za-z]:(?![\\/])/.test(requested)) {
+  const spelling = classify(requested)
+  if (spelling === "process-relative") {
     return yield* Effect.fail(new Error(`The working folder must be an absolute path: ${requested}`))
   }
-  const target = path.isAbsolute(requested) ? requested : path.resolve(input.base, requested)
+  const target = spelling === "absolute" ? requested : path.resolve(input.base, requested)
   const directory = yield* Effect.try({
     try: () => FSUtil.resolve(target),
     catch: (error) =>

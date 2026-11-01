@@ -17,6 +17,16 @@ where its relative paths resolve; it never changes what the child may reach.
   session created before folders were selectable keeps the project directory it
   was created in.
 - The folder must exist and be a directory. `~` is expanded; nothing else is.
+- A request is read by the rules of the platform the session runs on. An
+  absolute path - including a Windows UNC path (`\\server\share\folder`) - names
+  its own target. A relative one resolves from the caller's folder. Anything
+  that leans on process state instead - `C:folder`, which follows that drive's
+  current directory, and `\folder`, which follows the process's current drive -
+  is refused rather than quietly resolved from somewhere the caller never named.
+- Folders are compared the way the platform compares them: case-insensitively on
+  Windows, exactly everywhere else. A resume that only re-spells the case is
+  therefore the same task on Windows and a different folder elsewhere, where it
+  is refused.
 - `read`, `grep`, `glob`, `edit`, `write` and `apply_patch` resolve relative
   paths - and, for the search tools, their default root - from the session's
   folder. The system prompt reports it as `Working directory` and keeps the
