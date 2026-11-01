@@ -230,6 +230,25 @@ describe("review assistant text: real transcript fallback", () => {
     expect(frame).not.toContain("Needs fixes")
   })
 
+  test("a malformed completed report remains readable and has no verdict", async () => {
+    const app = (await mount({ agent: "review", completed: true, parts: [textPart("Malformed review content.\n\n<silvercode-review>\nnot-json\n</silvercode-review>")] })).app
+    await settleUntilFrame(app, "not-json")
+    const frame = await frameOfSpans(app)
+    expect(frame).toContain("Malformed review content.")
+    expect(frame).toContain("not-json")
+    expect(frame).not.toContain("✓ Approved")
+    expect(frame).not.toContain("✗ Needs fixes")
+  })
+
+  test("a valid envelope inside a non-review assistant example remains ordinary text", async () => {
+    const report = ReviewReport.envelope({ version: 1, revision: "synthetic", assessment: "approved", summary: "Not a review verdict", findings: [] })
+    const app = (await mount({ agent: "work", completed: true, parts: [textPart(`An example:\n\n\`\`\`xml\n${report}\n\`\`\``)] })).app
+    await settleUntilFrame(app, "Not a review verdict")
+    const frame = await frameOfSpans(app)
+    expect(frame).toContain("Not a review verdict")
+    expect(frame).not.toContain("✓ Approved")
+  })
+
   test("quoted valid protocol examples remain examples for a completed reviewer", async () => {
     const report = ReviewReport.envelope({ version: 1, revision: "synthetic", assessment: "approved", summary: "Example report only", findings: [] })
     const app = (await mount({ agent: "review", completed: true, parts: [textPart(`Example protocol:\n\n\`\`\`xml\n${report}\n\`\`\``)] })).app
