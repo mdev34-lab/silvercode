@@ -137,7 +137,6 @@ export const CORE_TOOLS = [
   "tool_search",
   "tool_search_regex",
   "shell",
-  "bash",
   "read",
   "glob",
   "grep",

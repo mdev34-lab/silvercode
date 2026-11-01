@@ -67,6 +67,7 @@ const STATE_CHANGING_TOOLS: readonly string[] = [
   "apply_patch",
   "attachment",
   "bash",
+  "shell",
   "edit",
   "question",
   "todowrite",

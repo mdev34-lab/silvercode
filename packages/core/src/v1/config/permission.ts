@@ -21,6 +21,10 @@ const InputObject = Schema.StructWithRest(
     glob: Schema.optional(Rule),
     grep: Schema.optional(Rule),
     list: Schema.optional(Rule),
+    shell: Schema.optional(Rule),
+    // Legacy spelling of the shell tool permission from before the #780
+    // rename. Kept typed so existing user config parses unchanged; matching
+    // treats it as an alias of "shell".
     bash: Schema.optional(Rule),
     task: Schema.optional(Rule),
     external_directory: Schema.optional(Rule),
