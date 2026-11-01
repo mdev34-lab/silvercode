@@ -2,7 +2,7 @@ import { afterEach, describe, expect } from "bun:test"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { Database } from "@opencode-ai/core/database/database"
-import { Effect } from "effect"
+import { Effect, Exit } from "effect"
 import path from "path"
 import { Agent } from "@/agent/agent"
 import { BackgroundJob } from "@/background/job"
@@ -31,7 +31,8 @@ import { RuntimeFlags } from "@/effect/runtime-flags"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { MessageID } from "@/session/schema"
-import { disposeAllInstances, TestInstance } from "../fixture/fixture"
+import { InstanceState } from "@/effect/instance-state"
+import { disposeAllInstances, TestInstance, tmpdirScoped } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
 
 afterEach(async () => {
@@ -179,6 +180,47 @@ describe("session working folder reaches tool execution", () => {
         expect(JSON.stringify(childRead)).toContain("child copy")
         expect(JSON.stringify(childRead)).not.toContain("project copy")
         expect(JSON.stringify(rootRead)).toContain("project copy")
+      }),
+    { config },
+  )
+
+  it.instance(
+    "an external selection keeps the instance anchor and existing access decisions",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const anchor = yield* InstanceState.context
+        const processDirectory = process.cwd()
+        const sessions = yield* Session.Service
+        const permissions = yield* Permission.Service
+        const fs = yield* FSUtil.Service
+        const allowed = yield* tmpdirScoped()
+        const denied = yield* tmpdirScoped()
+        yield* fs.writeWithDirs(path.join(allowed, "same.txt"), "allowed copy")
+        yield* fs.writeWithDirs(path.join(denied, "same.txt"), "denied copy")
+        const permission = [
+          { permission: "external_directory", pattern: path.join(allowed, "*"), action: "allow" as const },
+          { permission: "external_directory", pattern: path.join(denied, "*"), action: "deny" as const },
+        ]
+        const allowedChild = yield* sessions.create({
+          title: "Allowed child",
+          metadata: { workdir: allowed },
+          permission,
+        })
+        const deniedChild = yield* sessions.create({
+          title: "Denied child",
+          metadata: { workdir: denied },
+          permission,
+        })
+
+        expect(JSON.stringify(yield* readRelative(allowedChild))).toContain("allowed copy")
+        const blocked = yield* Effect.exit(readRelative(deniedChild))
+        expect(Exit.isFailure(blocked)).toBe(true)
+        expect((yield* permissions.list()).length).toBe(0)
+        // The resolution base changed, not the instance or its approval store.
+        expect(yield* InstanceState.context).toEqual(anchor)
+        expect(process.cwd()).toBe(processDirectory)
+        expect(anchor.directory).toBe(test.directory)
       }),
     { config },
   )

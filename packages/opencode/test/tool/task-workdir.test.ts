@@ -384,6 +384,45 @@ describe("tool.task working folder", () => {
   )
 
   it.instance(
+    "retains an existing external allow without extending it to a sibling",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const outer = yield* mkdir(
+          path.join(path.dirname(test.directory), `outside-${Math.random().toString(36).slice(2)}`),
+        )
+        const sibling = `${outer}-sibling`
+        const { chat, assistant } = yield* seed()
+        const sessions = yield* Session.Service
+        const permission = yield* Permission.Service
+        const grant = {
+          permission: "external_directory",
+          pattern: path.join(outer, "*"),
+          action: "allow" as const,
+        }
+        yield* sessions.setPermission({ sessionID: chat.id, permission: [grant] })
+
+        const result = yield* dispatch({ sessionID: chat.id, messageID: assistant.id, directory: outer })
+        const child = yield* sessions.get(SessionID.make(String(result.metadata.sessionId)))
+
+        // An existing grant survives selection exactly; the selected path adds no new grant.
+        expect(child.permission).toEqual(expect.arrayContaining([grant]))
+        expect(child.permission?.filter((rule) => rule.permission === "external_directory")).toEqual([grant])
+        expect(
+          Permission.evaluate("external_directory", path.join(outer, "file.txt"), child.permission ?? []).action,
+        ).toBe("allow")
+        expect(
+          Permission.evaluate("external_directory", path.join(sibling, "file.txt"), child.permission ?? []).action,
+        ).toBe("ask")
+        expect((yield* sessions.get(chat.id)).permission).toEqual([grant])
+        expect((yield* permission.list()).length).toBe(0)
+
+        yield* Effect.promise(() => import("fs/promises").then((fs) => fs.rm(outer, { recursive: true, force: true })))
+      }),
+    { config: FOREGROUND },
+  )
+
+  it.instance(
     "a nested child cannot escape the ancestor's ruleset by choosing a folder",
     () =>
       Effect.gen(function* () {
