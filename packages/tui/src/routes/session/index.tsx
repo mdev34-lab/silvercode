@@ -1390,7 +1390,7 @@ export function Session() {
                         <></>
                       </Match>
                       <Match when={message.role === "user"}>
-                        <UserMessage
+                        <UserMessageRow
                           index={index()}
                           onMouseUp={() => {
                             if (renderer.getSelection()?.getSelectedText()) return
@@ -1499,7 +1499,7 @@ export function Session() {
   )
 }
 
-function UserMessage(props: {
+function UserMessageRow(props: {
   message: UserMessage
   parts: Part[]
   onMouseUp: () => void
@@ -1691,6 +1691,9 @@ function UserMessage(props: {
     </>
   )
 }
+
+// Export the real user row for synthetic live-render transcript captures.
+export { UserMessageRow as CaptureUserMessage }
 
 // Exported so tests can render the assistant transcript row directly.
 export function AssistantMessageRow(props: { message: AssistantMessage; parts: Part[]; last: boolean }) {
