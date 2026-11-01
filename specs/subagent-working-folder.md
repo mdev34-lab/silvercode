@@ -54,9 +54,28 @@ The folder is a resolution base, never a boundary:
 ## Not covered yet
 
 `bash` still runs in the instance directory when the model omits `workdir`, so a
-child's default shell folder does not follow its selection. The shell tool's
-default-cwd resolution belongs to the shell permission surface (the `bash` tool
-id is being renamed, and the same file holds the shell permission ask), so it is
-handed over rather than changed here. Until it lands, a child that needs the
-shell in its own folder must pass `workdir` explicitly, which is resolved the
-same way and gated the same way.
+child's default shell folder does not follow its selection:
+
+```ts
+const cwd = params.workdir
+  ? yield* resolvePath(params.workdir, instanceCtx.directory, shell)
+  : instanceCtx.directory
+```
+
+Both branches of that line are in `packages/opencode/src/tool/shell.ts`, which
+also holds the shell permission ask and the tool-id rename in flight, so it is
+handed over rather than changed here.
+
+Until it lands, the workaround differs by spelling. An absolute `workdir` is
+used as given and gated by the same `external_directory` check, so a child can
+reach its folder that way. A relative one does not follow the selection: it
+resolves from the instance directory, because that is the base on the
+`resolvePath` call above - not from the child's folder, and not from the caller's
+either. Nothing in this change makes that worse or better; it is the one place
+left where the selection is not honoured.
+
+The coordinated change is to pass the session's folder into that call and use it
+as the default - `ctx.cwd ?? instanceCtx.directory` for the base, the same value
+for the fallback - together with the permission work landing on that file. It is
+not made here, because two owners editing that line at once is how the shell
+permission ask and the rename get broken.
