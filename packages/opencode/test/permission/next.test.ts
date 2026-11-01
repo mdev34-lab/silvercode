@@ -6,6 +6,7 @@ import { EventV2Bridge } from "../../src/event-v2-bridge"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { Npm } from "@opencode-ai/core/npm"
 import { Permission } from "../../src/permission"
+import { Config } from "@/config/config"
 import { InstanceBootstrap } from "../../src/project/bootstrap"
 import { InstanceStore } from "../../src/project/instance-store"
 import { TestInstance, tmpdirScoped } from "../fixture/fixture"
@@ -33,13 +34,31 @@ const stubNpm = Layer.succeed(
 )
 
 const env = AppNodeBuilder.build(
-  LayerNode.group([Permission.node, EventV2Bridge.node, CrossSpawnSpawner.node, InstanceStore.node]),
+  LayerNode.group([Permission.node, EventV2Bridge.node, CrossSpawnSpawner.node, InstanceStore.node, Config.node]),
   [
     [InstanceStore.bootstrapNode, noopBootstrap],
     [Npm.node, stubNpm],
   ],
 )
-const it = testEffect(env)
+const baseIt = testEffect(env)
+const it = {
+  ...baseIt,
+  instance: (...args: Parameters<typeof baseIt.instance>) => {
+    const [name, body, options, testOptions] = args
+    return baseIt.instance(
+      name,
+      Effect.gen(function* () {
+        // Config is lazy per instance. Initialize it before each test's permission readiness
+        // window so startup work cannot consume the fixed waitForPending deadline.
+        const config = yield* Config.Service
+        yield* config.get()
+        return yield* typeof body === "function" ? body() : body
+      }),
+      options,
+      testOptions,
+    )
+  },
+}
 
 let priorDepInstallFlag: string | undefined
 beforeEach(() => {
@@ -1001,6 +1020,9 @@ it.live("permission requests stay isolated by directory", () =>
     const one = yield* tmpdirScoped({ git: true })
     const two = yield* tmpdirScoped({ git: true })
     const store = yield* InstanceStore.Service
+    const configReady = Config.Service.use((config) => config.get())
+    yield* store.provide({ directory: one }, configReady)
+    yield* store.provide({ directory: two }, configReady)
 
     const a = yield* store
       .provide(
@@ -1206,13 +1228,17 @@ it.instance(
   { git: true },
 )
 
-// Guards the isolation above. The ask needs a prompt (the ruleset says "ask"), so it goes
-// through config load before it is published. If the flag stops being honored, or the beforeEach
-// stops setting it, the stubbed Npm.install records the attempt and this test fails.
-it.instance(
-  "config load never forks a background dependency install",
+// Exercise the cold config load explicitly before starting the permission readiness wait.
+// If startup forks the background dependency install, the stub records it and this test fails.
+baseIt.instance(
+  "config startup never forks a background dependency install",
   () =>
     Effect.gen(function* () {
+      const config = yield* Config.Service
+      yield* config.get()
+      yield* Effect.sleep("100 millis")
+      expect(depInstalls).toEqual([])
+
       const fiber = yield* ask({
         id: PermissionV1.ID.make("per_no_dep_install"),
         sessionID: SessionID.make("session_no_dep_install"),
@@ -1223,8 +1249,8 @@ it.instance(
         ruleset: [{ permission: "bash", pattern: "*", action: "ask" }],
       }).pipe(Effect.forkScoped)
 
-      // Pending membership means the ask already went through config load, so a fork that
-      // happened there has been started by now. The short pause lets its detached fiber run.
+      // The cold load and its no-install assertion happened above. This confirms the ask
+      // publishes normally after config readiness, then gives any regressed detached fork a beat.
       expect(yield* waitForPending(1)).toHaveLength(1)
       yield* Effect.sleep("100 millis")
       expect(depInstalls).toEqual([])
@@ -1233,4 +1259,75 @@ it.instance(
       yield* Fiber.await(fiber)
     }),
   { git: true },
+)
+
+// Deterministically distinguish cold config publication from poll starvation. The cold
+// control delays the first Config.get inside ask beyond the unchanged one-second wait;
+// the ready fixture performs that same startup work before asking, and the request is
+// then observed and rejected within the original wait budget.
+baseIt.live("readiness - preload keeps delayed config startup outside the pending deadline", () =>
+  Effect.gen(function* () {
+    const config = yield* Config.Service
+    const store = yield* InstanceStore.Service
+    const originalGet = config.get
+    let delayNextGet = false
+    Object.defineProperty(config, "get", {
+      configurable: true,
+      value: () =>
+        Effect.gen(function* () {
+          if (delayNextGet) {
+            delayNextGet = false
+            yield* Effect.sleep("1400 millis")
+          }
+          return yield* originalGet()
+        }),
+    })
+    yield* Effect.addFinalizer(() => Effect.sync(() => Object.defineProperty(config, "get", { value: originalGet })))
+
+    const coldDirectory = yield* tmpdirScoped()
+    const readyDirectory = yield* tmpdirScoped()
+
+    const cold = yield* store.provide(
+      { directory: coldDirectory },
+      Effect.gen(function* () {
+        delayNextGet = true
+        const fiber = yield* ask({
+          id: PermissionV1.ID.make("per_readiness_cold"),
+          sessionID: SessionID.make("session_readiness_cold"),
+          permission: "bash",
+          patterns: ["ls"],
+          metadata: {},
+          always: [],
+          ruleset: [],
+        }).pipe(Effect.forkScoped)
+        const result = yield* waitForPending(1).pipe(Effect.exit)
+        yield* Fiber.interrupt(fiber)
+        return result
+      }),
+    )
+    expect(Exit.isFailure(cold)).toBe(true)
+    if (Exit.isFailure(cold)) expect(String(Cause.squash(cold.cause))).toContain("timed out waiting for 1 pending")
+
+    yield* store.provide(
+      { directory: readyDirectory },
+      Effect.gen(function* () {
+        delayNextGet = true
+        yield* Config.Service.use((service) => service.get())
+        const fiber = yield* ask({
+          id: PermissionV1.ID.make("per_readiness_ready"),
+          sessionID: SessionID.make("session_readiness_ready"),
+          permission: "bash",
+          patterns: ["ls"],
+          metadata: {},
+          always: [],
+          ruleset: [],
+        }).pipe(Effect.forkScoped)
+        expect(yield* waitForPending(1)).toHaveLength(1)
+        yield* reply({ requestID: PermissionV1.ID.make("per_readiness_ready"), reply: "reject" })
+        const exit = yield* Fiber.await(fiber)
+        expect(Exit.isFailure(exit)).toBe(true)
+        if (Exit.isFailure(exit)) expect(Cause.squash(exit.cause)).toBeInstanceOf(PermissionV1.RejectedError)
+      }),
+    )
+  }),
 )
