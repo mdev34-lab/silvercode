@@ -62,7 +62,9 @@ The folder is a resolution base, never a boundary:
 child's default shell folder does not follow its selection:
 
 ```ts
-const cwd = params.workdir ? yield * resolvePath(params.workdir, instanceCtx.directory, shell) : instanceCtx.directory
+const cwd = params.workdir
+  ? yield* resolvePath(params.workdir, instanceCtx.directory, shell)
+  : instanceCtx.directory
 ```
 
 Both branches of that line are in `packages/opencode/src/tool/shell.ts`, which
