@@ -745,3 +745,10 @@ it.instance("a request the classifier is unsure about keeps Work's execution too
     for (const id of ["shell","edit","write","task","read"]) expect(ids.includes(id)).toBe(true)
   }
 }))
+
+it.instance("the model-facing catalog publishes exactly one shell tool and no bash tool (#780)", () => Effect.gen(function* () {
+  const registry=yield* ToolRegistry.Service
+  const ids=yield* registry.ids()
+  expect(ids.filter((id)=>id==="shell")).toHaveLength(1)
+  expect(ids).not.toContain("bash")
+}))

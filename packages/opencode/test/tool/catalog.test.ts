@@ -75,6 +75,15 @@ describe("ToolCatalog.options", () => {
 describe("ToolCatalog.deferred", () => {
   const options = ToolCatalog.options(undefined)
 
+  // #780: the always-loaded set names the shell tool once, under its
+  // canonical id; the stale pre-rename "bash" entry must not come back.
+  it.effect("core tools list shell exactly once and never bash", () =>
+    Effect.sync(() => {
+      expect(ToolCatalog.CORE_TOOLS.filter((id) => id === "shell")).toHaveLength(1)
+      expect(ToolCatalog.CORE_TOOLS).not.toContain("bash")
+    }),
+  )
+
   it.effect("never defers core builtin tools", () =>
     Effect.sync(() => {
       for (const id of ToolCatalog.CORE_TOOLS) {

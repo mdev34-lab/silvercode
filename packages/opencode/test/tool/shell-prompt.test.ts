@@ -77,6 +77,28 @@ describe("tool.shell prompt shell identity", () => {
     })
   }
 
+  // #780: the tool is published as "shell", so no profile may instruct the
+  // model to make "bash tool calls", and the POSIX intro must not claim a
+  // persistent bash session on hosts running zsh/sh/etc. (each call spawns a
+  // fresh process).
+  for (const [name, platform] of all) {
+    test(`${name} description names the tool "shell", never "bash"`, () => {
+      const description = flat(name, platform)
+
+      expect(description).toContain("shell tool call")
+      expect(description).not.toContain("bash tool call")
+      expect(description).not.toContain("a single Bash call")
+      expect(description).not.toContain("given bash command")
+      expect(description).not.toContain("persistent shell session")
+    })
+  }
+
+  test("POSIX intro says each call runs in a fresh shell process", () => {
+    for (const [name, platform] of posix) {
+      expect(flat(name, platform)).toContain("in a fresh shell process")
+    }
+  })
+
   test("rendered descriptions contain no leftover template placeholders", () => {
     for (const [name, platform] of all) {
       expect(ShellPrompt.render(name, platform, limits, 120_000).description).not.toContain("${")

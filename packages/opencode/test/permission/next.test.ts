@@ -191,14 +191,14 @@ test("fromConfig - preserves top-level config key order", () => {
   expect(wildcardFirst.map((r) => r.permission)).toEqual(["*", "bash"])
   expect(specificFirst.map((r) => r.permission)).toEqual(["bash", "*"])
 
-  expect(Permission.evaluate("bash", "ls", wildcardFirst).action).toBe("allow")
-  expect(Permission.evaluate("bash", "ls", specificFirst).action).toBe("deny")
+  expect(Permission.evaluate("shell", "ls", wildcardFirst).action).toBe("allow")
+  expect(Permission.evaluate("shell", "ls", specificFirst).action).toBe("deny")
 })
 
 test("fromConfig - wildcard acts as fallback when it appears before specifics", () => {
   const ruleset = Permission.fromConfig({ "*": "ask", bash: "allow" })
   expect(Permission.evaluate("edit", "foo.ts", ruleset).action).toBe("ask")
-  expect(Permission.evaluate("bash", "ls", ruleset).action).toBe("allow")
+  expect(Permission.evaluate("shell", "ls", ruleset).action).toBe("allow")
 })
 
 test("fromConfig - top-level ordering is not sorted by wildcard specificity", () => {
@@ -214,15 +214,52 @@ test("fromConfig - top-level ordering is not sorted by wildcard specificity", ()
 test("fromConfig - sub-pattern insertion order inside a tool key is preserved", () => {
   const ruleset = Permission.fromConfig({ bash: { "*": "deny", "git *": "allow" } })
   expect(ruleset.map((r) => r.pattern)).toEqual(["*", "git *"])
-  expect(Permission.evaluate("bash", "rm foo", ruleset).action).toBe("deny")
-  expect(Permission.evaluate("bash", "git status", ruleset).action).toBe("allow")
+  expect(Permission.evaluate("shell", "rm foo", ruleset).action).toBe("deny")
+  expect(Permission.evaluate("shell", "git status", ruleset).action).toBe("allow")
 })
 
 test("fromConfig - documented fallback-first example", () => {
   const ruleset = Permission.fromConfig({ "*": "ask", bash: "allow", edit: "deny" })
-  expect(Permission.evaluate("bash", "ls", ruleset).action).toBe("allow")
+  expect(Permission.evaluate("shell", "ls", ruleset).action).toBe("allow")
   expect(Permission.evaluate("edit", "foo.ts", ruleset).action).toBe("deny")
   expect(Permission.evaluate("read", "foo.ts", ruleset).action).toBe("ask")
+})
+
+// #780: the shell tool was renamed from "bash" to "shell". Pre-rename user
+// config, saved grants, and agent permission objects spell the action
+// "bash"; those rules must keep matching the canonical "shell" action with
+// full wildcard semantics and findLast precedence. A legacy "deny" must
+// never silently degrade to the default "ask".
+
+test("legacy bash deny still denies the renamed shell tool (no ask broadening)", () => {
+  const ruleset = Permission.fromConfig({ bash: "deny" })
+  expect(Permission.evaluate("shell", "rm foo", ruleset).action).toBe("deny")
+  expect(Permission.disabled(["shell", "read"], ruleset)).toEqual(new Set(["shell"]))
+})
+
+test("legacy bash per-pattern rules still gate shell commands", () => {
+  const ruleset = Permission.fromConfig({ bash: { "*": "ask", "git *": "allow" } })
+  expect(Permission.evaluate("shell", "git status", ruleset).action).toBe("allow")
+  expect(Permission.evaluate("shell", "rm foo", ruleset).action).toBe("ask")
+})
+
+test("legacy bash wildcard permission patterns still match shell (wildcard, not equality)", () => {
+  const ruleset: PermissionV1.Ruleset = [{ permission: "ba*", pattern: "*", action: "deny" }]
+  expect(Permission.evaluate("shell", "ls", ruleset).action).toBe("deny")
+  expect(Permission.disabled(["shell"], ruleset)).toEqual(new Set(["shell"]))
+})
+
+test("canonical shell and legacy bash rules resolve by ruleset order (last wins)", () => {
+  const legacyFirst = Permission.fromConfig({ bash: "deny", shell: "allow" })
+  const canonicalFirst = Permission.fromConfig({ shell: "allow", bash: "deny" })
+  expect(Permission.evaluate("shell", "ls", legacyFirst).action).toBe("allow")
+  expect(Permission.evaluate("shell", "ls", canonicalFirst).action).toBe("deny")
+})
+
+test("canonical shell deny hides the shell tool", () => {
+  const ruleset = Permission.fromConfig({ shell: "deny" })
+  expect(Permission.evaluate("shell", "ls", ruleset).action).toBe("deny")
+  expect(Permission.disabled(["shell", "read"], ruleset)).toEqual(new Set(["shell"]))
 })
 
 test("fromConfig - expands exact tilde to home directory", () => {
