@@ -264,6 +264,18 @@ test("legacy doom_loop bash patterns still gate the renamed shell tool", () => {
   expect(Permission.evaluate("edit", "shell", [{ permission: "edit", pattern: "bash", action: "deny" }]).action).toBe("ask")
 })
 
+test("evaluating under the legacy bash name resolves canonical shell rules", () => {
+  // #780: the two spellings are one action identity in both directions, so a
+  // legacy query name still resolves rules stored under the canonical key.
+  const ruleset: PermissionV1.Ruleset = [
+    { permission: "shell", pattern: "*", action: "allow" },
+    { permission: "shell", pattern: "rm -rf *", action: "deny" },
+  ]
+  expect(Permission.evaluate("bash", "rm -rf *", ruleset).action).toBe("deny")
+  expect(Permission.evaluate("bash", "ls", ruleset).action).toBe("allow")
+  expect(Permission.evaluate("shell", "rm -rf *", ruleset).action).toBe("deny")
+})
+
 test("canonical shell and legacy bash rules resolve by ruleset order (last wins)", () => {
   const legacyFirst = Permission.fromConfig({ bash: "deny", shell: "allow" })
   const canonicalFirst = Permission.fromConfig({ shell: "allow", bash: "deny" })

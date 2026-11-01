@@ -1338,7 +1338,7 @@ it.instance("migrates mixed legacy tools config", () =>
 
     const config = yield* Config.use.get()
     expect(named(config.agent?.["test"])?.permission).toEqual({
-      bash: "allow",
+      shell: "allow",
       edit: "allow",
       read: "deny",
       webfetch: "allow",
@@ -1357,7 +1357,7 @@ it.instance("merges legacy tools with existing permission config", () =>
     const config = yield* Config.use.get()
     expect(named(config.agent?.["test"])?.permission).toEqual({
       glob: "allow",
-      bash: "allow",
+      shell: "allow",
     })
   }),
 )
@@ -1413,7 +1413,7 @@ test("config parser preserves permission order while ignoring unknown top-level 
     "test",
   )
 
-  expect(Object.keys(config.permission!)).toEqual(["bash", "*", "edit"])
+  expect(Object.keys(config.permission!)).toEqual(["shell", "*", "edit"])
   expect(config).not.toHaveProperty("plugins")
 })
 
@@ -2168,9 +2168,10 @@ test("parseManagedPlist parses permission rules", async () => {
   expect(config.permission?.grep).toBe("allow")
   expect(config.permission?.webfetch).toBe("ask")
   expect(config.permission?.["~/.ssh/*"]).toBe("deny")
-  const bash = config.permission?.bash as Record<string, string>
-  expect(bash?.["rm -rf *"]).toBe("deny")
-  expect(bash?.["curl *"]).toBe("deny")
+  // #780: the legacy `bash` key in managed config decodes to canonical `shell`.
+  const shell = config.permission?.shell as Record<string, string>
+  expect(shell?.["rm -rf *"]).toBe("deny")
+  expect(shell?.["curl *"]).toBe("deny")
 })
 
 test("parseManagedPlist parses enabled_providers", async () => {

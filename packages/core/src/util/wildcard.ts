@@ -25,7 +25,11 @@ const LEGACY_ACTION_ALIASES: Readonly<Record<string, readonly string[]>> = { she
 
 export function matchAction(action: string, pattern: string) {
   if (match(action, pattern)) return true
-  return (LEGACY_ACTION_ALIASES[action] ?? []).some((legacy) => match(legacy, pattern))
+  if ((LEGACY_ACTION_ALIASES[action] ?? []).some((legacy) => match(legacy, pattern))) return true
+  // Symmetric: a query under the legacy spelling resolves rules written with
+  // the canonical one too — the two spellings are one action identity.
+  const canonicalName = canonical(action)
+  return canonicalName !== action && match(canonicalName, pattern)
 }
 
 /** Canonical spelling of a tool/permission name: legacy `bash` folds to `shell` (#780). */
