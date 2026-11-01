@@ -9,7 +9,7 @@
 // Slash commands:
 //   /permission [kind] → triggers a permission request variant
 //   /question [kind]   → triggers a question request variant
-//   /fmt <kind>   → emits a specific tool/text type (text, reasoning, bash,
+//   /fmt <kind>   → emits a specific tool/text type (text, reasoning, shell,
 //                   write, edit, patch, task, todo, question, error, mix)
 //
 // Demo mode also handles permission and question replies locally, completing
@@ -25,7 +25,7 @@ const KINDS = [
   "table",
   "text",
   "reasoning",
-  "bash",
+  "shell",
   "write",
   "edit",
   "patch",
@@ -35,7 +35,7 @@ const KINDS = [
   "error",
   "mix",
 ]
-const PERMISSIONS = ["edit", "bash", "read", "task", "external", "doom"] as const
+const PERMISSIONS = ["edit", "shell", "read", "task", "external", "doom"] as const
 const QUESTIONS = ["multi", "single", "checklist", "custom"] as const
 
 type PermissionKind = (typeof PERMISSIONS)[number]
@@ -582,8 +582,8 @@ function emitError(state: State, text: string): void {
   feed(state, event)
 }
 
-async function emitBash(state: State, signal?: AbortSignal): Promise<void> {
-  const ref = make(state, "bash", {
+async function emitShell(state: State, signal?: AbortSignal): Promise<void> {
+  const ref = make(state, "shell", {
     command: "git status",
     workdir: process.cwd(),
     description: "Show git status",
@@ -794,16 +794,16 @@ function emitPermission(state: State, kind: PermissionKind = "edit"): void {
   const root = process.cwd()
   const file = path.join(root, "src", "demo-format.ts")
 
-  if (kind === "bash") {
+  if (kind === "shell") {
     const command = "git status --short"
-    const ref = make(state, "bash", {
+    const ref = make(state, "shell", {
       command,
       workdir: root,
       description: "Inspect worktree changes",
     })
     askPermission(state, {
       ref,
-      permission: "bash",
+      permission: "shell",
       patterns: [command],
       always: ["*"],
       done: {
@@ -1041,8 +1041,8 @@ async function emitFmt(state: State, kind: string, body: string, signal?: AbortS
     return true
   }
 
-  if (kind === "bash") {
-    await emitBash(state, signal)
+  if (kind === "shell") {
+    await emitShell(state, signal)
     return true
   }
 
@@ -1086,7 +1086,7 @@ async function emitFmt(state: State, kind: string, body: string, signal?: AbortS
     await wait(50, signal)
     await emitReasoning(state, "Thinking through formatter edge cases [REDACTED].", signal)
     await wait(50, signal)
-    await emitBash(state, signal)
+    await emitShell(state, signal)
     emitWrite(state)
     emitEdit(state)
     emitPatch(state)
@@ -1109,7 +1109,7 @@ function intro(state: State): void {
       `- /question [kind] (${QUESTIONS.join(", ")})`,
       `- /fmt <kind> (${KINDS.join(", ")})`,
       "Examples:",
-      "- /permission bash",
+      "- /permission shell",
       "- /question custom",
       "- /fmt markdown",
       "- /fmt table",

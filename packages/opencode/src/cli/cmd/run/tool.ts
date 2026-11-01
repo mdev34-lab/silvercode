@@ -18,7 +18,7 @@ import stripAnsi from "strip-ansi"
 import type { ToolPart } from "@opencode-ai/sdk/v2"
 import type * as Tool from "@/tool/tool"
 import type { ApplyPatchTool } from "@/tool/apply_patch"
-import type { ShellTool as BashTool } from "@/tool/shell"
+import type { ShellTool } from "@/tool/shell"
 import type { EditTool } from "@/tool/edit"
 import type { GlobTool } from "@/tool/glob"
 import type { GrepTool } from "@/tool/grep"
@@ -95,7 +95,9 @@ type ToolPermissionCtx = {
 
 type ToolDefs = {
   invalid: typeof InvalidTool
-  bash: typeof BashTool
+  shell: typeof ShellTool
+  // Legacy persisted parts from before the #780 rename still say "bash".
+  bash: typeof ShellTool
   write: typeof WriteTool
   edit: typeof EditTool
   apply_patch: typeof ApplyPatchTool
@@ -805,7 +807,7 @@ function snapQuestion(p: ToolProps<typeof QuestionTool>): ToolSnapshot {
   }
 }
 
-function scrollBashStart(p: ToolProps<typeof BashTool>): string {
+function scrollShellStart(p: ToolProps<typeof ShellTool>): string {
   const cmd = p.input.command ?? ""
   const wd = p.input.workdir ?? ""
   const formatted = wd && wd !== "." ? toolPath(wd) : ""
@@ -821,7 +823,7 @@ function scrollBashStart(p: ToolProps<typeof BashTool>): string {
   return `# Running in ${dir}\n$ ${cmd}`
 }
 
-function scrollBashProgress(p: ToolProps<typeof BashTool>): string {
+function scrollShellProgress(p: ToolProps<typeof ShellTool>): string {
   const out = stripAnsi(p.frame.raw)
   const cmd = (p.input.command ?? "").trim()
   const fmt = (text: string) => {
@@ -854,7 +856,7 @@ function scrollBashProgress(p: ToolProps<typeof BashTool>): string {
   return fmt(out)
 }
 
-function scrollBashFinal(p: ToolProps<typeof BashTool>): string {
+function scrollShellFinal(p: ToolProps<typeof ShellTool>): string {
   const code = p.metadata.exit ?? num(p.frame.meta.exitCode) ?? num(p.frame.meta.exit_code)
   const time = span(p.frame.state)
   if (code === undefined) {
@@ -1198,7 +1200,7 @@ function permList(p: ToolPermissionProps): ToolPermissionInfo {
   }
 }
 
-function permBash(p: ToolPermissionProps<typeof BashTool>): ToolPermissionInfo {
+function permShell(p: ToolPermissionProps<typeof ShellTool>): ToolPermissionInfo {
   const cmd = p.input.command || ""
   return {
     icon: "#",
@@ -1264,18 +1266,33 @@ const TOOL_RULES = {
       final: scrollInvalidFinal,
     },
   },
+  shell: {
+    view: {
+      output: true,
+      final: false,
+    },
+    run: runShell,
+    scroll: {
+      start: scrollShellStart,
+      progress: scrollShellProgress,
+      final: scrollShellFinal,
+    },
+    permission: permShell,
+  },
+  // Legacy persisted parts from before the #780 rename still say "bash";
+  // they render through the same rule as canonical "shell" parts.
   bash: {
     view: {
       output: true,
       final: false,
     },
-    run: runBash,
+    run: runShell,
     scroll: {
-      start: scrollBashStart,
-      progress: scrollBashProgress,
-      final: scrollBashFinal,
+      start: scrollShellStart,
+      progress: scrollShellProgress,
+      final: scrollShellFinal,
     },
-    permission: permBash,
+    permission: permShell,
   },
   write: {
     view: {
@@ -1591,7 +1608,7 @@ export function toolFrame(commit: StreamCommit, raw: string): ToolFrame {
   }
 }
 
-function runBash(p: ToolProps<typeof BashTool>): ToolInline {
+function runShell(p: ToolProps<typeof ShellTool>): ToolInline {
   return {
     icon: "$",
     title: p.input.command || "",

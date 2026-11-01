@@ -308,7 +308,7 @@ export function PermissionPrompt(props: { request: PermissionRequest; directory?
               }
             }
 
-            if (permission === "bash") {
+            if (permission === "shell" || permission === "bash") {
               const command = typeof data.command === "string" ? data.command : ""
               return {
                 icon: "#",

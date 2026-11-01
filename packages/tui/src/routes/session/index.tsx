@@ -85,7 +85,13 @@ import { sessionEpilogue } from "../../util/presentation"
 import { setPreLayoutSiblingMargin } from "../../util/layout"
 import { useTuiConfig } from "../../config"
 import { useClipboard } from "../../context/clipboard"
-import { nextThinkingMode, reasoningOpen, reasoningSummary, useThinkingMode, type ThinkingMode } from "../../context/thinking"
+import {
+  nextThinkingMode,
+  reasoningOpen,
+  reasoningSummary,
+  useThinkingMode,
+  type ThinkingMode,
+} from "../../context/thinking"
 import { getScrollAcceleration } from "../../util/scroll"
 import { collapseToolOutput } from "../../util/collapse-tool-output"
 import { capOutputLines } from "../../util/cap-lines"
@@ -1761,35 +1767,35 @@ export function AssistantMessageRow(props: { message: AssistantMessage; parts: P
           const pause = createMemo(() => (group() && !group()!.owner ? undefined : pauseMarker(props.parts, index())))
           return (
             <>
-            <Show when={pause()}>
-              {(text) => (
-                <box
-                  marginTop={1}
-                  border={["top"]}
-                  title={` ↻ ${text()} `}
-                  titleAlignment="center"
-                  borderColor={theme.border}
-                />
-              )}
-            </Show>
-            <Switch>
-              <Match when={group()?.owner === true}>
-                <ActivityGroup groupID={group()!.groupID} />
-              </Match>
-              <Match when={group()?.owner === false}>
-                <></>
-              </Match>
-              <Match when={true}>
-                <Show when={component()}>
-                  <Dynamic
-                    last={index() === props.parts.length - 1}
-                    component={component()}
-                    part={part as any}
-                    message={props.message}
+              <Show when={pause()}>
+                {(text) => (
+                  <box
+                    marginTop={1}
+                    border={["top"]}
+                    title={` ↻ ${text()} `}
+                    titleAlignment="center"
+                    borderColor={theme.border}
                   />
-                </Show>
-              </Match>
-            </Switch>
+                )}
+              </Show>
+              <Switch>
+                <Match when={group()?.owner === true}>
+                  <ActivityGroup groupID={group()!.groupID} />
+                </Match>
+                <Match when={group()?.owner === false}>
+                  <></>
+                </Match>
+                <Match when={true}>
+                  <Show when={component()}>
+                    <Dynamic
+                      last={index() === props.parts.length - 1}
+                      component={component()}
+                      part={part as any}
+                      message={props.message}
+                    />
+                  </Show>
+                </Match>
+              </Switch>
             </>
           )
         }}
@@ -1905,7 +1911,7 @@ const PART_MAPPING = {
 
 const INLINE_TOOL_ICON_WIDTH = 2
 
-// Default content lines shown in a collapsed bash/write/edit block before "Click to expand".
+// Default content lines shown in a collapsed shell/write/edit block before "Click to expand".
 const COLLAPSED_TOOL_PREVIEW_LINES = 3
 
 function ReasoningPart(props: { last: boolean; part: ReasoningPart; message: AssistantMessage }) {
@@ -2466,8 +2472,7 @@ export function finishBlockView(part: ToolPart, input: Record<string, unknown>, 
   if (part.state.status !== "completed") return undefined
   const reason = stringValue(input.reason)
   const metadata = "metadata" in part.state ? part.state.metadata : undefined
-  const waiting =
-    metadata?.waiting === true || reason === "waiting_for_subagent" || reason === "subagent_wait"
+  const waiting = metadata?.waiting === true || reason === "waiting_for_subagent" || reason === "subagent_wait"
   if (waiting) return { tone: "waiting" as const, title: `${WAITING_ICON} ${WAITING_LABEL}`, detail: result }
   if (reason === "failure") return { tone: "failure" as const, title: "✗ Task failed", detail: result }
   if (reason !== undefined && reason !== "success")
@@ -2605,8 +2610,8 @@ function ReviewFinish(props: { review: { report: ReviewReport.Info; analysis: st
       COLLAPSED_TOOL_PREVIEW_LINES * Math.max(20, ctx.width - 6),
     ),
   )
-  const expandable = createMemo(() =>
-    analysisCollapsed().overflow || findings().some((finding) => (finding.detail ?? "").trim() !== ""),
+  const expandable = createMemo(
+    () => analysisCollapsed().overflow || findings().some((finding) => (finding.detail ?? "").trim() !== ""),
   )
   // The envelope is stripped from the default view; the exact canonical
   // JSON stays reachable on demand, re-serialized the same way the runtime
@@ -2631,7 +2636,8 @@ function ReviewFinish(props: { review: { report: ReviewReport.Info; analysis: st
             </span>
             <Show when={findings().length > 0}>
               <span style={{ fg: theme.textMuted }}>
-                {" · "}{findings().length} finding{findings().length === 1 ? "" : "s"}
+                {" · "}
+                {findings().length} finding{findings().length === 1 ? "" : "s"}
               </span>
             </Show>
           </text>
@@ -2651,12 +2657,14 @@ function ReviewFinish(props: { review: { report: ReviewReport.Info; analysis: st
                       <text fg={theme.text}>
                         {"↳ "}
                         <span style={{ fg: severityColor(finding.severity), bold: true }}>{finding.severity}</span>
-                        {" · "}{finding.title}
+                        {" · "}
+                        {finding.title}
                         {loc ? ` (${loc})` : ""}
                       </text>
                       <Show when={expanded() && (finding.detail ?? "").trim() !== ""}>
                         <text fg={theme.text}>
-                          {"   ↳ "}{finding.detail}
+                          {"   ↳ "}
+                          {finding.detail}
                         </text>
                       </Show>
                     </>
@@ -3716,6 +3724,8 @@ const nativeToolRenderers = {
   list_mcp_resources: McpResource,
   list_mcp_resource_templates: McpResource,
   read_mcp_resource: McpResource,
+  shell: Shell,
+  // Legacy persisted parts from before the #780 rename still say "bash".
   bash: Shell,
   glob: Glob,
   read: Read,

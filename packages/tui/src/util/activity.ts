@@ -188,8 +188,7 @@ export function summarizeActivity(parts: readonly ToolPart[]): ActivitySummary {
   return { count: parts.length, working, failed, denied, interrupted, durationMs }
 }
 
-
-export type ActivityKind = "explore" | "bash" | "edit" | "misc"
+export type ActivityKind = "explore" | "shell" | "edit" | "misc"
 
 // Working-block kinds, keyed by tool id. Everything not listed here (web
 // tools, LSP, skills, MCP, invalid, ...) stays in the unchanged "Working..."
@@ -200,7 +199,9 @@ const TOOL_KIND: Record<string, ActivityKind> = {
   glob: "explore",
   grep: "explore",
   list: "explore",
-  bash: "bash",
+  shell: "shell",
+  // Legacy persisted parts from before the #780 rename still say "bash".
+  bash: "shell",
   write: "edit",
   edit: "edit",
   apply_patch: "edit",
@@ -221,7 +222,7 @@ export type ActivitySubGroup = {
 
 // Splits one activity group into per-kind blocks in chronological order: a
 // change of activity kind closes the current block, and same-kind work after
-// an interleaving kind opens a NEW block (read, bash, read -> Explored, Ran,
+// an interleaving kind opens a NEW block (read, shell, read -> Explored, Ran,
 // Explored). Reasoning attaches to the block of the tool call that follows it,
 // since that is the action it plans; trailing reasoning lands in the last
 // block. Block ids are occurrence-indexed (act-<firstToolId>:<kind>:<n>), so
@@ -231,9 +232,7 @@ export type ActivitySubGroup = {
 // streamed updates never remount earlier sub-blocks or reset their collapse
 // state (which is keyed on the same id).
 export function computeActivitySubGroups(group: ActivityGroup): ActivitySubGroup[] {
-  const toolKinds = group.parts.map((item) =>
-    item.part.type === "tool" ? activityKindOf(item.part.tool) : undefined,
-  )
+  const toolKinds = group.parts.map((item) => (item.part.type === "tool" ? activityKindOf(item.part.tool) : undefined))
   // Resolve reasoning to the kind of the tool call that follows it (that is
   // the action it plans); trailing reasoning joins the previous tool's block.
   const nextTool: (ActivityKind | undefined)[] = new Array(group.parts.length)
@@ -318,7 +317,7 @@ function activityTarget(part: ToolPart, platform: NodeJS.Platform): string {
   }
 }
 
-// Distinct-target count for file-oriented blocks (Explored/Edited). Bash and
+// Distinct-target count for file-oriented blocks (Explored/Edited). Shell and
 // misc blocks count calls instead, so they pass targetCount = summary.count.
 export function countActivityTargets(
   items: readonly ActivityItem[],
@@ -351,14 +350,26 @@ export function typedActivityHeader(
     const main = summary.working
       ? `Exploring files...${suffix}`
       : `Explored ${targetCount} file${targetCount === 1 ? "" : "s"}${suffix}`
-    const note = summary.working ? undefined : summary.interrupted ? "interrupted" : summary.denied ? "denied" : undefined
+    const note = summary.working
+      ? undefined
+      : summary.interrupted
+        ? "interrupted"
+        : summary.denied
+          ? "denied"
+          : undefined
     return { marker, main, failed, note }
   }
-  if (kind === "bash") {
+  if (kind === "shell") {
     const main = summary.working
       ? `Running command...${suffix}`
       : `Ran ${summary.count} command${summary.count === 1 ? "" : "s"}${suffix}`
-    const note = summary.working ? undefined : summary.interrupted ? "interrupted" : summary.denied ? "denied" : undefined
+    const note = summary.working
+      ? undefined
+      : summary.interrupted
+        ? "interrupted"
+        : summary.denied
+          ? "denied"
+          : undefined
     return { marker, main, failed, note }
   }
   const main = summary.working
@@ -404,7 +415,12 @@ export function activityHeader(
   const calls = `${summary.count} tool call${summary.count === 1 ? "" : "s"}`
   const failed = summary.failed > 0 ? `${summary.failed} failed` : undefined
   if (summary.working) {
-    return { marker, main: `Working... ${calls}${options.duration ? ` · ${options.duration}` : ""}`, failed, note: undefined }
+    return {
+      marker,
+      main: `Working... ${calls}${options.duration ? ` · ${options.duration}` : ""}`,
+      failed,
+      note: undefined,
+    }
   }
   const main = options.duration ? `Worked for ${options.duration} · ${calls}` : calls
   const note = summary.interrupted ? "interrupted" : summary.denied ? "denied" : undefined
