@@ -265,13 +265,22 @@ test("legacy doom_loop bash patterns still gate the renamed shell tool", () => {
 })
 
 test("a later s* wildcard does not bypass an explicit legacy bash deny", () => {
-  // #780: `s*` was written when the tool was called `bash` (it covered
-  // `skill`). Evaluating the renamed tool must preserve the deny instead of
-  // recruiting `shell` into the later wildcard allow.
+  // #780: matching is union + findLast (canonical `s*` does name the tool),
+  // with one compatibility clamp: a wildcard that matches only via the new
+  // name cannot lift a deny that already applied under the legacy name.
   const ruleset = Permission.fromConfig({ bash: "deny", "s*": "allow" })
   expect(Permission.evaluate("shell", "ls", ruleset).action).toBe("deny")
-  // A legacy-spelling query is not widened by the new spelling either.
   expect(Permission.evaluate("bash", "ls", ruleset).action).toBe("deny")
+  expect(Permission.disabled(["shell"], ruleset)).toEqual(new Set(["shell"]))
+  // Canonical wildcards otherwise work, including as carve-outs.
+  expect(Permission.evaluate("shell", "ls", Permission.fromConfig({ "s*": "allow" })).action).toBe("allow")
+  expect(Permission.evaluate("shell", "ls", Permission.fromConfig({ "*": "ask", "s*": "allow" })).action).toBe(
+    "allow",
+  )
+  expect(Permission.evaluate("shell", "ls", Permission.fromConfig({ bash: "deny", "s*": "ask" })).action).toBe(
+    "deny",
+  )
+  expect(Permission.disabled(["shell"], Permission.fromConfig({ "s*": "deny" }))).toEqual(new Set(["shell"]))
   // Explicit re-permits still win by order (last matching literal wins).
   expect(Permission.evaluate("shell", "ls", Permission.fromConfig({ bash: "deny", shell: "allow" })).action).toBe(
     "allow",

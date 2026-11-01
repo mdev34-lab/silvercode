@@ -34,14 +34,27 @@ const layer = Layer.effect(
       }),
       hasStatements: () => statements.length > 0,
       evaluate: EffectRuntime.fn("Policy.evaluate")(function* (action, resource, fallback) {
-        // doom_loop resources are tool ids (action names), so legacy `bash` patterns
-        // must still gate the tool now published as `shell` (#780).
-        const matchResource = action === "doom_loop" ? Wildcard.matchAction : Wildcard.match
-        return (
-          statements.findLast(
-            (statement) => Wildcard.matchAction(action, statement.action) && matchResource(resource, statement.resource),
-          )?.effect ?? fallback
-        )
+        const isDeny = (statement: Info) => statement.effect === "deny"
+        // doom_loop resources are tool ids (action names), so legacy `bash`
+        // patterns must still gate the tool now published as `shell`, and the
+        // rename clamp applies on that dimension instead (#780).
+        const winner =
+          action === "doom_loop"
+            ? Wildcard.winningRule(
+                statements,
+                resource,
+                (statement) => statement.resource,
+                (statement) => Wildcard.matchAction(action, statement.action),
+                isDeny,
+              )
+            : Wildcard.winningRule(
+                statements,
+                action,
+                (statement) => statement.action,
+                (statement) => Wildcard.match(resource, statement.resource),
+                isDeny,
+              )
+        return winner?.effect ?? fallback
       }),
     })
   }),

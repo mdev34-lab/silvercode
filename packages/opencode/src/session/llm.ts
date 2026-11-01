@@ -413,7 +413,13 @@ const live: Layer.Layer<
 
         const ruleset = Permission.merge(input.agent.permission ?? [], input.permission ?? [])
         workflowModel.sessionPreapprovedTools = Object.keys(prepared.tools).filter((name) => {
-          const match = ruleset.findLast((rule) => CoreWildcard.matchAction(name, rule.permission))
+          const match = CoreWildcard.winningRule(
+            ruleset,
+            name,
+            (rule) => rule.permission,
+            () => true,
+            (rule) => rule.action === "deny",
+          )
           return !match || match.action !== "ask"
         })
 

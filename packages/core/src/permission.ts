@@ -80,18 +80,28 @@ export class NotFoundError extends Schema.TaggedErrorClass<NotFoundError>()("Per
 export type Error = BlockedError | CorrectedError
 
 export function evaluate(action: string, resource: string, ...rulesets: Permission.Ruleset[]): Permission.Rule {
-  // doom_loop rules key on the tool id, so their resources are action names: a legacy
-  // `bash` pattern must still gate the tool now published as `shell` (#780).
-  const matchResource = action === "doom_loop" ? Wildcard.matchAction : Wildcard.match
-  return (
-    rulesets
-      .flat()
-      .findLast((rule) => Wildcard.matchAction(action, rule.action) && matchResource(resource, rule.resource)) ?? {
-      action,
-      resource: "*",
-      effect: "ask",
-    }
-  )
+  const rules = rulesets.flat()
+  const isDeny = (rule: Permission.Rule) => rule.effect === "deny"
+  // doom_loop rules key on the tool id, so their resources are action names:
+  // legacy `bash` patterns must still gate the tool now published as `shell`,
+  // and the rename clamp applies on that dimension instead (#780).
+  const winner =
+    action === "doom_loop"
+      ? Wildcard.winningRule(
+          rules,
+          resource,
+          (rule) => rule.resource,
+          (rule) => Wildcard.matchAction(action, rule.action),
+          isDeny,
+        )
+      : Wildcard.winningRule(
+          rules,
+          action,
+          (rule) => rule.action,
+          (rule) => Wildcard.match(resource, rule.resource),
+          isDeny,
+        )
+  return winner ?? { action, resource: "*", effect: "ask" }
 }
 
 export function merge(...rulesets: Permission.Ruleset[]): Permission.Ruleset {

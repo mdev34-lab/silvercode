@@ -84,6 +84,10 @@ describe("Policy", () => {
       ])
       // An explicit later literal still wins.
       expect(yield* policy.evaluate("doom_loop", "shell", "deny")).toBe("allow")
+
+      yield* policy.load([new Policy.Info({ effect: "allow", action: "s*", resource: "*" })])
+      // Canonical wildcards name the tool when no legacy deny stands.
+      expect(yield* policy.evaluate("shell", "ls", "deny")).toBe("allow")
     }),
   )
 

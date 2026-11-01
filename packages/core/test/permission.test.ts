@@ -286,6 +286,16 @@ describe("PermissionV2", () => {
         PermissionV2.evaluate("doom_loop", "read", [{ action: "doom_loop", resource: "bash", effect: "deny" }])
           .effect,
       ).toBe("ask")
+      // Canonical wildcards name the tool when no legacy deny stands.
+      expect(PermissionV2.evaluate("shell", "ls", [{ action: "s*", resource: "*", effect: "allow" }]).effect).toBe(
+        "allow",
+      )
+      expect(
+        PermissionV2.evaluate("shell", "ls", [
+          { action: "*", resource: "*", effect: "ask" },
+          { action: "s*", resource: "*", effect: "allow" },
+        ]).effect,
+      ).toBe("allow")
     }),
   )
 
