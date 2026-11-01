@@ -228,3 +228,19 @@ test("a streaming continuation remains raw until its execution completes", async
   expect(completed).toContain("Later analysis.")
   expect(completed).not.toContain("✓ Approved")
 })
+
+test("conflicting reports with an unavailable parent remain raw", async () => {
+  const first = assistantMessage("msg_002", SESSION, { agent: "review", mode: "review", parentID: "msg_missing", time: { created: 1_700_000_001_000, completed: 1_700_000_002_000 } })
+  const second = assistantMessage("msg_003", SESSION, { agent: "review", mode: "review", parentID: "msg_missing", time: { created: 1_700_000_010_000, completed: 1_700_000_011_000 } })
+  const entries = [
+    { info: first, parts: [textPart("first", first, `Earlier analysis.\n${old}`)] },
+    { info: second, parts: [textPart("second", second, `Later analysis.\n${latest}`)] },
+  ]
+  const { app } = await mountSessionRoute({ width: 120, height: 50, sessions: [sessionInfo(SESSION)], messages: { [SESSION]: entries } })
+  await waitFor(app, () => app.captureCharFrame().includes("Later synthetic finding") ? true : undefined)
+  const result = await spansOf(app)
+  expect(result).toContain("Earlier synthetic approval")
+  expect(result).toContain("Later synthetic finding")
+  expect(result).not.toContain("✓ Approved")
+  expect(result).not.toContain("✗ Needs fixes")
+})

@@ -74,6 +74,34 @@ export function executionReviewPlan(messages: readonly Message[], parts: Readonl
     return { owner: current.id, members: new Set([current.id]) }
   }
   const entries: Entry[] = messages.map((info) => ({ info, parts: parts[info.id]! })).sort((a, b) => a.info.id.localeCompare(b.info.id))
+  if (!entries.some((entry) => entry.info.role === "user" && entry.info.id === current.parentID)) {
+    // With a missing anchor, the runtime deliberately uses only the current
+    // row. If nearby rows with the same unavailable parent disagree, we cannot
+    // establish whether they are history or one execution; show them raw.
+    const peers = entries.filter((entry) => entry.info.role === "assistant" && entry.info.parentID === current.parentID && Agent.canonicalID(entry.info.agent) === "review")
+    const position = peers.findIndex((entry) => entry.info.id === current.id)
+    let start = position, end = position
+    const finished = (entry: Entry) => entry.parts.some((part) => part.type === "tool" && part.tool === "finish" && part.state.status === "completed")
+    while (start > 0 && !finished(peers[start - 1])) start--
+    while (end + 1 < peers.length && !finished(peers[end])) end++
+    const segment = peers.slice(start, end + 1)
+    if (segment.length > 1) {
+      const reports = new Set<string>()
+      let uncertain = false
+      for (const entry of segment) {
+        if (entry.info.role !== "assistant" || entry.info.time.completed === undefined || entry.info.error) uncertain = true
+        const chunks = entry.parts.flatMap((part) => part.type === "text" && !part.synthetic && !part.ignored ? [part.text] : [])
+        const finish = entry.parts.findLast((part): part is ToolPart => part.type === "tool" && part.tool === "finish" && part.state.status === "completed")
+        if (finish?.state.status === "completed" && typeof finish.state.input.result === "string") chunks.push(finish.state.input.result)
+        const source = chunks.join("\n")
+        if (!ReviewReport.TAGS.some((tag) => source.includes(`<${tag}`))) continue
+        const delivery = ReviewReport.extract(chunks)
+        if (!delivery.ok) uncertain = true
+        else reports.add(JSON.stringify(delivery.report))
+      }
+      if (uncertain || reports.size > 1) return { owner: current.id, members: new Set(segment.map((entry) => entry.info.id)) }
+    }
+  }
   // Mark assistant messages in a copy, keeping all finish parts intact, so the
   // actual runtime collector tells us which rows belong to the same execution.
   const marked = entries.map(({ info, parts }) => ({
