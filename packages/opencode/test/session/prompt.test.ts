@@ -1709,12 +1709,55 @@ withMcpTools.instance(
 )
 
 it.instance(
-  "a truncated write retry stays outside the doom-loop identical-triplet condition",
+  "three identical calls in one assistant message reach the denied doom-loop permission",
   () =>
     Effect.gen(function* () {
-      // Keep `doom_loop` denied so any guard request, if reached, would halt this turn.
-      // The guard-specific evidence below is the structural check on recorded tool parts;
-      // this scenario does not establish that the runtime denial path was exercised.
+      const { dir, llm } = yield* useServerConfig((url) => ({
+        ...providerCfg(url),
+        permission: { "*": "allow", doom_loop: "deny" },
+      }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const agents = yield* AgentSvc.Service
+      const agent = yield* agents.get("build")
+      expect(Permission.evaluate("doom_loop", "bash", agent.permission).action).toBe("deny")
+      const session = yield* sessions.create({ title: "Doom-loop positive control" })
+      yield* prompt.prompt({
+        sessionID: session.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "run the same harmless command three times" }],
+      })
+
+      const input = { command: "echo SHOULD_NOT_RUN", description: "doom-loop positive control", workdir: dir }
+      // One provider response creates one assistant message with three real tool parts.
+      // A separate llm.tool() reply for each call would not exercise the per-message guard.
+      yield* llm.push(reply().tool("bash", input).tool("bash", input).tool("bash", input))
+      const result = yield* prompt.loop({ sessionID: session.id })
+      expect(result.info.role).toBe("assistant")
+      if (result.info.role !== "assistant") throw new Error("expected an assistant result")
+      // The guard's denied ask interrupts this model step after tool calls were issued.
+      // That is the observable runtime signal (as opposed to an inferred structural window).
+      expect(result.info.error).toBeDefined()
+      expect(JSON.stringify(result.info.error)).toContain("ProviderStreamInterruptedAfterToolCallError")
+
+      const messages = yield* sessions.messages({ sessionID: session.id })
+      const repeated = messages
+        .filter((message) => message.info.role === "assistant")
+        .map((message) => message.parts.filter((part) => part.type === "tool" && part.tool === "bash"))
+        .filter((parts) => parts.length === 3)
+      expect(repeated).toHaveLength(1)
+      expect(repeated[0]?.map((part) => part.type === "tool" && part.state.input)).toEqual([input, input, input])
+    }),
+  20_000,
+)
+
+it.instance(
+  "a truncated write retry completes without a doom-loop ask under deny policy",
+  () =>
+    Effect.gen(function* () {
+      // Keep `doom_loop` denied so any guard request halts this turn; the successful result
+      // below is the runtime no-ask assertion.
       const { dir, llm } = yield* useServerConfig((url) => ({
         ...providerCfg(url),
         permission: { "*": "allow", doom_loop: "deny" },
@@ -1752,10 +1795,10 @@ it.instance(
       yield* llm.tool("edit", { filePath: target, oldString: "line one\n", newString: "line one\n" + second })
       yield* llm.text("done")
 
-      // Completing the loop verifies the scripted recovery path; it does not by itself
-      // show that the doom_loop denial branch was reached.
       const result = yield* prompt.loop({ sessionID: session.id })
       expect(result.info.role).toBe("assistant")
+      if (result.info.role !== "assistant") throw new Error("expected an assistant result")
+      expect(result.info.error).toBeUndefined()
 
       const parts = (yield* sessions.messages({ sessionID: session.id })).flatMap((message) => message.parts)
       const executions = parts.filter(
@@ -1787,24 +1830,8 @@ it.instance(
       expect(executionsOf("edit")).toHaveLength(1)
       expect(yield* Effect.promise(() => readFile(target, "utf8"))).toBe(full)
 
-      // The guard's real failure definition (`processor.ts` DOOM_LOOP_THRESHOLD = 3): a
-      // window of three consecutive tool parts inside one assistant message with the same
-      // tool name and byte-identical input. A single truncated call contributes exactly
-      // one `invalid` placeholder, and its guided retry is a differently named `write`
-      // call carrying different input, so the pair cannot fill such a window.
-      expect(executions.filter((part) => part.tool === "invalid")).toHaveLength(1)
-      for (const messageID of new Set(executions.map((part) => part.messageID))) {
-        const owned = executions.filter((part) => part.messageID === messageID)
-        for (let index = 0; index + 3 <= owned.length; index++) {
-          const window = owned.slice(index, index + 3)
-          const identical =
-            window.every((part) => part.tool === window[0]?.tool) &&
-            window.every((part) => JSON.stringify(part.state.input) === JSON.stringify(window[0]?.state.input))
-          expect(identical).toBe(false)
-        }
-      }
-      // The deny rule is a safety condition only if the guard asks. This run's evidence is
-      // the structural no-triplet check above, not a runtime denial observation.
+      // The deny rule is live for the entire recovery. Completion with no assistant error
+      // is runtime evidence that the single truncated write and guided retry did not ask.
       expect(parts.some((part) => part.type === "text" && part.text === "done")).toBe(true)
     }),
   20_000,
@@ -1814,7 +1841,10 @@ it.instance(
   "a truncated write for an existing file keeps what earlier calls wrote",
   () =>
     Effect.gen(function* () {
-      const { dir, llm } = yield* useServerConfig(providerCfg)
+      const { dir, llm } = yield* useServerConfig((url) => ({
+        ...providerCfg(url),
+        permission: { "*": "allow", doom_loop: "deny" },
+      }))
       const prompt = yield* SessionPrompt.Service
       const sessions = yield* Session.Service
 
@@ -1824,8 +1854,6 @@ it.instance(
       const chunkTwo = "appended chunk two\n"
       // An earlier call in this session already produced this content; the guidance must
       // not assume the path is empty just because this call wrote nothing.
-      yield* writeText(target, existing)
-
       const session = yield* sessions.create({
         title: "Truncated write over existing file",
         permission: [{ permission: "*", pattern: "*", action: "allow" }],
@@ -1837,7 +1865,9 @@ it.instance(
         parts: [{ type: "text", text: "extend the notes" }],
       })
 
-      // Step 1: the write call is cut off inside `content`.
+      // Earlier bytes are created by a real tool call in this same session.
+      yield* llm.tool("write", { filePath: target, content: existing })
+      // Step 1: the next write call is cut off inside `content`.
       yield* llm.toolRaw("write", `{"filePath":${JSON.stringify(target)},"content":"# Notes\\n\\nreplacement`)
       // Step 2: the model follows the guidance - inspect the existing file, then append
       // each remaining chunk with edit. It never re-writes, so nothing already on disk is
@@ -1851,7 +1881,10 @@ it.instance(
       yield* llm.tool("edit", { filePath: target, oldString: chunkOne, newString: chunkOne + chunkTwo })
       yield* llm.text("done")
 
-      yield* prompt.loop({ sessionID: session.id })
+      const result = yield* prompt.loop({ sessionID: session.id })
+      expect(result.info.role).toBe("assistant")
+      if (result.info.role !== "assistant") throw new Error("expected an assistant result")
+      expect(result.info.error).toBeUndefined()
 
       const parts = (yield* sessions.messages({ sessionID: session.id })).flatMap((message) => message.parts)
       const executions = parts.filter(
@@ -1863,9 +1896,10 @@ it.instance(
       expect(repaired.state.output).toContain("do not start over with write")
       expect(repaired.state.output).toContain("would discard what is already there")
 
-      // the continuation executed only as appends: one truncated placeholder, two edits,
-      // and no write at all
-      expect(executions.filter((part) => part.tool === "write")).toHaveLength(0)
+      // The only executed write is the earlier content; this failed write did not replace it.
+      const writes = executions.filter((part) => part.tool === "write")
+      expect(writes).toHaveLength(1)
+      expect(writes[0]?.state.status === "completed" && writes[0].state.input).toMatchObject({ content: existing })
       expect(executions.filter((part) => part.tool === "edit")).toHaveLength(2)
 
       // every byte that was already there survives, and both chunks landed after it
