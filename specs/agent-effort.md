@@ -78,6 +78,9 @@ or a run starts, so changing it in an existing session changes what runs next:
   mid-generation this can make the `finish` stricter than the prompt the model
   saw for the generation that requested it; the level in effect at the call is
   the one enforced, and the delivery is labelled with it.
+- A new `task` child dispatched after the change inherits the parent's updated
+  selection; an already-created child keeps its own persisted selection under
+  the precedence order above.
 - The next user turn in the same session resolves the current level again; the
   selection is not cached per session or per run.
 
