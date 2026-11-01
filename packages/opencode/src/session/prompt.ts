@@ -152,6 +152,11 @@ const answered = (messages: readonly SessionV1.WithParts[], userID: string) =>
 // the whole transcript - instead of always taking the newest message by
 // creation time - is what keeps an answer with the caller that is owed it:
 //
+// 0. A continuation this run injected itself (the finish nudge) and is still
+//    owed an answer outranks every other turn. It belongs to the generation in
+//    progress, not to a new one: the run is mid-turn, and re-deriving the turn
+//    from the stored transcript must not spend a nudge without asking the
+//    model. See the in-flight note in runLoop.
 // 1. A repetition continuation the runner already injected and has not answered
 //    is the oldest unfinished generation. A prompt stored after it must not
 //    consume its instruction or leave it dangling.
@@ -201,8 +206,14 @@ type UserMessage = SessionV1.WithParts & { info: SessionV1.User }
 const generationTarget = (
   messages: readonly SessionV1.WithParts[],
   waiting: ReadonlySet<string>,
+  continuation?: string,
 ): UserMessage | undefined => {
   const users = messages.filter((message): message is UserMessage => message.info.role === "user")
+  const inFlight =
+    continuation === undefined
+      ? undefined
+      : users.findLast((message) => message.info.id === continuation && !answered(messages, continuation))
+  if (inFlight) return inFlight
   const owed = users.find(
     (message) => repetitionRecoveryPromptID(message) !== undefined && !answered(messages, message.info.id),
   )
@@ -1577,22 +1588,57 @@ const layer = Layer.effect(
         let structured: unknown
         let step = 0
         let finishNudges = 0
+        // The continuation this run injected and is still owed an answer. Turn
+        // selection reads the transcript back, but a stored timestamp can place
+        // this run's own nudge before the assistant that triggered it (a clock
+        // step between that generation and the nudge), and a read that has not
+        // observed the write yet looks the same. Deriving the turn from that
+        // read alone would select the same prompt again, append another nudge,
+        // and spend the whole nudge budget without asking the model once. The
+        // message this run persisted is therefore kept in flight until an
+        // assistant answers it, and it is the target of the next generation.
+        let inFlight: { message: SessionV1.User; part: SessionV1.TextPart; seen: ReadonlySet<string> } | undefined
         const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
 
         while (true) {
           yield* status.set(sessionID, { type: "busy" })
           yield* Effect.logInfo("loop", { "session.id": sessionID, step })
 
-          let msgs = yield* MessageV2.filterCompactedEffect(sessionID).pipe(
+          const stored = yield* MessageV2.filterCompactedEffect(sessionID).pipe(
             Effect.provideService(Database.Service, database),
           )
+          // An answer retires the continuation and a user message the loop had
+          // not already seen when it injected the continuation supersedes it
+          // (new input owns the next turn). Everything else keeps it in flight,
+          // as the newest message, even when the stored transcript places it
+          // earlier. Supersession is by identity, not by stored order, so a
+          // skewed clock cannot make the prompt the nudge already continues look
+          // like newer input.
+          const pending =
+            inFlight === undefined ||
+            answered(stored, inFlight.message.id) ||
+            stored.some(
+              (message) =>
+                message.info.role === "user" &&
+                message.info.id !== inFlight!.message.id &&
+                !inFlight!.seen.has(message.info.id),
+            )
+              ? undefined
+              : inFlight
+          inFlight = pending
+          let msgs: SessionV1.WithParts[] = pending
+            ? [
+                ...stored.filter((message) => message.info.id !== pending.message.id),
+                { info: pending.message, parts: [pending.part] },
+              ]
+            : stored
 
           // Choose the generation explicitly before deriving turn state. The
           // newest message by creation time is not necessarily the one that is
           // owed an answer (issue #738), so both the target and the transcript
           // it may see are decisions, not side effects of message order.
           const liveWaiters = yield* InstanceState.use(callers, (registry) => waiters(registry, sessionID))
-          const target = generationTarget(msgs, liveWaiters)
+          const target = generationTarget(msgs, liveWaiters, inFlight?.message.id)
           if (!target) throw new Error("No user message found in stream. This should never happen.")
           const view = generationView(msgs, target)
           const { assistant: lastAssistant, finished: lastFinished, tasks } = MessageV2.latest(view)
@@ -1793,14 +1839,24 @@ const layer = Layer.effect(
                 time: { created: Date.now() },
               }
               yield* sessions.updateMessage(nudge)
-              yield* sessions.updatePart({
+              const nudgePart: SessionV1.TextPart = {
                 id: PartID.ascending(),
                 messageID: nudge.id,
                 sessionID,
                 type: "text",
                 text: stagnated ? REVIEW_STAGNATION_NUDGE : FINISH_NUDGE,
                 synthetic: true,
-              } satisfies SessionV1.TextPart)
+              }
+              yield* sessions.updatePart(nudgePart)
+              // This nudge is owed the next generation: keep it in flight so the
+              // turn cannot be re-derived as the prompt that already ended.
+              inFlight = {
+                message: nudge,
+                part: nudgePart,
+                seen: new Set(
+                  msgs.filter((message) => message.info.role === "user").map((message) => message.info.id),
+                ),
+              }
               continue
             }
             if (finishRequired && activeAgent?.steps !== undefined && !completedFinish && step >= activeAgent.steps) {

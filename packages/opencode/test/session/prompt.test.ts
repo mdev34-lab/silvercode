@@ -332,6 +332,8 @@ const withMcpTools = testEffect(
     },
   }),
 )
+const FINISH_NUDGE_MARKER = "[WARNING] The turn ended without a successful finish call."
+
 const unix = process.platform !== "win32" ? it.instance : it.instance.skip
 const unixNoLLMServer = process.platform !== "win32" ? noLLMServer.instance : noLLMServer.instance.skip
 
@@ -7836,4 +7838,72 @@ it.instance(
     }),
   { config: cfg },
   20_000,
+)
+
+// The guard budget must be spent on model turns, never on re-deriving the same
+// turn. The runner injects the nudge and then reads the transcript back to pick
+// the next generation target; if that read does not place the nudge after the
+// assistant that triggered it, the loop would select the same prompt again,
+// append another nudge, and burn all three nudges without a single request. A
+// stored timestamp can produce exactly that shape (a clock step between the
+// generation and the nudge), and it is the shape CI reported for the retry-wait
+// fixture: three nudges, the terminal guard error, and no request after the
+// first. The loop therefore keeps the continuation it injected in flight.
+it.instance("a finish nudge owns the next generation even when the stored transcript places it early", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig((url) => ({ ...providerCfg(url), agent: { work: { finishTool: true } } }))
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({
+      title: "Pinned",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+    const seeded = yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "work",
+      noReply: true,
+      parts: [{ type: "text", text: "Bom dia" }],
+    })
+    const real = Date.now
+    let skew = 0
+    Date.now = () => real() + skew
+    yield* Effect.ensuring(
+      Effect.gen(function* () {
+        // Stepping the clock back once the first answer is on the wire stores
+        // every later message before the assistant it belongs to.
+        yield* llm.push(reply().text("a").onSend(() => void (skew = -60_000)))
+        yield* llm.push(reply().text("b"))
+        yield* llm.push(reply().text("c"))
+        yield* llm.push(reply().text("d"))
+
+        const result = yield* prompt.loop({ sessionID: chat.id, messageID: seeded.info.id })
+        const hits = yield* llm.hits
+        const messages = yield* sessions.messages({ sessionID: chat.id })
+        const nudges = messages.filter(
+          (message) =>
+            message.info.role === "user" &&
+            message.parts.some((part) => part.type === "text" && part.text.includes(FINISH_NUDGE_MARKER)),
+        )
+        const bodies = hits.map((hit) => JSON.stringify(hit.body))
+
+        // One request for the prompt and one for each nudge: the guard asked the
+        // model every time it spent a nudge.
+        expect(hits).toHaveLength(4)
+        expect(bodies.filter((body) => body.includes(FINISH_NUDGE_MARKER))).toHaveLength(3)
+        // The budget itself is unchanged, so the turn still stops, bounded.
+        expect(nudges).toHaveLength(3)
+        expect(result.info.role).toBe("assistant")
+        if (result.info.role === "assistant") {
+          expect(result.info.finish).toBe("error")
+          expect(result.info.error?.name).toBe("UnknownError")
+          if (result.info.error?.name === "UnknownError") {
+            expect(result.info.error.data.message).toContain("did not complete the required finish tool after 3 nudges")
+          }
+        }
+      }),
+      Effect.sync(() => void (Date.now = real)),
+    )
+  }),
+  { config: cfg },
+  30_000,
 )
