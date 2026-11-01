@@ -382,7 +382,7 @@ async function fileJson(file: string, level?: string): Promise<unknown> {
 }
 
 describe("agent effort selector", () => {
-  test("renders three levels with process meanings and the session's selection", async () => {
+  test("renders three levels with purpose-led copy and the session's selection", async () => {
     const harness = await mountEffort({
       route: { type: "session", sessionID: SESSION_THOROUGH },
       model: "test-provider/variant-model",
@@ -394,10 +394,17 @@ describe("agent effort selector", () => {
       expect(frame).toContain("Fast")
       expect(frame).toContain("Medium")
       expect(frame).toContain("Thorough")
-      expect(frame).toContain("no review ritual")
-      expect(frame).toContain("up to 2 review passes")
-      expect(frame).toContain("review until clean")
+      expect(frame).toContain("Reliable workhorse for everyday tasks")
+      expect(frame).toContain("Smarter agent for more demanding work")
+      expect(frame).toContain("Deep, meticulous work on complex tasks from start to finish")
       expect(frame).toContain("Stored on this session")
+      const lines = frame.split("\n")
+      const searchRow = lines.findIndex((line) => line.includes("Search"))
+      const footerRow = lines.findIndex((line) => line.includes("Stored on this session"))
+      expect(searchRow).toBeGreaterThanOrEqual(0)
+      expect(footerRow).toBeGreaterThan(searchRow)
+      const selectorRows = lines.slice(searchRow + 1, footerRow).filter((line) => line.trim().length > 0)
+      expect(selectorRows).toHaveLength(3)
       expect(markerLine(frame)).toContain("Thorough")
     } finally {
       await harness.dispose()
