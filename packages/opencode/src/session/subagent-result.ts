@@ -53,7 +53,7 @@ export function turnLineage(messages: readonly SessionV1.WithParts[], userID: st
 }
 
 function lineageResolver(messages: readonly SessionV1.WithParts[]) {
-  const byID = new Map(messages.map((message) => [message.info.id, message]))
+  const byID = new Map<string, SessionV1.WithParts>(messages.map((message) => [message.info.id, message]))
   const resolved = new Map<string, string>()
   return (userID: string) => {
     const seen = new Set<string>()
@@ -142,14 +142,23 @@ export function executionOrder(messages: readonly SessionV1.WithParts[]) {
   const all = [...new Map(messages.map((message) => [message.info.id, message])).values()].sort((a, b) =>
     a.info.id.localeCompare(b.info.id),
   )
-  const byID = new Map(all.map((message) => [message.info.id, message]))
+  const byID = new Map<string, SessionV1.WithParts>(all.map((message) => [message.info.id, message]))
   const lineage = lineageResolver(all)
   const boundaries = all.filter(
     (message) => message.info.role === "user" && continuationPromptID(message) === undefined,
   )
-  const crossed = (root: string, id: string) =>
-    id > root &&
-    boundaries.some((boundary) => boundary.info.id !== root && boundary.info.id > root && boundary.info.id < id)
+  const boundaryIDs = boundaries.map((boundary) => boundary.info.id)
+  const crossed = (root: string, id: string) => {
+    if (id <= root) return false
+    let low = 0
+    let high = boundaryIDs.length
+    while (low < high) {
+      const middle = (low + high) >>> 1
+      if (boundaryIDs[middle]! <= root) low = middle + 1
+      else high = middle
+    }
+    return low < boundaryIDs.length && boundaryIDs[low]! < id
+  }
   const continuations = all.filter((message) => {
     const root = lineage(message.info.id)
     const owner = byID.get(root)
@@ -159,6 +168,7 @@ export function executionOrder(messages: readonly SessionV1.WithParts[]) {
       !crossed(root, message.info.id)
     )
   })
+  const continuationIDs = new Set(continuations.map((message) => message.info.id))
   const roots = new Set(continuations.map((message) => lineage(message.info.id)))
   const first = new Map<string, string>()
   for (const message of continuations) {
@@ -179,11 +189,11 @@ export function executionOrder(messages: readonly SessionV1.WithParts[]) {
       parent === root &&
       start !== undefined &&
       (start < root ? !crossed(root, message.info.id) : message.info.id < start)
-    const continued = message.info.role === "user" && continuations.includes(message)
+    const continued = message.info.role === "user" && continuationIDs.has(message.info.id)
     const child =
       message.info.role === "assistant" &&
       parent !== undefined &&
-      continuations.some((continuation) => continuation.info.id === parent) &&
+      continuationIDs.has(parent) &&
       !crossed(root, message.info.id)
     const key = roots.has(root) && (message.info.id === root || direct || continued || child) ? root : message.info.id
     groups.set(key, [...(groups.get(key) ?? []), message])

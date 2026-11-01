@@ -8128,6 +8128,7 @@ it.instance(
       expect(result.info.role).toBe("assistant")
       if (result.info.role === "assistant") expect(RepetitionGuard.isStoredError(result.info.error)).toBe(true)
       expect(yield* llm.pending).toBe(1)
+      if (result.info.role !== "assistant") throw new Error("expected an assistant result")
       const resumed = yield* prompt.loop({ sessionID: chat.id, messageID: result.info.parentID })
       expect(resumed.info.id).toBe(result.info.id)
       expect(yield* llm.calls).toBe(3)
@@ -8286,10 +8287,11 @@ it.instance(
       })
       const stored = yield* sessions.messages({ sessionID: chat.id })
       const user = stored.find((message) => message.info.role === "user")
-      expect(user?.parts[0]?.type === "text" ? user.parts[0].metadata : undefined).toEqual({
+      if (!user || result.info.role !== "assistant") throw new Error("expected a user and assistant result")
+      expect(user.parts[0]?.type === "text" ? user.parts[0].metadata : undefined).toEqual({
         retained: "ordinary metadata",
       })
-      expect(result.info.parentID).toBe(user?.info.id)
+      expect(result.info.parentID).toBe(user.info.id)
       expect(yield* llm.calls).toBe(1)
       const request = JSON.stringify(turnInputs(yield* llm.inputs))
       expect(request).toContain("CALLER_TEXT")
@@ -8437,6 +8439,7 @@ it.instance(
       const nudges = stored.filter((message) => finishContinuationPromptID(message) === p1ID)
       expect(yield* llm.calls).toBe(2)
       expect(nudges).toHaveLength(1)
+      if (result.info.role !== "assistant") throw new Error("expected an assistant result")
       expect(result.info.parentID).toBe(nudges[0]!.info.id)
       expect(result.info.error?.name).toBe("MessageAbortedError")
       expect(continuesPrompt(stored, result, p1ID)).toBe(true)
