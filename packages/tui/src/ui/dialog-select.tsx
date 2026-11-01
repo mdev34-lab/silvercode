@@ -219,14 +219,13 @@ export function DialogSelect<T>(props: DialogSelectProps<T>) {
       return acc + (i > 0 ? 2 : 1)
     }, 0)
     // An opt-in blank row sits above every option that does not already start
-    // a group (a category header supplies that separation), so the height cap
+    // its group (a category header supplies that separation), so the height cap
     // counts the same painted lines the scrollbox lays out.
-    const gaps =
-      spacing > 0
-        ? spacing *
-          grouped().reduce((acc, [category, options]) => acc + Math.max(0, options.length - (category ? 0 : 1)), 0)
-        : 0
-    return flat().reduce((acc, option) => acc + 1 + (option.details?.length ?? 0), headers + gaps)
+    const gaps = grouped().reduce(
+      (acc, [category, options], i) => acc + Math.max(0, options.length - 1) + (!category && i > 0 ? 1 : 0),
+      0,
+    )
+    return flat().reduce((acc, option) => acc + 1 + (option.details?.length ?? 0), headers + spacing * gaps)
   })
 
   const dimensions = useTerminalDimensions()
