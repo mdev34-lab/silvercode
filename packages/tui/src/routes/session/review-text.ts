@@ -42,7 +42,16 @@ function hasQuotedTag(text: string) {
       if (!fence) fence = { marker: marker[1][0], length: marker[1].length }
       else if (marker[1][0] === fence.marker && marker[1].length >= fence.length) fence = undefined
     }
-    if ((fence || /^\s*>/.test(line)) && ReviewReport.TAGS.some((tag) => line.includes(`<${tag}>`))) return true
+    for (const tag of ReviewReport.TAGS) {
+      let start = line.indexOf(`<${tag}>`)
+      while (start >= 0) {
+        if (fence || /^\s*>/.test(line)) return true
+        // Be conservative with inline code spans too. Do not turn an example
+        // into an approval when a reviewer is discussing the wire format.
+        if ((line.slice(0, start).match(/(?<!\\)`+/g) ?? []).length % 2 === 1) return true
+        start = line.indexOf(`<${tag}>`, start + tag.length + 2)
+      }
+    }
   }
   return false
 }

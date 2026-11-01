@@ -32,6 +32,7 @@ describe("review text presentation boundary", () => {
     expect(reviewText({ ...message, agent: "work" }, parts(envelope))).toBeUndefined()
     expect(reviewText(message, parts(`Example:\n\`\`\`xml\n${envelope}\n\`\`\``))).toBeUndefined()
     expect(reviewText(message, parts(`> ${envelope}`))).toBeUndefined()
+    expect(reviewText(message, parts(`An example: \`${envelope}\``))).toBeUndefined()
   })
   test("recognizes persisted reviewer aliases and legacy envelopes", () => {
     expect(reviewText({ ...message, agent: "code-review" }, parts(envelope.replaceAll("silvercode-review", "alphacode-review")))?.report).toEqual(report)
