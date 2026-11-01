@@ -205,6 +205,32 @@ function textPart(value: string, id = "prt_text"): TextPart {
 }
 
 describe("review assistant text: real transcript fallback", () => {
+  test("renders a completed multipart review once with its analysis", async () => {
+    const report = ReviewReport.envelope({ version: 1, revision: "synthetic", assessment: "needs-fixes", summary: "Synthetic issue summary", findings: [] })
+    const mounted = await mount({ agent: "review", completed: true, parts: [textPart("Synthetic analysis.", "prt_a"), textPart(report, "prt_b")] })
+    await settleUntilFrame(mounted.app, "Synthetic issue summary")
+    const frame = await frameOfSpans(mounted.app)
+    expect(frame).toContain("Synthetic analysis.")
+    expect(frame).toContain("Synthetic issue summary")
+    expect(frame).toContain("Needs fixes")
+    expect(frame).not.toContain("silvercode-review")
+    expect(frame.match(/Synthetic issue summary/g)?.length).toBe(1)
+  })
+
+  test("switches from ordinary streaming text to a structured completed review", async () => {
+    const report = ReviewReport.envelope({ version: 1, revision: "synthetic", assessment: "approved", summary: "Synthetic approval summary", findings: [] })
+    const mounted = await mount({ agent: "review", parts: [textPart(`Streaming analysis.\n\n${report}`)] })
+    await settleUntilFrame(mounted.app, "Streaming analysis.")
+    expect(await frameOfSpans(mounted.app)).not.toContain("✓ Approved")
+    mounted.sync.set("message", SESSION, 0, "time", "completed", BASE + 1000)
+    await settleUntilFrame(mounted.app, "✓ Approved")
+    const frame = await frameOfSpans(mounted.app)
+    expect(frame).toContain("✓ Approved")
+    expect(frame).toContain("Synthetic approval summary")
+    expect(frame).toContain("Streaming analysis.")
+    expect(frame).not.toContain("silvercode-review")
+  })
+
   test("an incomplete reviewer stream remains visible without a verdict", async () => {
     const mounted = await mount({ agent: "review", parts: [textPart("Streaming analysis remains visible.\n\n<silvercode-review>\n{ incomplete")] })
     const app = mounted.app

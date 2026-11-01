@@ -64,6 +64,7 @@ import { DialogForkFromTimeline } from "./dialog-fork-from-timeline"
 import { DialogSessionRename } from "../../component/dialog-session-rename"
 import { Sidebar } from "./sidebar"
 import { SubagentFooter } from "./subagent-footer.tsx"
+import { reviewText } from "./review-text"
 import { filetype } from "../../util/filetype"
 import parsers from "../../parsers-config"
 import { errorMessage } from "../../util/error"
@@ -1648,6 +1649,7 @@ export function AssistantMessageRow(props: { message: AssistantMessage; parts: P
   const sync = useSync()
   const messages = createMemo(() => sync.data.message[props.message.sessionID] ?? [])
   const model = createMemo(() => Model.name(ctx.providers(), props.message.providerID, props.message.modelID))
+  const textReview = createMemo(() => reviewText(props.message, props.parts))
 
   const final = createMemo(() => {
     return props.message.finish && !["tool-calls", "unknown"].includes(props.message.finish)
@@ -1773,6 +1775,11 @@ export function AssistantMessageRow(props: { message: AssistantMessage; parts: P
               )}
             </Show>
             <Switch>
+              <Match when={part.type === "text" && textReview()?.textPartIDs.includes(part.id)}>
+                <Show when={textReview()?.textPartIDs[0] === part.id && textReview()}>
+                  {(review) => <ReviewFinish review={review()} />}
+                </Show>
+              </Match>
               <Match when={group()?.owner === true}>
                 <ActivityGroup groupID={group()!.groupID} />
               </Match>
@@ -2584,7 +2591,7 @@ export function reviewFindingLocation(finding: ReviewReport.Finding): string | u
   return file + line
 }
 
-function ReviewFinish(props: { review: { report: ReviewReport.Info; analysis: string }; part: ToolPart }) {
+function ReviewFinish(props: { review: { report: ReviewReport.Info; analysis: string }; part?: ToolPart }) {
   const { theme } = useTheme()
   const ctx = use()
   const [expanded, setExpanded] = createSignal(false)
@@ -2670,15 +2677,32 @@ function ReviewFinish(props: { review: { report: ReviewReport.Info; analysis: st
           </Show>
         </box>
       </BlockTool>
-      <InlineTool
-        icon="⚙"
-        pending="Preparing review report..."
-        complete={true}
-        part={props.part}
-        onClick={() => setRawOpen((prev) => !prev)}
+      <Show
+        when={props.part}
+        fallback={
+          <InlineToolRow
+            icon="⚙"
+            color={theme.textMuted}
+            pending=""
+            complete={true}
+            onMouseUp={() => setRawOpen((prev) => !prev)}
+          >
+            {rawOpen() ? "Click to hide the raw report" : "Raw review report"}
+          </InlineToolRow>
+        }
       >
-        {rawOpen() ? "Click to hide the raw report" : "Raw review report"}
-      </InlineTool>
+        {(part) => (
+          <InlineTool
+            icon="⚙"
+            pending="Preparing review report..."
+            complete={true}
+            part={part()}
+            onClick={() => setRawOpen((prev) => !prev)}
+          >
+            {rawOpen() ? "Click to hide the raw report" : "Raw review report"}
+          </InlineTool>
+        )}
+      </Show>
       <Show when={rawOpen()}>
         <box paddingLeft={5}>
           <text fg={theme.textMuted}>{rawReport()}</text>
