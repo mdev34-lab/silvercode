@@ -1,5 +1,6 @@
 import { NodeHttpServer, NodeHttpServerRequest } from "@effect/platform-node"
 import * as Http from "node:http"
+import { createHash } from "node:crypto"
 import { Deferred, Effect, Layer, Context, Stream } from "effect"
 import * as HttpServer from "effect/unstable/http/HttpServer"
 import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/unstable/http"
@@ -25,6 +26,12 @@ type Match = (hit: Hit) => boolean
 type Queue = {
   item: Item
   match?: Match
+}
+
+type RepeatedMatch = {
+  item: Item
+  match: Match
+  remaining: number
 }
 
 type Wait = {
@@ -648,23 +655,149 @@ function hit(url: string, body: unknown) {
 
 const MAX_MISSES = 20
 
+type Identifier = { path: string; value: string }
+type Identity = { length: number; sha256: string; preview: string }
+type Identifiers = { session: Identifier[]; conversation: Identifier[]; message: Identifier[] }
+
 interface Miss {
   url: URL
   body: string
+  request: {
+    route: string
+    model?: string
+    phase: string
+    messageCount: number
+    finalRole?: string
+    identifiers: Identifiers
+    keys: {
+      system?: Identity
+      firstUser?: Identity
+      lastUser?: Identity
+    }
+  }
+}
+
+function contentText(content: unknown): string {
+  if (typeof content === "string") return content
+  if (Array.isArray(content)) {
+    return content
+      .map((part) => (part && typeof part === "object" && "text" in part ? String(part.text ?? "") : ""))
+      .join("\n")
+  }
+  return content === undefined ? "" : JSON.stringify(content)
+}
+
+function requestMessages(body: Record<string, unknown>): unknown[] {
+  if (Array.isArray(body.messages)) return body.messages
+  if (Array.isArray(body.input)) return body.input
+  return []
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+}
+
+function requestPhase(hit: Hit, messages: unknown[]): string {
+  const last = messages.at(-1)
+  const lastRole = isRecord(last) ? last.role : undefined
+  const users = messages.filter((entry): entry is Record<string, unknown> => isRecord(entry) && entry.role === "user")
+  const firstUserText = contentText(users[0]?.content)
+  const lastUserText = contentText(users.at(-1)?.content)
+  const serialized = JSON.stringify(hit.body)
+  // This is a pure per-request label, not a mutable session/arrival-order phase.
+  // A child marker found only in prior transcript content does not mean the
+  // current request came from the child agent.
+  if (isTitleRequest(hit.body)) return "automatic-title"
+  if (firstUserText.includes("CHILD_WAIT_INPUT")) return "child-task-conversation"
+  if (lastRole === "tool" && serialized.includes("child wait probe")) return "root-child-waiting-poll"
+  if (lastUserText.includes("child done") || lastUserText.includes("task_result")) return "child-result-return"
+  if (lastUserText.includes("Research the child wait report")) return "root-child-prompt"
+  if (lastUserText.includes("CHILD_WAIT_INPUT")) return "child-wait-attempt"
+  if (serialized.includes("CHILD_WAIT_INPUT")) return "contains-child-marker-context"
+  return "other-model-or-auxiliary"
+}
+
+function requestIdentifiers(body: Record<string, unknown>): Identifiers {
+  const result: Identifiers = { session: [], conversation: [], message: [] }
+  const visited = new Set<object>()
+  let inspected = 0
+  const add = (group: keyof Identifiers, path: string, value: unknown) => {
+    if (typeof value !== "string" && typeof value !== "number") return
+    const text = String(value)
+    if (!text || result[group].some((item) => item.value === text)) return
+    if (result[group].length < 12) result[group].push({ path, value: text.slice(0, 160) })
+  }
+  const visit = (value: unknown, path: string[], depth: number): void => {
+    if (!value || typeof value !== "object" || depth > 10 || inspected++ > 3000) return
+    if (visited.has(value)) return
+    visited.add(value)
+    if (Array.isArray(value)) {
+      value.slice(0, 120).forEach((entry, index) => visit(entry, [...path, `[${index}]`], depth + 1))
+      return
+    }
+    for (const [key, child] of Object.entries(value)) {
+      const normalized = key.toLowerCase().replaceAll(/[^a-z0-9]/g, "")
+      const parentPath = path.join(".").toLowerCase()
+      const direct = (name: string) => new RegExp(`${name}.*(?:id|key)$`).test(normalized)
+      if (direct("session") || (normalized === "id" && /session/.test(parentPath))) {
+        if (Array.isArray(child)) child.slice(0, 12).forEach((entry) => add("session", [...path, key].join("."), entry))
+        else add("session", [...path, key].join("."), child)
+      }
+      if (direct("conversation") || (normalized === "id" && /conversation/.test(parentPath))) {
+        if (Array.isArray(child)) child.slice(0, 12).forEach((entry) => add("conversation", [...path, key].join("."), entry))
+        else add("conversation", [...path, key].join("."), child)
+      }
+      if (direct("message") || (normalized === "id" && /messages?/.test(parentPath))) {
+        if (Array.isArray(child)) child.slice(0, 12).forEach((entry) => add("message", [...path, key].join("."), entry))
+        else add("message", [...path, key].join("."), child)
+      }
+      visit(child, [...path, key], depth + 1)
+    }
+  }
+  visit(body, [], 0)
+  return result
+}
+
+function identity(content: unknown): Identity {
+  const text = contentText(content)
+  return {
+    length: text.length,
+    sha256: createHash("sha256").update(text).digest("hex").slice(0, 16),
+    preview: text.replaceAll(/\s+/g, " ").slice(0, 180),
+  }
 }
 
 function miss(hit: Hit): Miss {
-  // The decisive part of an unmatched request is its final messages, not the
-  // JSON tail: chat bodies end with the tools array, so a raw slice shows
-  // tool schemas instead of the message that failed to match. Excerpt the
-  // last two messages (chat mode) or input items (responses mode) instead.
-  const body = hit.body as { messages?: unknown; input?: unknown }
-  const items = Array.isArray(body.messages) ? body.messages : Array.isArray(body.input) ? body.input : []
-  const excerpt = items
+  // Keep a short body excerpt and bounded identity metadata so a matcher miss
+  // can be diagnosed without retaining or printing the whole provider request.
+  const body = hit.body
+  const messages = requestMessages(body)
+  const role = (entry: unknown) => (isRecord(entry) ? entry.role : undefined)
+  const system = messages.find((entry) => role(entry) === "system")
+  const users = messages.filter((entry): entry is Record<string, unknown> => role(entry) === "user")
+  const excerpt = messages
     .slice(-2)
     .map((entry) => JSON.stringify(entry).slice(-500))
     .join("\n---\n")
-  return { url: hit.url, body: excerpt || JSON.stringify(hit.body).slice(-800) }
+  const model = typeof body.model === "string" ? body.model : undefined
+  const finalRole = role(messages.at(-1))
+  return {
+    url: hit.url,
+    body: excerpt || JSON.stringify(hit.body).slice(-800),
+    request: {
+      route: hit.url.pathname,
+      model,
+      phase: requestPhase(hit, messages),
+      messageCount: messages.length,
+      finalRole: typeof finalRole === "string" ? finalRole : "?",
+      identifiers: requestIdentifiers(body),
+      keys: {
+        system: isRecord(system) ? identity(system.content) : undefined,
+        firstUser: users[0] ? identity(users[0].content) : undefined,
+        lastUser: users.at(-1) ? identity(users.at(-1)?.content) : undefined,
+      },
+    },
+  }
 }
 
 function isTitleRequest(body: unknown): boolean {
@@ -677,6 +810,8 @@ namespace TestLLMServer {
     readonly url: string
     readonly push: (...input: (Item | Reply)[]) => Effect.Effect<void>
     readonly pushMatch: (match: Match, ...input: (Item | Reply)[]) => Effect.Effect<void>
+    /** Reuse one scripted response for a bounded number of matching attempts. */
+    readonly pushMatchRepeat: (match: Match, input: Item | Reply, maxUses: number) => Effect.Effect<void>
     readonly textMatch: (match: Match, value: string, opts?: { usage?: Usage }) => Effect.Effect<void>
     readonly toolMatch: (match: Match, name: string, input: unknown) => Effect.Effect<void>
     readonly text: (value: string, opts?: { usage?: Usage }) => Effect.Effect<void>
@@ -707,6 +842,7 @@ export class TestLLMServer extends Context.Service<TestLLMServer, TestLLMServer.
 
       let hits: Hit[] = []
       let list: Queue[] = []
+      let repeated: RepeatedMatch[] = []
       let waits: Wait[] = []
       let misses: Miss[] = []
 
@@ -718,6 +854,13 @@ export class TestLLMServer extends Context.Service<TestLLMServer, TestLLMServer.
         list = [...list, ...input.map((value) => ({ item: item(value), match }))]
       }
 
+      const queueMatchRepeat = (match: Match, input: Item | Reply, maxUses: number) => {
+        if (!Number.isSafeInteger(maxUses) || maxUses < 1) {
+          throw new RangeError("maxUses must be a positive safe integer")
+        }
+        repeated = [...repeated, { item: item(input), match, remaining: maxUses }]
+      }
+
       const notify = Effect.fnUntraced(function* () {
         const ready = waits.filter((item) => hits.length >= item.count)
         if (!ready.length) return
@@ -727,10 +870,24 @@ export class TestLLMServer extends Context.Service<TestLLMServer, TestLLMServer.
 
       const pull = (hit: Hit) => {
         const index = list.findIndex((entry) => !entry.match || entry.match(hit))
-        if (index === -1) return
-        const first = list[index]
-        list = [...list.slice(0, index), ...list.slice(index + 1)]
-        return first.item
+        if (index !== -1) {
+          const first = list[index]
+          list = [...list.slice(0, index), ...list.slice(index + 1)]
+          return first.item
+        }
+
+        const repeatIndex = repeated.findIndex((entry) => entry.match(hit))
+        if (repeatIndex === -1) return
+        const entry = repeated[repeatIndex]
+        repeated =
+          entry.remaining === 1
+            ? [...repeated.slice(0, repeatIndex), ...repeated.slice(repeatIndex + 1)]
+            : [
+                ...repeated.slice(0, repeatIndex),
+                { ...entry, remaining: entry.remaining - 1 },
+                ...repeated.slice(repeatIndex + 1),
+              ]
+        return entry.item
       }
 
       const handle = Effect.fn("TestLLMServer.handle")(function* (mode: "chat" | "responses") {
@@ -784,6 +941,13 @@ export class TestLLMServer extends Context.Service<TestLLMServer, TestLLMServer.
         pushMatch: Effect.fn("TestLLMServer.pushMatch")(function* (match: Match, ...input: (Item | Reply)[]) {
           queueMatch(match, ...input)
         }),
+        pushMatchRepeat: Effect.fn("TestLLMServer.pushMatchRepeat")(function* (
+          match: Match,
+          input: Item | Reply,
+          maxUses: number,
+        ) {
+          queueMatchRepeat(match, input, maxUses)
+        }),
         textMatch: Effect.fn("TestLLMServer.textMatch")(function* (
           match: Match,
           value: string,
@@ -835,6 +999,7 @@ export class TestLLMServer extends Context.Service<TestLLMServer, TestLLMServer.
         reset: Effect.sync(() => {
           hits = []
           list = []
+          repeated = []
           waits = []
           misses = []
         }),

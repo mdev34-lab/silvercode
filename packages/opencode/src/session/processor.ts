@@ -33,6 +33,80 @@ import { Usage, type LLMEvent } from "@opencode-ai/llm"
 import { createGenerationClock } from "./generation-metrics"
 
 const DOOM_LOOP_THRESHOLD = 3
+// Page size when scanning backward through the current user turn for prior
+// tool-execution steps. Paging stops at the turn's real user message or once
+// `DOOM_LOOP_THRESHOLD - 1` execution steps are collected, so neither session
+// length nor runs of tool-less/nudge messages bound the check.
+const DOOM_LOOP_PAGE_SIZE = 20
+// Keyed on the literal `"invalid"` tool ID: `llm.ts` strips `"invalid"` from
+// `activeTools` and reserves it exclusively for `experimental_repairToolCall`'s
+// non-executing repair placeholder (MCP tools are `${client}_`-prefixed).
+const INVALID_TOOL = "invalid"
+
+// Synthetic continuation prompts (`FINISH_NUDGE`, `REVIEW_STAGNATION_NUDGE`,
+// compaction/subtask continuations) carry only synthetic parts and continue the
+// active user turn rather than starting a new one.
+const isSyntheticUser = (message: SessionV1.WithParts) =>
+  message.info.role === "user" &&
+  message.parts.length > 0 &&
+  message.parts.every(
+    (part) => ("synthetic" in part && part.synthetic === true) || (part.type === "compaction" && part.auto),
+  )
+
+// Completed or errored non-placeholder tool executions grouped by generation
+// step (`step-start` boundary), newest step first. Steps with no real tool
+// executions (text-only steps or `invalid`-only repair steps) produce no entry.
+const executionSteps = (parts: readonly SessionV1.Part[], maxStepIndex = Number.POSITIVE_INFINITY) => {
+  const steps: SessionV1.ToolPart[][] = []
+  let stepIndex = 0
+  let current: SessionV1.ToolPart[] | undefined
+  let currentIndex = -1
+  for (const part of parts) {
+    if (part.type === "step-start") {
+      stepIndex++
+      continue
+    }
+    if (stepIndex >= maxStepIndex) break
+    if (part.type !== "tool" || part.tool === INVALID_TOOL) continue
+    if (part.state.status !== "completed" && part.state.status !== "error") continue
+    if (currentIndex !== stepIndex || !current) {
+      current = []
+      currentIndex = stepIndex
+      steps.push(current)
+    }
+    current.push(part)
+  }
+  return steps.reverse()
+}
+
+const localStepState = (parts: readonly SessionV1.Part[], currentPartID: SessionV1.ToolPart["id"] | undefined) => {
+  let stepIndex = 0
+  let currentStepIndex: number | undefined
+  for (const part of parts) {
+    if (part.type === "step-start") {
+      stepIndex++
+      continue
+    }
+    if (currentPartID && part.id === currentPartID) {
+      currentStepIndex = stepIndex
+      break
+    }
+  }
+  const activeStepIndex = currentStepIndex ?? stepIndex
+
+  return {
+    activeStepIndex,
+    priorSteps: executionSteps(parts, activeStepIndex),
+  }
+}
+
+const isRepeatedFailureStep = (step: readonly SessionV1.ToolPart[], name: string, serializedInput: string) =>
+  step.length > 0 &&
+  step.every(
+    (part) =>
+      part.state.status === "error" && part.tool === name && JSON.stringify(part.state.input) === serializedInput,
+  )
+
 export type Result = "compact" | "stop" | "continue"
 
 export interface Handle {
@@ -142,6 +216,8 @@ const layer = Layer.effect(
       // its side effects. An attempt that touched tools is therefore never
       // retried; a text-only attempt is always safe to.
       let sawToolActivity = false
+      let priorStepsMemo: readonly (readonly SessionV1.ToolPart[])[] | undefined
+      const doomLoopAskedSteps = new Set<number>()
       const clock = createGenerationClock()
 
       const parse = (e: unknown) =>
@@ -359,8 +435,54 @@ const layer = Layer.effect(
         }
       }
 
+      // Prior messages of the active turn are immutable while this assistant
+      // message streams, so memoize the turn's newest `DOOM_LOOP_THRESHOLD - 1`
+      // prior execution steps once per `process` attempt.
+      const loadPriorSteps = Effect.fn("SessionProcessor.loadPriorSteps")(function* () {
+        if (priorStepsMemo !== undefined) return priorStepsMemo
+        const needed = DOOM_LOOP_THRESHOLD - 1
+        const collected: (readonly SessionV1.ToolPart[])[] = []
+        const initialCursor: string | undefined = MessageV2.cursor.encode({
+          id: ctx.assistantMessage.id,
+          time: ctx.assistantMessage.time.created,
+        })
+        let before = initialCursor
+        while (collected.length < needed) {
+          const page = yield* MessageV2.page({
+            sessionID: ctx.assistantMessage.sessionID,
+            limit: DOOM_LOOP_PAGE_SIZE,
+            before,
+          }).pipe(
+            Effect.catchIf(
+              (error) => MessageV2.InvalidCursorError.isInstance(error),
+              (error) => Effect.die(error),
+            ),
+            Effect.provideService(Database.Service, database),
+          )
+          if (page.items.length === 0) break
+          let hitUserBoundary = false
+          for (let i = page.items.length - 1; i >= 0 && collected.length < needed; i--) {
+            const message = page.items[i]
+            if (!message || message.info.id === ctx.assistantMessage.id) continue
+            if (message.info.role === "user") {
+              if (isSyntheticUser(message)) continue
+              hitUserBoundary = true
+              break
+            }
+            for (const step of executionSteps(message.parts)) {
+              collected.push(step)
+              if (collected.length >= needed) break
+            }
+          }
+          if (hitUserBoundary || !page.more || !page.cursor) break
+          before = page.cursor
+        }
+        priorStepsMemo = collected
+        return collected
+      })
+
       const handleEvent = Effect.fnUntraced(function* (value: StreamEvent) {
-                switch (value.type) {
+        switch (value.type) {
           case "reasoning-start":
             if (value.id in ctx.reasoningMap) return
             ctx.reasoningMap[value.id] = {
@@ -437,24 +559,35 @@ const layer = Layer.effect(
                 : value.providerMetadata,
             }))
 
+            // Doom-loop guard (#186): ask before the model retries a call that keeps
+            // failing the same way across distinct generation steps (#725). Only real
+            // failures count: completed calls, pending calls, and `invalid` repair
+            // placeholders are excluded, and siblings fanned out in one step are a
+            // single attempt rather than a cross-step loop.
+            if (value.name === INVALID_TOOL) return
+
             const parts = yield* MessageV2.parts(ctx.assistantMessage.id).pipe(
               Effect.provideService(Database.Service, database),
             )
-            const recentParts = parts.slice(-DOOM_LOOP_THRESHOLD)
+            const needed = DOOM_LOOP_THRESHOLD - 1
+            const serializedInput = JSON.stringify(input)
+            const local = localStepState(parts, ctx.toolcalls[value.id]?.partID)
+            if (doomLoopAskedSteps.has(local.activeStepIndex)) return
+            const localWindow = local.priorSteps.slice(0, needed)
+            if (!localWindow.every((step) => isRepeatedFailureStep(step, value.name, serializedInput))) return
+            const recentSteps =
+              localWindow.length >= needed
+                ? localWindow
+                : [...localWindow, ...(yield* loadPriorSteps())].slice(0, needed)
 
             if (
-              recentParts.length !== DOOM_LOOP_THRESHOLD ||
-              !recentParts.every(
-                (part) =>
-                  part.type === "tool" &&
-                  part.tool === value.name &&
-                  part.state.status !== "pending" &&
-                  JSON.stringify(part.state.input) === JSON.stringify(input),
-              )
+              recentSteps.length !== needed ||
+              !recentSteps.every((step) => isRepeatedFailureStep(step, value.name, serializedInput))
             ) {
               return
             }
 
+            doomLoopAskedSteps.add(local.activeStepIndex)
             const agent = yield* agents.get(ctx.assistantMessage.agent)
             // Unlike a tool permission this ask runs inside the event stream, not inside a
             // tool, so a failure here halts the turn instead of failing one tool call. That
@@ -774,6 +907,8 @@ const layer = Layer.effect(
             ctx.currentText = undefined
             stepFinishReason = undefined
             sawToolActivity = false
+            priorStepsMemo = undefined
+            doomLoopAskedSteps.clear()
             // A retry after a stalled or failed stream must not leave the previous attempt's thought open.
             yield* Effect.forEach(Object.keys(ctx.reasoningMap), finishReasoning)
             ctx.reasoningMap = {}
