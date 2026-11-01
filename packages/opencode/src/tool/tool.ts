@@ -40,9 +40,10 @@ export type Context<M extends Metadata = Metadata> = {
   messageID: MessageID
   agent: string
   /**
-   * The working folder this session resolves relative paths from and uses as
-   * its default search root. A delegated child can work in a folder other than
-   * the project it was dispatched from.
+   * The working folder this session's file, search, and edit tools resolve
+   * relative paths from and use as their default search root. A delegated child
+   * can work in a folder other than the project it was dispatched from; shell
+   * still uses the instance directory until its coordinated cwd change lands.
    *
    * This is a resolution base, never a permission boundary: `external_directory`
    * approval is still measured against the instance the session runs in, so a

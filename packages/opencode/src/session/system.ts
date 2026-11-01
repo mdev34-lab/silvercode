@@ -29,6 +29,7 @@ import { LocationServiceMap, locationServiceMapLayer } from "@opencode-ai/core/l
 import { Reference } from "@opencode-ai/core/reference"
 import { MCP } from "@/mcp"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
+import { Workdir } from "./workdir"
 
 export const STE_LITE = PROMPT_STE_LITE
 
@@ -71,10 +72,13 @@ export function provider(model: Provider.Model) {
 
 export interface Interface {
   /**
-   * @param directory the session's working folder, shown instead of the project
-   * directory when a delegated child works somewhere other than where it was
-   * dispatched from. It never replaces the project directory in the prompt: the
-   * child still has to know which project its permissions are measured against.
+   * @param directory the session's working folder for file, search, and edit
+   * tools when a delegated child works somewhere other than where it was
+   * dispatched from. When it differs from the project directory, the prompt
+   * reports both separately and states the per-tool split: file/search/edit
+   * tools use this folder, while shell commands still default to (and resolve
+   * relative `workdir` from) the project directory and permissions remain
+   * anchored to the project instance.
    */
   readonly environment: (model: Provider.Model, directory?: string) => Effect.Effect<string[]>
   readonly skills: (agent: Agent.Info) => Effect.Effect<string | undefined>
@@ -98,6 +102,7 @@ const layer = Layer.effect(
       environment: Effect.fn("SystemPrompt.environment")(function* (model: Provider.Model, directory?: string) {
         const ctx = yield* InstanceState.context
         const cwd = directory ?? ctx.directory
+        const sameFolder = Workdir.same(cwd, ctx.directory)
         const shell = Shell.name(Shell.acceptable((yield* config.get()).shell))
         const references = yield* Effect.gen(function* () {
           return (yield* (yield* Reference.Service).list()).filter((reference) => reference.description !== undefined)
@@ -107,14 +112,28 @@ const layer = Layer.effect(
             `You are powered by the model named ${model.api.id}. The exact model ID is ${model.providerID}/${model.api.id}`,
             `Here is some useful information about the environment you are running in:`,
             `<env>`,
-            `  Working directory: ${cwd}`,
-            ...(cwd === ctx.directory ? [] : [`  Project directory: ${ctx.directory}`]),
+            ...(sameFolder
+              ? [`  Working directory: ${cwd}`]
+              : [
+                  `  Session working folder (Read, Grep, Glob, Edit, Write, ApplyPatch only): ${cwd}`,
+                  `  Project directory (default Shell working directory): ${ctx.directory}`,
+                ]),
             `  Desktop directory: ${global.desktop ?? "unavailable (do not infer a path)"}`,
             `  Workspace root folder: ${ctx.worktree}`,
-            `  Is directory a git repo: ${ctx.project.vcs === "git" ? "yes" : "no"}`,
+            sameFolder
+              ? `  Is directory a git repo: ${ctx.project.vcs === "git" ? "yes" : "no"}`
+              : `  Is project directory a git repo: ${ctx.project.vcs === "git" ? "yes" : "no"}`,
             `  OS: ${os.type()} ${os.release()}; Shell: ${shell}`,
             `  Today's date: ${new Date().toDateString()}`,
             `</env>`,
+            ...(sameFolder
+              ? []
+              : [
+                  `Tool working-directory split for this session:`,
+                  `- File, search, and edit tools (Read, Grep, Glob, Edit, Write, ApplyPatch) resolve relative paths and default search roots from ${cwd}.`,
+                  `- Shell commands do NOT default to ${cwd} (even where the shell tool description says "working directory"): omitted \`workdir\` runs in ${ctx.directory}, and a relative \`workdir\` also resolves from ${ctx.directory}.`,
+                  `- To run a shell command in ${cwd}, pass the explicit absolute \`workdir\` "${cwd}" (or an absolute path under it). Before running destructive, write, build, or git shell commands, pass an explicit absolute \`workdir\` and verify the target path so commands never modify or delete files in ${ctx.directory} by mistake.`,
+                ]),
           ].join("\n"),
           references.length === 0
             ? undefined

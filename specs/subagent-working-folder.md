@@ -26,11 +26,17 @@ where its relative paths resolve; it never changes what the child may reach.
 - Folders are compared the way the platform compares them: case-insensitively on
   Windows, exactly everywhere else. A resume that only re-spells the case is
   therefore the same task on Windows and a different folder elsewhere, where it
-  is refused.
+  is refused. (Whether `FSUtil.resolve` canonicalizes on-disk casing on
+  case-insensitive non-Windows volumes such as default macOS APFS has not been
+  verified on a macOS runner.)
 - `read`, `grep`, `glob`, `edit`, `write` and `apply_patch` resolve relative
   paths - and, for the search tools, their default root - from the session's
-  folder. The system prompt reports it as `Working directory` and keeps the
-  project directory visible as `Project directory`.
+  folder. When the session's folder is the project directory, `<env>` keeps
+  `Working directory` unchanged; when it differs, `<env>` reports
+  `Session working folder (Read, Grep, Glob, Edit, Write, ApplyPatch only)` and
+  `Project directory (default Shell working directory)` separately, scopes the
+  git status line to `Is project directory a git repo`, and appends an explicit
+  per-tool working-directory split warning.
 
 ## Permissions
 
@@ -71,11 +77,27 @@ used as given and gated by the same `external_directory` check, so a child can
 reach its folder that way. A relative one does not follow the selection: it
 resolves from the instance directory, because that is the base on the
 `resolvePath` call above - not from the child's folder, and not from the caller's
-either. Nothing in this change makes that worse or better; it is the one place
-left where the selection is not honoured.
+either.
 
-The coordinated change is to pass the session's folder into that call and use it
-as the default - `ctx.cwd ?? instanceCtx.directory` for the base, the same value
-for the fallback - together with the permission work landing on that file. It is
-not made here, because two owners editing that line at once is how the shell
-permission ask and the rename get broken.
+Both the child's environment prompt (`system.ts`) and the parent's `task`
+description/parameter schema (`task.txt`, `task.ts`) state this split explicitly:
+file/search/edit tools use the selected folder, omitted and relative shell
+`workdir` values use the project directory, and shell commands meant for the
+child's folder (especially destructive, write, build, or git commands) must pass
+an explicit absolute `workdir` and verify target paths. Calling the child folder
+`Session working folder (... only)` instead of an unqualified `Working directory`
+prevents `<env>` from pairing with the shell tool's `"Commands run in the
+working directory by default"` text to imply shell commands default to the
+child's folder.
+
+This prompt distinction is an honest mitigation, **not** completion of folder
+support, and disclosure alone cannot make destructive shell commands safe by
+runtime enforcement: because `instanceCtx.directory` is inside the project,
+`external_directory` does not block an in-project shell command if a model
+ignores the prompt and omits `workdir` or passes a relative `workdir`.
+
+The coordinated runtime change is to pass the session's folder into that call
+and use it as the default - `ctx.cwd ?? instanceCtx.directory` for the base, the
+same value for the fallback - together with the permission work landing on that
+file. It is not made here, because two owners editing that line at once is how
+the shell permission ask and the rename get broken.

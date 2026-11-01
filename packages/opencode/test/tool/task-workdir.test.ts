@@ -23,6 +23,7 @@ import { Truncate } from "@/tool/truncate"
 import { ToolRegistry } from "@/tool/registry"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { TaskTool, type TaskPromptOps } from "../../src/tool/task"
+import { ToolJsonSchema } from "../../src/tool/json-schema"
 import { Workdir } from "@/session/workdir"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
@@ -191,6 +192,36 @@ const mkdir = Effect.fn("TaskWorkdirTest.mkdir")(function* (directory: string) {
 })
 
 describe("tool.task working folder", () => {
+  it.instance(
+    "task description and directory schema warn that shell defaults and relative workdir stay on the project directory",
+    () =>
+      Effect.gen(function* () {
+        const tool = yield* TaskTool
+        const def = yield* tool.init()
+        const dirSchema = ToolJsonSchema.fromSchema(def.parameters).properties?.directory
+        const directoryDescription = typeof dirSchema === "object" ? (dirSchema.description ?? "") : ""
+
+        // Both parent-facing surfaces must scope `directory` to file/search/edit
+        // tools and disclose that shell still defaults to (and resolves relative
+        // `workdir` from) the project directory unless given an absolute `workdir`.
+        expect(def.description).toContain("(`read`, `grep`, `glob`, `edit`, `write`, `apply_patch`)")
+        expect(def.description).toContain("Shell commands do NOT follow `directory` yet")
+        expect(def.description).toContain("omitted `workdir` runs in the project directory")
+        expect(def.description).toContain("a relative `workdir` resolves from the project directory")
+        expect(def.description).toContain("pass an explicit absolute `workdir` and verify target paths")
+        expect(def.description).toContain("can still affect the project directory")
+
+        expect(directoryDescription).toContain(
+          "file, search, and edit tools (read, grep, glob, edit, write, apply_patch)",
+        )
+        expect(directoryDescription).toContain(
+          "Shell commands still default to the project directory and resolve relative workdir from the project directory",
+        )
+        expect(directoryDescription).toContain("explicit absolute workdir")
+      }),
+    { config: FOREGROUND },
+  )
+
   it.instance(
     "inherits the parent's folder when the call omits one",
     () =>

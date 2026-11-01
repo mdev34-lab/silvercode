@@ -19,7 +19,10 @@ import { Provider } from "@/provider/provider"
 import { MCP } from "@/mcp"
 import { LSP } from "@/lsp/lsp"
 import { Instruction } from "@/session/instruction"
+import { SystemPrompt } from "@/session/system"
+import { Workdir } from "@/session/workdir"
 import { Skill } from "@/skill"
+import { ShellID } from "@/tool/shell/id"
 import { ToolRegistry } from "@/tool/registry"
 import { ToolCatalog } from "@/tool/catalog"
 import { Truncate } from "@/tool/truncate"
@@ -66,6 +69,7 @@ const it = testEffect(
       Format.node,
       Truncate.node,
       Instruction.node,
+      SystemPrompt.node,
       CrossSpawnSpawner.node,
       RuntimeFlags.node,
     ]),
@@ -180,6 +184,45 @@ describe("session working folder reaches tool execution", () => {
         expect(JSON.stringify(childRead)).toContain("child copy")
         expect(JSON.stringify(childRead)).not.toContain("project copy")
         expect(JSON.stringify(rootRead)).toContain("project copy")
+      }),
+    { config },
+  )
+
+  it.instance(
+    "a child's assembled environment and live tool descriptions never imply shell defaults to the child folder",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const sessions = yield* Session.Service
+        const provider = yield* Provider.Service
+        const sys = yield* SystemPrompt.Service
+        const childDir = path.join(test.directory, "child")
+        const fs = yield* FSUtil.Service
+        yield* fs.ensureDir(childDir)
+
+        const child = yield* sessions.create({ title: "Child", metadata: Workdir.select(undefined, childDir) })
+        const root = yield* sessions.create({ title: "Root" })
+        const model = yield* provider.getModel(ref.providerID, ref.modelID)
+
+        const childEnv = (yield* sys.environment(model, Workdir.of(child)))[0]
+        const rootEnv = (yield* sys.environment(model, Workdir.of(root)))[0]
+        const childTools = yield* resolveTools(child)
+        const shellDescription = childTools[ShellID.ToolID]?.description ?? ""
+
+        expect(shellDescription).toContain("Commands run in the working directory by default")
+        expect(childEnv).not.toContain(`Working directory: ${childDir}`)
+        expect(childEnv.split("\n").some((line) => line.startsWith("  Working directory:"))).toBe(false)
+        expect(childEnv).toContain(
+          `  Session working folder (Read, Grep, Glob, Edit, Write, ApplyPatch only): ${childDir}`,
+        )
+        expect(childEnv).toContain(`  Project directory (default Shell working directory): ${test.directory}`)
+        expect(childEnv).toContain(`Shell commands do NOT default to ${childDir}`)
+        expect(childEnv).toContain(`omitted \`workdir\` runs in ${test.directory}`)
+        expect(childEnv).toContain(`a relative \`workdir\` also resolves from ${test.directory}`)
+        expect(childEnv).toContain(`pass the explicit absolute \`workdir\` "${childDir}"`)
+
+        expect(rootEnv).toContain(`  Working directory: ${test.directory}`)
+        expect(rootEnv).not.toContain("Tool working-directory split")
       }),
     { config },
   )

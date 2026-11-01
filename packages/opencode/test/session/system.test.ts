@@ -12,6 +12,8 @@ import type { Provider } from "../../src/provider/provider"
 import { SystemPrompt } from "../../src/session/system"
 import { subagentWorktreeEditCapability } from "../../src/agent/subagent-permissions"
 import { MCP } from "../../src/mcp"
+import { ShellPrompt } from "../../src/tool/shell/prompt"
+import { TestInstance } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
 import { InstanceRef } from "../../src/effect/instance-ref"
 import type { InstanceContext } from "../../src/project/instance-context"
@@ -286,21 +288,41 @@ describe("session.system", () => {
   )
 
   it.instance(
-    "environment names the session's folder and keeps the project directory visible",
+    "environment distinguishes file-tool folder from default shell project directory when they differ",
     () =>
       Effect.gen(function* () {
+        const instance = yield* TestInstance
         const prompt = yield* SystemPrompt.Service
         const model = { providerID: "test", api: { id: "model" } } as Provider.Model
+        const childDir = path.resolve(os.tmpdir(), "opencode-child-folder")
         const project = (yield* prompt.environment(model))[0]
-        // A child that was given a folder of its own still has to know which
-        // project its permissions are measured against.
-        const child = (yield* prompt.environment(model, "/tmp/child-folder"))[0]
+        const sameAsProject = (yield* prompt.environment(model, instance.directory))[0]
+        // Render alongside the real shell prompt so the combined text a child
+        // model receives cannot imply shell commands default to the child folder.
+        const shellPrompt = ShellPrompt.render("bash", process.platform, { maxLines: 2000, maxBytes: 50_000 }, 120_000)
+        const child = (yield* prompt.environment(model, childDir))[0]
 
-        expect(project).toContain("  Working directory: ")
-        expect(project).not.toContain("  Project directory:")
-        expect(child.split("\n").filter((line) => line.startsWith("  Working directory:"))).toHaveLength(1)
-        expect(child).toContain("  Working directory: /tmp/child-folder")
-        expect(child.split("\n").filter((line) => line.startsWith("  Project directory:"))).toHaveLength(1)
+        expect(project).toContain(`  Working directory: ${instance.directory}`)
+        expect(project).not.toContain("Project directory")
+        expect(project).not.toContain("Tool working-directory split")
+        expect(sameAsProject).toBe(project)
+
+        expect(shellPrompt.description).toContain("Commands run in the working directory by default")
+        // `<env>` must never label `childDir` as an unqualified `Working directory:`
+        // while the shell prompt says commands run in the working directory by default.
+        expect(child.split("\n").some((line) => line.startsWith("  Working directory:"))).toBe(false)
+        expect(child).not.toContain(`Working directory: ${childDir}`)
+        expect(child).toContain(
+          `  Session working folder (Read, Grep, Glob, Edit, Write, ApplyPatch only): ${childDir}`,
+        )
+        expect(child).toContain(`  Project directory (default Shell working directory): ${instance.directory}`)
+        expect(child).toContain("  Is project directory a git repo:")
+        expect(child).not.toContain("  Is directory a git repo:")
+        expect(child).toContain(`Shell commands do NOT default to ${childDir}`)
+        expect(child).toContain(`omitted \`workdir\` runs in ${instance.directory}`)
+        expect(child).toContain(`a relative \`workdir\` also resolves from ${instance.directory}`)
+        expect(child).toContain(`pass the explicit absolute \`workdir\` "${childDir}"`)
+        expect(child).toContain("verify the target path")
       }),
   )
 

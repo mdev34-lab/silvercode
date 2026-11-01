@@ -119,7 +119,7 @@ const BaseParameterFields = {
   }),
   directory: Schema.optional(Schema.String).annotate({
     description:
-      "Working folder for the child; relative paths resolve from it. Omit to inherit this session's folder. A resumed task keeps the folder it was created with. Choosing a folder is not an authorization: paths outside the project still ask the usual permissions.",
+      "Working folder for the child's file, search, and edit tools (read, grep, glob, edit, write, apply_patch); omit to inherit this session's folder. Shell commands still default to the project directory and resolve relative workdir from the project directory, so shell commands meant for this folder must pass an explicit absolute workdir. A resumed task keeps the folder it was created with. Choosing a folder is not an authorization: paths outside the project still ask the usual permissions.",
   }),
   command: Schema.optional(Schema.String).annotate({ description: "Triggering command" }),
 }
