@@ -252,7 +252,7 @@ test("legacy bash wildcard permission patterns still match shell (wildcard, not 
 test("legacy doom_loop bash patterns still gate the renamed shell tool", () => {
   // #780: doom_loop rules key on the tool id. A legacy `bash` pattern must still gate the
   // tool now published as `shell`, with the same wildcard + findLast semantics.
-  const ruleset: Permission.Ruleset = [{ permission: "doom_loop", pattern: "bash", action: "deny" }]
+  const ruleset: PermissionV1.Ruleset = [{ permission: "doom_loop", pattern: "bash", action: "deny" }]
   expect(Permission.evaluate("doom_loop", "shell", ruleset).action).toBe("deny")
   expect(Permission.evaluate("doom_loop", "shell", [{ permission: "doom_loop", pattern: "ba*", action: "deny" }]).action).toBe("deny")
   expect(Permission.evaluate("doom_loop", "shell", [
