@@ -75,20 +75,20 @@ const normalize = (agent: Schema.Schema.Type<typeof AgentSchema>): Schema.Schema
     if (!KNOWN_KEYS.has(key)) options[key] = value
   }
 
-  const permission: ConfigPermissionV1.Info = {}
+  const derived: ConfigPermissionV1.Info = {}
   for (const [tool, enabled] of Object.entries(agent.tools ?? {})) {
     const action = enabled ? "allow" : "deny"
     if (tool === "write" || tool === "edit" || tool === "patch") {
-      permission.edit = action
+      derived.edit = action
       continue
     }
     // #780: `tools: { bash: ... }` is the pre-rename spelling of the shell tool.
-    permission[tool === "bash" ? "shell" : tool] = action
+    derived[tool === "bash" ? "shell" : tool] = action
   }
-  globalThis.Object.assign(
-    permission,
-    agent.permission ? ConfigPermissionV1.canonicalize(agent.permission) : undefined,
-  )
+  // The explicit permission is the later layer: its entries keep their own
+  // order after the tools-derived entries (ordered merge, not Object.assign,
+  // which would leave an overridden key at the tools layer's position).
+  const permission = ConfigPermissionV1.merge(derived, agent.permission) as ConfigPermissionV1.Info
 
   const steps = agent.steps ?? agent.maxSteps
   return { ...agent, options, permission, ...(steps !== undefined ? { steps } : {}) }

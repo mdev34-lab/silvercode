@@ -254,6 +254,41 @@ describe("PermissionV2", () => {
   // #780: the tool now asserts action "shell", but saved grants and
   // configured rules persisted under the legacy "bash" action must keep
   // applying with the same precedence (no deny-to-ask broadening).
+  it.effect("a later s* wildcard does not bypass an explicit legacy bash deny (V2 evaluate)", () =>
+    Effect.sync(() => {
+      // #780: wildcard patterns keep their pre-rename extension; literals keep
+      // last-wins. doom_loop resources are tool ids and follow the same rule.
+      expect(
+        PermissionV2.evaluate("shell", "ls", [
+          { action: "bash", resource: "*", effect: "deny" },
+          { action: "s*", resource: "*", effect: "allow" },
+        ]).effect,
+      ).toBe("deny")
+      expect(
+        PermissionV2.evaluate("shell", "ls", [
+          { action: "bash", resource: "*", effect: "deny" },
+          { action: "shell", resource: "*", effect: "allow" },
+        ]).effect,
+      ).toBe("allow")
+      expect(
+        PermissionV2.evaluate("doom_loop", "shell", [
+          { action: "doom_loop", resource: "bash", effect: "deny" },
+          { action: "doom_loop", resource: "s*", effect: "allow" },
+        ]).effect,
+      ).toBe("deny")
+      expect(
+        PermissionV2.evaluate("doom_loop", "shell", [
+          { action: "doom_loop", resource: "bash", effect: "deny" },
+          { action: "doom_loop", resource: "shell", effect: "allow" },
+        ]).effect,
+      ).toBe("allow")
+      expect(
+        PermissionV2.evaluate("doom_loop", "read", [{ action: "doom_loop", resource: "bash", effect: "deny" }])
+          .effect,
+      ).toBe("ask")
+    }),
+  )
+
   it.effect("uses saved legacy bash approvals for shell while preserving configured deny precedence", () =>
     Effect.gen(function* () {
       yield* setup()

@@ -264,6 +264,34 @@ test("legacy doom_loop bash patterns still gate the renamed shell tool", () => {
   expect(Permission.evaluate("edit", "shell", [{ permission: "edit", pattern: "bash", action: "deny" }]).action).toBe("ask")
 })
 
+test("a later s* wildcard does not bypass an explicit legacy bash deny", () => {
+  // #780: `s*` was written when the tool was called `bash` (it covered
+  // `skill`). Evaluating the renamed tool must preserve the deny instead of
+  // recruiting `shell` into the later wildcard allow.
+  const ruleset = Permission.fromConfig({ bash: "deny", "s*": "allow" })
+  expect(Permission.evaluate("shell", "ls", ruleset).action).toBe("deny")
+  // A legacy-spelling query is not widened by the new spelling either.
+  expect(Permission.evaluate("bash", "ls", ruleset).action).toBe("deny")
+  // Explicit re-permits still win by order (last matching literal wins).
+  expect(Permission.evaluate("shell", "ls", Permission.fromConfig({ bash: "deny", shell: "allow" })).action).toBe(
+    "allow",
+  )
+  expect(Permission.evaluate("shell", "ls", Permission.fromConfig({ "s*": "deny", shell: "allow" })).action).toBe(
+    "allow",
+  )
+  // A later legacy wildcard deny still gates the renamed tool.
+  expect(Permission.evaluate("shell", "ls", Permission.fromConfig({ shell: "allow", "ba*": "deny" })).action).toBe(
+    "deny",
+  )
+  // doom_loop resources follow the same rule: s* must not bypass bash deny.
+  expect(
+    Permission.evaluate("doom_loop", "shell", [
+      { permission: "doom_loop", pattern: "bash", action: "deny" },
+      { permission: "doom_loop", pattern: "s*", action: "allow" },
+    ]).action,
+  ).toBe("deny")
+})
+
 test("evaluating under the legacy bash name resolves canonical shell rules", () => {
   // #780: the two spellings are one action identity in both directions, so a
   // legacy query name still resolves rules stored under the canonical key.

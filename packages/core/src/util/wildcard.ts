@@ -16,20 +16,28 @@ export function match(input: string, pattern: string) {
 /**
  * Legacy permission-action aliases. The shell tool was published as "bash"
  * before the rename to "shell" (#780); persisted rules, saved grants, and user
- * config may still spell the action "bash". Matching a canonical action also
- * tries each legacy spelling as the subject, so wildcard patterns keep their
- * exact semantics under both spellings and a legacy "deny" can never silently
- * degrade to the default "ask".
+ * config may still spell the action "bash".
+ *
+ * Matching preserves what every pattern meant when it was written:
+ * - A literal pattern names the tool under either exact spelling, so legacy
+ *   `bash` rules and new `shell` rules both apply, in written order.
+ * - A wildcard pattern keeps its pre-rename extension: it is matched against
+ *   the legacy spelling(s) only. `ba*` therefore still gates the renamed
+ *   tool, while `s*` — which covered `skill` when the tool was called
+ *   `bash` — does not silently recruit `shell` and cannot bypass an explicit
+ *   legacy deny ordered before it. (New config should name the tool exactly:
+ *   `shell`.)
  */
 const LEGACY_ACTION_ALIASES: Readonly<Record<string, readonly string[]>> = { shell: ["bash"] }
 
 export function matchAction(action: string, pattern: string) {
-  if (match(action, pattern)) return true
-  if ((LEGACY_ACTION_ALIASES[action] ?? []).some((legacy) => match(legacy, pattern))) return true
-  // Symmetric: a query under the legacy spelling resolves rules written with
-  // the canonical one too — the two spellings are one action identity.
   const canonicalName = canonical(action)
-  return canonicalName !== action && match(canonicalName, pattern)
+  const legacy = LEGACY_ACTION_ALIASES[canonicalName] ?? []
+  if (legacy.length === 0) return match(action, pattern)
+  if (!pattern.includes("*") && !pattern.includes("?")) {
+    return match(canonicalName, pattern) || legacy.some((name) => match(name, pattern))
+  }
+  return legacy.some((name) => match(name, pattern))
 }
 
 /** Canonical spelling of a tool/permission name: legacy `bash` folds to `shell` (#780). */

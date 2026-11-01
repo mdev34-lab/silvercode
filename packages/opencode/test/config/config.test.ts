@@ -792,7 +792,7 @@ Ordered permissions`,
     )
 
     const config = yield* Config.use.get()
-    expect(Object.keys(named(config.agent?.ordered)?.permission ?? {})).toEqual(["shell", "*", "edit"])
+    expect(Object.keys(named(config.agent?.ordered)?.permission ?? {})).toEqual(["bash", "*", "edit"])
   }),
 )
 
@@ -826,6 +826,120 @@ it.effect("layered permission merge keeps last-layer precedence for symmetric ba
   ),
 )
 
+// #780 follow-up: folding or merging must preserve the actual rule sequence
+// (including wildcard/pattern positions), not just the surviving values.
+it.instance(
+  "single-file bash/* /shell interleaving keeps its rule order (last deny wins)",
+  Effect.gen(function* () {
+    const config = yield* Config.use.get()
+    expect(Permission.evaluate("shell", "ls", Permission.fromConfig(config.permission ?? {})).action).toBe("deny")
+  }),
+  { config: { permission: { bash: "ask", "*": "allow", shell: "deny" } } },
+)
+
+it.instance(
+  "single-file nested bash/shell objects keep inner pattern order",
+  Effect.gen(function* () {
+    const config = yield* Config.use.get()
+    const ruleset = Permission.fromConfig(config.permission ?? {})
+    expect(Permission.evaluate("shell", "rm -rf x", ruleset).action).toBe("deny")
+    expect(Permission.evaluate("shell", "ls", ruleset).action).toBe("allow")
+  }),
+  { config: { permission: { bash: { "rm *": "allow" }, shell: { "*": "allow", "rm *": "deny" } } } },
+)
+
+it.effect("layered merge keeps inner pattern position when a later layer overrides a pattern", () =>
+  withConfigTree(
+    {
+      global: { permission: { shell: { "rm *": "allow", "*": "allow" } } },
+      project: { permission: { shell: { "rm *": "deny" } } },
+    },
+    Effect.gen(function* () {
+      const config = yield* Config.use.get()
+      const ruleset = Permission.fromConfig(config.permission ?? {})
+      expect(Permission.evaluate("shell", "rm -rf x", ruleset).action).toBe("deny")
+      expect(Permission.evaluate("shell", "ls", ruleset).action).toBe("allow")
+    }),
+  ),
+)
+
+it.effect("layered merge keeps rule order across bash/shell spellings with nested patterns", () =>
+  withConfigTree(
+    {
+      global: { permission: { bash: { "rm *": "allow", "*": "allow" } } },
+      local: { permission: { shell: { "rm *": "deny" } } },
+    },
+    Effect.gen(function* () {
+      const config = yield* Config.use.get()
+      expect(Permission.evaluate("shell", "rm -rf x", Permission.fromConfig(config.permission ?? {})).action).toBe(
+        "deny",
+      )
+    }),
+  ),
+)
+
+it.effect("layered legacy tools config resolves shell by layer order across spellings", () =>
+  withConfigTree(
+    {
+      global: { tools: { shell: false } },
+      project: { tools: { bash: true } },
+      local: { tools: { shell: false } },
+    },
+    Effect.gen(function* () {
+      const config = yield* Config.use.get()
+      expect(Permission.evaluate("shell", "ls", Permission.fromConfig(config.permission ?? {})).action).toBe("deny")
+    }),
+  ),
+)
+
+it.effect("layered legacy tools config resolves shell by layer order (symmetric spellings)", () =>
+  withConfigTree(
+    {
+      global: { tools: { bash: false } },
+      project: { tools: { shell: true } },
+      local: { tools: { bash: false } },
+    },
+    Effect.gen(function* () {
+      const config = yield* Config.use.get()
+      expect(Permission.evaluate("shell", "ls", Permission.fromConfig(config.permission ?? {})).action).toBe("deny")
+    }),
+  ),
+)
+
+it.instance(
+  "managed tools shell:false overrides user tools bash:true",
+  Effect.gen(function* () {
+    yield* writeManagedSettingsEffect({
+      $schema: "https://opencode.ai/config.json",
+      tools: { shell: false },
+    })
+
+    const config = yield* Config.use.get()
+    expect(Permission.evaluate("shell", "ls", Permission.fromConfig(config.permission ?? {})).action).toBe("deny")
+  }),
+  { config: { tools: { bash: true } } },
+)
+
+it.instance("agent explicit permission keeps its own order after the tools-derived layer", () =>
+  Effect.gen(function* () {
+    const test = yield* TestInstance
+    yield* writeConfigEffect(test.directory, {
+      $schema: "https://opencode.ai/config.json",
+      agent: {
+        denied: { tools: { bash: true }, permission: { "*": "allow", shell: "deny" } },
+        allowed: { tools: { bash: false }, permission: { "*": "deny", shell: "allow" } },
+      },
+    })
+
+    const config = yield* Config.use.get()
+    const denied = named(config.agent?.["denied"])?.permission ?? {}
+    expect(Object.keys(denied)).toEqual(["*", "shell"])
+    expect(Permission.evaluate("shell", "ls", Permission.fromConfig(denied)).action).toBe("deny")
+    const allowed = named(config.agent?.["allowed"])?.permission ?? {}
+    expect(Permission.evaluate("shell", "ls", Permission.fromConfig(allowed)).action).toBe("allow")
+  }),
+)
+
 it.instance(
   "managed shell deny overrides user config carrying both bash and shell spellings",
   Effect.gen(function* () {
@@ -840,7 +954,7 @@ it.instance(
   { config: { permission: { shell: "ask", bash: "allow" } } },
 )
 
-it.instance("agent tools shell plus mixed bash/shell permission resolves to one canonical permission", () =>
+it.instance("agent tools shell plus mixed bash/shell permission resolves in written rule order", () =>
   Effect.gen(function* () {
     const test = yield* TestInstance
     yield* writeConfigEffect(test.directory, {
@@ -849,7 +963,11 @@ it.instance("agent tools shell plus mixed bash/shell permission resolves to one 
     })
 
     const config = yield* Config.use.get()
-    expect(named(config.agent?.["test"])?.permission).toEqual({ shell: "deny" })
+    const permission = named(config.agent?.["test"])?.permission ?? {}
+    // Tools-derived allow comes first; the explicit layer then applies in its
+    // own order, so the final explicit shell deny is the last matching rule.
+    expect(Object.keys(permission)).toEqual(["bash", "shell"])
+    expect(Permission.evaluate("shell", "ls", Permission.fromConfig(permission)).action).toBe("deny")
   }),
 )
 
@@ -1413,7 +1531,7 @@ test("config parser preserves permission order while ignoring unknown top-level 
     "test",
   )
 
-  expect(Object.keys(config.permission!)).toEqual(["shell", "*", "edit"])
+  expect(Object.keys(config.permission!)).toEqual(["bash", "*", "edit"])
   expect(config).not.toHaveProperty("plugins")
 })
 
@@ -2168,10 +2286,9 @@ test("parseManagedPlist parses permission rules", async () => {
   expect(config.permission?.grep).toBe("allow")
   expect(config.permission?.webfetch).toBe("ask")
   expect(config.permission?.["~/.ssh/*"]).toBe("deny")
-  // #780: the legacy `bash` key in managed config decodes to canonical `shell`.
-  const shell = config.permission?.shell as Record<string, string>
-  expect(shell?.["rm -rf *"]).toBe("deny")
-  expect(shell?.["curl *"]).toBe("deny")
+  const bash = config.permission?.bash as Record<string, string>
+  expect(bash?.["rm -rf *"]).toBe("deny")
+  expect(bash?.["curl *"]).toBe("deny")
 })
 
 test("parseManagedPlist parses enabled_providers", async () => {

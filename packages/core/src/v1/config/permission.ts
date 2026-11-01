@@ -41,29 +41,54 @@ const InputObject = Schema.StructWithRest(
 
 const InputSchema = Schema.Union([Action, InputObject])
 
-// #780: `bash` is the pre-rename spelling of the `shell` permission. Config layers merge
-// by object key, so letting both spellings survive would let an older layer's `bash`
-// outrank a newer layer's `shell` (or the reverse) purely by key position once merged.
-// Fold the legacy key into `shell` as each layer is decoded, preserving entry order:
-// two rule objects deep-merge per pattern and otherwise the later entry wins — exactly
-// how an already-canonical config behaves across layers.
-export function canonicalize<T extends Record<string, Rule | undefined>>(permission: T): T {
-  if (!("bash" in permission)) return permission
-  const out: Record<string, Rule> = {}
-  for (const [key, value] of globalThis.Object.entries(permission)) {
-    if (value === undefined) continue
-    const canonical = key === "bash" ? "shell" : key
-    const existing = out[canonical]
-    out[canonical] =
-      existing !== undefined && typeof existing === "object" && typeof value === "object"
-        ? { ...existing, ...value }
-        : value
-  }
-  return out as T
+const normalizeInput = (input: Schema.Schema.Type<typeof InputSchema>): Schema.Schema.Type<typeof InputObject> =>
+  typeof input === "string" ? { "*": input } : input
+
+type MergeInput = Action | Record<string, Rule | undefined> | undefined
+
+const toRecord = (input: MergeInput): Record<string, Rule | undefined> => {
+  if (typeof input === "string") return { "*": input }
+  if (typeof input !== "object" || input === null || globalThis.Array.isArray(input)) return {}
+  return input
 }
 
-const normalizeInput = (input: Schema.Schema.Type<typeof InputSchema>): Schema.Schema.Type<typeof InputObject> =>
-  typeof input === "string" ? { "*": input } : canonicalize(input)
+const mergeRule = (target: Rule, source: Rule): Rule => {
+  if (typeof target === "string" && typeof source === "string") return source
+  // A flat action is the "*" pattern written first; promote it so inner
+  // patterns keep their written sequence instead of being replaced wholesale.
+  const out: Record<string, Action> = { ...(typeof target === "string" ? { "*": target } : target) }
+  for (const [pattern, action] of globalThis.Object.entries(
+    typeof source === "string" ? { "*": source } : source,
+  )) {
+    if (action === undefined) continue
+    delete out[pattern]
+    out[pattern] = action
+  }
+  return out
+}
+
+/**
+ * Merge two permission layers with rule-sequence semantics: the result
+ * evaluates exactly as if the target's rules were followed by the source's
+ * rules and the last matching rule won. A key the source writes moves to the
+ * source's position (delete + reinsert) instead of keeping its first-seen
+ * position the way a plain deep merge would — key position is precedence for
+ * permission objects, across both spellings of a renamed action (#780) and
+ * across config layers (global/project/local/managed/env/agent).
+ */
+export function merge(target: MergeInput, source: MergeInput): Record<string, Rule> {
+  const out: Record<string, Rule> = {}
+  for (const [key, value] of globalThis.Object.entries(toRecord(target))) {
+    if (value !== undefined) out[key] = value
+  }
+  for (const [key, value] of globalThis.Object.entries(toRecord(source))) {
+    if (value === undefined) continue
+    const existing = out[key]
+    delete out[key]
+    out[key] = existing === undefined ? value : mergeRule(existing, value)
+  }
+  return out
+}
 
 export const Info = InputSchema.pipe(
   Schema.decodeTo(InputObject, {

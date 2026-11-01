@@ -37,18 +37,82 @@ import { withTransientReadRetry } from "@/util/effect-http-client"
 
 // Custom merge function that concatenates array fields instead of replacing them
 // Keep remeda's deep conditional merge type out of hot config-loading paths; TS profiling showed it dominates here.
-// #780: fold the legacy `bash` permission key into `shell` before merging layers, so two
-// layers spelling the same permission differently still resolve by layer order instead
-// of by object key position after the merge. Schema decoding already canonicalizes file
-// configs; this also covers operands that reach the merge without decoding.
-function canonicalizePermission(config: Info): Info {
-  const permission = config.permission
-  if (!permission || typeof permission !== "object" || !("bash" in permission)) return config
-  return { ...config, permission: ConfigPermissionV1.canonicalize(permission) }
+// #780: legacy `tools` records may spell the shell tool `bash`. Fold that key
+// to `shell` in each layer before merging so the boolean resolves by layer
+// order, whichever spelling a layer used.
+function foldTools(tools: Record<string, boolean> | undefined): Record<string, boolean> | undefined {
+  if (!tools || !("bash" in tools)) return tools
+  const out: Record<string, boolean> = {}
+  for (const [key, value] of Object.entries(tools)) {
+    const canonical = key === "bash" ? "shell" : key
+    delete out[canonical]
+    out[canonical] = value
+  }
+  return out
+}
+
+function foldRecordTools<T>(record: T): T {
+  if (!isRecord(record)) return record
+  let out = record
+  for (const [name, entry] of Object.entries(record)) {
+    if (!isRecord(entry)) continue
+    const tools = foldTools(entry.tools as Record<string, boolean> | undefined)
+    if (tools === entry.tools) continue
+    if (out === record) out = { ...record }
+    ;(out as Record<string, unknown>)[name] = { ...entry, tools }
+  }
+  return out
+}
+
+function foldConfigTools(config: Info): Info {
+  const tools = foldTools(config.tools)
+  const agent = foldRecordTools(config.agent)
+  const mode = foldRecordTools(config.mode)
+  if (tools === config.tools && agent === config.agent && mode === config.mode) return config
+  return { ...config, tools, agent, mode }
+}
+
+// Permission objects carry precedence in key order (last matching rule wins),
+// which mergeDeep does not preserve: an overridden key keeps its first-seen
+// position. Recompute permission fields with the ordered merge so a layered
+// config evaluates as the concatenation of its layers' rule sequences —
+// across spellings of a renamed action and across pattern positions (#780).
+function mergeRecordPermissions<T>(merged: T, target: T, source: T): T {
+  if (!isRecord(merged)) return merged
+  let out = merged
+  for (const [name, entry] of Object.entries(merged)) {
+    if (!isRecord(entry)) continue
+    const targetPermission = isRecord(target) && isRecord(target[name]) ? target[name].permission : undefined
+    const sourcePermission = isRecord(source) && isRecord(source[name]) ? source[name].permission : undefined
+    if (targetPermission === undefined && sourcePermission === undefined) continue
+    if (out === merged) out = { ...merged }
+    ;(out as Record<string, unknown>)[name] = {
+      ...entry,
+      permission: ConfigPermissionV1.merge(
+        targetPermission as ConfigPermissionV1.Info | undefined,
+        sourcePermission as ConfigPermissionV1.Info | undefined,
+      ),
+    }
+  }
+  return out
+}
+
+function mergeAgentRecords<T extends object>(current: T, next: T): T {
+  return mergeRecordPermissions(
+    mergeDeep(foldRecordTools(current), foldRecordTools(next)) as T,
+    foldRecordTools(current),
+    foldRecordTools(next),
+  )
 }
 
 function mergeConfig(target: Info, source: Info): Info {
-  return mergeDeep(canonicalizePermission(target), canonicalizePermission(source)) as Info
+  const merged = mergeDeep(foldConfigTools(target), foldConfigTools(source)) as Info
+  if (target.permission !== undefined || source.permission !== undefined) {
+    merged.permission = ConfigPermissionV1.merge(target.permission, source.permission) as Info["permission"]
+  }
+  merged.agent = mergeRecordPermissions(merged.agent, target.agent, source.agent)
+  merged.mode = mergeRecordPermissions(merged.mode, target.mode, source.mode)
+  return merged
 }
 
 function mergeConfigConcatArrays(target: Info, source: Info): Info {
@@ -523,8 +587,8 @@ const layer = Layer.effect(
           }
 
           result.command = mergeDeep(result.command ?? {}, yield* Effect.promise(() => ConfigCommand.load(dir)))
-          result.agent = mergeDeep(result.agent ?? {}, yield* Effect.promise(() => ConfigAgent.load(dir)))
-          result.agent = mergeDeep(result.agent ?? {}, yield* Effect.promise(() => ConfigAgent.loadMode(dir)))
+          result.agent = mergeAgentRecords(result.agent ?? {}, yield* Effect.promise(() => ConfigAgent.load(dir)))
+          result.agent = mergeAgentRecords(result.agent ?? {}, yield* Effect.promise(() => ConfigAgent.loadMode(dir)))
           // Auto-discovered plugins under `.opencode/plugin(s)` are already local files, so ConfigPlugin.load
           // returns normalized Specs and we only need to attach origin metadata here.
           const list = yield* Effect.promise(() => ConfigPlugin.load(dir))
@@ -600,7 +664,7 @@ const layer = Layer.effect(
         }
 
         for (const [name, mode] of Object.entries(result.mode ?? {})) {
-          result.agent = mergeDeep(result.agent ?? {}, {
+          result.agent = mergeAgentRecords(result.agent ?? {}, {
             [name]: {
               ...mode,
               mode: "primary" as const,
@@ -610,10 +674,10 @@ const layer = Layer.effect(
 
         if (Flag.OPENCODE_PERMISSION) {
           try {
-            result.permission = mergeDeep(
-              ConfigPermissionV1.canonicalize(result.permission ?? {}),
-              ConfigPermissionV1.canonicalize(JSON.parse(Flag.OPENCODE_PERMISSION)),
-            )
+            result.permission = ConfigPermissionV1.merge(
+              result.permission,
+              JSON.parse(Flag.OPENCODE_PERMISSION),
+            ) as Info["permission"]
           } catch (err) {
             yield* Effect.logWarning("OPENCODE_PERMISSION contains invalid JSON, skipping", { err })
           }
@@ -630,7 +694,7 @@ const layer = Layer.effect(
             // #780: `tools: { bash: ... }` is the pre-rename spelling of the shell tool.
             perms[tool === "bash" ? "shell" : tool] = action
           }
-          result.permission = mergeDeep(perms, ConfigPermissionV1.canonicalize(result.permission ?? {}))
+          result.permission = ConfigPermissionV1.merge(perms, result.permission) as Info["permission"]
         }
 
         if (!result.username) {

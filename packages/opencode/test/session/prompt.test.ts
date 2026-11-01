@@ -1793,6 +1793,63 @@ it.instance(
 )
 
 it.instance(
+  "an archived bash tool part is replayed from stored output, never re-executed (#780)",
+  () =>
+    Effect.gen(function* () {
+      const { dir, llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+
+      const chat = yield* sessions.create({
+        title: "Archived bash part",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      const seeded = yield* seed(chat.id, { finish: "stop" })
+      const marker = path.join(dir, "archived-bash-replayed.txt")
+      // A persisted pre-rename history part: completed, with stored output.
+      yield* sessions.updatePart({
+        id: PartID.ascending(),
+        messageID: seeded.assistant.id,
+        sessionID: chat.id,
+        type: "tool",
+        callID: "archived-bash-call",
+        tool: "bash",
+        state: {
+          status: "completed",
+          input: { command: `touch ${marker}` },
+          output: "stored output from before the rename",
+          title: "done",
+          metadata: {},
+          time: { start: Date.now(), end: Date.now() },
+        },
+      })
+
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "continue please" }],
+      })
+      yield* llm.text("done")
+
+      const result = yield* prompt.loop({ sessionID: chat.id })
+      expect(result.info.role).toBe("assistant")
+
+      // The archived call was not re-executed under the new name, and its
+      // stored output is preserved verbatim.
+      expect(yield* Effect.promise(() => Bun.file(marker).exists())).toBe(false)
+      const parts = (yield* sessions.messages({ sessionID: chat.id })).flatMap((message) => message.parts)
+      expect(parts.some((part) => part.type === "tool" && part.tool === "shell")).toBe(false)
+      const archived = parts.find((part) => part.type === "tool" && part.tool === "bash")
+      expect(archived?.type).toBe("tool")
+      if (archived?.type === "tool" && archived.state.status === "completed") {
+        expect(archived.state.output).toBe("stored output from before the rename")
+      }
+    }),
+  20_000,
+)
+
+it.instance(
   "a truncated write retry completes without a doom-loop ask under deny policy",
   () =>
     Effect.gen(function* () {
