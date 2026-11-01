@@ -6456,3 +6456,91 @@ it.instance(
     }),
   20_000,
 )
+
+// Upgrade makes the finish checkpoint stricter than the prompt the model saw
+// for the generation that requested it: the in-flight request keeps the fast
+// policy it was sent with, but every finish the model calls after the upgrade
+// is judged thorough and therefore requires a review. With no review present
+// the gate declines, never as approved, and the persisted change is not reset.
+it.instance(
+  "mid-session effort upgrade is enforced by the finish checkpoint of the same turn",
+  () =>
+    Effect.gen(function* () {
+      const { dir, llm } = yield* useServerConfig((url) => ({
+        ...providerCfg(url),
+        agent: { work: { finishTool: true } },
+      }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({
+        title: "Effort finish upgrade",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+        metadata: withAgentEffort({}, "fast"),
+      })
+      const file = path.join(dir, "effort-finish-upgrade.txt")
+      yield* prompt.prompt({
+        sessionID: session.id,
+        agent: "work",
+        noReply: true,
+        parts: [{ type: "text", text: "Write a file and finish." }],
+      })
+      yield* llm.tool("write", { filePath: file, content: "done" })
+      const held = defer<void>()
+      const extra = path.join(dir, "effort-finish-upgrade-2.txt")
+      yield* llm.push(reply().tool("write", { filePath: extra, content: "done" }).wait(held.promise))
+      // The model will try to finish three times: the first attempt after the
+      // upgrade is declined as thorough (no review), and the two nudge-driven
+      // retries are declined the same way until the loop hits its nudge limit.
+      yield* llm.push(reply().text("Delivered.").tool("finish", { reason: "success", result: "Wrote the file." }).stop())
+      yield* llm.push(reply().text("Still done.").tool("finish", { reason: "success", result: "Wrote the file again." }).stop())
+      yield* llm.push(reply().text("Again.").tool("finish", { reason: "success", result: "Again." }).stop())
+      yield* llm.push(reply().text("Final.").tool("finish", { reason: "success", result: "Final." }).stop())
+
+      const fiber = yield* prompt.loop({ sessionID: session.id }).pipe(Effect.forkChild)
+      yield* awaitWithTimeout(llm.wait(1), "timed out waiting for step 1", "10 seconds")
+      yield* awaitWithTimeout(llm.wait(2), "timed out waiting for step 2", "10 seconds")
+      expect(JSON.stringify((yield* llm.hits)[1]?.body)).toContain("## Agent effort: fast")
+      expect(JSON.stringify((yield* llm.hits)[1]?.body)).not.toContain("## Agent effort: thorough")
+
+      // Upgrade while step 2 is in flight: the in-flight request keeps its
+      // fast prompt, and every finish after that is judged thorough.
+      yield* sessions.setMetadata({ sessionID: session.id, metadata: withAgentEffort({}, "thorough") })
+      held.resolve()
+
+      const exit = yield* Fiber.await(fiber)
+      expect(Exit.isSuccess(exit)).toBe(true)
+      const result = (exit as Exit.Success<SessionV1.WithParts>).value
+      expect(result.info.finish).toBe("error")
+      expect(result.info.error?.data.message).toContain("did not complete the required finish tool after 3 nudges")
+
+      const messages = yield* sessions.messages({ sessionID: session.id })
+      const finishes = messages
+        .flatMap((message) => message.parts)
+        .filter((part): part is SessionV1.ToolPart => part.type === "tool" && part.tool === "finish")
+      // Every finish attempt was declined as thorough requiring review; none
+      // succeeded as the stale fast level would have.
+      expect(finishes.length).toBeGreaterThanOrEqual(3)
+      expect(finishes.every((f) => f.state.status === "error")).toBe(true)
+      for (const finish of finishes) {
+        if (finish.state.status !== "error") continue
+        expect(finish.state.error).toContain("Review required")
+        expect(finish.state.error).not.toContain("effort fast")
+      }
+      // The last recorded decline carries the thorough effort in its metadata
+      // (the stale fast mutant would have recorded fast).
+      const lastMeta = finishes.at(-1)?.state.status === "error" ? (finishes.at(-1) as { state: { metadata?: { review?: { effort?: string } } } }).state.metadata : undefined
+      // If metadata is present, it must be thorough; if the tool only recorded
+      // nudged metadata, the error message alone proves the level.
+      if (lastMeta?.review?.effort) expect(lastMeta.review.effort).toBe("thorough")
+      expect((yield* sessions.get(session.id)).metadata?.agentEffort).toBe("thorough")
+      expect(yield* Effect.promise(() => readFile(file, "utf8"))).toBe("done")
+      // No replay: the two writes from before the change landed exactly once,
+      // and the loop did not fabricate a successful finish.
+      const writes = messages
+        .flatMap((message) => message.parts)
+        .filter((part): part is SessionV1.ToolPart => part.type === "tool" && part.tool === "write")
+      expect(writes).toHaveLength(2)
+      expect(writes.map((p) => p.state.status)).toEqual(["completed", "completed"])
+    }),
+  30_000,
+)
