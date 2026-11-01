@@ -244,3 +244,21 @@ test("conflicting reports with an unavailable parent remain raw", async () => {
   expect(result).not.toContain("✓ Approved")
   expect(result).not.toContain("✗ Needs fixes")
 })
+
+test("mixed-agent execution text is not promoted into a review verdict", async () => {
+  const user = userMessage("msg_001", SESSION, { agent: "review" })
+  const first = assistantMessage("msg_002", SESSION, { agent: "work", mode: "work", parentID: user.id, time: { created: 1_700_000_001_000, completed: 1_700_000_002_000 } })
+  const second = assistantMessage("msg_003", SESSION, { agent: "review", mode: "review", parentID: user.id, time: { created: 1_700_000_010_000, completed: 1_700_000_011_000 } })
+  const entries = [
+    { info: user, parts: [textPart("request", user, "Synthetic review request")] },
+    { info: first, parts: [textPart("first", first, `Work analysis.\n${old}`)] },
+    { info: second, parts: [textPart("second", second, `Review analysis.\n${latest}`)] },
+  ]
+  const { app } = await mountSessionRoute({ width: 120, height: 55, sessions: [sessionInfo(SESSION)], messages: { [SESSION]: entries } })
+  await waitFor(app, () => app.captureCharFrame().includes("Later synthetic finding") ? true : undefined)
+  const result = await spansOf(app)
+  expect(result).toContain("Work analysis.")
+  expect(result).toContain("Review analysis.")
+  expect(result).not.toContain("✓ Approved")
+  expect(result).not.toContain("✗ Needs fixes")
+})

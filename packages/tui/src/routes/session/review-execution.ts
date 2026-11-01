@@ -124,8 +124,8 @@ export function executionReviewPlan(messages: readonly Message[], parts: Readonl
   }
   if (!owner || owner.info.role !== "assistant") return undefined
   const selected = entries.filter((entry) => members.includes(entry.info.id))
-  if (selected.length !== members.length || selected.some((entry) => entry.info.role !== "assistant" || Agent.canonicalID(entry.info.agent) !== "review")) return undefined
   const fallback: Plan = { owner: owner.info.id, members: new Set(members) }
+  if (selected.length !== members.length || selected.some((entry) => entry.info.role !== "assistant" || Agent.canonicalID(entry.info.agent) !== "review")) return fallback
   const first = selected[0].info as AssistantMessage
   const anchor = entries.findIndex((entry) => entry.info.id === first.parentID && entry.info.role === "user")
   const anchorPart = entries[anchor]?.parts
