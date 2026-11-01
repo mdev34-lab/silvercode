@@ -1885,7 +1885,7 @@ export function AssistantMessageRow(props: { message: AssistantMessage; parts: P
                 </Show>
               </Match>
               <Match when={part.type === "tool" && part.tool === "finish" && execution() && !execution()?.report}>
-                <Finish part={part as ToolPart} input={(part as ToolPart).state.input} output={(part as ToolPart).state.status === "completed" ? ((part as ToolPart).state as Extract<ToolPart["state"], { status: "completed" }>).output : undefined} metadata={{}} tool="finish" suppressReview />
+                <ToolPart last={index() === props.parts.length - 1} part={part as ToolPart} message={props.message} suppressReview />
               </Match>
               <Match when={part.type === "text" && textReview()?.textPartIDs.includes(part.id)}>
                 <Show when={textReview()?.textPartIDs[0] === part.id && displayedTextReview()}>
@@ -2299,7 +2299,7 @@ function ActivityGroupPartRow(props: { item: ActivityGroupPart }) {
   return <ToolPart last={false} part={props.item.part} message={props.item.message} />
 }
 
-function ToolPart(props: { last: boolean; part: ToolPart; message: AssistantMessage }) {
+function ToolPart(props: { last: boolean; part: ToolPart; message: AssistantMessage; suppressReview?: boolean }) {
   const ctx = use()
   const renderer = createMemo(() => toolRenderer(props.part.tool))
 
@@ -2321,6 +2321,9 @@ function ToolPart(props: { last: boolean; part: ToolPart; message: AssistantMess
     },
     get part() {
       return props.part
+    },
+    get suppressReview() {
+      return props.suppressReview
     },
   }
 

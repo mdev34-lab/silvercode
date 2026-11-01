@@ -272,6 +272,20 @@ describe("review assistant text: real transcript fallback", () => {
     expect(frame.match(/Raw review report/g)?.length).toBe(1)
   })
 
+  test("same-message conflicting text and finish use only the canonical finish verdict", async () => {
+    const first = ReviewReport.envelope({ version: 1, revision: "synthetic", assessment: "approved", summary: "Earlier approval", findings: [] })
+    const latest = ReviewReport.envelope({ version: 1, revision: "synthetic", assessment: "needs-fixes", summary: "Latest finding", findings: [] })
+    const finish = completedTool("finish", { reason: "success", result: `Finish analysis.\n${latest}` }, `Finish analysis.\n${latest}`)
+    const mounted = await mount({ agent: "review", completed: true, parts: [textPart(`Text analysis.\n${first}`), finish] })
+    await settleUntilFrame(mounted.app, "Latest finding")
+    const frame = await frameOfSpans(mounted.app)
+    expect(frame).toContain("Text analysis.")
+    expect(frame).toContain("Finish analysis.")
+    expect(frame).toContain("✗ Needs fixes")
+    expect(frame).not.toContain("✓ Approved")
+    expect(frame.match(/Raw review report/g)?.length).toBe(1)
+  })
+
   test("a declined finish cannot turn same-message text into an approval", async () => {
     const report = ReviewReport.envelope({ version: 1, revision: "synthetic", assessment: "approved", summary: "Undelivered report", findings: [] })
     const failed = completedTool("finish", { reason: "failure", result: report }, report)

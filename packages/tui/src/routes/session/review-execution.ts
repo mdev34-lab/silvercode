@@ -3,6 +3,8 @@ import { Agent } from "@opencode-ai/schema/agent"
 import type { SessionV1 } from "@opencode-ai/core/v1/session"
 import type { AssistantMessage, Message, Part, TextPart, ToolPart } from "@opencode-ai/sdk/v2"
 import { resultChunks } from "../../../../opencode/src/session/subagent-result"
+import FINISH_NUDGE from "../../../../opencode/src/session/prompt/finish-nudge.txt"
+import REVIEW_STAGNATION_NUDGE from "../../../../opencode/src/session/prompt/review-stagnation-nudge.txt"
 import { hasQuotedTag } from "./review-text"
 
 type Entry = { info: Message; parts: readonly Part[] }
@@ -49,13 +51,28 @@ function envelopeRanges(source: string): [number, number][] | undefined {
     ranges.push([match.index, end])
     token.lastIndex = end
   }
+  // Incomplete or stray protocol fragments outside validated envelopes must
+  // stay visible on the fallback path, even when an older report parsed.
+  let remaining = ""
+  let start = 0
+  for (const [left, right] of ranges) {
+    remaining += source.slice(start, left)
+    start = right
+  }
+  remaining += source.slice(start)
+  if (ReviewReport.TAGS.some((tag) => remaining.includes(`<${tag}`) || remaining.includes(`</${tag}`))) return undefined
   return ranges
 }
 
 /** Uses the runtime collector for identity, ordering, nudges, and finish boundaries. */
 export function executionReviewPlan(messages: readonly Message[], parts: Readonly<Record<string, readonly Part[] | undefined>>, current: AssistantMessage): Plan | undefined {
   if (Agent.canonicalID(current.agent) !== "review") return undefined
-  if (!messages.some((message) => message.id === current.id) || messages.some((message) => !parts[message.id])) return undefined
+  if (!messages.some((message) => message.id === current.id)) return undefined
+  if (messages.some((message) => !parts[message.id])) {
+    // Hydration has not established execution boundaries yet. Keep each
+    // reviewer row raw until the missing transcript parts are available.
+    return { owner: current.id, members: new Set([current.id]) }
+  }
   const entries: Entry[] = messages.map((info) => ({ info, parts: parts[info.id]! })).sort((a, b) => a.info.id.localeCompare(b.info.id))
   // Mark assistant messages in a copy, keeping all finish parts intact, so the
   // actual runtime collector tells us which rows belong to the same execution.
@@ -67,16 +84,27 @@ export function executionReviewPlan(messages: readonly Message[], parts: Readonl
   let members: string[] = []
   for (const entry of [...entries].reverse()) {
     if (entry.info.role !== "assistant" || Agent.canonicalID(entry.info.agent) !== "review") continue
-    const parentID = entry.info.parentID
-    if (!entries.some((row) => row.info.role === "user" && row.info.id === parentID)) continue
     const target = marked.find((row) => row.info.id === entry.info.id)!
     const ids = resultChunks(marked, target)
-    if (ids.length > 1 && ids.includes(current.id)) { owner = entry; members = ids; break }
+    const ownFinish = entry.info.id === current.id && entry.parts.some((part) => part.type === "tool" && part.tool === "finish") &&
+      entry.parts.some((part) => part.type === "text" && !part.ignored && !part.synthetic)
+    const parentID = entry.info.parentID
+    const parentPresent = entries.some((row) => row.info.role === "user" && row.info.id === parentID)
+    if ((ids.length > 1 && parentPresent && ids.includes(current.id)) || (ids.length === 1 && ownFinish)) {
+      owner = entry; members = ids; break
+    }
   }
   if (!owner || owner.info.role !== "assistant") return undefined
   const selected = entries.filter((entry) => members.includes(entry.info.id))
   if (selected.length !== members.length || selected.some((entry) => entry.info.role !== "assistant" || Agent.canonicalID(entry.info.agent) !== "review")) return undefined
   const fallback: Plan = { owner: owner.info.id, members: new Set(members) }
+  const first = selected[0].info as AssistantMessage
+  const anchor = entries.findIndex((entry) => entry.info.id === first.parentID && entry.info.role === "user")
+  const anchorPart = entries[anchor]?.parts
+  if (anchor < 0 && members.length > 1) return fallback
+  if (anchorPart?.length === 1 && anchorPart[0].type === "text" && anchorPart[0].synthetic &&
+      [FINISH_NUDGE.trim(), REVIEW_STAGNATION_NUDGE.trim()].includes(anchorPart[0].text.trim()) &&
+      !entries.slice(0, anchor).some((entry) => entry.info.role === "user")) return fallback
   const textParts = selected.flatMap((entry) => entry.parts.filter((part): part is TextPart => part.type === "text" && !part.synthetic && !part.ignored))
   const chunks = textParts.map((part) => part.text)
   const finishes = owner.parts.filter((part): part is ToolPart => part.type === "tool" && part.tool === "finish")

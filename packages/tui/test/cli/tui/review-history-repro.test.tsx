@@ -146,3 +146,85 @@ test("a malformed later report cannot leave an earlier approval as current", asy
   expect(result).toContain("Malformed later report.")
   expect(result).not.toContain("✓ Approved")
 })
+
+test("execution report preserves prose positions and exposes the full original text", async () => {
+  const user = userMessage("msg_001", SESSION, { agent: "review" })
+  const first = assistantMessage("msg_002", SESSION, { agent: "review", mode: "review", parentID: user.id, time: { created: 1_700_000_001_000, completed: 1_700_000_002_000 } })
+  const second = assistantMessage("msg_003", SESSION, { agent: "review", mode: "review", parentID: user.id, time: { created: 1_700_000_010_000, completed: 1_700_000_011_000 } })
+  const entries = [
+    { info: user, parts: [textPart("request", user, "Synthetic review request")] },
+    { info: first, parts: [textPart("first", first, `Earlier analysis.\n${old}\nEarlier follow-up.`)] },
+    { info: second, parts: [textPart("second", second, `Later analysis.\n${latest}\nLater follow-up.`)] },
+  ]
+  const { app } = await mountSessionRoute({ width: 120, height: 70, sessions: [sessionInfo(SESSION)], messages: { [SESSION]: entries } })
+  await waitFor(app, () => app.captureCharFrame().includes("Later synthetic finding") ? true : undefined)
+  const before = await spansOf(app)
+  expect(before.indexOf("Earlier analysis.")).toBeLessThan(before.indexOf("Earlier follow-up."))
+  expect(before.indexOf("Earlier follow-up.")).toBeLessThan(before.indexOf("Later analysis."))
+  expect(before.indexOf("Later analysis.")).toBeLessThan(before.indexOf("Later follow-up."))
+  expect(before).not.toContain("Earlier synthetic approval")
+  const row = before.split("\n").findIndex((line) => line.includes("Raw review report"))
+  expect(row).toBeGreaterThanOrEqual(0)
+  await app.mockMouse.click(5, row)
+  await waitFor(app, () => app.captureCharFrame().includes("Earlier synthetic approval") ? true : undefined)
+  const after = await spansOf(app)
+  expect(after).toContain("Earlier synthetic approval")
+  expect(after).toContain("Later synthetic finding")
+  expect(after).toContain("Earlier follow-up.")
+})
+
+test("an incomplete later tag cannot present an earlier approval as current", async () => {
+  const user = userMessage("msg_001", SESSION, { agent: "review" })
+  const first = assistantMessage("msg_002", SESSION, { agent: "review", mode: "review", parentID: user.id, time: { created: 1_700_000_001_000, completed: 1_700_000_002_000 } })
+  const second = assistantMessage("msg_003", SESSION, { agent: "review", mode: "review", parentID: user.id, time: { created: 1_700_000_010_000, completed: 1_700_000_011_000 } })
+  const entries = [
+    { info: user, parts: [textPart("request", user, "Synthetic review request")] },
+    { info: first, parts: [textPart("first", first, `Earlier analysis.\n${old}`)] },
+    { info: second, parts: [textPart("second", second, "Incomplete later report.\n<silvercode-review")] },
+  ]
+  const { app } = await mountSessionRoute({ width: 120, height: 45, sessions: [sessionInfo(SESSION)], messages: { [SESSION]: entries } })
+  await waitFor(app, () => app.captureCharFrame().includes("Incomplete later report.") ? true : undefined)
+  const result = await spansOf(app)
+  expect(result).toContain("Earlier analysis.")
+  expect(result).toContain("Incomplete later report.")
+  expect(result).not.toContain("✓ Approved")
+})
+
+test("a truncated nudge chain stays on the raw path without a verdict", async () => {
+  const nudge = userMessage("msg_001", SESSION, { agent: "review" })
+  const first = assistantMessage("msg_002", SESSION, { agent: "review", mode: "review", parentID: nudge.id, time: { created: 1_700_000_001_000, completed: 1_700_000_002_000 } })
+  const second = assistantMessage("msg_003", SESSION, { agent: "review", mode: "review", parentID: nudge.id, time: { created: 1_700_000_010_000, completed: 1_700_000_011_000 } })
+  const entries = [
+    { info: nudge, parts: [{ ...textPart("nudge", nudge, FINISH_NUDGE), synthetic: true }] },
+    { info: first, parts: [textPart("first", first, `Earlier analysis.\n${old}`)] },
+    { info: second, parts: [textPart("second", second, `Later analysis.\n${latest}`)] },
+  ]
+  const { app } = await mountSessionRoute({ width: 120, height: 55, sessions: [sessionInfo(SESSION)], messages: { [SESSION]: entries } })
+  await waitFor(app, () => app.captureCharFrame().includes("Later synthetic finding") ? true : undefined)
+  const result = await spansOf(app)
+  expect(result).toContain("Earlier analysis.")
+  expect(result).toContain("Later analysis.")
+  expect(result).not.toContain("✓ Approved")
+  expect(result).not.toContain("✗ Needs fixes")
+})
+
+test("a streaming continuation remains raw until its execution completes", async () => {
+  const user = userMessage("msg_001", SESSION, { agent: "review" })
+  const first = assistantMessage("msg_002", SESSION, { agent: "review", mode: "review", parentID: user.id, time: { created: 1_700_000_001_000, completed: 1_700_000_002_000 } })
+  const second = assistantMessage("msg_003", SESSION, { agent: "review", mode: "review", parentID: user.id, time: { created: 1_700_000_010_000 } })
+  const entries = [
+    { info: user, parts: [textPart("request", user, "Synthetic review request")] },
+    { info: first, parts: [textPart("first", first, `Earlier analysis.\n${old}`)] },
+    { info: second, parts: [textPart("second", second, "Streaming continuation.\n<silvercode-review>{")] },
+  ]
+  const { app, sync } = await mountSessionRoute({ width: 120, height: 50, sessions: [sessionInfo(SESSION)], messages: { [SESSION]: entries } })
+  await waitFor(app, () => app.captureCharFrame().includes("Streaming continuation.") ? true : undefined)
+  expect(await spansOf(app)).not.toContain("✓ Approved")
+  sync.set("part", second.id, [textPart("second", second, `Later analysis.\n${latest}`)])
+  sync.set("message", SESSION, (item) => item.id === second.id, "time", { created: 1_700_000_010_000, completed: 1_700_000_011_000 })
+  await waitFor(app, () => app.captureCharFrame().includes("✗ Needs fixes") ? true : undefined)
+  const completed = await spansOf(app)
+  expect(completed).toContain("Earlier analysis.")
+  expect(completed).toContain("Later analysis.")
+  expect(completed).not.toContain("✓ Approved")
+})
