@@ -533,6 +533,16 @@ export class Reply {
     return this.toolCalls()
   }
 
+  /**
+   * Emits a tool call whose argument text is sent verbatim, so a test can stream a
+   * payload that is not valid JSON (e.g. the truncated `write` call in #736).
+   */
+  toolRaw(name: string, args: string) {
+    const id = this.#id()
+    this.#tail = [...this.#tail, toolStartLine(id, name), toolArgsLine(args)]
+    return this.toolCalls()
+  }
+
   pendingTool(name: string, input: unknown) {
     const id = this.#id()
     const args = JSON.stringify(input)
@@ -816,6 +826,7 @@ namespace TestLLMServer {
     readonly toolMatch: (match: Match, name: string, input: unknown) => Effect.Effect<void>
     readonly text: (value: string, opts?: { usage?: Usage }) => Effect.Effect<void>
     readonly tool: (name: string, input: unknown) => Effect.Effect<void>
+    readonly toolRaw: (name: string, args: string) => Effect.Effect<void>
     readonly toolHang: (name: string, input: unknown) => Effect.Effect<void>
     readonly reason: (value: string, opts?: { text?: string; usage?: Usage }) => Effect.Effect<void>
     readonly fail: (message?: unknown) => Effect.Effect<void>
@@ -967,6 +978,9 @@ export class TestLLMServer extends Context.Service<TestLLMServer, TestLLMServer.
         }),
         tool: Effect.fn("TestLLMServer.tool")(function* (name: string, input: unknown) {
           queue(reply().tool(name, input).item())
+        }),
+        toolRaw: Effect.fn("TestLLMServer.toolRaw")(function* (name: string, args: string) {
+          queue(reply().toolRaw(name, args).item())
         }),
         toolHang: Effect.fn("TestLLMServer.toolHang")(function* (name: string, input: unknown) {
           queue(reply().pendingTool(name, input).hang().item())

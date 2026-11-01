@@ -1716,6 +1716,172 @@ withMcpTools.instance(
   20_000,
 )
 
+it.instance(
+  "a truncated write retry stays outside the doom-loop identical-triplet condition",
+  () =>
+    Effect.gen(function* () {
+      // Keep `doom_loop` denied so any guard request, if reached, would halt this turn.
+      // The guard-specific evidence below is the structural check on recorded tool parts;
+      // this scenario does not establish that the runtime denial path was exercised.
+      const { dir, llm } = yield* useServerConfig((url) => ({
+        ...providerCfg(url),
+        permission: { "*": "allow", doom_loop: "deny" },
+      }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+
+      const session = yield* sessions.create({
+        title: "Truncated write",
+        permission: [
+          { permission: "*", pattern: "*", action: "allow" },
+          { permission: "doom_loop", pattern: "*", action: "deny" },
+        ],
+      })
+      yield* prompt.prompt({
+        sessionID: session.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "write the report" }],
+      })
+
+      const target = path.join(dir, "report.md")
+      const first = "# Report\n\nline one\n"
+      const second = "line two\n"
+      const full = first + second
+
+      // Step 1: a write call whose arguments are cut off inside `content` - the path
+      // arrived complete, the body never did.
+      yield* llm.toolRaw("write", `{"filePath":${JSON.stringify(target)},"content":"# Report\\n\\nline one\\nline two`)
+      // Step 2: the model follows the recovery instruction - inspect, write the first
+      // chunk, then append the rest with edit. A second `write` would replace the first
+      // chunk, so the scripted continuation must not use one.
+      yield* llm.tool("bash", { command: `test -e ${target} && echo exists || echo missing` })
+      yield* llm.tool("write", { filePath: target, content: first })
+      yield* llm.tool("edit", { filePath: target, oldString: "line one\n", newString: "line one\n" + second })
+      yield* llm.text("done")
+
+      // Completing the loop verifies the scripted recovery path; it does not by itself
+      // show that the doom_loop denial branch was reached.
+      const result = yield* prompt.loop({ sessionID: session.id })
+      expect(result.info.role).toBe("assistant")
+
+      const parts = (yield* sessions.messages({ sessionID: session.id })).flatMap((message) => message.parts)
+      const executions = parts.filter(
+        (part): part is SessionV1.ToolPart => part.type === "tool" && part.state.status !== "pending",
+      )
+      const executionsOf = (name: string) => executions.filter((part) => part.tool === name)
+      const repaired = parts.find((part) => part.type === "tool" && part.tool === "invalid")
+      expect(repaired?.type).toBe("tool")
+      if (repaired?.type !== "tool" || repaired.state.status !== "completed") throw new Error("expected a completed repair")
+      expect(repaired.state.input).toMatchObject({ tool: "write" })
+      expect(repaired.state.output).toContain(target)
+      expect(repaired.state.output).toContain("did not execute")
+      expect(repaired.state.output).toContain("wrote nothing")
+      expect(repaired.state.output).toContain("first chunk")
+      expect(repaired.state.output).toContain("append")
+      expect(repaired.state.output).toContain("edit calls")
+      expect(repaired.state.output).toContain("write replaces the entire file")
+      // the fragment's unfinished body is never presented as recovered content: the
+      // only echo of the raw text is the provider/parser error inside the parenthetical
+      const recovered = repaired.state.output.slice(repaired.state.output.indexOf("Recovered from the partial arguments:"))
+      expect(recovered).not.toContain("line two")
+      expect(recovered).not.toContain("Report")
+
+      // the guided retry actually executed, in the shape the guidance asks for: `write`
+      // for the first chunk, then an `edit` append - never a second full `write`
+      const writes = executionsOf("write")
+      expect(writes).toHaveLength(1)
+      expect(writes[0]?.state.status === "completed" && writes[0].state.input).toMatchObject({ content: first })
+      expect(executionsOf("edit")).toHaveLength(1)
+      expect(yield* Effect.promise(() => readFile(target, "utf8"))).toBe(full)
+
+      // The guard's real failure definition (`processor.ts` DOOM_LOOP_THRESHOLD = 3): a
+      // window of three consecutive tool parts inside one assistant message with the same
+      // tool name and byte-identical input. A single truncated call contributes exactly
+      // one `invalid` placeholder, and its guided retry is a differently named `write`
+      // call carrying different input, so the pair cannot fill such a window.
+      expect(executions.filter((part) => part.tool === "invalid")).toHaveLength(1)
+      for (const messageID of new Set(executions.map((part) => part.messageID))) {
+        const owned = executions.filter((part) => part.messageID === messageID)
+        for (let index = 0; index + 3 <= owned.length; index++) {
+          const window = owned.slice(index, index + 3)
+          const identical =
+            window.every((part) => part.tool === window[0]?.tool) &&
+            window.every((part) => JSON.stringify(part.state.input) === JSON.stringify(window[0]?.state.input))
+          expect(identical).toBe(false)
+        }
+      }
+      // The deny rule is a safety condition only if the guard asks. This run's evidence is
+      // the structural no-triplet check above, not a runtime denial observation.
+      expect(parts.some((part) => part.type === "text" && part.text === "done")).toBe(true)
+    }),
+  20_000,
+)
+
+it.instance(
+  "a truncated write for an existing file keeps what earlier calls wrote",
+  () =>
+    Effect.gen(function* () {
+      const { dir, llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+
+      const target = path.join(dir, "notes.md")
+      const existing = "# Notes\n\nexisting line one\nexisting line two\n"
+      const chunkOne = "appended chunk one\n"
+      const chunkTwo = "appended chunk two\n"
+      // An earlier call in this session already produced this content; the guidance must
+      // not assume the path is empty just because this call wrote nothing.
+      yield* writeText(target, existing)
+
+      const session = yield* sessions.create({
+        title: "Truncated write over existing file",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      yield* prompt.prompt({
+        sessionID: session.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "extend the notes" }],
+      })
+
+      // Step 1: the write call is cut off inside `content`.
+      yield* llm.toolRaw("write", `{"filePath":${JSON.stringify(target)},"content":"# Notes\\n\\nreplacement`)
+      // Step 2: the model follows the guidance - inspect the existing file, then append
+      // each remaining chunk with edit. It never re-writes, so nothing already on disk is
+      // replaced by a partial payload.
+      yield* llm.tool("bash", { command: `cat ${target}` })
+      yield* llm.tool("edit", {
+        filePath: target,
+        oldString: "existing line two\n",
+        newString: "existing line two\n" + chunkOne,
+      })
+      yield* llm.tool("edit", { filePath: target, oldString: chunkOne, newString: chunkOne + chunkTwo })
+      yield* llm.text("done")
+
+      yield* prompt.loop({ sessionID: session.id })
+
+      const parts = (yield* sessions.messages({ sessionID: session.id })).flatMap((message) => message.parts)
+      const executions = parts.filter(
+        (part): part is SessionV1.ToolPart => part.type === "tool" && part.state.status !== "pending",
+      )
+      const repaired = executions.find((part) => part.tool === "invalid")
+      if (repaired?.state.status !== "completed") throw new Error("expected a completed repair")
+      // the guidance names the existing-file branch instead of instructing a fresh write
+      expect(repaired.state.output).toContain("do not start over with write")
+      expect(repaired.state.output).toContain("would discard what is already there")
+
+      // the continuation executed only as appends: one truncated placeholder, two edits,
+      // and no write at all
+      expect(executions.filter((part) => part.tool === "write")).toHaveLength(0)
+      expect(executions.filter((part) => part.tool === "edit")).toHaveLength(2)
+
+      // every byte that was already there survives, and both chunks landed after it
+      expect(yield* Effect.promise(() => readFile(target, "utf8"))).toBe(existing + chunkOne + chunkTwo)
+    }),
+  20_000,
+)
+
 withMcpTools.instance(
   "an MCP tool discovered by tool_search is callable on the next step",
   () =>
