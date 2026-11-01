@@ -7,6 +7,7 @@ import { LLMRequestPrep } from "@/session/llm/request"
 import { SystemPrompt } from "@/session/system"
 import DEFAULT_PROMPT from "../../src/session/prompt/default.txt"
 import TRINITY_PROMPT from "../../src/session/prompt/trinity.txt"
+import REVIEW_PROMPT from "../../src/agent/prompt/review.txt"
 import type { Provider } from "@/provider/provider"
 
 const MARKER = "Do not apply this style to deliverables"
@@ -36,7 +37,7 @@ const model = {
   headers: {},
 } as Provider.Model
 
-const prepare = (input?: { steLite?: boolean; prompt?: string }) =>
+const prepare = (input?: { steLite?: boolean; prompt?: string; system?: string[] }) =>
   LLMRequestPrep.prepare({
     user: {
       id: "msg_user-test",
@@ -55,7 +56,7 @@ const prepare = (input?: { steLite?: boolean; prompt?: string }) =>
       permission: [],
       prompt: input?.prompt,
     } as any,
-    system: [],
+    system: input?.system ?? [],
     messages: [{ role: "user", content: "Hello" }],
     tools: {
       lookup: {
@@ -112,5 +113,35 @@ describe("ste-lite", () => {
     const result = await Effect.runPromise(prepare({ steLite: false, prompt: "You are compaction." }))
     expect(result.system.join("\n")).not.toContain(MARKER)
     expect(result.system.join("\n")).toContain("You are compaction.")
+  })
+})
+
+describe("efficient tool use and Review prompt", () => {
+  test("request includes efficiency guidance for every effort with provider and Review prompts", async () => {
+    for (const effort of ["fast", "medium", "thorough"]) {
+      for (const prompt of [undefined, REVIEW_PROMPT]) {
+        const result = await Effect.runPromise(prepare({ prompt, system: [`## Agent effort: ${effort}`] }))
+        const system = result.system.join("\n")
+        expect(system).toContain(`## Agent effort: ${effort}`)
+        expect(system).toContain("Be fast, quick, and direct at every effort level")
+        expect(system).toContain("Make useful independent tool calls in parallel")
+        expect(system).toContain("make dependent calls sequentially")
+        expect(system).toContain("include whole files or wider context when necessary")
+        if (prompt) expect(system).toContain("Your final message is the report itself")
+      }
+    }
+  })
+
+  test("Review preserves its report contract and evaluates without taking over", () => {
+    expect(REVIEW_PROMPT).toContain("Do not author new tests or scripts")
+    expect(REVIEW_PROMPT).toContain("return findings to Code or Work for action")
+    expect(REVIEW_PROMPT).toContain("Existing relevant tests, typechecks, lint")
+    expect(REVIEW_PROMPT).toContain("task’s premise, completion, and instruction following")
+    expect(REVIEW_PROMPT).toContain("read whole files when necessary")
+    expect(REVIEW_PROMPT).toContain("do not invent a finding, approve without support, or omit the verdict")
+    expect(REVIEW_PROMPT).toContain("Assessment: [Approved | Needs fixes]")
+    expect(REVIEW_PROMPT).toContain('"assessment": "needs-fixes"')
+    expect(REVIEW_PROMPT).toContain('"severity": "important"')
+    expect(REVIEW_PROMPT).toContain("<silvercode-review>")
   })
 })
