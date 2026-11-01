@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test"
 import type { AssistantMessage, Part } from "@opencode-ai/sdk/v2"
 import { reviewText } from "../../../src/routes/session/review-text"
 
-const report = { version: 1, revision: "uncommitted", assessment: "needs-fixes", summary: "Synthetic finding", findings: [] }
+const report = { version: 1 as const, revision: "uncommitted", assessment: "needs-fixes" as const, summary: "Synthetic finding", findings: [] }
 const envelope = `<silvercode-review>${JSON.stringify(report)}</silvercode-review>`
 const message = { agent: "review", time: { created: 1, completed: 2 } } as AssistantMessage
 function parts(...chunks: string[]): Part[] {
@@ -15,6 +15,11 @@ describe("review text presentation boundary", () => {
     expect(result?.report).toEqual(report)
     expect(result?.analysis).toBe("Synthetic analysis.\n\nAfterward.")
     expect(result?.textPartIDs).toEqual(["p0", "p1", "p2", "p3"])
+  })
+  test("reassembles tags split across multiple boundaries", () => {
+    const result = reviewText(message, parts("Analysis", ...envelope.slice(0, 19).split(""), envelope.slice(19)))
+    expect(result?.report).toEqual(report)
+    expect(result?.analysis).toBe("Analysis")
   })
   test("keeps streaming, failed, malformed and incomplete output as ordinary text", () => {
     expect(reviewText({ ...message, time: { created: 1 } }, parts(envelope))).toBeUndefined()

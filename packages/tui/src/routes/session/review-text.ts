@@ -1,12 +1,12 @@
 import { ReviewReport } from "@opencode-ai/core/review-report"
 import { Agent } from "@opencode-ai/schema/agent"
-import type { AssistantMessage, Part } from "@opencode-ai/sdk/v2"
+import type { AssistantMessage, Part, TextPart } from "@opencode-ai/sdk/v2"
 
 /** A presentation candidate, not evidence that the review run passed its finish gate. */
 export function reviewText(message: AssistantMessage, parts: readonly Part[]) {
   if (Agent.canonicalID(message.agent) !== "review" || message.time.completed === undefined || message.error)
     return undefined
-  const text = parts.filter((part) => part.type === "text" && !part.ignored && !part.synthetic)
+  const text = parts.filter((part): part is TextPart => part.type === "text" && !part.ignored && !part.synthetic)
   if (!text.length) return undefined
   const chunks = text.map((part) => part.text)
   const joined = joinSplitTags(chunks)
@@ -22,16 +22,16 @@ export function reviewText(message: AssistantMessage, parts: readonly Part[]) {
 // itself be split by streaming/part boundaries; only remove that separator when
 // the two sides together spell a complete protocol tag.
 function joinSplitTags(chunks: string[]) {
+  // Pick a delimiter absent from the source so no user text is lost.
+  let separator = "\u0000"
+  while (chunks.some((chunk) => chunk.includes(separator))) separator += "\u0000"
   const tags = ReviewReport.TAGS.flatMap((tag) => [`<${tag}>`, `</${tag}>`])
-  return chunks.reduce((joined, chunk, index) => {
-    if (!index) return chunk
-    const splitTag = tags.some((tag) =>
-      Array.from({ length: tag.length - 1 }, (_, i) => i + 1).some(
-        (offset) => joined.endsWith(tag.slice(0, offset)) && chunk.startsWith(tag.slice(offset)),
-      ),
-    )
-    return joined + (splitTag ? "" : "\n") + chunk
-  }, "")
+  let joined = chunks.join(separator)
+  for (const tag of tags) {
+    const pattern = tag.split("").map((char) => char.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join(`(?:${separator})*`)
+    joined = joined.replace(new RegExp(pattern, "g"), tag)
+  }
+  return joined.split(separator).join("\n")
 }
 
 function hasQuotedTag(text: string) {
