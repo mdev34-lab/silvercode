@@ -64,6 +64,29 @@ another. A task dispatched by a parent that does not own the child (for
 example, a `task_id` from another parent) neither reads nor writes that child's
 selection, and no effort is published for it in the task metadata.
 
+## Changing the level in an existing session
+
+The persisted selection is read at execution time, not captured when a session
+or a run starts, so changing it in an existing session changes what runs next:
+
+- Each generation step resolves the level from the session row when it builds
+  its request. A change made while a request is already in flight applies to the
+  next step built after it; the request already sent keeps the system prompt it
+  was sent with, because a provider call cannot be rewritten retroactively.
+- `finish` resolves the level from the same row when it is called. A change that
+  lands before the call is therefore enforced by that call. On an upgrade made
+  mid-generation this can make the `finish` stricter than the prompt the model
+  saw for the generation that requested it; the level in effect at the call is
+  the one enforced, and the delivery is labelled with it.
+- A new `task` child dispatched after the change inherits the parent's updated
+  selection; an already-created child keeps its own persisted selection under
+  the precedence order above.
+- The next user turn in the same session resolves the current level again; the
+  selection is not cached per session or per run.
+
+Switching needs no cancellation, restart, new session or replay: completed tool
+effects and the transcript are preserved, and the run continues in place.
+
 ## TUI default for new sessions
 
 The TUI's home screen owns one extra piece of state: the default a newly created
