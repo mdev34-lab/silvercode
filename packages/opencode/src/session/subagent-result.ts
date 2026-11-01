@@ -1,5 +1,6 @@
 import type { SessionV1 } from "@opencode-ai/core/v1/session"
 
+import { isRecord } from "@/util/record"
 import FINISH_NUDGE from "./prompt/finish-nudge.txt"
 import REVIEW_STAGNATION_NUDGE from "./prompt/review-stagnation-nudge.txt"
 
@@ -7,14 +8,30 @@ export const TEXT_RESULT_TAG = "silvercode-result"
 
 const NUDGES = new Set([FINISH_NUDGE, REVIEW_STAGNATION_NUDGE].map((text) => text.trim()))
 
-// Only the runner's own finish/stagnation reminder continues a prompt. Any other synthetic-only user
-// message (shell marker, task summary, bridge text) is a boundary, not a continuation.
+// Issue #738: metadata key on the synthetic user message that resumes a guard-aborted generation.
+// It records the prompt the continuation belongs to, so the recovery is recognised as part of the
+// same prompt execution instead of a new user boundary, and so its budget is scoped to that lineage
+// rather than to one runLoop invocation.
+export const REPETITION_RECOVERY = "repetitionRecovery"
+
+/** The prompt a repetition-recovery message continues, or undefined for any other message. */
+export function repetitionRecoveryPromptID(message: SessionV1.WithParts): string | undefined {
+  if (message.info.role !== "user" || message.parts.length !== 1) return undefined
+  const part = message.parts[0]!
+  if (part.type !== "text" || part.synthetic !== true) return undefined
+  const marker = part.metadata?.[REPETITION_RECOVERY]
+  return isRecord(marker) && typeof marker.promptID === "string" ? marker.promptID : undefined
+}
+
+// Only the runner's own finish/stagnation reminder and bounded repetition recovery continue a prompt.
+// Any other synthetic-only user message (shell marker, task summary, bridge text) is a boundary, not
+// a continuation.
 const isNudge = (message: SessionV1.WithParts) =>
   message.info.role === "user" &&
   message.parts.length === 1 &&
   message.parts[0]!.type === "text" &&
   message.parts[0]!.synthetic === true &&
-  NUDGES.has(message.parts[0]!.text.trim())
+  (NUDGES.has(message.parts[0]!.text.trim()) || repetitionRecoveryPromptID(message) !== undefined)
 
 const finished = (message: SessionV1.WithParts) =>
   message.parts.some((part) => part.type === "tool" && part.tool === "finish" && part.state.status === "completed")
@@ -37,6 +54,11 @@ function anchorsOf(ordered: readonly SessionV1.WithParts[], current: SessionV1.W
   while (isNudge(ordered[at]!)) {
     const previous = ordered.slice(0, at).findLastIndex((message) => message.info.role === "user")
     if (previous < 0) break
+    // A repetition recovery names the prompt it resumed. If a different user message landed
+    // between that prompt and the recovery, the declared lineage is stale: treat the recovery as
+    // a boundary instead of borrowing whichever prompt happens to precede it.
+    const declared = repetitionRecoveryPromptID(ordered[at]!)
+    if (declared !== undefined && ordered[previous]!.info.id !== declared) break
     if (ordered.slice(previous + 1, at).some(finished)) break
     at = previous
     anchors.push(at)
