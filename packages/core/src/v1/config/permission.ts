@@ -44,50 +44,73 @@ const InputSchema = Schema.Union([Action, InputObject])
 const normalizeInput = (input: Schema.Schema.Type<typeof InputSchema>): Schema.Schema.Type<typeof InputObject> =>
   typeof input === "string" ? { "*": input } : input
 
-type MergeInput = Action | Record<string, Rule | undefined> | undefined
+// The two spellings of the shell tool's permission action across the #780
+// rename. They are one logical permission slot written with either name.
+const SHELL_RENAME_SPELLINGS: readonly string[] = ["bash", "shell"]
 
-const toRecord = (input: MergeInput): Record<string, Rule | undefined> => {
-  if (typeof input === "string") return { "*": input }
-  if (typeof input !== "object" || input === null || globalThis.Array.isArray(input)) return {}
-  return input
-}
-
-const mergeRule = (target: Rule, source: Rule): Rule => {
-  if (typeof target === "string" && typeof source === "string") return source
-  // A flat action is the "*" pattern written first; promote it so inner
-  // patterns keep their written sequence instead of being replaced wholesale.
-  const out: Record<string, Action> = { ...(typeof target === "string" ? { "*": target } : target) }
-  for (const [pattern, action] of globalThis.Object.entries(
-    typeof source === "string" ? { "*": source } : source,
-  )) {
-    if (action === undefined) continue
-    delete out[pattern]
-    out[pattern] = action
+/**
+ * Permission layers merge with the pre-existing deep-merge contract
+ * (remeda `mergeDeep` / `Object.assign`): an overridden key or pattern keeps
+ * its first-written position, and a flat action replaces a pattern record
+ * wholesale. That contract is unchanged for every permission — with one
+ * rename-scoped exception handled here.
+ *
+ * The rename split one logical permission across two keys (`bash`/`shell`),
+ * so plain deep merge can order the spellings by first-seen position rather
+ * than by last write: e.g. global `shell`, project `bash`, then local
+ * `shell` would leave the local layer's `shell` entry sitting before the
+ * project layer's `bash` entry, and the wrong layer would win under
+ * last-match evaluation. `orderShellRename` runs after a base merge and
+ * fixes ONLY the relative order of the two spellings, permuting them within
+ * the key positions they already occupy: spellings the later layer
+ * (`source`) wrote come after spellings it did not write, in `source`
+ * order. No value changes, no other key moves — a spelling never crosses
+ * `*` or any unrelated key, so single-layer written order and every other
+ * permission keep exact base semantics.
+ */
+export function orderShellRename<T extends object>(merged: T, source: unknown): T {
+  if (typeof source !== "object" || source === null || globalThis.Array.isArray(source)) return merged
+  const record = merged as Record<string, unknown>
+  const keys = globalThis.Object.keys(record)
+  const present = keys.filter((key) => SHELL_RENAME_SPELLINGS.includes(key))
+  if (present.length < 2) return merged
+  const written = globalThis.Object.keys(source as Record<string, unknown>).filter(
+    (key) => SHELL_RENAME_SPELLINGS.includes(key) && (source as Record<string, unknown>)[key] !== undefined,
+  )
+  if (written.length === 0) return merged
+  const desired = [
+    ...present.filter((key) => !written.includes(key)),
+    ...written.filter((key) => present.includes(key)),
+  ]
+  if (desired.every((key, index) => key === present[index])) return merged
+  const out: Record<string, unknown> = {}
+  let slot = 0
+  for (const key of keys) {
+    if (!SHELL_RENAME_SPELLINGS.includes(key)) {
+      out[key] = record[key]
+      continue
+    }
+    const replacement = desired[slot++]
+    out[replacement] = record[replacement]
   }
-  return out
+  return out as T
 }
 
 /**
- * Merge two permission layers with rule-sequence semantics: the result
- * evaluates exactly as if the target's rules were followed by the source's
- * rules and the last matching rule won. A key the source writes moves to the
- * source's position (delete + reinsert) instead of keeping its first-seen
- * position the way a plain deep merge would — key position is precedence for
- * permission objects, across both spellings of a renamed action (#780) and
- * across config layers (global/project/local/managed/env/agent).
+ * Companion for tools-derived permission records: the derived `shell` entry
+ * is a synthetic compat slot (folded from `tools: { bash/shell: ... }`), so
+ * when an explicit permission writes a spelling, the derived entry for that
+ * spelling is cleared first and the base assign/merge then appends the
+ * explicit entry at its own written position instead of inheriting the
+ * derived entry's position. Explicit entries for every other tool keep
+ * base assign semantics.
  */
-export function merge(target: MergeInput, source: MergeInput): Record<string, Rule> {
-  const out: Record<string, Rule> = {}
-  for (const [key, value] of globalThis.Object.entries(toRecord(target))) {
-    if (value !== undefined) out[key] = value
+export function clearDerivedShellRename(derived: Record<string, unknown>, explicit: unknown): void {
+  if (typeof explicit !== "object" || explicit === null || globalThis.Array.isArray(explicit)) return
+  const record = explicit as Record<string, unknown>
+  for (const key of SHELL_RENAME_SPELLINGS) {
+    if (record[key] !== undefined) delete derived[key]
   }
-  for (const [key, value] of globalThis.Object.entries(toRecord(source))) {
-    if (value === undefined) continue
-    const existing = out[key]
-    delete out[key]
-    out[key] = existing === undefined ? value : mergeRule(existing, value)
-  }
-  return out
 }
 
 export const Info = InputSchema.pipe(

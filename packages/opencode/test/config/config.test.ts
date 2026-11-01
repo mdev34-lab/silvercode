@@ -848,7 +848,13 @@ it.instance(
   { config: { permission: { bash: { "rm *": "allow" }, shell: { "*": "allow", "rm *": "deny" } } } },
 )
 
-it.effect("layered merge keeps inner pattern position when a later layer overrides a pattern", () =>
+// #780 review: the rename must not change the pre-existing deep-merge
+// contract. An overridden pattern keeps its first-written position — a later
+// layer updates the pattern's action in place instead of moving it after
+// patterns the earlier layer wrote later. That holds for shell exactly as it
+// held for bash before the rename, so here the global "*" written after
+// "rm *" still wins over the project layer's in-place "rm *" update.
+it.effect("layered merge keeps base pattern positions for shell (no rename-specific reordering)", () =>
   withConfigTree(
     {
       global: { permission: { shell: { "rm *": "allow", "*": "allow" } } },
@@ -857,8 +863,74 @@ it.effect("layered merge keeps inner pattern position when a later layer overrid
     Effect.gen(function* () {
       const config = yield* Config.use.get()
       const ruleset = Permission.fromConfig(config.permission ?? {})
+      expect(Permission.evaluate("shell", "rm -rf x", ruleset).action).toBe("allow")
+      expect(Permission.evaluate("shell", "ls", ruleset).action).toBe("allow")
+    }),
+  ),
+)
+
+it.effect("layered merge override is effective when the pattern already sits last", () =>
+  withConfigTree(
+    {
+      global: { permission: { shell: { "*": "allow", "rm *": "allow" } } },
+      project: { permission: { shell: { "rm *": "deny" } } },
+    },
+    Effect.gen(function* () {
+      const config = yield* Config.use.get()
+      const ruleset = Permission.fromConfig(config.permission ?? {})
       expect(Permission.evaluate("shell", "rm -rf x", ruleset).action).toBe("deny")
       expect(Permission.evaluate("shell", "ls", ruleset).action).toBe("allow")
+    }),
+  ),
+)
+
+// The same base contract for permissions unrelated to the rename: a project
+// layer re-writing "*" must not move it past the global layer's "src/**"
+// deny (independent-review regression case).
+it.effect("layered merge keeps base pattern positions for unrelated edit rules", () =>
+  withConfigTree(
+    {
+      global: { permission: { edit: { "*": "allow", "src/**": "deny" } } },
+      project: { permission: { edit: { "*": "allow" } } },
+    },
+    Effect.gen(function* () {
+      const config = yield* Config.use.get()
+      const ruleset = Permission.fromConfig(config.permission ?? {})
+      expect(Permission.evaluate("edit", "src/index.ts", ruleset).action).toBe("deny")
+      expect(Permission.evaluate("edit", "README.md", ruleset).action).toBe("allow")
+    }),
+  ),
+)
+
+it.effect("layered merge keeps base pattern positions for unrelated external_directory rules", () =>
+  withConfigTree(
+    {
+      global: { permission: { external_directory: { "*": "allow", "/secrets/**": "deny" } } },
+      project: { permission: { external_directory: { "*": "allow" } } },
+    },
+    Effect.gen(function* () {
+      const config = yield* Config.use.get()
+      const ruleset = Permission.fromConfig(config.permission ?? {})
+      expect(Permission.evaluate("external_directory", "/secrets/key.pem", ruleset).action).toBe("deny")
+      expect(Permission.evaluate("external_directory", "/srv/data/file.txt", ruleset).action).toBe("allow")
+    }),
+  ),
+)
+
+// Base semantics wholesale-replace a pattern record with a later layer's
+// flat action (and vice versa); the rename must not promote/merge them.
+it.effect("a later layer's flat action replaces an earlier pattern record wholesale", () =>
+  withConfigTree(
+    {
+      global: { permission: { edit: { "*": "allow", "src/**": "deny" } } },
+      project: { permission: { edit: "ask" } },
+    },
+    Effect.gen(function* () {
+      const config = yield* Config.use.get()
+      expect(config.permission?.edit).toBe("ask")
+      const ruleset = Permission.fromConfig(config.permission ?? {})
+      expect(Permission.evaluate("edit", "src/index.ts", ruleset).action).toBe("ask")
+      expect(Permission.evaluate("edit", "README.md", ruleset).action).toBe("ask")
     }),
   ),
 )

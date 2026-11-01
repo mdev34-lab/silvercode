@@ -85,10 +85,12 @@ const normalize = (agent: Schema.Schema.Type<typeof AgentSchema>): Schema.Schema
     // #780: `tools: { bash: ... }` is the pre-rename spelling of the shell tool.
     derived[tool === "bash" ? "shell" : tool] = action
   }
-  // The explicit permission is the later layer: its entries keep their own
-  // order after the tools-derived entries (ordered merge, not Object.assign,
-  // which would leave an overridden key at the tools layer's position).
-  const permission = ConfigPermissionV1.merge(derived, agent.permission) as ConfigPermissionV1.Info
+  // Base layering: tools-derived entries first, explicit permission assigned
+  // over them. The only adjustment is #780's: an explicit `bash`/`shell`
+  // entry lands at its own written position instead of the derived slot's.
+  ConfigPermissionV1.clearDerivedShellRename(derived, agent.permission)
+  globalThis.Object.assign(derived, agent.permission)
+  const permission = derived
 
   const steps = agent.steps ?? agent.maxSteps
   return { ...agent, options, permission, ...(steps !== undefined ? { steps } : {}) }
