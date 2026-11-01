@@ -1,4 +1,5 @@
 import { SessionID, MessageID } from "./schema"
+import { RepetitionGuard } from "./llm/repetition-guard"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import {
@@ -68,10 +69,9 @@ type Cursor = typeof Cursor.Type
 
 const decodeCursor = Schema.decodeUnknownSync(Cursor)
 
-export class InvalidCursorError extends Schema.TaggedErrorClass<InvalidCursorError>()(
-  "MessageV2.InvalidCursorError",
-  { message: Schema.String },
-) {
+export class InvalidCursorError extends Schema.TaggedErrorClass<InvalidCursorError>()("MessageV2.InvalidCursorError", {
+  message: Schema.String,
+}) {
   static isInstance(input: unknown): input is InvalidCursorError {
     return input instanceof InvalidCursorError
   }
@@ -263,8 +263,18 @@ export const toModelMessagesEffect = Effect.fnUntraced(function* (
       if (
         msg.info.error &&
         !(
-          AbortedError.isInstance(msg.info.error) &&
-          msg.parts.some((part) => part.type !== "step-start" && part.type !== "reasoning")
+          (AbortedError.isInstance(msg.info.error) &&
+            msg.parts.some((part) => part.type !== "step-start" && part.type !== "reasoning")) ||
+          // Issue #738: a guard abort is a deliberate cutoff of a generation,
+          // not evidence that its work should disappear. The parts persisted
+          // before the abort (streamed text and any tool call that already
+          // completed) stay visible to the recovery request, so the model can
+          // build on what happened instead of re-issuing a finished call.
+          // Replaying this transcript state never re-executes a tool: completed
+          // calls are presented with their recorded output, and calls still
+          // pending/running keep their existing "[Tool execution was
+          // interrupted]" rendering below.
+          RepetitionGuard.isStoredError(msg.info.error)
         )
       ) {
         continue
@@ -730,6 +740,16 @@ export function fromError(
           responseBody: parsed.responseBody,
           metadata: parsed.metadata,
         },
+        { cause: e },
+      ).toObject()
+    // Issue #738: a tripped repetition guard is the harness's own abort, so it
+    // is recorded with a stable identity instead of being inferred later from
+    // its message text. The UnknownError name and message stay byte-identical
+    // (renderers and SessionRetry.retryable read them); data.ref is the typed
+    // marker recovery checks, and a provider HTTP error can never carry it.
+    case e instanceof RepetitionGuard.RepetitionDetectedError:
+      return new NamedError.Unknown(
+        { message: errorMessage(e), ref: RepetitionGuard.ERROR_REF },
         { cause: e },
       ).toObject()
     // Named session errors thrown upstream (e.g. from a provider-error stream
