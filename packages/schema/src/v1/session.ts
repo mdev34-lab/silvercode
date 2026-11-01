@@ -383,6 +383,12 @@ export const User = Schema.Struct({
   }),
   system: Schema.optional(Schema.String),
   tools: Schema.optional(Schema.Record(Schema.String, Schema.Boolean)),
+  // Persisted form of `PromptInput.noReply`: the submission stored this message
+  // without a caller waiting for a turn. A later run needs that fact to tell a
+  // silent injection (a background-task marker, a no-reply note) from input that
+  // is actually owed an answer, and part shape cannot stand in for it because a
+  // caller may legitimately submit synthetic parts.
+  noReply: Schema.optional(Schema.Boolean),
 }).annotate({ identifier: "UserMessage" })
 export type User = Types.DeepMutable<Schema.Schema.Type<typeof User>>
 
