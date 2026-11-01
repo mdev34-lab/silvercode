@@ -37,7 +37,7 @@ export function reviewText(message: AssistantMessage, parts: readonly Part[]) {
   return { report: delivery.report, analysis, textPartIDs: text.map((part) => part.id) }
 }
 
-function hasQuotedTag(text: string) {
+export function hasQuotedTag(text: string) {
   let fence: { marker: string; length: number } | undefined
   let htmlCode = false
   for (const line of text.split("\n")) {

@@ -66,6 +66,7 @@ import { DialogSessionRename } from "../../component/dialog-session-rename"
 import { Sidebar } from "./sidebar"
 import { SubagentFooter } from "./subagent-footer.tsx"
 import { backgroundReview, reviewPresentationAnalysis, reviewText, subagentReview } from "./review-text"
+import { executionReviewPlan } from "./review-execution"
 import { filetype } from "../../util/filetype"
 import parsers from "../../parsers-config"
 import { errorMessage } from "../../util/error"
@@ -1699,7 +1700,8 @@ export function AssistantMessageRow(props: { message: AssistantMessage; parts: P
   const sync = useSync()
   const messages = createMemo(() => sync.data.message[props.message.sessionID] ?? [])
   const model = createMemo(() => Model.name(ctx.providers(), props.message.providerID, props.message.modelID))
-  const textReview = createMemo(() => reviewText(props.message, props.parts))
+  const execution = createMemo(() => executionReviewPlan(messages(), sync.data.part, props.message))
+  const textReview = createMemo(() => execution() ? undefined : reviewText(props.message, props.parts))
   const matchingFinish = createMemo(() => {
     const text = textReview()
     if (!text) return undefined
@@ -1730,7 +1732,7 @@ export function AssistantMessageRow(props: { message: AssistantMessage; parts: P
     return undefined
   })
   const repeatedFinish = createMemo(() => {
-    if (textReview()) return undefined
+    if (execution() || textReview()) return undefined
     const earlier = earlierReview()
     if (!earlier) return undefined
     return props.parts.find((part): part is ToolPart => {
@@ -1874,6 +1876,17 @@ export function AssistantMessageRow(props: { message: AssistantMessage; parts: P
               )}
             </Show>
             <Switch>
+              <Match when={part.type === "text" && execution()?.prose?.has(part.id)}>
+                <TextPart last={index() === props.parts.length - 1} part={{ ...(part as TextPart), text: execution()!.prose!.get(part.id)! }} message={props.message} />
+              </Match>
+              <Match when={part.type === "tool" && part.tool === "finish" && execution()?.report && part.id === execution()?.finishID}>
+                <Show when={execution()?.finishProse?.trim()}>
+                  <box paddingLeft={3} marginTop={1}><text fg={theme.text}>{execution()!.finishProse}</text></box>
+                </Show>
+              </Match>
+              <Match when={part.type === "tool" && part.tool === "finish" && execution() && !execution()?.report}>
+                <Finish part={part as ToolPart} input={(part as ToolPart).state.input} output={(part as ToolPart).state.status === "completed" ? ((part as ToolPart).state as Extract<ToolPart["state"], { status: "completed" }>).output : undefined} metadata={{}} tool="finish" suppressReview />
+              </Match>
               <Match when={part.type === "text" && textReview()?.textPartIDs.includes(part.id)}>
                 <Show when={textReview()?.textPartIDs[0] === part.id && displayedTextReview()}>
                   {(review) => <ReviewFinish review={review()} part={matchingFinish()?.part} />}
@@ -1908,6 +1921,9 @@ export function AssistantMessageRow(props: { message: AssistantMessage; parts: P
           )
         }}
       </For>
+      <Show when={execution()?.owner === props.message.id && execution()?.report}>
+        {(report) => <ReviewFinish review={{ report: report(), analysis: "", raw: execution()?.raw }} />}
+      </Show>
       <Show when={props.parts.some((x) => x.type === "tool" && x.tool === "task")}>
         <box paddingTop={1} paddingLeft={3}>
           <text fg={theme.text}>
@@ -2445,7 +2461,7 @@ function Invalid(props: ToolProps) {
   )
 }
 
-function Finish(props: ToolProps) {
+function Finish(props: ToolProps & { suppressReview?: boolean }) {
   const ctx = use()
   const { theme } = useTheme()
   const result = createMemo(() => finishResult(props.input, props.output))
@@ -2455,7 +2471,7 @@ function Finish(props: ToolProps) {
   // qualifies, since a running finish can still be declined by the review
   // gate and must not pre-announce its verdict.
   const review = createMemo(() =>
-    props.part.state.status === "completed" && finishBlockView(props.part, props.input)?.tone === "success"
+    !props.suppressReview && props.part.state.status === "completed" && finishBlockView(props.part, props.input)?.tone === "success"
       ? parseReviewReport(result())
       : undefined,
   )
