@@ -24,6 +24,7 @@ import { ToolRegistry } from "@/tool/registry"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Ripgrep } from "@opencode-ai/core/ripgrep"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
+import { FSUtil } from "@opencode-ai/core/fs-util"
 import { REVIEW_LOOP_METADATA } from "@opencode-ai/core/review-loop"
 import { disposeAllInstances } from "../fixture/fixture"
 import { pollWithTimeout, testEffect } from "../lib/effect"
@@ -53,6 +54,7 @@ const layer = () =>
       EventV2Bridge.node,
       Permission.node,
       CrossSpawnSpawner.node,
+      FSUtil.node,
       BackgroundJob.node,
       SessionRunState.node,
       SessionStatus.node,
