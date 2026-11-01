@@ -191,7 +191,7 @@ describe("opencode run (non-interactive subprocess)", () => {
     ({ llm, opencode }) =>
       Effect.gen(function* () {
         yield* llm.push(
-          reply().text("  before tool  ").tool("bash", {
+          reply().text("  before tool  ").tool("shell", {
             command: "printf tool-output",
             description: "Print deterministic output",
           }),
@@ -252,7 +252,7 @@ describe("opencode run (non-interactive subprocess)", () => {
     ({ llm, opencode }) =>
       Effect.gen(function* () {
         yield* llm.push(
-          reply().text("partial response").tool("bash", {
+          reply().text("partial response").tool("shell", {
             command: "printf tool",
             description: "Print deterministic output",
           }),
@@ -333,7 +333,7 @@ describe("opencode run (non-interactive subprocess)", () => {
     ({ llm, opencode }) =>
       Effect.gen(function* () {
         yield* llm.push(
-          reply().reason("reasoning").text("before").tool("bash", {
+          reply().reason("reasoning").text("before").tool("shell", {
             command: "printf tool",
             description: "Print deterministic output",
           }),
@@ -363,7 +363,7 @@ describe("opencode run (non-interactive subprocess)", () => {
         expect(events.find((event) => event.type === "tool_use")?.part).toEqual(
           expect.objectContaining({
             type: "tool",
-            tool: "bash",
+            tool: "shell",
             state: expect.objectContaining({ status: "completed" }),
           }),
         )
@@ -382,7 +382,7 @@ describe("opencode run (non-interactive subprocess)", () => {
     ({ llm, opencode }) =>
       Effect.gen(function* () {
         yield* llm.push(
-          reply().text("partial json").tool("bash", {
+          reply().text("partial json").tool("shell", {
             command: "printf tool",
             description: "Print deterministic output",
           }),
@@ -418,26 +418,28 @@ describe("opencode run (non-interactive subprocess)", () => {
     "rejects requested permissions by default and allows them with the dangerous flag",
     ({ home, llm, opencode }) =>
       Effect.gen(function* () {
-        yield* llm.tool("bash", { command: "rm -f denied-file", description: "Remove a test file" })
+        yield* llm.tool("shell", { command: "rm -f denied-file", description: "Remove a test file" })
         yield* llm.text("continued after rejection")
+        // Legacy "bash" permission spelling (#780): pre-rename user config must
+        // still gate the renamed shell tool, so these runs keep it on purpose.
         const denied = yield* opencode.run("Generate a report with permission", { permission: { bash: "ask" } })
         opencode.expectExit(denied, 0)
-        expect(denied.stderr).toContain("permission requested: bash")
+        expect(denied.stderr).toContain("permission requested: shell")
         expect(denied.stdout).toBe("")
 
         yield* llm.reset
-        yield* llm.tool("bash", { command: "rm -f allowed-file", description: "Remove a test file" })
+        yield* llm.tool("shell", { command: "rm -f allowed-file", description: "Remove a test file" })
         yield* llm.text("continued after approval")
         const allowed = yield* opencode.run("Generate a report with permission", {
           permission: { bash: "ask" },
           extraArgs: ["--dangerously-skip-permissions"],
         })
         opencode.expectExit(allowed, 0)
-        expect(allowed.stderr).not.toContain("permission requested: bash")
+        expect(allowed.stderr).not.toContain("permission requested: shell")
         expect(allowed.stdout).toContain("continued after approval")
 
         yield* llm.reset
-        yield* llm.tool("bash", { command: "touch explicitly-denied", description: "Create a denied marker" })
+        yield* llm.tool("shell", { command: "touch explicitly-denied", description: "Create a denied marker" })
         yield* llm.text("continued after explicit denial")
         const explicitlyDenied = yield* opencode.run("Generate a report with denied permission", {
           permission: { bash: "deny" },

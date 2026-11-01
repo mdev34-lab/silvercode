@@ -67,20 +67,20 @@ function chainGuidance(name: string) {
     return "If the commands depend on each other and must run sequentially, avoid '&&' in this shell because Windows PowerShell (5.1) does not support it. Use PowerShell conditionals such as `cmd1; if ($?) { cmd2 }` when later commands must depend on earlier success."
   }
   if (PS.has(name)) {
-    return "Chain dependent commands in a single bash tool call with '&&'."
+    return "Chain dependent commands in a single shell tool call with '&&'."
   }
   if (CMD.has(name)) {
-    return "Chain dependent commands in a single bash tool call with `&&`."
+    return "Chain dependent commands in a single shell tool call with `&&`."
   }
-  return "Chain dependent commands in a single Bash call with '&&' (e.g., `mkdir out && cp a out/`)."
+  return "Chain dependent commands in a single shell tool call with '&&' (e.g., `mkdir out && cp a out/`)."
 }
 
-function bashCommandSection(chain: string, limits: Limits, defaultTimeoutMs: number) {
+function posixCommandSection(chain: string, limits: Limits, defaultTimeoutMs: number) {
   return `Usage notes:
   - Quote file paths containing spaces with double quotes. Verify a parent directory exists (\`ls\`) before creating files in it.
   - Optional timeout in milliseconds; commands will time out after ${defaultTimeoutMs}ms if not specified.
   - Output beyond ${limits.maxLines} lines or ${limits.maxBytes} bytes is truncated and saved to a file; read it with Read offset/limit or Grep. Do NOT pipe through \`head\`, \`tail\` or similar to limit output.
-  - Independent commands: make multiple bash tool calls in one message. ${chain} Use ';' when later commands should run even if earlier ones fail. Do not separate commands with newlines.`
+  - Independent commands: make multiple shell tool calls in one message. ${chain} Use ';' when later commands should run even if earlier ones fail. Do not separate commands with newlines.`
 }
 
 function powershellCommandSection(
@@ -96,7 +96,7 @@ Usage notes:
   - Quote file paths containing spaces with double quotes. Verify a parent directory exists (\`Test-Path -LiteralPath <parent>\`) before creating files in it.
   - Optional timeout in milliseconds; commands will time out after ${defaultTimeoutMs}ms if not specified.
   - Output beyond ${limits.maxLines} lines or ${limits.maxBytes} bytes is truncated and saved to a file; read it with Read offset/limit or Grep. Do NOT use \`Select-Object -First/-Last\` or similar to limit output.
-  - Independent commands: make multiple bash tool calls in one message. ${chain} Use \`;\` when later commands should run even if earlier ones fail. Do not separate commands with newlines.`
+  - Independent commands: make multiple shell tool calls in one message. ${chain} Use \`;\` when later commands should run even if earlier ones fail. Do not separate commands with newlines.`
 }
 
 function cmdCommandSection(chain: string, limits: Limits, defaultTimeoutMs: number) {
@@ -110,7 +110,7 @@ Usage notes:
   - Quote file paths containing spaces with double quotes. Verify a parent directory exists (\`if exist\`) before creating files in it.
   - Optional timeout in milliseconds; commands will time out after ${defaultTimeoutMs}ms if not specified.
   - Output beyond ${limits.maxLines} lines or ${limits.maxBytes} bytes is truncated and saved to a file; read it with Read offset/limit or Grep. Do NOT use \`more\` or similar to limit output.
-  - Independent commands: make multiple bash tool calls in one message. ${chain} Use \`&\` when later commands should run even if earlier ones fail. Do not separate commands with newlines.`
+  - Independent commands: make multiple shell tool calls in one message. ${chain} Use \`&\` when later commands should run even if earlier ones fail. Do not separate commands with newlines.`
 }
 
 const NO_RETRY_RULE = `- On the first shell parse error (\`ParserError\`, "is not recognized", "not a valid regular expression", etc.), STOP retrying the same construct. Either (a) translate the command to this shell's native syntax, or (b) for anything multi-line or loop-shaped, write a script file with the Write tool (\`.py\`, \`.ps1\`, or \`.sh\` as appropriate) and execute it. Never attempt the same failing syntax pattern more than once.`
@@ -173,12 +173,12 @@ function profile(name: string, platform: NodeJS.Platform, limits: Limits, defaul
   }
   return {
     intro:
-      "Executes a given bash command in a persistent shell session with optional timeout, ensuring proper handling and security measures.",
+      "Executes a given shell command in a fresh shell process with optional timeout, ensuring proper handling and security measures. Each call starts a new process; shell state such as exported variables does not persist between calls.",
     workdirSection:
       "Commands run in the working directory by default; use `workdir` to run elsewhere.",
-    commandSection: bashCommandSection(chain, limits, defaultTimeoutMs),
-    gitCommands: "bash commands",
-    gitCommandRestriction: "git bash commands",
+    commandSection: posixCommandSection(chain, limits, defaultTimeoutMs),
+    gitCommands: "shell commands",
+    gitCommandRestriction: "git shell commands",
     createPrInstruction:
       "Create PR using gh pr create with the format below. Use a HEREDOC to pass the body to ensure correct formatting.",
     createPrExample: `gh pr create --title "the pr title" --body "$(cat <<'EOF'

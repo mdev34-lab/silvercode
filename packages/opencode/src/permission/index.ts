@@ -41,15 +41,28 @@ interface State {
 }
 
 export function evaluate(permission: string, pattern: string, ...rulesets: PermissionV1.Ruleset[]): PermissionV1.Rule {
-  return (
-    rulesets
-      .flat()
-      .findLast((rule) => Wildcard.match(permission, rule.permission) && Wildcard.match(pattern, rule.pattern)) ?? {
-      action: "ask",
-      permission,
-      pattern: "*",
-    }
-  )
+  const rules = rulesets.flat()
+  const isDeny = (rule: PermissionV1.Rule) => rule.action === "deny"
+  // doom_loop rules key on the tool id, so their resource patterns are action
+  // names: legacy `bash` patterns must still gate the tool now published as
+  // `shell`, and the rename clamp applies on that dimension instead (#780).
+  const winner =
+    permission === "doom_loop"
+      ? Wildcard.winningRule(
+          rules,
+          pattern,
+          (rule) => rule.pattern,
+          (rule) => Wildcard.matchAction(permission, rule.permission),
+          isDeny,
+        )
+      : Wildcard.winningRule(
+          rules,
+          permission,
+          (rule) => rule.permission,
+          (rule) => Wildcard.match(pattern, rule.pattern),
+          isDeny,
+        )
+  return winner ?? { action: "ask", permission, pattern: "*" }
 }
 
 /**
@@ -109,7 +122,7 @@ const layer = Layer.effect(
         })
         if (rule.action === "deny") {
           return yield* new PermissionV1.DeniedError({
-            ruleset: ruleset.filter((rule) => Wildcard.match(request.permission, rule.permission)),
+            ruleset: ruleset.filter((rule) => Wildcard.matchAction(request.permission, rule.permission)),
           })
         }
         if (rule.action === "allow") continue
@@ -324,7 +337,13 @@ export function disabled(tools: string[], ruleset: PermissionV1.Ruleset): Set<st
   return new Set(
     tools.filter((tool) => {
       const permission = edits.includes(tool) ? "edit" : reads.includes(tool) ? "read" : tool
-      const rule = ruleset.findLast((rule) => Wildcard.match(permission, rule.permission))
+      const rule = Wildcard.winningRule(
+        ruleset,
+        permission,
+        (candidate) => candidate.permission,
+        () => true,
+        (candidate) => candidate.action === "deny",
+      )
       return rule?.pattern === "*" && rule.action === "deny"
     }),
   )

@@ -37,8 +37,93 @@ import { withTransientReadRetry } from "@/util/effect-http-client"
 
 // Custom merge function that concatenates array fields instead of replacing them
 // Keep remeda's deep conditional merge type out of hot config-loading paths; TS profiling showed it dominates here.
+// #780: legacy `tools` records may spell the shell tool `bash`. Fold that key
+// to `shell` in each layer before merging so the boolean resolves by layer
+// order, whichever spelling a layer used.
+function foldTools(tools: Record<string, boolean> | undefined): Record<string, boolean> | undefined {
+  if (!tools || !("bash" in tools)) return tools
+  const out: Record<string, boolean> = {}
+  for (const [key, value] of Object.entries(tools)) {
+    const canonical = key === "bash" ? "shell" : key
+    delete out[canonical]
+    out[canonical] = value
+  }
+  return out
+}
+
+function foldRecordTools<T>(record: T): T {
+  if (!isRecord(record)) return record
+  let out = record
+  for (const [name, entry] of Object.entries(record)) {
+    if (!isRecord(entry)) continue
+    const tools = foldTools(entry.tools as Record<string, boolean> | undefined)
+    if (tools === entry.tools) continue
+    if (out === record) out = { ...record }
+    ;(out as Record<string, unknown>)[name] = { ...entry, tools }
+  }
+  return out
+}
+
+function foldConfigTools(config: Info): Info {
+  const tools = foldTools(config.tools)
+  const agent = foldRecordTools(config.agent)
+  const mode = foldRecordTools(config.mode)
+  if (tools === config.tools && agent === config.agent && mode === config.mode) return config
+  return { ...config, tools, agent, mode }
+}
+
+// Permission layering keeps the base mergeDeep contract (an overridden key
+// or pattern keeps its first-written position). The one adjustment is
+// #780's: `bash`/`shell` are two spellings of one permission, so their
+// relative order follows last write — see
+// ConfigPermissionV1.orderShellRename.
+function orderRecordPermissions<T>(merged: T, source: T): T {
+  if (!isRecord(merged)) return merged
+  let out = merged
+  for (const [name, entry] of Object.entries(merged)) {
+    if (!isRecord(entry) || !isRecord(entry.permission)) continue
+    const sourcePermission = isRecord(source) && isRecord(source[name]) ? source[name].permission : undefined
+    const permission = ConfigPermissionV1.orderShellRename(entry.permission, sourcePermission)
+    if (permission === entry.permission) continue
+    if (out === merged) out = { ...merged }
+    ;(out as Record<string, unknown>)[name] = { ...entry, permission }
+  }
+  return out
+}
+
+function orderConfigPermissions<T>(merged: T, source: T): T {
+  if (!isRecord(merged)) return merged
+  let out = merged as Record<string, unknown>
+  const copy = () => {
+    if (out === (merged as Record<string, unknown>)) out = { ...(merged as Record<string, unknown>) }
+  }
+  if (isRecord(merged.permission)) {
+    const permission = ConfigPermissionV1.orderShellRename(
+      merged.permission,
+      isRecord(source) ? source.permission : undefined,
+    )
+    if (permission !== merged.permission) {
+      copy()
+      out.permission = permission
+    }
+  }
+  for (const field of ["agent", "mode"] as const) {
+    const records = orderRecordPermissions(merged[field], isRecord(source) ? source[field] : undefined)
+    if (records !== merged[field]) {
+      copy()
+      out[field] = records
+    }
+  }
+  return out as T
+}
+
+function mergeAgentRecords<T extends object>(current: T, next: T): T {
+  return orderRecordPermissions(mergeDeep(foldRecordTools(current), foldRecordTools(next)) as T, next)
+}
+
 function mergeConfig(target: Info, source: Info): Info {
-  return mergeDeep(target, source) as Info
+  const merged = mergeDeep(foldConfigTools(target), foldConfigTools(source)) as Info
+  return orderConfigPermissions(merged, source)
 }
 
 function mergeConfigConcatArrays(target: Info, source: Info): Info {
@@ -513,8 +598,8 @@ const layer = Layer.effect(
           }
 
           result.command = mergeDeep(result.command ?? {}, yield* Effect.promise(() => ConfigCommand.load(dir)))
-          result.agent = mergeDeep(result.agent ?? {}, yield* Effect.promise(() => ConfigAgent.load(dir)))
-          result.agent = mergeDeep(result.agent ?? {}, yield* Effect.promise(() => ConfigAgent.loadMode(dir)))
+          result.agent = mergeAgentRecords(result.agent ?? {}, yield* Effect.promise(() => ConfigAgent.load(dir)))
+          result.agent = mergeAgentRecords(result.agent ?? {}, yield* Effect.promise(() => ConfigAgent.loadMode(dir)))
           // Auto-discovered plugins under `.opencode/plugin(s)` are already local files, so ConfigPlugin.load
           // returns normalized Specs and we only need to attach origin metadata here.
           const list = yield* Effect.promise(() => ConfigPlugin.load(dir))
@@ -590,7 +675,7 @@ const layer = Layer.effect(
         }
 
         for (const [name, mode] of Object.entries(result.mode ?? {})) {
-          result.agent = mergeDeep(result.agent ?? {}, {
+          result.agent = mergeAgentRecords(result.agent ?? {}, {
             [name]: {
               ...mode,
               mode: "primary" as const,
@@ -600,7 +685,14 @@ const layer = Layer.effect(
 
         if (Flag.OPENCODE_PERMISSION) {
           try {
-            result.permission = mergeDeep(result.permission ?? {}, JSON.parse(Flag.OPENCODE_PERMISSION))
+            const envPermission = JSON.parse(Flag.OPENCODE_PERMISSION)
+            result.permission = mergeDeep(result.permission ?? {}, envPermission)
+            if (isRecord(result.permission)) {
+              result.permission = ConfigPermissionV1.orderShellRename(
+                result.permission,
+                envPermission,
+              ) as Info["permission"]
+            }
           } catch (err) {
             yield* Effect.logWarning("OPENCODE_PERMISSION contains invalid JSON, skipping", { err })
           }
@@ -614,8 +706,12 @@ const layer = Layer.effect(
               perms.edit = action
               continue
             }
-            perms[tool] = action
+            // #780: `tools: { bash: ... }` is the pre-rename spelling of the shell tool.
+            perms[tool === "bash" ? "shell" : tool] = action
           }
+          // The tools-derived `shell` slot must not park an explicit entry:
+          // clear it so the base merge appends explicit entries in order.
+          ConfigPermissionV1.clearDerivedShellRename(perms, result.permission)
           result.permission = mergeDeep(perms, result.permission ?? {})
         }
 
@@ -681,9 +777,9 @@ const layer = Layer.effect(
       const dir = yield* InstanceState.directory
       const file = path.join(dir, "config.json")
       const existing = yield* loadFile(file)
-      yield* fs
-        .writeFileString(file, JSON.stringify(mergeDeep(writable(existing), writable(config)), null, 2))
-        .pipe(Effect.orDie)
+      const patch = writable(config)
+      const merged = orderConfigPermissions(mergeDeep(writable(existing), patch), patch)
+      yield* fs.writeFileString(file, JSON.stringify(merged, null, 2)).pipe(Effect.orDie)
     })
 
     const invalidate = Effect.fn("Config.invalidate")(function* () {
@@ -699,7 +795,7 @@ const layer = Layer.effect(
       let changed: boolean
       if (!file.endsWith(".jsonc")) {
         const existing = ConfigParse.schema(ConfigV1.Info, ConfigParse.jsonc(before, file), file)
-        const merged = mergeDeep(writable(existing), patch)
+        const merged = orderConfigPermissions(mergeDeep(writable(existing), patch), patch)
         const serialized = JSON.stringify(merged, null, 2)
         changed = serialized !== before
         if (changed) yield* fs.writeFileString(file, serialized).pipe(Effect.orDie)

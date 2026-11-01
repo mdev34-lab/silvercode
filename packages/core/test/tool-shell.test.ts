@@ -14,7 +14,7 @@ import { PermissionV2 } from "@opencode-ai/core/permission"
 import { AppProcess } from "@opencode-ai/core/process"
 import { AbsolutePath } from "@opencode-ai/core/schema"
 import { SessionV2 } from "@opencode-ai/core/session"
-import { BashTool } from "@opencode-ai/core/tool/bash"
+import { ShellTool } from "@opencode-ai/core/tool/shell"
 import * as ShellEncoding from "@opencode-ai/core/shell-encoding"
 import { NarrationDetector } from "@opencode-ai/core/tool/narration"
 import { ToolRegistry } from "@opencode-ai/core/tool/registry"
@@ -113,7 +113,7 @@ const withTool = <A, E, R>(
   }).pipe(
     Effect.provide(
       AppNodeBuilder.build(
-        LayerNode.group([ToolRegistry.node, ToolRegistry.toolsNode, LocationMutation.node, BashTool.node]),
+        LayerNode.group([ToolRegistry.node, ToolRegistry.toolsNode, LocationMutation.node, ShellTool.node]),
         [
           [Location.node, activeLocation],
           [PermissionV2.node, permission],
@@ -126,15 +126,15 @@ const withTool = <A, E, R>(
   )
 }
 
-const call = (input: typeof BashTool.Input.Type, id = "call-bash") => ({
+const call = (input: typeof ShellTool.Input.Type, id = "call-shell") => ({
   sessionID,
   ...toolIdentity,
-  call: { type: "tool-call" as const, id, name: "bash", input },
+  call: { type: "tool-call" as const, id, name: "shell", input },
 })
 
 const it = testEffect(Layer.empty)
 
-describe("BashTool", () => {
+describe("ShellTool", () => {
   it.live("registers and returns structured successful output from the active Location", () =>
     Effect.acquireUseRelease(
       Effect.promise(() => tmpdir()),
@@ -143,12 +143,14 @@ describe("BashTool", () => {
         return withTool(tmp.path, (registry) =>
           Effect.gen(function* () {
             const definitions = yield* toolDefinitions(registry)
-            expect(definitions.map((tool) => tool.name)).toEqual(["bash"])
+            expect(definitions.map((tool) => tool.name)).toEqual(["shell"])
             expect(definitions[0]?.inputSchema).not.toHaveProperty("properties.background")
             expect(definitions[0]?.inputSchema).not.toHaveProperty("properties.description")
             expect(definitions[0]?.outputSchema).not.toHaveProperty("properties.output")
             expect(definitions[0]?.outputSchema).not.toHaveProperty("properties.command")
             expect(definitions[0]?.outputSchema).not.toHaveProperty("properties.cwd")
+            expect(yield* toolDefinitions(registry, [{ action: "shell", resource: "*", effect: "deny" }])).toEqual([])
+            // Legacy pre-rename spelling (#780): a saved/configured "bash" deny must still hide the shell tool.
             expect(yield* toolDefinitions(registry, [{ action: "bash", resource: "*", effect: "deny" }])).toEqual([])
             expect(yield* settleTool(registry, call({ command: "pwd" }))).toEqual({
               result: {
@@ -172,9 +174,9 @@ describe("BashTool", () => {
             expect(runs).toMatchObject([{ command: "pwd", cwd: realpathSync(tmp.path) }])
             expect(runs[0]?.options).toMatchObject({
               combineOutput: true,
-              maxOutputBytes: BashTool.MAX_CAPTURE_BYTES,
+              maxOutputBytes: ShellTool.MAX_CAPTURE_BYTES,
             })
-            expect(assertions).toMatchObject([{ sessionID, action: "bash", resources: ["pwd"], save: ["pwd"] }])
+            expect(assertions).toMatchObject([{ sessionID, action: "shell", resources: ["pwd"], save: ["pwd"] }])
           }),
         )
       },
@@ -207,7 +209,7 @@ describe("BashTool", () => {
         reset()
         const workdir = path.join(tmp.path, "src")
         afterPermission = (input) =>
-          input.action === "bash"
+          input.action === "shell"
             ? Effect.promise(async () => {
                 await fs.rm(workdir, { recursive: true })
                 await fs.writeFile(workdir, "not a directory")
@@ -220,7 +222,7 @@ describe("BashTool", () => {
           Effect.andThen(
             Effect.sync(() => {
               expect(runs).toEqual([])
-              expect(assertions.map((input) => input.action)).toEqual(["bash"])
+              expect(assertions.map((input) => input.action)).toEqual(["shell"])
             }),
           ),
         )
@@ -237,7 +239,7 @@ describe("BashTool", () => {
           reset()
           return withTool(
             tmp.path,
-            (registry) => settleTool(registry, call({ command: "printf core-bash" })),
+            (registry) => settleTool(registry, call({ command: "printf core-shell" })),
             LayerNode.compile(AppProcess.node),
           ).pipe(
             Effect.andThen((settled) =>
@@ -245,7 +247,7 @@ describe("BashTool", () => {
                 expect(settled.result).toEqual({
                   type: "content",
                   value: [
-                    { type: "text", text: "core-bash" },
+                    { type: "text", text: "core-shell" },
                     { type: "text", text: "Command exited with code 0." },
                   ],
                 })
@@ -262,7 +264,7 @@ describe("BashTool", () => {
     )
   }
 
-  it.live("approves an explicit external workdir before bash execution", () =>
+  it.live("approves an explicit external workdir before shell execution", () =>
     Effect.acquireUseRelease(
       Effect.promise(() => Promise.all([tmpdir(), tmpdir()])),
       ([active, outside]) => {
@@ -272,7 +274,7 @@ describe("BashTool", () => {
         ).pipe(
           Effect.andThen(
             Effect.sync(() => {
-              expect(assertions.map((item) => item.action)).toEqual(["external_directory", "bash"])
+              expect(assertions.map((item) => item.action)).toEqual(["external_directory", "shell"])
               expect(assertions[0]).toMatchObject({
                 resources: [path.join(realpathSync(outside.path), "*").replaceAll("\\", "/")],
               })
@@ -288,7 +290,7 @@ describe("BashTool", () => {
     ),
   )
 
-  it.live("does not execute after external-directory or bash denial", () =>
+  it.live("does not execute after external-directory or shell denial", () =>
     Effect.acquireUseRelease(
       Effect.promise(() => Promise.all([tmpdir(), tmpdir()])),
       ([active, outside]) =>
@@ -302,9 +304,9 @@ describe("BashTool", () => {
           expect(runs).toEqual([])
 
           reset()
-          denyAction = "bash"
+          denyAction = "shell"
           yield* withTool(active.path, (registry) => executeTool(registry, call({ command: "pwd" })))
-          expect(assertions.map((item) => item.action)).toEqual(["bash"])
+          expect(assertions.map((item) => item.action)).toEqual(["shell"])
           expect(runs).toEqual([])
         }),
       ([active, outside]) =>
@@ -349,7 +351,7 @@ describe("BashTool", () => {
         return withTool(active.path, (registry) => settleTool(registry, call({ command: `cat ${target}` }))).pipe(
           Effect.andThen((settled) =>
             Effect.sync(() => {
-              expect(assertions.map((item) => item.action)).toEqual(["bash"])
+              expect(assertions.map((item) => item.action)).toEqual(["shell"])
               expect(runs).toHaveLength(1)
               expect(settled.output?.structured).toMatchObject({
                 truncated: false,
@@ -445,7 +447,7 @@ describe("BashTool", () => {
   )
 })
 
-describe("BashTool — narration-only guidance", () => {
+describe("ShellTool — narration-only guidance", () => {
   // 1. Narration receives guidance — output preserved, guidance appended
   it.live("appends harness guidance after narration-only command output", () =>
     Effect.acquireUseRelease(
@@ -782,7 +784,7 @@ describe("BashTool — narration-only guidance", () => {
 
 
 test("keeps locked deferred parity TODOs visible", async () => {
-  const source = await fs.readFile(new URL("../src/tool/bash.ts", import.meta.url), "utf8")
+  const source = await fs.readFile(new URL("../src/tool/shell.ts", import.meta.url), "utf8")
   for (const todo of [
     "Port tree-sitter bash / PowerShell parser-based approval reduction.",
     "Port BashArity reusable command-prefix approvals.",
