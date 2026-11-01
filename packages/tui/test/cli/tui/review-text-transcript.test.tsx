@@ -318,6 +318,22 @@ describe("review assistant text: real transcript fallback", () => {
     expect(frame).not.toContain("silvercode-review")
   })
 
+  test("a conflicting task termination stays visible without a review verdict", async () => {
+    const info = { version: 1 as const, revision: "synthetic", assessment: "approved" as const, summary: "Untrusted task result", findings: [] }
+    const report = ReviewReport.envelope(info)
+    const task = completedTool("task", { description: "Inspect synthetic changes", subagent_type: "review" },
+      `<task id="child" state="completed">\n<task_result>\n${report}\n</task_result>\n<termination reason="failure">Failed</termination>\n</task>`,
+      { sessionId: "child", review: { report: info, sessionId: "child", revision: info.revision }, termination: { reason: "success" } })
+    const mounted = await mount({ agent: "work", completed: true, parts: [task] })
+    await settleUntilFrame(mounted.app, "Untrusted task result")
+    const frame = await frameOfSpans(mounted.app)
+    expect(frame).toContain("Inspect synthetic changes")
+    expect(frame).toContain("Untrusted task result")
+    expect(frame).toContain('reason="failure"')
+    expect(frame).not.toContain("✓ Approved")
+    expect(frame).not.toContain("Raw review report")
+  })
+
   test("excluded conflicting report remains visible without a structured verdict", async () => {
     const actual = ReviewReport.envelope({ version: 1, revision: "synthetic", assessment: "approved", summary: "Trusted report", findings: [] })
     const excluded = ReviewReport.envelope({ version: 1, revision: "synthetic", assessment: "needs-fixes", summary: "Ignored conflicting report", findings: [] })

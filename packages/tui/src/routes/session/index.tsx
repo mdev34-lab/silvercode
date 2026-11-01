@@ -3332,7 +3332,20 @@ function Task(props: ToolProps) {
     >
       {content()}
     </InlineTool>
-    <Show when={review()}>{(value) => <ReviewFinish review={value()} />}</Show>
+    <Show
+      when={review()}
+      fallback={
+        <Show when={props.part.state.status === "completed" && Boolean(props.metadata.review) && props.output}>
+          {(output) => (
+            <box paddingLeft={3} marginTop={1} flexShrink={0}>
+              <text fg={theme.text}>{output()}</text>
+            </box>
+          )}
+        </Show>
+      }
+    >
+      {(value) => <ReviewFinish review={value()} />}
+    </Show>
     </>
   )
 }
