@@ -16,6 +16,13 @@ export function reviewText(message: AssistantMessage, parts: readonly Part[]) {
     const reason = part.state.input.reason
     return reason !== undefined && reason !== "success"
   })) return undefined
+  // These parts still have an ordinary transcript rendering path. Do not put a
+  // structured verdict next to excluded protocol-looking text, including a
+  // truncated candidate; retain all of it on the existing Markdown path.
+  if (parts.some((part) =>
+    part.type === "text" && (part.ignored || part.synthetic) &&
+    ReviewReport.TAGS.some((tag) => part.text.includes(`<${tag}`) || part.text.includes(`</${tag}`)),
+  )) return undefined
   const text = parts.filter((part): part is TextPart => part.type === "text" && !part.ignored && !part.synthetic)
   if (!text.length) return undefined
   const chunks = text.map((part) => part.text)
@@ -86,10 +93,15 @@ export function subagentReview(part: ToolPart) {
   const inputAgent = part.state.input.subagent_type
   if (typeof inputAgent !== "string" || Agent.canonicalID(inputAgent) !== "review") return undefined
   const output = part.state.output
-  const opening = output.match(/^<task id="([^"]+)"(?: run="[^"]+")? state="completed">\n/)
-  if (!opening || opening[1] !== session) return undefined
-  const body = output.match(/(?:^|\n)<task_result>\n([\s\S]*?)\n<\/task_result>(?:\n|$)/)?.[1]
-  if (!body || hasQuotedTag(body)) return undefined
+  // Match the entire shape emitted by task.renderOutput. A matching prefix or
+  // first result is not enough: extra results, inconsistent termination, a
+  // missing closing task, and trailing content must never become a verdict.
+  const envelope = output.match(/^<task id="([^"\n]+)"(?: run="[^"\n]+")? state="completed">\n(?:<summary>([^\n]*)<\/summary>\n)?<task_result>\n([\s\S]*?)\n<\/task_result>\n<termination reason="success"><\/termination>\n<\/task>$/)
+  if (!envelope || envelope[1] !== session) return undefined
+  const body = envelope[3]
+  // Runtime task bodies are free text, so ambiguous embedded wrapper tags are
+  // not safely distinguishable from a second envelope. Keep the fallback.
+  if (!body || /<\/?(?:task|task_result|task_error|summary|termination)(?:\s|>)/.test(body) || hasQuotedTag(body)) return undefined
   const delivery = ReviewReport.extract([body])
   if (!delivery.ok) return undefined
   const metadataReport = Option.getOrUndefined(Schema.decodeUnknownOption(ReviewReport.Info)(source.report))

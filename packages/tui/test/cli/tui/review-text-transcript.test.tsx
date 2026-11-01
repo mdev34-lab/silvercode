@@ -307,7 +307,7 @@ describe("review assistant text: real transcript fallback", () => {
     const info = { version: 1 as const, revision: "synthetic", assessment: "needs-fixes" as const, summary: "Child synthetic verdict", findings: [] }
     const report = ReviewReport.envelope(info)
     const task = completedTool("task", { description: "Inspect synthetic changes", subagent_type: "review" },
-      `<task id="child" state="completed">\n<task_result>\nChild analysis.\n\n${report}\n</task_result>\n<termination reason="success">Done</termination>\n</task>`,
+      `<task id="child" state="completed">\n<task_result>\nChild analysis.\n\n${report}\n</task_result>\n<termination reason="success"></termination>\n</task>`,
       { sessionId: "child", review: { report: info, sessionId: "child", revision: info.revision }, termination: { reason: "success" } })
     const mounted = await mount({ agent: "work", completed: true, parts: [task] })
     await settleUntilFrame(mounted.app, "Child synthetic verdict")
@@ -316,6 +316,30 @@ describe("review assistant text: real transcript fallback", () => {
     expect(frame).toContain("Child synthetic verdict")
     expect(frame).toContain("Child analysis.")
     expect(frame).not.toContain("silvercode-review")
+  })
+
+  test("excluded conflicting report remains visible without a structured verdict", async () => {
+    const actual = ReviewReport.envelope({ version: 1, revision: "synthetic", assessment: "approved", summary: "Trusted report", findings: [] })
+    const excluded = ReviewReport.envelope({ version: 1, revision: "synthetic", assessment: "needs-fixes", summary: "Ignored conflicting report", findings: [] })
+    const ignored = { ...textPart(`Ignored source: \`\`\`xml\n${excluded}\n\`\`\``, "ignored"), ignored: true }
+    const mounted = await mount({ agent: "review", completed: true, parts: [textPart(`Trusted analysis.\n\n${actual}`), ignored] })
+    await settleUntilFrame(mounted.app, "Ignored conflicting report")
+    const frame = await frameOfSpans(mounted.app)
+    expect(frame).toContain("Trusted analysis.")
+    expect(frame).toContain("Ignored conflicting report")
+    expect(frame).not.toContain("✓ Approved")
+    expect(frame).not.toContain("Raw review report")
+  })
+
+  test("unrelated synthetic prose stays visible beside a structured reviewer report", async () => {
+    const actual = ReviewReport.envelope({ version: 1, revision: "synthetic", assessment: "approved", summary: "Trusted report", findings: [] })
+    const synthetic = { ...textPart("Unrelated synthetic note.", "synthetic"), synthetic: true }
+    const mounted = await mount({ agent: "review", completed: true, parts: [textPart(actual), synthetic] })
+    await settleUntilFrame(mounted.app, "Unrelated synthetic note.")
+    const frame = await frameOfSpans(mounted.app)
+    expect(frame).toContain("Unrelated synthetic note.")
+    expect(frame).toContain("✓ Approved")
+    expect(frame).toContain("Trusted report")
   })
 
   test("an incomplete reviewer stream remains visible without a verdict", async () => {

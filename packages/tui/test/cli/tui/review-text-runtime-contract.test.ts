@@ -67,6 +67,15 @@ describe("review text runtime contracts", () => {
     expect(reviewText(assistant("review"), parts)).toBeUndefined()
   })
 
+  test("excluded text with a protocol candidate keeps the entire message on the honest fallback", () => {
+    const good = text(envelope("real report", "approved"), 0)
+    const ignored = text(envelope("ignored conflict", "needs-fixes"), 1, "parent", { ignored: true })
+    const synthetic = text("<silvercode-review>{truncated", 2, "parent", { synthetic: true })
+    expect(reviewText(assistant("review"), [good, ignored])).toBeUndefined()
+    expect(reviewText(assistant("review"), [good, synthetic])).toBeUndefined()
+    expect(reviewText(assistant("review"), [good, text("Unrelated synthetic prose.", 3, "parent", { synthetic: true })])?.report.summary).toBe("real report")
+  })
+
   test("ordinary messages and quoted examples do not gain a verdict", () => {
     const body = envelope("example", "approved")
     expect(reviewText(assistant("work"), [text(body, 0)])).toBeUndefined()
@@ -106,12 +115,26 @@ describe("foreground task review provenance", () => {
       id: "task", sessionID: "parent", messageID: "assistant", type: "tool", tool: "task", callID: "call",
       state: {
         status: "completed", input: { description: "Review", subagent_type: "review" }, title: "Review",
-        output: `<task id="child" state="completed">\n<task_result>\n${body}\n</task_result>\n<termination reason="success">Done</termination>\n</task>`,
+        output: `<task id="child" state="completed">\n<task_result>\n${body}\n</task_result>\n<termination reason="success"></termination>\n</task>`,
         metadata: { sessionId: "child", review: { sessionId: "child", revision: info.revision, report: info }, termination: { reason: "success" } },
         time: { start: 1, end: 2 },
       },
     }
   }
+  test("requires a complete unambiguous runtime task envelope", () => {
+    const part = task()
+    if (part.state.status !== "completed") throw new Error("expected completed fixture")
+    const output = part.state.output
+    const altered = (value: string) => subagentReview({ ...part, state: { ...part.state, output: value } })
+    expect(altered(output.replace('reason="success"', 'reason="failure"'))).toBeUndefined()
+    expect(altered(output.replace("</task_result>", `</task_result>\n<task_result>\n${envelope("conflict", "approved")}\n</task_result>`))).toBeUndefined()
+    expect(altered(`${output}\nextra trailing content`)).toBeUndefined()
+    expect(altered(output.replace("</task>", ""))).toBeUndefined()
+    expect(altered(output.replace('<termination reason="success"></termination>\n', ""))).toBeUndefined()
+    expect(altered(output.replace("<task_result>", "<task_result>\n<task_result>"))).toBeUndefined()
+    expect(altered(output)).toBeDefined()
+  })
+
   test("requires matching task metadata, child identity, successful termination and canonical output", () => {
     const part = task()
     expect(subagentReview(part)?.report).toEqual(info)
