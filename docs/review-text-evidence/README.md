@@ -9,3 +9,5 @@ For example, from `packages/tui` with Bun installed:
 ```sh
 script -q -e -c 'stty cols 100 rows 24; bun test/cli/tui/review-text-capture.tsx multipart' /dev/null > multipart.ansi
 ```
+
+The four streams were recorded again from code at `d75acc0` after the conservative delivery-boundary changes. They were byte-for-byte identical to the committed streams; the PNGs were regenerated from the fresh recordings. These examples do not demonstrate the unresolved cross-message history case or background-review provenance.
