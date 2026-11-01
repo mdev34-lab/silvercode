@@ -1867,11 +1867,22 @@ const doomTurn = (dir: string) =>
       activeUser = msg
       return msg
     })
+    const prose = Effect.fnUntraced(function* () {
+      const msg = yield* assistant(chat.id, activeUser.id, path.resolve(dir))
+      yield* session.updatePart({
+        id: PartID.ascending(),
+        messageID: msg.id,
+        sessionID: chat.id,
+        type: "text",
+        text: "still thinking",
+      })
+      return msg
+    })
     const nextTurn = Effect.fnUntraced(function* (text: string) {
       activeUser = yield* user(chat.id, text)
       return activeUser
     })
-    return { send, nudge, nextTurn }
+    return { send, nudge, prose, nextTurn }
   })
 
 const lookup = { query: "same" }
@@ -2103,7 +2114,9 @@ const itDoomDifferentFailureBreaksStreak = testEffect(
         {
           id: `different-failure-${index}`,
           name,
-          input: name === "lookup" ? lookup : { value: 1 },
+          // Keep input identical so this probe isolates the tool-name comparison;
+          // the separate six-step input probe covers a changed input on the same tool.
+          input: lookup,
           outcome: "error",
         },
       ]),
@@ -2395,15 +2408,22 @@ itDoomNudges.live(
     provideTmpdirInstance(
       (dir) =>
         Effect.gen(function* () {
-          const { send, nudge, nextTurn } = yield* doomTurn(dir)
+          const { send, nudge, prose, nextTurn } = yield* doomTurn(dir)
 
           yield* send() // first lookup failure
           for (let i = 0; i < 4; i++) {
             yield* nudge("Call the finish tool when done.")
             yield* send() // tool-less assistant text
           }
+          // Persisted tool-less history still has to be paged through. Add enough
+          // immutable messages to cross the 20-message page without multiplying
+          // processor boots and exhausting the test's existing execution budget.
+          for (let i = 0; i < 7; i++) {
+            yield* nudge("Call the finish tool when done.")
+            yield* prose()
+          }
           yield* nudge("Stop repeating and call finish.")
-          yield* send() // second lookup failure across >6 intervening messages
+          yield* send() // second lookup failure across >20 intervening messages
           expect(nudgeAsks).toHaveLength(0)
 
           yield* nudge("Stop repeating and call finish.")
