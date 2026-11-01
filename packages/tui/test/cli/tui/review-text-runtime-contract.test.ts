@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import { ReviewReport } from "@opencode-ai/core/review-report"
-import type { AssistantMessage, Part, TextPart } from "@opencode-ai/sdk/v2"
-import { reviewText } from "../../../src/routes/session/review-text"
+import type { AssistantMessage, Part, TextPart, ToolPart } from "@opencode-ai/sdk/v2"
+import { reviewText, subagentReview } from "../../../src/routes/session/review-text"
 
 const report = (summary: string, assessment: "approved" | "needs-fixes" = "needs-fixes"): ReviewReport.Info => ({
   version: 1,
@@ -74,7 +74,7 @@ describe("review text runtime contracts", () => {
     expect(reviewText(assistant("review"), [text(`> ${body.replaceAll("\n", "\n> ")}`, 0)])).toBeUndefined()
   })
 
-  test("last complete report wins but earlier raw envelopes remain in canonical analysis", () => {
+  test("last complete report wins while presentation removes earlier copies and keeps surrounding analysis", () => {
     const first = envelope("earlier", "approved")
     const second = envelope("later", "needs-fixes")
     const chunks = ["Analysis.", first, "Between.", second]
@@ -85,14 +85,43 @@ describe("review text runtime contracts", () => {
     expect(canonical.report.summary).toBe("later")
     expect(canonical.analysis).toContain(first)
     expect(displayed?.report).toEqual(canonical.report)
-    expect(displayed?.analysis).toBe(canonical.analysis)
-    // The held renderer must avoid displaying the superseded raw envelope
-    // without discarding the surrounding human analysis.
+    expect(displayed?.analysis).toContain("Analysis.")
+    expect(displayed?.analysis).toContain("Between.")
+    expect(displayed?.analysis).not.toContain("silvercode-review")
   })
 
   test("a malformed later complete envelope supersedes an earlier approval", () => {
     const chunks = [envelope("earlier", "approved"), "<silvercode-review>{invalid}</silvercode-review>"]
     expect(ReviewReport.extract(chunks).ok).toBe(false)
     expect(reviewText(assistant("review"), chunks.map((chunk, i) => text(chunk, i)))).toBeUndefined()
+  })
+})
+
+
+describe("foreground task review provenance", () => {
+  const info = report("delivered by child")
+  const body = `Child analysis.\n\n${ReviewReport.envelope(info)}`
+  function task(): ToolPart {
+    return {
+      id: "task", sessionID: "parent", messageID: "assistant", type: "tool", tool: "task", callID: "call",
+      state: {
+        status: "completed", input: { description: "Review", subagent_type: "review" }, title: "Review",
+        output: `<task id="child" state="completed">\n<task_result>\n${body}\n</task_result>\n<termination reason="success">Done</termination>\n</task>`,
+        metadata: { sessionId: "child", review: { sessionId: "child", revision: info.revision, report: info }, termination: { reason: "success" } },
+        time: { start: 1, end: 2 },
+      },
+    }
+  }
+  test("requires matching task metadata, child identity, successful termination and canonical output", () => {
+    const part = task()
+    expect(subagentReview(part)?.report).toEqual(info)
+    expect(subagentReview(part)?.analysis).toBe("Child analysis.")
+    if (part.state.status !== "completed") throw new Error("expected completed fixture")
+    expect(subagentReview({ ...part, state: { ...part.state, metadata: {} } })).toBeUndefined()
+    expect(subagentReview({ ...part, state: { ...part.state, metadata: { ...part.state.metadata, sessionId: "other" } } })).toBeUndefined()
+    expect(subagentReview({ ...part, state: { ...part.state, metadata: { ...part.state.metadata, termination: { reason: "failure" } } } })).toBeUndefined()
+    expect(subagentReview({ ...part, state: { ...part.state, output: part.state.output.replace("delivered by child", "other") } })).toBeUndefined()
+    expect(subagentReview({ ...part, state: { ...part.state, input: { ...part.state.input, subagent_type: "general" } } })).toBeUndefined()
+    expect(subagentReview({ ...part, state: { ...part.state, metadata: { ...part.state.metadata, review: { sessionId: "child", revision: info.revision, report: info, verdict: "pending" } } } })).toBeUndefined()
   })
 })

@@ -3,7 +3,7 @@ import { afterEach, describe, expect, test } from "bun:test"
 import { createMemo, For, onCleanup } from "solid-js"
 import { testRender, useRenderer } from "@opentui/solid"
 import { createDefaultOpenTuiKeymap } from "@opentui/keymap/opentui"
-import type { AssistantMessage, Part, Provider, TextPart } from "@opencode-ai/sdk/v2"
+import type { AssistantMessage, Part, Provider, TextPart, ToolPart } from "@opencode-ai/sdk/v2"
 import { mkdir } from "node:fs/promises"
 import path from "node:path"
 import { tmpdir } from "../../fixture/fixture"
@@ -22,6 +22,7 @@ import { LocalProvider } from "../../../src/context/local"
 import { ThemeProvider } from "../../../src/context/theme"
 import { TuiConfigProvider, useTuiConfig } from "../../../src/config"
 import { ToastProvider } from "../../../src/ui/toast"
+import { DialogProvider } from "../../../src/ui/dialog"
 import { LocationProvider } from "../../../src/context/location"
 import { OpencodeKeymapProvider, registerOpencodeKeymap } from "../../../src/keymap"
 import { AssistantMessageRow, SessionContext } from "../../../src/routes/session"
@@ -118,6 +119,7 @@ async function mount(options: { agent: string; completed?: boolean; parts: Part[
     }
     return (
       <OpencodeKeymapProvider keymap={keymap}>
+        <DialogProvider>
         <SessionContext.Provider value={ctxValue}>
           <LocationProvider location={{ directory: "/tmp", workspaceID: undefined }}>
             <For each={storeSync.data.message[SESSION] ?? []}>
@@ -131,6 +133,7 @@ async function mount(options: { agent: string; completed?: boolean; parts: Part[
             </For>
           </LocationProvider>
         </SessionContext.Provider>
+        </DialogProvider>
       </OpencodeKeymapProvider>
     )
   }
@@ -195,6 +198,14 @@ async function mount(options: { agent: string; completed?: boolean; parts: Part[
       tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
     },
   ])
+  if (options.parts.some((part) => part.type === "tool" && part.tool === "task")) {
+    sync.set("message", "child", [{
+      id: "child-message", sessionID: "child", role: "assistant", time: { created: BASE, completed: BASE + 500 },
+      parentID: "child-request", modelID: "model", providerID: "test", mode: "review", agent: "review",
+      path: { cwd: "/tmp", root: "/tmp" }, cost: 0,
+      tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+    }])
+  }
   sync.set("part", "m1", options.parts)
   await app.renderOnce()
   return setup!
@@ -202,6 +213,11 @@ async function mount(options: { agent: string; completed?: boolean; parts: Part[
 
 function textPart(value: string, id = "prt_text"): TextPart {
   return { id, sessionID: SESSION, messageID: "m1", type: "text", text: value }
+}
+
+function completedTool(tool: string, input: Record<string, unknown>, output: string, metadata: Record<string, unknown> = {}): ToolPart {
+  return { id: `tool_${tool}`, sessionID: SESSION, messageID: "m1", type: "tool", tool, callID: `call_${tool}`,
+    state: { status: "completed", input, output, metadata, title: "Synthetic task", time: { start: BASE, end: BASE + 1000 } } }
 }
 
 describe("review assistant text: real transcript fallback", () => {
@@ -222,12 +238,71 @@ describe("review assistant text: real transcript fallback", () => {
     const mounted = await mount({ agent: "review", parts: [textPart(`Streaming analysis.\n\n${report}`)] })
     await settleUntilFrame(mounted.app, "Streaming analysis.")
     expect(await frameOfSpans(mounted.app)).not.toContain("✓ Approved")
-    mounted.sync.set("message", SESSION, 0, "time", "completed", BASE + 1000)
+    mounted.sync.set("message", SESSION, 0, "time", { created: BASE, completed: BASE + 1000 })
     await settleUntilFrame(mounted.app, "✓ Approved")
     const frame = await frameOfSpans(mounted.app)
     expect(frame).toContain("✓ Approved")
     expect(frame).toContain("Synthetic approval summary")
     expect(frame).toContain("Streaming analysis.")
+    expect(frame).not.toContain("silvercode-review")
+  })
+
+  test("removes earlier duplicate protocol blocks while retaining their analysis", async () => {
+    const first = ReviewReport.envelope({ version: 1, revision: "synthetic", assessment: "approved", summary: "Earlier", findings: [] })
+    const last = ReviewReport.envelope({ version: 1, revision: "synthetic", assessment: "needs-fixes", summary: "Final synthetic summary", findings: [] })
+    const mounted = await mount({ agent: "review", completed: true, parts: [textPart(`First analysis.\n\n${first}`, "p1"), textPart(`Later analysis.\n\n${last}`, "p2")] })
+    await settleUntilFrame(mounted.app, "Final synthetic summary")
+    const frame = await frameOfSpans(mounted.app)
+    expect(frame).toContain("First analysis.")
+    expect(frame).toContain("Later analysis.")
+    expect(frame).toContain("Needs fixes")
+    expect(frame).not.toContain("silvercode-review")
+    expect(frame).not.toContain("✓ Approved")
+  })
+
+  test("a same-message finish and text delivery show one report without losing analysis", async () => {
+    const report = ReviewReport.envelope({ version: 1, revision: "synthetic", assessment: "approved", summary: "One synthetic verdict", findings: [] })
+    const finish = completedTool("finish", { reason: "success", result: `Finish analysis.\n\n${report}` }, `Finish analysis.\n\n${report}`)
+    const mounted = await mount({ agent: "review", completed: true, parts: [textPart(`Text analysis.\n\n${report}`), finish] })
+    await settleUntilFrame(mounted.app, "One synthetic verdict")
+    const frame = await frameOfSpans(mounted.app)
+    expect(frame).toContain("Text analysis.")
+    expect(frame).toContain("Finish analysis.")
+    expect(frame.match(/One synthetic verdict/g)?.length).toBe(1)
+    expect(frame.match(/Raw review report/g)?.length).toBe(1)
+  })
+
+  test("a later finish does not repeat an identical prior text review", async () => {
+    const report = ReviewReport.envelope({ version: 1, revision: "synthetic", assessment: "approved", summary: "Prior synthetic verdict", findings: [] })
+    const mounted = await mount({ agent: "review", completed: true, parts: [textPart(`Prior analysis.\n\n${report}`)] })
+    const finish = { ...completedTool("finish", { reason: "success", result: report }, report), messageID: "m2" }
+    mounted.sync.set("part", "m2", [finish])
+    mounted.sync.set("message", SESSION, (rows) => [...rows, {
+      id: "m2", sessionID: SESSION, role: "assistant" as const, time: { created: BASE + 1000, completed: BASE + 2000 },
+      parentID: "msg_user", modelID: "model", providerID: "test", mode: "review", agent: "review",
+      path: { cwd: "/tmp", root: "/tmp" }, cost: 0,
+      tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+    }])
+    await settleUntilFrame(mounted.app, "Task completed")
+    const frame = await frameOfSpans(mounted.app)
+    expect(frame.match(/Prior synthetic verdict/g)?.length).toBe(1)
+    expect(frame.match(/Raw review report/g)?.length).toBe(1)
+    expect(frame).toContain("Prior analysis.")
+    expect(frame).toContain("Task completed")
+  })
+
+  test("a foreground subagent delivery retains the task row and displays the verified report", async () => {
+    const info = { version: 1 as const, revision: "synthetic", assessment: "needs-fixes" as const, summary: "Child synthetic verdict", findings: [] }
+    const report = ReviewReport.envelope(info)
+    const task = completedTool("task", { description: "Inspect synthetic changes", subagent_type: "review" },
+      `<task id="child" state="completed">\n<task_result>\nChild analysis.\n\n${report}\n</task_result>\n<termination reason="success">Done</termination>\n</task>`,
+      { sessionId: "child", review: { report: info, sessionId: "child", revision: info.revision }, termination: { reason: "success" } })
+    const mounted = await mount({ agent: "work", completed: true, parts: [task] })
+    await settleUntilFrame(mounted.app, "Child synthetic verdict")
+    const frame = await frameOfSpans(mounted.app)
+    expect(frame).toContain("Inspect synthetic changes")
+    expect(frame).toContain("Child synthetic verdict")
+    expect(frame).toContain("Child analysis.")
     expect(frame).not.toContain("silvercode-review")
   })
 

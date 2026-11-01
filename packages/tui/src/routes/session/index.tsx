@@ -64,7 +64,7 @@ import { DialogForkFromTimeline } from "./dialog-fork-from-timeline"
 import { DialogSessionRename } from "../../component/dialog-session-rename"
 import { Sidebar } from "./sidebar"
 import { SubagentFooter } from "./subagent-footer.tsx"
-import { reviewText } from "./review-text"
+import { reviewPresentationAnalysis, reviewText, subagentReview } from "./review-text"
 import { filetype } from "../../util/filetype"
 import parsers from "../../parsers-config"
 import { errorMessage } from "../../util/error"
@@ -1650,6 +1650,55 @@ export function AssistantMessageRow(props: { message: AssistantMessage; parts: P
   const messages = createMemo(() => sync.data.message[props.message.sessionID] ?? [])
   const model = createMemo(() => Model.name(ctx.providers(), props.message.providerID, props.message.modelID))
   const textReview = createMemo(() => reviewText(props.message, props.parts))
+  const matchingFinish = createMemo(() => {
+    const text = textReview()
+    if (!text) return undefined
+    for (const part of props.parts) {
+      if (part.type !== "tool" || part.tool !== "finish" || part.state.status !== "completed") continue
+      if (finishBlockView(part, part.state.input)?.tone !== "success") continue
+      const finish = parseReviewReport(finishResult(part.state.input, part.state.output))
+      if (!finish || JSON.stringify(finish.report) !== JSON.stringify(text.report)) continue
+      const analysis = reviewPresentationAnalysis(finish.analysis)
+      if (analysis === undefined) continue
+      return { part, analysis }
+    }
+    return undefined
+  })
+  const earlierReview = createMemo(() => {
+    const rows = messages()
+    const index = rows.findIndex((row) => row.id === props.message.id)
+    if (index < 0) return undefined
+    for (let i = index - 1; i >= 0; i--) {
+      const row = rows[i]
+      if (row.role !== "assistant" || row.parentID !== props.message.parentID || row.agent !== props.message.agent) break
+      const parts = sync.data.part[row.id]
+      if (!parts) return undefined
+      if (parts.some((part) => part.type === "tool" && part.tool === "finish" && part.state.status === "completed")) break
+      const review = reviewText(row, parts)
+      if (review) return review
+    }
+    return undefined
+  })
+  const repeatedFinish = createMemo(() => {
+    if (textReview()) return undefined
+    const earlier = earlierReview()
+    if (!earlier) return undefined
+    return props.parts.find((part): part is ToolPart => {
+      if (part.type !== "tool" || part.tool !== "finish" || part.state.status !== "completed") return false
+      if (finishBlockView(part, part.state.input)?.tone !== "success") return false
+      const finish = parseReviewReport(finishResult(part.state.input, part.state.output))
+      if (!finish || JSON.stringify(finish.report) !== JSON.stringify(earlier.report)) return false
+      const analysis = reviewPresentationAnalysis(finish.analysis)
+      return analysis !== undefined && (!analysis.trim() || earlier.analysis.includes(analysis.trim()))
+    })
+  })
+  const displayedTextReview = createMemo(() => {
+    const text = textReview()
+    if (!text) return undefined
+    const analysis = matchingFinish()?.analysis?.trim()
+    if (!analysis || text.analysis.includes(analysis)) return text
+    return { ...text, analysis: [text.analysis, analysis].filter(Boolean).join("\n\n") }
+  })
 
   const final = createMemo(() => {
     return props.message.finish && !["tool-calls", "unknown"].includes(props.message.finish)
@@ -1776,9 +1825,17 @@ export function AssistantMessageRow(props: { message: AssistantMessage; parts: P
             </Show>
             <Switch>
               <Match when={part.type === "text" && textReview()?.textPartIDs.includes(part.id)}>
-                <Show when={textReview()?.textPartIDs[0] === part.id && textReview()}>
-                  {(review) => <ReviewFinish review={review()} />}
+                <Show when={textReview()?.textPartIDs[0] === part.id && displayedTextReview()}>
+                  {(review) => <ReviewFinish review={review()} part={matchingFinish()?.part} />}
                 </Show>
+              </Match>
+              <Match when={part.id === matchingFinish()?.part.id}>
+                <></>
+              </Match>
+              <Match when={part.id === repeatedFinish()?.id}>
+                <InlineTool icon="✓" pending="Completing task..." complete={true} part={repeatedFinish()!} separate={true}>
+                  Task completed
+                </InlineTool>
               </Match>
               <Match when={group()?.owner === true}>
                 <ActivityGroup groupID={group()!.groupID} />
@@ -3171,6 +3228,7 @@ function Task(props: ToolProps) {
     if (sessionID && !sync.data.message[sessionID]?.length) void sync.session.sync(sessionID)
   })
 
+  const review = createMemo(() => subagentReview(props.part))
   const sessionID = createMemo(() => stringValue(props.metadata.sessionId))
   const messages = createMemo(() => sync.data.message[sessionID() ?? ""] ?? [])
 
@@ -3243,6 +3301,7 @@ function Task(props: ToolProps) {
   })
 
   return (
+    <>
     <InlineTool
       icon={
         props.part.state.status !== "completed"
@@ -3269,6 +3328,8 @@ function Task(props: ToolProps) {
     >
       {content()}
     </InlineTool>
+    <Show when={review()}>{(value) => <ReviewFinish review={value()} />}</Show>
+    </>
   )
 }
 
