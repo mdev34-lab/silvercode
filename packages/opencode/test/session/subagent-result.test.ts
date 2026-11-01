@@ -3,6 +3,7 @@ import type { SessionV1 } from "@opencode-ai/core/v1/session"
 import FINISH_NUDGE from "../../src/session/prompt/finish-nudge.txt"
 import {
   continuesPrompt,
+  executionOrder,
   finishContinuationPromptID,
   REPETITION_RECOVERY,
   repetitionRecoveryPromptID,
@@ -310,5 +311,89 @@ describe("declared continuation root lineage (#788)", () => {
     const answer = assistant("04", "03", [text(envelope)])
     expect(finishContinuationPromptID(spoof)).toBeUndefined()
     expect(continuesPrompt([user("01"), spoof, answer], answer, "01")).toBe(false)
+  })
+})
+
+
+describe("review repair: silent annotations and causal nudge order", () => {
+  const silent = (id: string) =>
+    ({ info: { id, role: "user", noReply: true }, parts: [text("silent background note")] }) as unknown as SessionV1.WithParts
+  const marked = (id: string, promptID: string, sequence: number, assistantIDs: string[]) =>
+    ({
+      info: { id, role: "user" },
+      parts: [
+        {
+          type: "text",
+          text: FINISH_NUDGE,
+          synthetic: true,
+          metadata: { finishContinuation: { promptID, sequence, assistantIDs } },
+        },
+      ],
+    }) as unknown as SessionV1.WithParts
+  const finish = { type: "tool", tool: "finish", state: { status: "completed" } }
+
+  test("a silent note between the prompt and its assistant does not split result ownership", () => {
+    const answer = assistant("03", "01", [text(envelope), finish])
+    const history = [user("01"), silent("02"), answer]
+    expect(continuesPrompt(history, answer, "01")).toBe(true)
+    expect(resultChunks(history, answer)).toEqual([envelope])
+  })
+
+  test("a silent note between an assistant and the next nudge preserves pre-nudge chunks", () => {
+    const first = assistant("02", "01", [text(envelope)])
+    const last = assistant("05", "04", [text("final"), finish])
+    const history = [user("01"), first, silent("03"), marked("04", "01", 1, ["02"]), last]
+    expect(continuesPrompt(history, last, "01")).toBe(true)
+    expect(resultChunks(history, last)).toEqual([envelope, "final"])
+  })
+
+  test("a silent note between a nudge and its answer preserves the whole execution", () => {
+    const first = assistant("02", "01", [text(envelope)])
+    const last = assistant("05", "03", [text("final"), finish])
+    const history = [user("01"), first, marked("03", "01", 1, ["02"]), silent("04"), last]
+    expect(continuesPrompt(history, last, "01")).toBe(true)
+    expect(resultChunks(history, last)).toEqual([envelope, "final"])
+  })
+
+  test("a real caller boundary still defeats a silent-looking stale parent", () => {
+    const answer = assistant("04", "01", [text(envelope)])
+    const history = [user("01"), silent("02"), user("03"), answer]
+    expect(continuesPrompt(history, answer, "01")).toBe(false)
+    expect(resultChunks(history, answer)).toEqual([envelope])
+  })
+
+  test("multi-nudge clock rollback follows causal sequence, not smaller nudge IDs", () => {
+    const p1 = user("50")
+    const a1 = assistant("51", "50", [text("first")])
+    const n1 = marked("30", "50", 1, ["51"])
+    const a2 = assistant("31", "30", [text("second")])
+    const n2 = marked("20", "50", 2, ["51", "31"])
+    const a3 = assistant("21", "20", [text("third"), finish])
+    const history = [a3, n2, p1, a2, n1, a1]
+    expect(executionOrder(history).map((message) => String(message.info.id))).toEqual(["50", "51", "30", "31", "20", "21"])
+    expect(continuesPrompt(history, a3, "50")).toBe(true)
+    expect(resultChunks(history, a3)).toEqual(["first", "second", "third"])
+  })
+
+  test("childless rollback keeps the root before its nudge and answer", () => {
+    const p1 = user("50")
+    const n1 = marked("10", "50", 1, [])
+    const a2 = assistant("11", "10", [text("answer"), finish])
+    const history = [a2, n1, p1]
+    expect(executionOrder(history).map((message) => String(message.info.id))).toEqual(["50", "10", "11"])
+    expect(continuesPrompt(history, a2, "50")).toBe(true)
+    expect(resultChunks(history, a2)).toEqual(["answer"])
+  })
+
+  test("a direct rolled-back assistant is retained by the later causal nudge", () => {
+    const p1 = user("50")
+    const a1 = assistant("51", "50", [text("direct")])
+    const n1 = marked("10", "50", 1, ["51"])
+    const a2 = assistant("11", "10", [text("nudged")])
+    const n2 = marked("20", "50", 2, ["51", "11"])
+    const a3 = assistant("21", "20", [text("final"), finish])
+    const history = [n2, a3, p1, n1, a1, a2]
+    expect(executionOrder(history).map((message) => String(message.info.id))).toEqual(["50", "51", "10", "11", "20", "21"])
+    expect(resultChunks(history, a3)).toEqual(["direct", "nudged", "final"])
   })
 })

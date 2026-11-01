@@ -64,6 +64,7 @@ import { RepetitionGuard } from "../../src/session/llm/repetition-guard"
 import {
   continuesPrompt,
   finishContinuationPromptID,
+  renderTextResult,
   resultChunks,
   textResult,
 } from "../../src/session/subagent-result"
@@ -8444,6 +8445,207 @@ it.instance(
       expect(result.info.error?.name).toBe("MessageAbortedError")
       expect(continuesPrompt(stored, result, p1ID)).toBe(true)
       expect(yield* status.get(chat.id)).toEqual({ type: "idle" })
+    }),
+  { config: cfg },
+  30_000,
+)
+
+// ---------------------------------------------------------------------------
+// Independent REQUEST-CHANGES repair controls (silent notes, mid-tool ownership,
+// compaction continuation settlement). These assert the causal transcript, not
+// just the returned terminal message.
+
+it.instance(
+  "review HIGH1: a silent note before the first assistant preserves result chunks and continuation",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig((url) => ({ ...providerCfg(url), agent: { work: { finishTool: true } } }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "silent chunks" })
+      const gate = defer<void>()
+      const envelope = renderTextResult("pre-nudge result")
+      yield* llm.push(
+        reply().text(envelope).stop().wait(gate.promise),
+        reply().text("final").tool("finish", { reason: "success", result: "done" }),
+      )
+      const p1 = yield* prompt
+        .prompt({ sessionID: chat.id, agent: "work", parts: [{ type: "text", text: "P1" }] })
+        .pipe(Effect.forkChild)
+      yield* llm.wait(1)
+      yield* prompt
+        .prompt({ sessionID: chat.id, agent: "work", noReply: true, parts: [{ type: "text", text: "silent note" }] })
+        .pipe(Effect.forkChild)
+      yield* pollWithTimeout(
+        Effect.gen(function* () {
+          const msgs = yield* sessions.messages({ sessionID: chat.id })
+          return msgs.some((m) => m.parts.some((part) => part.type === "text" && part.text === "silent note")) || undefined
+        }),
+        "silent note was not persisted",
+      )
+      gate.resolve(undefined)
+      const result = assistantExit(yield* awaitWithTimeout(Fiber.await(p1), "P1 never settled", "15 seconds"))
+      const stored = yield* sessions.messages({ sessionID: chat.id })
+      const p1ID = stored.find((m) => m.info.role === "user" && m.parts.some((part) => part.type === "text" && part.text === "P1"))!.info.id
+      expect(yield* llm.calls).toBe(2)
+      expect(continuesPrompt(stored, result, p1ID)).toBe(true)
+      expect(resultChunks(stored, result)).toEqual([envelope, "final"])
+      expect(textResult(resultChunks(stored, result))).toEqual({ ok: true, text: "pre-nudge result" })
+      expect(stored.filter((m) => finishContinuationPromptID(m) !== undefined)).toHaveLength(1)
+    }),
+  { config: cfg },
+  30_000,
+)
+
+it.instance(
+  "review HIGH2: a queued background completion cannot preempt an unfinished parent tool step",
+  () =>
+    Effect.gen(function* () {
+      const { llm, dir } = yield* useServerConfig((url) => ({ ...providerCfg(url), agent: { work: { finishTool: true } } }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({
+        title: "mid-tool ownership",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      const gate = path.join(dir, "release")
+      const marker = path.join(dir, "ran")
+      yield* llm.push(
+        reply().tool("bash", {
+          command: `while [ ! -f '${gate}' ]; do sleep 0.05; done; printf ran >> '${marker}'`,
+          description: "gated tool",
+        }),
+        reply().text("P1 done").tool("finish", { reason: "success", result: "P1 done" }),
+        reply().text("P2 done").tool("finish", { reason: "success", result: "P2 done" }),
+      )
+      const p1 = yield* prompt
+        .prompt({ sessionID: chat.id, agent: "work", parts: [{ type: "text", text: "P1" }] })
+        .pipe(Effect.forkChild)
+      yield* pollWithTimeout(
+        Effect.gen(function* () {
+          const msgs = yield* sessions.messages({ sessionID: chat.id })
+          return (
+            msgs.some((m) =>
+              m.parts.some((part) => part.type === "tool" && part.tool === "bash" && part.state.status === "running"),
+            ) || undefined
+          )
+        }),
+        "P1 bash tool never started",
+      )
+      const p2 = yield* prompt
+        .prompt({ sessionID: chat.id, agent: "work", parts: [{ type: "text", text: "P2 background completion" }] })
+        .pipe(Effect.forkChild)
+      yield* pollWithTimeout(
+        Effect.gen(function* () {
+          const msgs = yield* sessions.messages({ sessionID: chat.id })
+          return (
+            msgs.some((m) =>
+              m.parts.some((part) => part.type === "text" && part.text === "P2 background completion"),
+            ) || undefined
+          )
+        }),
+        "P2 was not persisted while P1 tool was running",
+      )
+      yield* writeText(gate, "release")
+      const a1 = assistantExit(yield* awaitWithTimeout(Fiber.await(p1), "P1 never settled", "20 seconds"))
+      const a2 = assistantExit(yield* awaitWithTimeout(Fiber.await(p2), "P2 never settled", "20 seconds"))
+      const stored = yield* sessions.messages({ sessionID: chat.id })
+      const p1ID = stored.find((m) => m.info.role === "user" && m.parts.some((part) => part.type === "text" && part.text === "P1"))!.info.id
+      const p2ID = stored.find((m) => m.info.role === "user" && m.parts.some((part) => part.type === "text" && part.text === "P2 background completion"))!.info.id
+      expect(yield* llm.calls).toBe(3)
+      expect(a1.info.parentID).toBe(p1ID)
+      expect(a2.info.parentID).toBe(p2ID)
+      expectCompletedFinish(a1)
+      expectCompletedFinish(a2)
+      expect(continuesPrompt(stored, a1, p1ID)).toBe(true)
+      expect(continuesPrompt(stored, a2, p2ID)).toBe(true)
+      const ran = yield* Effect.promise(() => readFile(marker, "utf8"))
+      expect(ran).toBe("ran")
+    }),
+  { config: cfg },
+  40_000,
+)
+
+it.instance(
+  "review HIGH3: overflow after a finish nudge settles the original prompt through compaction continuation",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig((url) => ({ ...providerCfg(url), agent: { work: { finishTool: true } } }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({
+        title: "overflow continuation",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      yield* llm.push(
+        reply().text("pre-nudge").stop(),
+        reply().tool("bash", { command: "printf ok", description: "overflow tool" }).usage({ input: 200_000, output: 100 }),
+        reply().text("summary").stop(),
+        reply().text("post-compaction").tool("finish", { reason: "success", result: "done" }),
+      )
+      const result = yield* prompt.prompt({ sessionID: chat.id, agent: "work", parts: [{ type: "text", text: "P1" }] })
+      const stored = yield* sessions.messages({ sessionID: chat.id })
+      const p1 = stored.find((m) => m.info.role === "user" && m.parts.some((part) => part.type === "text" && part.text === "P1"))!
+      const continuation = stored.find((m) =>
+        m.parts.some((part) => part.type === "text" && part.metadata?.compaction_continue === true),
+      )
+      expect(yield* llm.calls).toBe(4)
+      expectCompletedFinish(result)
+      expect(continuation).toBeDefined()
+      const part = continuation!.parts.find((part) => part.type === "text" && part.metadata?.compaction_continue === true)
+      expect(part?.type === "text" ? part.metadata?.compactionContinuation : undefined).toEqual({ promptID: p1.info.id })
+      expect(result.info.role).toBe("assistant")
+      if (result.info.role === "assistant") expect(result.info.parentID).toBe(continuation!.info.id)
+      expect(continuesPrompt(stored, result, p1.info.id)).toBe(true)
+    }),
+  { config: cfg },
+  40_000,
+)
+
+it.instance(
+  "review HIGH3: step-0 compaction settles the caller instead of returning the stale seed generation",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig((url) => ({ ...providerCfg(url), agent: { work: { finishTool: true } } }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const compaction = yield* SessionCompaction.Service
+      const chat = yield* sessions.create({ title: "step-0 compaction" })
+      const seeded = yield* seed(chat.id, { finish: "stop" })
+      yield* compaction.create({ sessionID: chat.id, agent: "work", model: ref, auto: true })
+      yield* llm.push(reply().text("summary").stop(), reply().text("continued").tool("finish", { reason: "success", result: "done" }))
+      const result = yield* prompt.loop({ sessionID: chat.id, messageID: seeded.user.id })
+      const stored = yield* sessions.messages({ sessionID: chat.id })
+      const continuation = stored.find((m) =>
+        m.parts.some((part) => part.type === "text" && part.metadata?.compaction_continue === true),
+      )
+      expect(yield* llm.calls).toBe(2)
+      expectCompletedFinish(result)
+      expect(result.info.role).toBe("assistant")
+      if (result.info.role === "assistant") expect(result.info.parentID).toBe(continuation!.info.id)
+      expect(continuesPrompt(stored, result, seeded.user.id)).toBe(true)
+    }),
+  { config: cfg },
+  40_000,
+)
+
+it.instance(
+  "review MED: resume does not spend a request on a trailing silent marker after a completed finish",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig((url) => ({ ...providerCfg(url), agent: { work: { finishTool: true } } }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "silent resume" })
+      yield* llm.push(reply().text("done").tool("finish", { reason: "success", result: "done" }))
+      const first = yield* prompt.prompt({ sessionID: chat.id, agent: "work", parts: [{ type: "text", text: "P1" }] })
+      yield* prompt
+        .prompt({ sessionID: chat.id, agent: "work", noReply: true, parts: [{ type: "text", text: "silent" }] })
+        .pipe(Effect.forkChild)
+      const resumed = yield* prompt.loop({ sessionID: chat.id })
+      expect(yield* llm.calls).toBe(1)
+      expect(resumed.info.id).toBe(first.info.id)
+      expectCompletedFinish(resumed)
     }),
   { config: cfg },
   30_000,
