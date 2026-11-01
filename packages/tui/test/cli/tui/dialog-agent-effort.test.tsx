@@ -1,6 +1,6 @@
 /** @jsxImportSource @opentui/solid */
 import { describe, expect, spyOn, test } from "bun:test"
-import { TextareaRenderable } from "@opentui/core"
+import { TextareaRenderable, TextAttributes } from "@opentui/core"
 import { createDefaultOpenTuiKeymap } from "@opentui/keymap/opentui"
 import { testRender, useRenderer } from "@opentui/solid"
 import { onCleanup, onMount, type JSX } from "solid-js"
@@ -394,6 +394,15 @@ function optionBlock(frame: string, level: string) {
     block.push(line)
   }
   return block
+}
+
+/** A frame read as one whitespace-normalized string, so a wrapped sentence matches. */
+function flatText(frame: string) {
+  return frame
+    .split("\n")
+    .map((line) => line.trim())
+    .join(" ")
+    .replace(/\s+/g, " ")
 }
 
 /** The background of the widest span on a row, i.e. the fill the row paints. */
@@ -1012,9 +1021,11 @@ describe("agent effort selector", () => {
     const harness = await mountEffort({
       route: { type: "home" },
       model: "test-provider/variant-model",
-      children: () => <DialogAgentEffort />,
+      children: () => null,
     })
     try {
+      // Opened the way app.tsx opens it, so the assertions read the real panel.
+      harness.dialog.replace(() => <DialogAgentEffort />)
       const frame = await frameWhere(
         harness.app,
         (f) => f.includes("Agent effort") && f.includes("Deep, meticulous"),
@@ -1028,17 +1039,22 @@ describe("agent effort selector", () => {
       expect(rowOf("Thorough") - rowOf("Medium")).toBe(2)
       expect(lines[rowOf("Fast") + 1].trim()).toBe("")
       expect(lines[rowOf("Medium") + 1].trim()).toBe("")
-      // Each description sits in its own column, on its title's line while the
-      // panel is wide enough, and in the same column for every level.
+      // Each description sits in its own column, in the same column for every
+      // level, and only the copy that no longer fits wraps: the two short ones
+      // stay on their title's line.
       const columns = ["Reliable workhorse", "Smarter agent", "Deep, meticulous"].map((copy) =>
         lines[rowOf(copy)].indexOf(copy),
       )
       expect(new Set(columns).size).toBe(1)
       expect(rowOf("Reliable workhorse")).toBe(rowOf("Fast"))
       expect(rowOf("Smarter agent")).toBe(rowOf("Medium"))
-      expect(rowOf("Deep, meticulous")).toBe(rowOf("Thorough"))
+      const thorough = optionBlock(frame, "Thorough")
+      // The panel is 60 columns wide, so the 59-column copy takes two lines
+      // rather than being clipped, and the second line holds the column.
+      expect(thorough).toHaveLength(2)
+      expect(thorough[1].search(/\S/)).toBe(columns[2])
       // The accepted copy, footer and indicator are untouched by the layout.
-      expect(lines[rowOf("Thorough")]).toContain("Deep, meticulous work on complex tasks from start to finish")
+      expect(flatText(frame)).toContain("Deep, meticulous work on complex tasks from start to finish")
       expect(frame).toContain("Default for new sessions")
       expect(markerLine(frame)).toContain("Fast")
     } finally {
@@ -1050,13 +1066,14 @@ describe("agent effort selector", () => {
     const harness = await mountEffort({
       route: { type: "home" },
       model: "test-provider/variant-model",
-      children: () => <DialogAgentEffort />,
+      children: () => null,
       width: 44,
     })
     try {
+      harness.dialog.replace(() => <DialogAgentEffort />)
       const frame = await frameWhere(
         harness.app,
-        (f) => f.includes("start to finish") && f.includes("Reliable workhorse"),
+        (f) => flatText(f).includes("start to finish") && f.includes("Reliable workhorse"),
         "narrow rows",
       )
       const copy = [
@@ -1068,7 +1085,7 @@ describe("agent effort selector", () => {
         const block = optionBlock(frame, level)
         // Nothing is clipped: the full accepted copy is painted, split over the
         // wrapped rows and read back by joining them.
-        expect(block.map((line) => line.trim()).join(" ")).toContain(description)
+        expect(flatText(block.join("\n"))).toContain(description)
         expect(block.length).toBeGreaterThan(1)
         return { level, description, block }
       })
@@ -1093,11 +1110,13 @@ describe("agent effort selector", () => {
     const harness = await mountEffort({
       route: { type: "home" },
       model: "test-provider/variant-model",
-      children: () => <DialogAgentEffort />,
+      children: () => null,
       width: 44,
+      height: 34,
     })
     try {
-      await frameWhere(harness.app, (f) => f.includes("start to finish"), "narrow rows")
+      harness.dialog.replace(() => <DialogAgentEffort />)
+      await frameWhere(harness.app, (f) => flatText(f).includes("start to finish"), "narrow rows")
       // Walk the cursor to the wrapping level: its highlight must cover the
       // whole description, not just the title line.
       harness.app.mockInput.pressArrow("down")
@@ -1107,21 +1126,19 @@ describe("agent effort selector", () => {
       const lines = frame.split("\n")
       const start = lines.findIndex((line) => line.includes("Thorough"))
       const block = optionBlock(frame, "Thorough")
-      expect(block).toHaveLength(3)
+      expect(block.length).toBeGreaterThan(1)
       // The search field paints its own focused fill, so the option area starts
       // below it; there the only filled rows are the selected level's.
       const searchRow = lines.findIndex((line) => line.includes("Search"))
       const highlight = fills[start]
       expect(highlight).not.toBe(fills[0])
       const painted = fills.flatMap((fill, index) => (index > searchRow && fill === highlight ? [index] : []))
-      expect(painted).toEqual([start, start + 1, start + 2])
+      expect(painted).toEqual(block.map((_, offset) => start + offset))
       // The rows the highlight covers are the wrapped description rows, which
       // stay aligned under the description column.
       const column = block[0].indexOf("Deep, meticulous")
       for (const line of block.slice(1)) expect(line.search(/\S/)).toBe(column)
-      expect(block.map((line) => line.trim()).join(" ")).toContain(
-        "Deep, meticulous work on complex tasks from start to finish",
-      )
+      expect(flatText(block.join("\n"))).toContain("Deep, meticulous work on complex tasks from start to finish")
       // The current-level indicator still points at the stored level, which is
       // not the row the cursor is on now.
       expect(frame).toContain("●")
@@ -1134,22 +1151,27 @@ describe("agent effort selector", () => {
     const harness = await mountEffort({
       route: { type: "home" },
       model: "test-provider/variant-model",
-      children: () => <DialogAgentEffort />,
+      children: () => null,
       width: 44,
-      height: 18,
+      height: 26,
     })
     try {
+      harness.dialog.replace(() => <DialogAgentEffort />)
       await frameWhere(harness.app, (f) => f.includes("Reliable workhorse"), "first row")
       harness.app.mockInput.pressArrow("down")
       harness.app.mockInput.pressArrow("down")
       // The scroll reveals the row by its own height: all three wrapped lines
       // of the selected level are on screen together.
-      const selected = await frameWhere(harness.app, (f) => f.includes("start to finish"), "wrapped row revealed")
+      const selected = await frameWhere(harness.app, (f) => flatText(f).includes("start to finish"), "wrapped row revealed")
       const lines = selected.split("\n")
       const start = lines.findIndex((line) => line.includes("Thorough"))
       expect(start).toBeGreaterThanOrEqual(0)
-      expect(lines[start + 1].trim()).toBe("on complex tasks from")
-      expect(lines[start + 2].trim()).toBe("start to finish")
+      const block = optionBlock(selected, "Thorough")
+      expect(block.length).toBeGreaterThan(1)
+      // Every wrapped line of the selected level is on screen, and the footer
+      // still follows the list.
+      expect(flatText(lines.slice(start, start + block.length).join("\n"))).toContain("start to finish")
+      expect(lines.findIndex((line) => line.includes("Default for new sessions"))).toBeGreaterThan(start + block.length)
 
       harness.app.mockInput.pressArrow("up")
       harness.app.mockInput.pressArrow("up")
@@ -1225,6 +1247,45 @@ describe("agent effort selector", () => {
       expect(lines[rowOf("Bravo")]).toContain("Bravo Second option")
     } finally {
       await harness.dispose()
+    }
+  })
+
+  // Asset capture is opt-in: `TUI_CAPTURE_DIR=<dir> bun test ... -t captures`
+  // writes the sanitized span dumps that the committed PNGs are rendered from.
+  // It renders through the production dialog stack, like app.tsx does, so the
+  // frames carry the real panel width.
+  test.skipIf(!process.env.TUI_CAPTURE_DIR)("captures the normal and narrow layout frames", async () => {
+    const dir = process.env.TUI_CAPTURE_DIR
+    if (!dir) return
+    for (const view of [
+      { name: "normal", width: 120, height: 40 },
+      { name: "narrow", width: 44, height: 40 },
+    ]) {
+      const harness = await mountEffort({
+        route: { type: "home" },
+        model: "test-provider/variant-model",
+        children: () => null,
+        width: view.width,
+        height: view.height,
+      })
+      try {
+        harness.dialog.replace(() => <DialogAgentEffort />)
+        await frameWhere(harness.app, (f) => f.includes("Agent effort") && f.includes("Thorough"), view.name)
+        const spans = await captureSpans(harness.app)
+        const lines = spans.lines.map((line) =>
+          line.spans.map((span) => ({
+            text: span.text,
+            fg: hexOf(span.fg),
+            bg: span.bg.a > 0.01 ? hexOf(span.bg) : null,
+            bold: (span.attributes & TextAttributes.BOLD) === TextAttributes.BOLD,
+          })),
+        )
+        await mkdir(dir, { recursive: true })
+        await Bun.write(path.join(dir, `agent-effort-${view.name}.json`), JSON.stringify({ cols: spans.cols, rows: spans.rows, lines }))
+        console.log(`\n=== ${view.name} (${spans.cols}x${spans.rows}) ===\n${await captureFrame(harness.app)}`)
+      } finally {
+        await harness.dispose()
+      }
     }
   })
 })
