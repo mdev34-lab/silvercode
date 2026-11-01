@@ -531,34 +531,34 @@ export function DialogSelect<T>(props: DialogSelectProps<T>) {
 
   let scroll: ScrollBoxRenderable | undefined
   // The painted rows are the only honest source for a wrapped row's height, so
-  // the scrollbox is sized from the extent they actually laid out to. A layout
-  // can settle over more than one pass, so this re-reads until two passes agree
-  // and then stops.
-  function measureLaidOutRows() {
-    const children = scroll?.getChildren()
-    if (!children || children.length === 0) return
-    const last = children[children.length - 1]
-    const measured = last.y + last.height - children[0].y
-    if (measured > 0) setLaidOutRows(measured)
-  }
+  // the scrollbox is sized from the extent they actually laid out to. Rows only
+  // report a height once they have one, and a layout can settle over more than
+  // one pass, so this re-reads until consecutive passes agree and then stops.
   let measureGeneration = 0
-  createEffect(() => {
-    if (!wrapping()) return
-    grouped()
-    dimensions()
-    selected()
+  function measureLaidOutRows() {
     const generation = ++measureGeneration
     let previous = -1
     let passes = 0
     const settle = () => {
       if (generation !== measureGeneration) return
-      measureLaidOutRows()
-      const measured = laidOutRows()
-      if (measured === previous || ++passes > 3) return
-      previous = measured
+      const children = scroll?.getChildren()
+      if (children && children.length > 0) {
+        const last = children[children.length - 1]
+        const measured = last.y + last.height - children[0].y
+        if (measured > 0) setLaidOutRows(measured)
+      }
+      if (laidOutRows() === previous || ++passes > 6) return
+      previous = laidOutRows()
       renderer.requestAnimationFrame(settle)
     }
     renderer.requestAnimationFrame(settle)
+  }
+  createEffect(() => {
+    if (!wrapping()) return
+    grouped()
+    dimensions()
+    selected()
+    measureLaidOutRows()
   })
   onCleanup(() => {
     measureGeneration++
@@ -694,7 +694,11 @@ export function DialogSelect<T>(props: DialogSelectProps<T>) {
             paddingRight={1}
             scrollbarOptions={{ visible: false }}
             scrollAcceleration={scrollAcceleration()}
-            ref={(r: ScrollBoxRenderable) => (scroll = r)}
+            ref={(r: ScrollBoxRenderable) => {
+              scroll = r
+              // The first measurement can run before the list is attached.
+              measureLaidOutRows()
+            }}
             maxHeight={height()}
           >
             <For each={grouped()}>

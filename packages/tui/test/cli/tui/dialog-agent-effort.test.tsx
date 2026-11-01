@@ -428,13 +428,14 @@ async function panelGeometry(app: Setup, title: string) {
 async function settledPanel(app: Setup, title: string) {
   let signature = ""
   let same = 0
-  for (let attempt = 0; attempt < 60; attempt++) {
+  for (let attempt = 0; attempt < 120; attempt++) {
     const geometry = await panelGeometry(app, title)
     const next = `${geometry.top}:${geometry.bottom}`
     same = next === signature ? same + 1 : 0
     signature = next
-    if (same >= 2) return geometry
-    await Bun.sleep(20)
+    // Three agreeing reads: one late resize alone must not be read as settled.
+    if (same >= 3) return geometry
+    await Bun.sleep(25)
   }
   throw new Error("panel geometry never settled")
 }
