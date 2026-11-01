@@ -22,6 +22,7 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { buildPrompt } from "@opencode-ai/core/session/compaction"
 import { SessionCompactionEvent } from "@opencode-ai/schema/session-compaction-event"
+import { COMPACTION_CONTINUATION, turnLineage } from "./subagent-result"
 
 export const Event = SessionCompactionEvent
 
@@ -174,6 +175,7 @@ export interface Interface {
     sessionID: SessionID
     auto: boolean
     overflow?: boolean
+    promptID?: MessageID
   }) => Effect.Effect<"continue" | "stop">
   readonly create: (input: {
     sessionID: SessionID
@@ -322,6 +324,7 @@ const layer = Layer.effect(
       sessionID: SessionID
       auto: boolean
       overflow?: boolean
+      promptID?: MessageID
     }) {
       const parent = input.messages.findLast((m) => m.info.id === input.parentID)
       if (!parent || parent.info.role !== "user") {
@@ -468,6 +471,7 @@ const layer = Layer.effect(
       if (result === "continue" && input.auto) {
         if (replay) {
           const original = replay.info
+          const replayPromptID = input.promptID ?? MessageID.make(turnLineage(input.messages, original.id))
           const replayMsg = yield* session.updateMessage({
             id: MessageID.ascending(),
             role: "user",
@@ -479,17 +483,45 @@ const layer = Layer.effect(
             tools: original.tools,
             system: original.system,
           })
+          let linked = false
           for (const part of replay.parts) {
             if (part.type === "compaction") continue
             const replayPart =
               part.type === "file" && MessageV2.isMedia(part.mime)
                 ? { type: "text" as const, text: `[Attached ${part.mime}: ${part.filename ?? "file"}]` }
                 : part
+            // The replay is runner-owned continuation of the compacted turn,
+            // not a new caller boundary. Link its first text part so ownership
+            // and anti-spoof checks resolve to the original prompt.
+            const linkedPart =
+              !linked && replayPart.type === "text"
+                ? {
+                    ...replayPart,
+                    synthetic: true,
+                    metadata: {
+                      ...("metadata" in replayPart ? replayPart.metadata : undefined),
+                      [COMPACTION_CONTINUATION]: { promptID: replayPromptID },
+                    },
+                  }
+                : replayPart
+            if (!linked && replayPart.type === "text") linked = true
             yield* session.updatePart({
-              ...replayPart,
+              ...linkedPart,
               id: PartID.ascending(),
               messageID: replayMsg.id,
               sessionID: input.sessionID,
+            })
+          }
+          if (!linked) {
+            yield* session.updatePart({
+              id: PartID.ascending(),
+              messageID: replayMsg.id,
+              sessionID: input.sessionID,
+              type: "text",
+              synthetic: true,
+              text: "",
+              metadata: { [COMPACTION_CONTINUATION]: { promptID: replayPromptID } },
+              time: { start: Date.now(), end: Date.now() },
             })
           }
         }
@@ -537,7 +569,10 @@ const layer = Layer.effect(
               // Internal marker for auto-compaction followups so provider plugins
               // can distinguish them from manual post-compaction user prompts.
               // This is not a stable plugin contract and may change or disappear.
-              metadata: { compaction_continue: true },
+              metadata: {
+                compaction_continue: true,
+                ...(input.promptID ? { [COMPACTION_CONTINUATION]: { promptID: input.promptID } } : {}),
+              },
               synthetic: true,
               text,
               time: {

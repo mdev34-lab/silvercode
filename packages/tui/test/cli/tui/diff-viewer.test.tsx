@@ -32,6 +32,23 @@ test("closing the diff viewer returns to the route it opened from", async () => 
   }
 })
 
+test("diff readiness includes the request after close command registration", async () => {
+  let releaseRequest!: () => void
+  const requestGate = new Promise<void>((resolve) => {
+    releaseRequest = resolve
+  })
+  // Release in the task after the readiness check. The old command-only wait
+  // returned to its assertions before that task; the request-aware wait pumps
+  // another frame. No retry count or delay budget changes (#789).
+  const viewer = await renderDiffViewer([], 20, undefined, requestGate, () => void setTimeout(releaseRequest, 0))
+  try {
+    expect(viewer.commands.has("diff.close")).toBe(true)
+    expect(viewer.vcsDiffInput()).toEqual({ directory: "/repo/session", mode: "git", context: 12 })
+  } finally {
+    viewer.app.renderer.destroy()
+  }
+})
+
 test("brackets navigate diff hunks", async () => {
   const viewer = await renderDiffViewer(
     [
@@ -98,7 +115,13 @@ test("brackets navigate diff hunks", async () => {
   }
 })
 
-async function renderDiffViewer(vcsDiff: unknown[], height = 20, initialRoute?: TuiRouteCurrent) {
+async function renderDiffViewer(
+  vcsDiff: unknown[],
+  height = 20,
+  initialRoute?: TuiRouteCurrent,
+  requestGate?: Promise<void>,
+  onRequestCheck?: () => void,
+) {
   const commands = new Map<
     string,
     NonNullable<Parameters<TuiPluginApi["keymap"]["registerLayer"]>[0]["commands"]>[number]
@@ -121,12 +144,14 @@ async function renderDiffViewer(vcsDiff: unknown[], height = 20, initialRoute?: 
       client: {
         vcs: {
           diff: async (input: unknown) => {
+            await requestGate
             vcsDiffInput = input
             return { data: vcsDiff }
           },
         },
         session: {
           diff: async (input: unknown) => {
+            await requestGate
             sessionDiffInput = input
             return { data: [] }
           },
@@ -173,7 +198,16 @@ async function renderDiffViewer(vcsDiff: unknown[], height = 20, initialRoute?: 
   }
 
   const app = await testRender(() => <Harness />, { width: 80, height })
-  await waitForCommand(app, commands, "diff.close")
+  await waitForCommand(
+    app,
+    commands,
+    "diff.close",
+    () =>
+      ("params" in current && current.params && "mode" in current.params && current.params.mode === "last-turn"
+        ? sessionDiffInput
+        : vcsDiffInput) !== undefined,
+    onRequestCheck,
+  )
   return {
     app,
     commands,
@@ -246,10 +280,17 @@ async function waitForCommand(
   app: Awaited<ReturnType<typeof testRender>>,
   commands: Map<string, unknown>,
   command: string,
+  ready: () => boolean,
+  onCheck?: () => void,
 ) {
   for (let attempt = 0; attempt < 10; attempt++) {
     await app.renderOnce()
-    if (commands.has(command)) return
+    // Commands and the resource request become observable independently after
+    // KV/theme readiness. Keep the original frame budget, but require both.
+    if (commands.has(command)) {
+      onCheck?.()
+      if (ready()) return
+    }
     await new Promise((resolve) => setTimeout(resolve, 25))
   }
 }

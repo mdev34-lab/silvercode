@@ -1,7 +1,16 @@
 import { describe, expect, test } from "bun:test"
 import type { SessionV1 } from "@opencode-ai/core/v1/session"
 import FINISH_NUDGE from "../../src/session/prompt/finish-nudge.txt"
-import { continuesPrompt, resultChunks, textResult, renderTextResult } from "../../src/session/subagent-result"
+import {
+  continuesPrompt,
+  executionOrder,
+  finishContinuationPromptID,
+  REPETITION_RECOVERY,
+  repetitionRecoveryPromptID,
+  resultChunks,
+  textResult,
+  renderTextResult,
+} from "../../src/session/subagent-result"
 
 // Only the fields consumed by the collector are relevant to this pure boundary test.
 const user = (id: string) => ({ info: { id, role: "user" }, parts: [] }) as unknown as SessionV1.WithParts
@@ -49,7 +58,10 @@ describe("subagent result execution boundary", () => {
     expect(textResult(resultChunks([user("01"), old, user("03"), nudge("05"), last], last))).toEqual({ ok: false })
   })
   test("a nudge after a completed finish does not resurrect the earlier result", () => {
-    const old = assistant("02", "01", [text(envelope), { type: "tool", tool: "finish", state: { status: "completed" } }])
+    const old = assistant("02", "01", [
+      text(envelope),
+      { type: "tool", tool: "finish", state: { status: "completed" } },
+    ])
     const last = assistant("04", "03", [text("")])
     expect(textResult(resultChunks([user("01"), old, nudge("03"), last], last))).toEqual({ ok: false })
   })
@@ -100,7 +112,9 @@ describe("prompt continuation boundaries", () => {
   test("a synthetic user message that is not the runner nudge is a boundary", () => {
     const last = assistant("04", "03", [text("b")])
     const old = assistant("02", "01", [text(envelope)])
-    expect(continuesPrompt([user("01"), old, synthetic("03", "Background task finished"), last], last, "01")).toBe(false)
+    expect(continuesPrompt([user("01"), old, synthetic("03", "Background task finished"), last], last, "01")).toBe(
+      false,
+    )
     expect(resultChunks([user("01"), old, synthetic("03", "Background task finished"), last], last)).toEqual(["b"])
   })
   test("a nudge after a completed finish does not continue the earlier prompt", () => {
@@ -152,16 +166,234 @@ describe("text result envelope", () => {
   })
 })
 
-
 test("rejects nested tags and an unfinished newer result instead of using stale text", () => {
-  expect(textResult(["<silvercode-result>outer<silvercode-result>inner</silvercode-result></silvercode-result>"])).toEqual({ ok: false })
+  expect(
+    textResult(["<silvercode-result>outer<silvercode-result>inner</silvercode-result></silvercode-result>"]),
+  ).toEqual({ ok: false })
   expect(textResult([renderTextResult("earlier"), "<silvercode-result>unfinished"])).toEqual({ ok: false })
 })
 
 test("a corrected later envelope recovers after an unfinished earlier assistant result", () => {
-  expect(textResult(["<silvercode-result>unfinished", renderTextResult("corrected")])).toEqual({ ok: true, text: "corrected" })
+  expect(textResult(["<silvercode-result>unfinished", renderTextResult("corrected")])).toEqual({
+    ok: true,
+    text: "corrected",
+  })
 })
 
 test("a corrected later envelope recovers after a stray closing tag", () => {
   expect(textResult(["</silvercode-result>", renderTextResult("corrected")])).toEqual({ ok: true, text: "corrected" })
+})
+
+describe("repetition recovery continuation", () => {
+  const recovery = (id: string, promptID: string, text = "The previous response was cut off by the repetition guard") =>
+    ({
+      info: { id, role: "user" },
+      parts: [{ type: "text", text, synthetic: true, metadata: { [REPETITION_RECOVERY]: { promptID, attempt: 1 } } }],
+    }) as unknown as SessionV1.WithParts
+
+  test("a recovery message continues the prompt it resumes", () => {
+    const aborted = assistant("02", "01", [text("partial output")])
+    const resumed = assistant("04", "03", [text(envelope)])
+    expect(continuesPrompt([user("01"), aborted, recovery("03", "01"), resumed], resumed, "01")).toBe(true)
+    expect(textResult(resultChunks([user("01"), aborted, recovery("03", "01"), resumed], resumed))).toEqual({
+      ok: true,
+      text: plan,
+    })
+  })
+  test("a recovery only continues its own prompt lineage", () => {
+    const resumed = assistant("04", "03", [text(envelope)])
+    expect(continuesPrompt([user("01"), user("02"), recovery("03", "01"), resumed], resumed, "02")).toBe(false)
+  })
+  test("another synthetic message is still a boundary", () => {
+    const resumed = assistant("03", "02", [text(envelope)])
+    expect(continuesPrompt([user("01"), synthetic("02", "shell marker"), resumed], resumed, "01")).toBe(false)
+  })
+  test("the lineage marker is readable only from a synthetic text part", () => {
+    expect(repetitionRecoveryPromptID(recovery("03", "01"))).toBe("01")
+    expect(repetitionRecoveryPromptID(synthetic("04", "opaque"))).toBeUndefined()
+    expect(repetitionRecoveryPromptID(user("05"))).toBeUndefined()
+    expect(
+      repetitionRecoveryPromptID({
+        info: { id: "06", role: "user" },
+        parts: [{ type: "text", text: "not synthetic", metadata: { [REPETITION_RECOVERY]: { promptID: "01" } } }],
+      } as unknown as SessionV1.WithParts),
+    ).toBeUndefined()
+  })
+})
+
+describe("declared continuation root lineage (#788)", () => {
+  const marked = (id: string, promptID: string, recovery = false) =>
+    ({
+      info: { id, role: "user" },
+      parts: [
+        {
+          type: "text",
+          text: recovery ? "The previous response was cut off by the repetition guard" : FINISH_NUDGE,
+          synthetic: true,
+          metadata: recovery
+            ? { [REPETITION_RECOVERY]: { promptID, attempt: 1 } }
+            : { finishContinuation: { promptID } },
+        },
+      ],
+    }) as unknown as SessionV1.WithParts
+  const finish = { type: "tool", tool: "finish", state: { status: "completed" } }
+
+  test("N2 and N3 declare the original root and retain the whole execution", () => {
+    const first = assistant("02", "01", [text(envelope)])
+    const second = assistant("04", "03", [text("second")])
+    const third = assistant("06", "05", [text("third")])
+    const last = assistant("08", "07", [text("last"), finish])
+    const history = [user("01"), first, marked("03", "01"), second, marked("05", "01"), third, marked("07", "01"), last]
+    expect(continuesPrompt(history, last, "01")).toBe(true)
+    expect(resultChunks(history, last)).toEqual([envelope, "second", "third", "last"])
+    expect(continuesPrompt(history, last, "03")).toBe(false)
+  })
+
+  test("mixed recovery and finish markers resolve transitively to their own root", () => {
+    const first = assistant("02", "01", [text(envelope)])
+    const recovered = assistant("04", "03", [text("recovered")])
+    const last = assistant("06", "05", [text("finished"), finish])
+    const history = [user("01"), first, marked("03", "01", true), recovered, marked("05", "01"), last]
+    expect(continuesPrompt(history, last, "01")).toBe(true)
+    expect(resultChunks(history, last)).toEqual([envelope, "recovered", "finished"])
+    const chained = [user("01"), first, marked("03", "01"), recovered, marked("05", "03", true), last]
+    expect(continuesPrompt(chained, last, "01")).toBe(true)
+    expect(resultChunks(chained, last)).toEqual([envelope, "recovered", "finished"])
+  })
+
+  test("clock rollback keeps each async prompt with its own complete execution", () => {
+    const p1 = user("50")
+    const a1 = assistant("51", "50", [text("P1 progress")])
+    const n1 = marked("11", "50")
+    const f1 = assistant("12", "11", [text("P1 done"), finish])
+    const p2 = user("60")
+    const a2 = assistant("61", "60", [text("P2 progress")])
+    const n2 = marked("21", "60")
+    const f2 = assistant("22", "21", [text("P2 done"), finish])
+    const history = [f2, p1, n2, a1, f1, n1, p2, a2]
+    expect(continuesPrompt(history, f1, "50")).toBe(true)
+    expect(continuesPrompt(history, f2, "60")).toBe(true)
+    expect(continuesPrompt(history, f2, "50")).toBe(false)
+    expect(resultChunks(history, f1)).toEqual(["P1 progress", "P1 done"])
+    expect(resultChunks(history, f2)).toEqual(["P2 progress", "P2 done"])
+  })
+
+  test("a declared root cannot jump a real boundary or authorize a stale parent", () => {
+    const stale = assistant("05", "01", [text("stale")])
+    const history = [user("01"), user("03"), marked("04", "01"), stale]
+    expect(continuesPrompt(history, stale, "01")).toBe(false)
+    const late = assistant("06", "04", [text("late")])
+    expect(continuesPrompt([...history, late], late, "01")).toBe(false)
+    expect(resultChunks([...history, late], late)).toEqual(["late"])
+  })
+
+  test("a stale direct assistant after a nudge is not moved before that nudge", () => {
+    const first = assistant("02", "01", [text(envelope)])
+    const nudged = assistant("04", "03", [text("nudged"), finish])
+    const stale = assistant("05", "01", [text("stale")])
+    const history = [user("01"), first, marked("03", "01"), nudged, stale]
+    expect(continuesPrompt(history, stale, "01")).toBe(false)
+    expect(resultChunks(history, stale)).toEqual(["stale"])
+  })
+
+  test("cycles fail closed without borrowing either caller", () => {
+    const answer = assistant("05", "03", [text(envelope)])
+    const history = [user("01"), marked("02", "03"), marked("03", "02"), answer]
+    expect(continuesPrompt(history, answer, "01")).toBe(false)
+    expect(continuesPrompt(history, answer, "02")).toBe(false)
+    expect(continuesPrompt(history, answer, "03")).toBe(false)
+    expect(resultChunks(history, answer)).toEqual([envelope])
+  })
+
+  test("finish metadata on arbitrary caller text is not a runner continuation", () => {
+    const spoof = marked("03", "01")
+    ;(spoof.parts[0] as { text: string }).text = "Caller-controlled text"
+    const answer = assistant("04", "03", [text(envelope)])
+    expect(finishContinuationPromptID(spoof)).toBeUndefined()
+    expect(continuesPrompt([user("01"), spoof, answer], answer, "01")).toBe(false)
+  })
+})
+
+
+describe("review repair: silent annotations and causal nudge order", () => {
+  const silent = (id: string) =>
+    ({ info: { id, role: "user", noReply: true }, parts: [text("silent background note")] }) as unknown as SessionV1.WithParts
+  const marked = (id: string, promptID: string, sequence: number, assistantIDs: string[]) =>
+    ({
+      info: { id, role: "user" },
+      parts: [
+        {
+          type: "text",
+          text: FINISH_NUDGE,
+          synthetic: true,
+          metadata: { finishContinuation: { promptID, sequence, assistantIDs } },
+        },
+      ],
+    }) as unknown as SessionV1.WithParts
+  const finish = { type: "tool", tool: "finish", state: { status: "completed" } }
+
+  test("a silent note between the prompt and its assistant does not split result ownership", () => {
+    const answer = assistant("03", "01", [text(envelope), finish])
+    const history = [user("01"), silent("02"), answer]
+    expect(continuesPrompt(history, answer, "01")).toBe(true)
+    expect(resultChunks(history, answer)).toEqual([envelope])
+  })
+
+  test("a silent note between an assistant and the next nudge preserves pre-nudge chunks", () => {
+    const first = assistant("02", "01", [text(envelope)])
+    const last = assistant("05", "04", [text("final"), finish])
+    const history = [user("01"), first, silent("03"), marked("04", "01", 1, ["02"]), last]
+    expect(continuesPrompt(history, last, "01")).toBe(true)
+    expect(resultChunks(history, last)).toEqual([envelope, "final"])
+  })
+
+  test("a silent note between a nudge and its answer preserves the whole execution", () => {
+    const first = assistant("02", "01", [text(envelope)])
+    const last = assistant("05", "03", [text("final"), finish])
+    const history = [user("01"), first, marked("03", "01", 1, ["02"]), silent("04"), last]
+    expect(continuesPrompt(history, last, "01")).toBe(true)
+    expect(resultChunks(history, last)).toEqual([envelope, "final"])
+  })
+
+  test("a real caller boundary still defeats a silent-looking stale parent", () => {
+    const answer = assistant("04", "01", [text(envelope)])
+    const history = [user("01"), silent("02"), user("03"), answer]
+    expect(continuesPrompt(history, answer, "01")).toBe(false)
+    expect(resultChunks(history, answer)).toEqual([envelope])
+  })
+
+  test("multi-nudge clock rollback follows causal sequence, not smaller nudge IDs", () => {
+    const p1 = user("50")
+    const a1 = assistant("51", "50", [text("first")])
+    const n1 = marked("30", "50", 1, ["51"])
+    const a2 = assistant("31", "30", [text("second")])
+    const n2 = marked("20", "50", 2, ["51", "31"])
+    const a3 = assistant("21", "20", [text("third"), finish])
+    const history = [a3, n2, p1, a2, n1, a1]
+    expect(executionOrder(history).map((message) => String(message.info.id))).toEqual(["50", "51", "30", "31", "20", "21"])
+    expect(continuesPrompt(history, a3, "50")).toBe(true)
+    expect(resultChunks(history, a3)).toEqual(["first", "second", "third"])
+  })
+
+  test("childless rollback keeps the root before its nudge and answer", () => {
+    const p1 = user("50")
+    const n1 = marked("10", "50", 1, [])
+    const a2 = assistant("11", "10", [text("answer"), finish])
+    const history = [a2, n1, p1]
+    expect(executionOrder(history).map((message) => String(message.info.id))).toEqual(["50", "10", "11"])
+    expect(continuesPrompt(history, a2, "50")).toBe(true)
+    expect(resultChunks(history, a2)).toEqual(["answer"])
+  })
+
+  test("a direct rolled-back assistant is retained by the later causal nudge", () => {
+    const p1 = user("50")
+    const a1 = assistant("51", "50", [text("direct")])
+    const n1 = marked("10", "50", 1, ["51"])
+    const a2 = assistant("11", "10", [text("nudged")])
+    const n2 = marked("20", "50", 2, ["51", "11"])
+    const a3 = assistant("21", "20", [text("final"), finish])
+    const history = [n2, a3, p1, n1, a1, a2]
+    expect(executionOrder(history).map((message) => String(message.info.id))).toEqual(["50", "51", "10", "11", "20", "21"])
+    expect(resultChunks(history, a3)).toEqual(["direct", "nudged", "final"])
+  })
 })

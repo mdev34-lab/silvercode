@@ -12,6 +12,7 @@ import fs from "node:fs/promises"
 import path from "node:path"
 import { LLM } from "../../src/session/llm"
 import { SessionCompaction } from "../../src/session/compaction"
+import { compactionContinuationPromptID } from "../../src/session/subagent-result"
 import { Token } from "@/util/token"
 import { Plugin } from "../../src/plugin"
 import { provideTmpdirInstance, TestInstance } from "../fixture/fixture"
@@ -1175,6 +1176,7 @@ describe("session.compaction.process", () => {
       expect(
         last?.parts.some((part) => part.type === "text" && part.text.includes("Attached image/png: cat.png")),
       ).toBe(true)
+      expect(last ? compactionContinuationPromptID(last) : undefined).toBe(replay.id)
     }),
   )
 
