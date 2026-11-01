@@ -1,3 +1,4 @@
+import { scriptWorkStages, stageMatch } from "../fixture/work-flow"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { expect } from "bun:test"
@@ -199,23 +200,27 @@ const cfg = {
   },
 }
 
-const useServerConfig = Effect.gen(function* () {
-  const { directory: dir } = yield* TestInstance
-  const llm = yield* TestLLMServer
-  const fs = yield* FSUtil.Service
-  yield* fs.writeWithDirs(
-    path.join(dir, "opencode.json"),
-    JSON.stringify({
-      $schema: "https://opencode.ai/config.json",
-      ...cfg,
-      provider: {
-        ...cfg.provider,
-        test: { ...cfg.provider.test, options: { ...cfg.provider.test.options, baseURL: llm.url } },
-      },
-    }),
-  )
-  return { dir, llm }
-})
+const serverConfig = (agents: Record<string, object> = {}) =>
+  Effect.gen(function* () {
+    const { directory: dir } = yield* TestInstance
+    const llm = yield* TestLLMServer
+    const fs = yield* FSUtil.Service
+    yield* fs.writeWithDirs(
+      path.join(dir, "opencode.json"),
+      JSON.stringify({
+        $schema: "https://opencode.ai/config.json",
+        ...cfg,
+        agent: { ...cfg.agent, ...agents },
+        provider: {
+          ...cfg.provider,
+          test: { ...cfg.provider.test, options: { ...cfg.provider.test.options, baseURL: llm.url } },
+        },
+      }),
+    )
+    return { dir, llm }
+  })
+
+const useServerConfig = serverConfig()
 
 const user = Effect.fn("test.user")(function* (sessionID: SessionID, text: string, agent = "work") {
   const session = yield* Session.Service
@@ -235,6 +240,45 @@ const user = Effect.fn("test.user")(function* (sessionID: SessionID, text: strin
     text,
   })
   return msg
+})
+
+// The Review Loop policy and effort block are a nudge that appears once the
+// session has written files (the finish gate enforces the requirement either
+// way). Seed an earlier turn whose completed edit declared a file write.
+const seedPriorWrite = Effect.fn("test.seedPriorWrite")(function* (sessionID: SessionID) {
+  const session = yield* Session.Service
+  const earlier = yield* user(sessionID, "earlier request")
+  const assistant: SessionV1.Assistant = {
+    id: MessageID.ascending(),
+    role: "assistant",
+    parentID: earlier.id,
+    sessionID,
+    mode: "work",
+    agent: "work",
+    cost: 0,
+    path: { cwd: "/tmp", root: "/tmp" },
+    tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+    modelID: ref.modelID,
+    providerID: ref.providerID,
+    time: { created: Date.now() },
+  }
+  yield* session.updateMessage(assistant)
+  yield* session.updatePart({
+    id: PartID.ascending(),
+    messageID: assistant.id,
+    sessionID,
+    type: "tool",
+    callID: "call-seed-edit",
+    tool: "edit",
+    state: {
+      status: "completed",
+      input: {},
+      output: "ok",
+      title: "edit",
+      metadata: { reviewLoop: { writesFiles: true } },
+      time: { start: Date.now(), end: Date.now() },
+    },
+  } as SessionV1.ToolPart)
 })
 
 const bodyString = (hit: { body: unknown }) => JSON.stringify(hit.body)
@@ -257,7 +301,7 @@ const reviewerMatch = (hit: { body: unknown }) => bodyString(hit).includes("## V
 // reach these matchers.
 const policyMatch = (hit: { body: unknown }) => {
   const body = bodyString(hit)
-  return body.includes("## Review Loop") && !reviewerMatch(hit)
+  return body.includes("## Review Loop") && !reviewerMatch(hit) && !stageMatch(hit)
 }
 
 const noPolicyMatch = (hit: { body: unknown }) => {
@@ -339,9 +383,9 @@ const scriptPolicyFollowingModel = Effect.gen(function* () {
   // required envelope through the real finish call, so the review can complete.
   yield* llm.pushMatch(reviewerMatch, reply().tool("finish", { reason: "success", result: REPORT }))
   // Policy present, verdict received: consume it and fix the finding.
-  yield* llm.pushMatch(policyMatch, reply().text("Fixed the off-by-one in src/cache.ts."))
+  yield* llm.pushMatch(policyMatch, reply().text("Fixed the off-by-one in src/cache.ts.").stop())
   // Policy absent (control arm): self-review, the old behavior.
-  yield* llm.pushMatch(noPolicyMatch, reply().text("I re-read the diff and the tests pass — the fix looks correct."))
+  yield* llm.pushMatch(noPolicyMatch, reply().text("I re-read the diff and the tests pass — the fix looks correct.").stop())
 })
 
 type CompletedToolPart = SessionV1.ToolPart & { state: SessionV1.ToolStateCompleted }
@@ -363,6 +407,7 @@ it.instance(
         permission: [{ permission: "*", pattern: "*", action: "allow" }],
       })
       yield* llm.hang
+      yield* seedPriorWrite(chat.id)
       yield* user(chat.id, "fix the off-by-one in the cache key")
       const fiber = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
       yield* awaitWithTimeout(llm.wait(1), "timed out waiting for the model request", "10 seconds")
@@ -378,10 +423,10 @@ it.instance(
       expect(body).toContain("the required next step is review, not completion")
       expect(body).toContain("explicitly asks for a code review")
 
-      // Review is a requirement (#231): a declined finish is not a waiver, and
-      // the policy no longer offers a second finish as a way to skip it.
+      // Review is expected before finishing file-writing work; without one the result is delivered
+      // labelled UNREVIEWED, never approved.
       expect(body).toContain("Review is required before finishing file-writing work.")
-      expect(body).toContain("A declined `finish` is not a waiver")
+      expect(body).toContain("`finish` delivers it labelled UNREVIEWED")
       expect(body).not.toContain("explicitly skip review")
 
       // The carve-out: trivial turns with no file changes must not be reviewed.
@@ -405,6 +450,98 @@ it.instance(
       yield* Fiber.await(fiber)
     }),
   15_000,
+)
+
+// Activation: a fresh session does not carry the Review Loop policy; the
+// request right after the first file write does (and keeps the effort block).
+it.instance(
+  "review policy appears on the request after the session's first file write",
+  () =>
+    Effect.gen(function* () {
+      const { llm, dir } = yield* useServerConfig
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({
+        title: "Pinned",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      yield* llm.tool("write", { filePath: `${dir}/first-write.txt`, content: "hello" })
+      yield* llm.hang
+      yield* user(chat.id, "Write a report in first-write.txt")
+      const fiber = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+      yield* awaitWithTimeout(llm.wait(2), "timed out waiting for the post-write request", "10 seconds")
+
+      const hits = (yield* llm.hits).filter((hit) => !reviewerMatch(hit) && bodyString(hit).includes("You are opencode"))
+      expect(hits.length).toBeGreaterThanOrEqual(2)
+      expect(bodyString(hits[0])).not.toContain("## Review Loop")
+      expect(bodyString(hits[0])).not.toContain("## Agent effort")
+      expect(bodyString(hits[1])).toContain("## Review Loop")
+      expect(bodyString(hits[1])).toContain("## Agent effort")
+
+      yield* prompt.cancel(chat.id)
+      yield* Fiber.await(fiber)
+    }),
+  20_000,
+)
+
+// Compaction can remove the write markers from the visible history; a
+// compacted session keeps the policy on.
+it.instance(
+  "review policy stays on for a compacted session",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({
+        title: "Pinned",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      const session = yield* Session.Service
+      const compactionUser = yield* user(chat.id, "compact")
+      yield* session.updatePart({
+        id: PartID.ascending(),
+        messageID: compactionUser.id,
+        sessionID: chat.id,
+        type: "compaction",
+        auto: false,
+      } as SessionV1.CompactionPart)
+      const summary: SessionV1.Assistant = {
+        id: MessageID.ascending(),
+        role: "assistant",
+        parentID: compactionUser.id,
+        sessionID: chat.id,
+        mode: "compaction",
+        agent: "compaction",
+        summary: true,
+        finish: "stop",
+        cost: 0,
+        path: { cwd: "/tmp", root: "/tmp" },
+        tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+        modelID: ref.modelID,
+        providerID: ref.providerID,
+        time: { created: Date.now() },
+      }
+      yield* session.updateMessage(summary)
+      yield* session.updatePart({
+        id: PartID.ascending(),
+        messageID: summary.id,
+        sessionID: chat.id,
+        type: "text",
+        text: "Summary of earlier work.",
+      })
+      yield* llm.hang
+      yield* user(chat.id, "continue")
+      const fiber = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+      yield* awaitWithTimeout(llm.wait(1), "timed out waiting for the model request", "10 seconds")
+
+      const hit = (yield* llm.hits).find((h) => !reviewerMatch(h) && bodyString(h).includes("You are opencode"))
+      expect(bodyString(hit ?? { body: {} })).toContain("## Review Loop")
+
+      yield* prompt.cancel(chat.id)
+      yield* Fiber.await(fiber)
+    }),
+  20_000,
 )
 
 // Provider prompts must route explicit review requests to the review subagent
@@ -440,9 +577,12 @@ it.instance(
         title: "Pinned",
         permission: [{ permission: "*", pattern: "*", action: "allow" }],
       })
+      yield* serverConfig({plan:{finishTool:true},think:{finishTool:true},code:{finishTool:true}})
+      yield* scriptWorkStages(policyMatch)
       yield* scriptPolicyFollowingModel
 
-      yield* user(chat.id, "fix the off-by-one in the cache key and add a test")
+      yield* seedPriorWrite(chat.id)
+      yield* user(chat.id, "Fix the software bug in the cache key and add a test")
       const result = yield* prompt.loop({ sessionID: chat.id })
       expect(result.info.role).toBe("assistant")
 
@@ -452,10 +592,10 @@ it.instance(
       expect(reviewHits).toHaveLength(2)
 
       // The reviewer ran with its own prompt — and no review loop of its own,
-      // so reviews cannot recurse. The default primary is Work, so `review`
-      // resolved to the Work reviewer rather than the generic one.
+      // so reviews cannot recurse. After the consolidation every parent
+      // resolves `review` to the same single reviewer.
       const reviewBody = bodyString(reviewHits[0])
-      expect(reviewBody).toContain("Senior Work Reviewer")
+      expect(reviewBody).toContain("Senior Reviewer")
       expect(reviewBody).not.toContain("## Review Loop")
       expect(reviewBody).toContain("uncommitted working tree")
 
@@ -476,7 +616,7 @@ it.instance(
       const msgs = yield* MessageV2.filterCompactedEffect(chat.id)
       const taskPart = msgs
         .flatMap((msg) => msg.parts)
-        .find((part): part is SessionV1.ToolPart => part.type === "tool" && part.tool === "task")
+        .find((part): part is SessionV1.ToolPart => part.type === "tool" && part.tool === "task" && part.state.input.subagent_type === "review")
       expect(taskPart?.state.status).toBe("completed")
       const completed = taskPart as CompletedToolPart
       expect(completed.state.metadata?.background).not.toBe(true)
@@ -484,7 +624,7 @@ it.instance(
       const childID = completed.state.metadata?.sessionId
       expect(typeof childID).toBe("string")
       const child = yield* sessions.get(SessionID.make(childID as string))
-      expect(child.agent).toBe("work-review")
+      expect(child.agent).toBe("review")
       expect(child.parentID).toBe(chat.id)
 
       // The real Review runner must record the rejected first finish and then
@@ -504,8 +644,8 @@ it.instance(
 
       // The findings were consumed: the parent's follow-up request contains
       // the report and the instructions to act on it.
-      expect(policyHits).toHaveLength(2)
-      const followUp = bodyString(policyHits[1])
+      expect(policyHits).toHaveLength(4)
+      const followUp = bodyString(policyHits[3])
       expect(followUp).toContain("Needs fixes")
       expect(followUp).toContain("src/cache.ts:42")
       expect(followUp).toContain("instruction to act, not an acknowledgment")
@@ -581,12 +721,14 @@ it.instance(
       expect(result.info.role).toBe("assistant")
 
       const hits = yield* llm.hits
-      const parentHits = hits.filter(policyMatch)
+      const parentHits = hits.filter(noPolicyMatch)
       expect(parentHits).toHaveLength(1)
 
-      // The carve-out instruction reached the model on this trivial turn.
+      // Before any file write the Review Loop policy is not sent (no tokens
+      // spent on it); the todo scope contract still is.
       const body = bodyString(parentHits[0] ?? { body: {} })
-      expect(body).toContain("does not apply to turns with no file changes")
+      expect(body).toContain("## Todo as scope contract")
+      expect(body).not.toContain("## Review Loop")
 
       // Nothing dispatched a reviewer and no review nudge was injected: the
       // only parts are the user's greeting and the assistant's reply.
@@ -602,3 +744,80 @@ it.instance(
     }),
   15_000,
 )
+
+// No reviewer opt-in in these configs. Exercise the real model/tool pipeline,
+// routing, report delivery, and approval.
+for (const [parent, reviewer] of [
+  ["work", "review"],
+  ["code", "review"],
+  ["custom", "review"],
+]) {
+  for (const effort of ["medium", "thorough"] as const) {
+    it.instance(
+      `default ${reviewer} delivers review before ${parent} finishes (${effort})`,
+      () =>
+        Effect.gen(function* () {
+          const { dir, llm } = yield* serverConfig({ [parent]: { finishTool: true }, ...(parent === "work" ? {plan:{finishTool:true},think:{finishTool:true},code:{finishTool:true}} : {}) })
+          const sessions = yield* Session.Service
+          const prompt = yield* SessionPrompt.Service
+          const chat = yield* sessions.create({
+            title: "Pinned",
+            agent: parent,
+            metadata: { agentEffort: effort },
+            permission: [{ permission: "*", pattern: "*", action: "allow" }],
+          })
+          const parentMatch = (hit: { body: unknown }) => !reviewerMatch(hit) && (parent !== "work" || !stageMatch(hit))
+          if (parent === "work") yield* scriptWorkStages(parentMatch,{filePath:path.join(dir,"result.txt"),content:"verified work"})
+          else yield* llm.pushMatch(
+            parentMatch,
+            reply().tool("write", { filePath: path.join(dir, "result.txt"), content: "verified work" }),
+          )
+          yield* llm.pushMatch(
+            parentMatch,
+            reply().tool("task", { description: "Review file", subagent_type: "review", prompt: "Review result.txt" }),
+          )
+          const report = `<silvercode-review>\n${JSON.stringify({ ...REVIEW_REPORT, assessment: "approved", summary: "No findings.", findings: [] })}\n</silvercode-review>`
+          yield* llm.pushMatch(reviewerMatch, reply().tool("finish", { reason: "success", result: report }))
+          yield* llm.pushMatch(parentMatch, reply().tool("finish", { reason: "success", result: "reviewed work" }))
+          yield* user(chat.id, parent === "work" ? "Implement software and write result.txt, then review it" : "write result.txt and review it", parent)
+          yield* prompt.loop({ sessionID: chat.id })
+          const history = yield* sessions.messages({ sessionID: chat.id })
+          if(process.env.WORK_FLOW_CAPTURE && parent === "work") {
+            const children=yield* sessions.children(chat.id)
+            const childMessages:Record<string,unknown>={}
+            for(const child of children) childMessages[child.id]=yield* sessions.messages({sessionID:child.id})
+            yield* Effect.promise(()=>Bun.write(`/tmp/wf-runtime-success-${effort}.json`,JSON.stringify({session:chat,messages:history,children,childMessages})))
+          }
+          const tools = history
+            .flatMap((message) => message.parts)
+            .filter((part): part is SessionV1.ToolPart => part.type === "tool")
+          if(parent === "work") {
+            const implementation=tools.find(part=>part.tool === "task" && part.state.input.subagent_type === "code")
+            expect(implementation?.state.status).toBe("completed")
+            if(implementation?.state.status === "completed") {
+              const childHistory=yield* sessions.messages({sessionID:SessionID.make(implementation.state.metadata.sessionId)})
+              expect(childHistory.flatMap(message=>message.parts).find((part):part is SessionV1.ToolPart=>part.type === "tool" && part.tool === "write")?.state.status).toBe("completed")
+            }
+          } else expect(tools.find((part) => part.tool === "write")?.state.status).toBe("completed")
+          const finishes = tools.filter((part) => part.tool === "finish")
+          expect(finishes.map((part) => part.state.status)).toEqual(["completed"])
+          const task = tools.find((part) => part.tool === "task" && part.state.input.subagent_type === "review")
+          expect(task?.state.status).toBe("completed")
+          if (task?.state.status !== "completed") return
+          expect(task.state.metadata.background).toBe(false)
+          const child = yield* sessions.get(SessionID.make(task.state.metadata.sessionId))
+          expect(child.agent).toBe(reviewer)
+          expect(task.state.metadata.review.report.assessment).toBe("approved")
+          const last = finishes.at(-1)
+          if (last?.state.status !== "completed") return
+          expect(last.state.metadata.review).toMatchObject({
+            effort,
+            disposition: "reviewed",
+            termination: "approved",
+            reviews: 1,
+          })
+        }),
+      20_000,
+    )
+  }
+}

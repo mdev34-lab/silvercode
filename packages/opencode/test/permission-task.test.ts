@@ -1,12 +1,37 @@
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
-import { describe, test, expect } from "bun:test"
-import { Effect } from "effect"
+import { Npm } from "@opencode-ai/core/npm"
+import { describe, test, expect, beforeEach, afterEach } from "bun:test"
+import { Effect, Layer } from "effect"
 import { Permission } from "../src/permission"
 import { Config } from "@/config/config"
 import { testEffect } from "./lib/effect"
 
-const it = testEffect(LayerNode.compile(Config.node))
+// Each instance config load forks the background dependency preseed into the process-wide
+// global config dir (see permission/next.test.ts). These fixtures configure no plugins, so the
+// flag keeps them out of it, and the stub records any attempt for the guard test below.
+const depInstalls: string[] = []
+const stubNpm = Layer.succeed(
+  Npm.Service,
+  Npm.Service.of({
+    add: () => Effect.die(new Error("permission task fixtures must not install packages")),
+    install: (dir) => Effect.sync(() => void depInstalls.push(dir)),
+    which: () => Effect.die(new Error("permission task fixtures must not install packages")),
+  }),
+)
+
+const it = testEffect(LayerNode.compile(Config.node, [[Npm.node, stubNpm]]))
+
+let priorDepInstallFlag: string | undefined
+beforeEach(() => {
+  priorDepInstallFlag = process.env.OPENCODE_DISABLE_CONFIG_DEP_INSTALL
+  process.env.OPENCODE_DISABLE_CONFIG_DEP_INSTALL = "1"
+  depInstalls.length = 0
+})
+afterEach(() => {
+  if (priorDepInstallFlag === undefined) delete process.env.OPENCODE_DISABLE_CONFIG_DEP_INSTALL
+  else process.env.OPENCODE_DISABLE_CONFIG_DEP_INSTALL = priorDepInstallFlag
+})
 
 const load = Config.use.get()
 
@@ -317,3 +342,18 @@ describe("permission.task with real config files", () => {
     },
   )
 })
+
+// Guards the isolation above. Reading the fixture's permission config proves this instance's
+// config load ran, so the empty-install check is not passing on a path that never loaded config.
+// Without the flag, the stubbed Npm.install records the attempt and this test fails.
+it.instance(
+  "config load never forks a background dependency install",
+  () =>
+    Effect.gen(function* () {
+      const config = yield* load
+      expect(config.permission?.task).toEqual({ "*": "allow" })
+      yield* Effect.sleep("100 millis")
+      expect(depInstalls).toEqual([])
+    }),
+  { git: true, config: { permission: { task: { "*": "allow" } } } },
+)

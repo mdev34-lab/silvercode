@@ -28,14 +28,30 @@ function syntheticNudge() {
   } as unknown as SessionV1.WithParts
 }
 
+/**
+ * A persisted `task(review)` part.
+ *
+ * The two axes have to be settable separately, because since synchronous
+ * execution became a per-agent opt-in they can disagree: `background` is what the
+ * caller asked for, and `delivery` is what the tool recorded as the mode it ran in
+ * (`false` foreground, `true` background). Leaving `delivery` out builds the older
+ * transcript shape, which carries no recorded mode and is judged on the request
+ * alone - so a fixture that only ever sets `background` cannot express a request
+ * that was overridden, nor a foreground review nobody asked to wait for.
+ */
 function reviewMessage(
   output: string,
   options?: {
     status?: "completed" | "running"
-    background?: boolean
+    background?: boolean | "omitted"
+    delivery?: boolean
     metadata?: Record<string, unknown>
   },
 ) {
+  const input =
+    options?.background === "omitted"
+      ? { subagent_type: "review" }
+      : { subagent_type: "review", background: options?.background ?? false }
   return {
     info: { role: "assistant" },
     parts: [
@@ -44,9 +60,12 @@ function reviewMessage(
         tool: "task",
         state: {
           status: options?.status ?? "completed",
-          input: { subagent_type: "review", background: options?.background ?? false },
+          input,
           output,
-          ...(options?.metadata ? { metadata: options.metadata } : {}),
+          metadata: {
+            ...(options?.delivery === undefined ? {} : { background: options.delivery }),
+            ...options?.metadata,
+          },
         },
       },
     ],
@@ -117,7 +136,7 @@ describe("review loop prompt contract", () => {
 
     expect(prompt).toContain("## Todo as scope contract")
     expect(prompt).toContain(
-      "At the start of ANY task — review, audit, question, debugging session, not just implementation — write the task's scope as todo items BEFORE your first tool call.",
+      "At the start of any task, write its scope as todo items before your first tool call.",
     )
     expect(prompt).toContain("The todo list IS the task's scope.")
     expect(prompt).toContain("Doing out-of-scope work silently and then reverting it is forbidden.")
@@ -149,7 +168,7 @@ describe("review loop prompt contract", () => {
     const prompt = await readPrompt("review-loop.txt")
 
     expect(prompt).toContain("`finish` is the only enforcement checkpoint")
-    expect(prompt).toContain("Repeated `finish` calls never waive a required review")
+    expect(prompt).toContain("A missing or stale review is never reported as approved")
     expect(prompt).not.toContain("Review is guidance, not an enforcement gate")
     expect(prompt).not.toContain("explicitly skip review")
     expect(prompt).not.toContain("Mandatory Review Loop")
@@ -161,7 +180,7 @@ describe("review loop prompt contract", () => {
     expect(nudge).toContain("explicit Approved review from the Review subagent")
     expect(nudge).toContain('`subagent_type: "review"` and `background: false`')
     expect(nudge).toContain("latest review returned `Needs fixes`")
-    expect(nudge).toContain("repeating `finish` does not skip it")
+    expect(nudge).toContain("labelled UNREVIEWED and is never approval")
     expect(nudge).not.toContain("review-cap")
   })
 
@@ -169,7 +188,7 @@ describe("review loop prompt contract", () => {
     const prompt = (await readPrompt("review-loop.txt")).replace(/\s+/g, " ")
 
     expect(prompt).toContain("Review is required before finishing file-writing work.")
-    expect(prompt).toContain("A declined `finish` is not a waiver: retrying it is declined again")
+    expect(prompt).toContain("`finish` delivers it labelled UNREVIEWED")
     // #233 replaced the runtime waiver with three outcomes, none of which is a
     // skip: the attempt cap, a child's unreviewed handoff, and a blocked
     // dispatch that only an honest failure may report.
@@ -188,7 +207,7 @@ describe("review loop prompt contract", () => {
     expect(nudge).toContain("explicit Approved review from the Review subagent")
     expect(nudge).toContain('`subagent_type: "review"` and `background: false`')
     expect(nudge).toContain("latest review returned `Needs fixes`")
-    expect(nudge).toContain("calling `finish` again without running the Review subagent is declined again")
+    expect(nudge).toContain("a Review that returned blocking findings holds `finish` back")
     expect(nudge).toContain("budget-exhausted")
     expect(nudge).not.toMatch(/explicitly skip review|strongly recommended/)
   })
@@ -196,9 +215,9 @@ describe("review loop prompt contract", () => {
   test("the finish tool description states the requirement and offers no skip path", async () => {
     const description = (await readTool("finish.txt")).replace(/\s+/g, " ")
 
-    expect(description).toContain("finish requires an explicit Approved review of that work from the Review subagent")
+    expect(description).toContain("an explicit Approved review of that work from the Review subagent is expected before finish")
     expect(description).toContain('`subagent_type: "review"` and `background: false`')
-    expect(description).toContain("Retrying finish does not skip review")
+    expect(description).toContain("labelled UNREVIEWED and never approved")
     expect(description).toContain("`budget-exhausted`")
     // #233: the waiver is gone from the tool description too. A dispatch that
     // cannot run blocks success and only an honest failure may report it.
@@ -454,6 +473,11 @@ describe("runtime review gate", () => {
   test("requires an explicit synchronous review", () => {
     const background = reviewMessage("### Assessment\n\n**Ready to proceed?** Approved", { background: true })
     const synchronous = reviewMessage("### Assessment\n\n**Ready to proceed?** Approved")
+    // The third arm is the one the first two cannot express: the input still says
+    // "wait", and the outcome says otherwise. Synchronous execution is a per-agent
+    // opt-in, so a `background: false` request that the agent did not opt into
+    // comes back as a launch, and the gate has to judge the effective mode.
+    const launched = reviewMessage("### Assessment\n\n**Ready to proceed?** Approved", { delivery: true })
 
     expect(reviewLoopState([userMessage(), toolMessage("edit", { writesFiles: true }), background]).verdict).toBe(
       "pending",
@@ -461,6 +485,152 @@ describe("runtime review gate", () => {
     expect(reviewLoopState([userMessage(), toolMessage("edit", { writesFiles: true }), synchronous]).verdict).toBe(
       "approved",
     )
+    expect(reviewLoopState([userMessage(), toolMessage("edit", { writesFiles: true }), launched]).verdict).toBe(
+      "pending",
+    )
+  })
+
+  // A review that ran detached from the parent - launched in the background by the
+  // agent's configuration, or promoted out of a wait that started in the foreground
+  // - persists as a *completed* tool part carrying a running envelope. Nothing was
+  // delivered, so it must neither count toward the review cap nor clear the
+  // unreviewed-work gate, and it must not mint a verdict.
+  const LAUNCH_ENVELOPE = [
+    '<task id="ses_review" state="running">',
+    "<summary>Background task started: review cache fix</summary>",
+    "</task>",
+  ].join("\n")
+
+  const launch = (output = LAUNCH_ENVELOPE, metadata: Record<string, unknown> = {}) =>
+    reviewMessage(output, { delivery: true, metadata: { jobId: "ses_review", ...metadata } })
+
+  test("a review launched instead of awaited is not a delivered review", () => {
+    const state = reviewLoopState([userMessage(), toolMessage("edit", { writesFiles: true }), launch()])
+
+    expect(state.reviews).toBe(0)
+    expect(state.workSinceReview).toBe(true)
+    expect(state.phase).toBe("work")
+    expect(state.verdict).toBe("pending")
+    expect(finishGateError(state)).toBeInstanceOf(Error)
+  })
+
+  test("launches do not walk the turn to the review cap", () => {
+    // The cap disarms the gate, so counting launches would let a model finish
+    // unreviewed work by asking for a verdict three times and never waiting for
+    // one - the failure the cancelled-review rule already refuses.
+    const state = reviewLoopState(
+      [userMessage(), toolMessage("edit", { writesFiles: true }), launch(), launch(), launch()],
+      2,
+    )
+
+    expect(state.reviews).toBe(0)
+    expect(state.verdict).toBe("pending")
+    expect(finishGateError(state)).toBeInstanceOf(Error)
+  })
+
+  test("a launch mints no verdict from its own envelope text", () => {
+    const state = reviewLoopState([
+      userMessage(),
+      toolMessage("edit", { writesFiles: true }),
+      launch(`${LAUNCH_ENVELOPE}\n\n### Assessment\n\n**Ready to proceed?** Approved`),
+    ])
+
+    expect(state.reviews).toBe(0)
+    expect(state.verdict).toBe("pending")
+    expect(state.workSinceReview).toBe(true)
+  })
+
+  test("a report on a detached part does not satisfy the gate without a foreground delivery", () => {
+    // The verdict of a launched review reaches the parent as a later notification,
+    // not as this part's result; the gate stays a foreground contract.
+    const state = reviewLoopState([
+      userMessage(),
+      toolMessage("edit", { writesFiles: true }),
+      launch(LAUNCH_ENVELOPE, {
+        review: { report: { version: 1, assessment: "approved", summary: "Clean.", findings: [] } },
+      }),
+    ])
+
+    expect(state.reviews).toBe(0)
+    expect(state.verdict).toBe("pending")
+    expect(finishGateError(state)).toBeInstanceOf(Error)
+  })
+
+  // A completed part carrying a real report, i.e. the delivery a foreground review
+  // produces; only the two mode axes vary between the arms below.
+  const WITH_REPORT = {
+    metadata: {
+      sessionId: "ses_review",
+      review: { report: { version: 1, assessment: "approved", summary: "Clean.", findings: [] } },
+    },
+  }
+
+  // The recorded mode is the authority, which has to hold in both directions. An
+  // omitted argument on an opted-in agent is the shape the opt-in exists to
+  // produce: the model dispatches `review`, says nothing about waiting, and the
+  // configured reviewer hands the verdict back in this turn. Losing that would
+  // leave a real, configured, foreground review uncounted - an armed gate over
+  // work that was in fact reviewed.
+  test("counts a configured foreground review whose caller omitted the argument", () => {
+    const state = reviewLoopState([
+      userMessage(),
+      toolMessage("edit", { writesFiles: true }),
+      reviewMessage("### Assessment\n\n**Ready to proceed?** Approved", {
+        background: "omitted",
+        delivery: false,
+        ...WITH_REPORT,
+      }),
+    ])
+
+    expect(state.reviews).toBe(1)
+    expect(state.verdict).toBe("approved")
+    expect(state.workSinceReview).toBe(false)
+    expect(finishGateError(state)).toBeUndefined()
+  })
+
+  test("an omitted request that ran in the background is not a delivered review", () => {
+    const state = reviewLoopState([
+      userMessage(),
+      toolMessage("edit", { writesFiles: true }),
+      reviewMessage(LAUNCH_ENVELOPE, { background: "omitted", delivery: true }),
+    ])
+
+    expect(state.reviews).toBe(0)
+    expect(state.workSinceReview).toBe(true)
+    expect(state.verdict).toBe("pending")
+    expect(finishGateError(state)).toBeInstanceOf(Error)
+  })
+
+  test("the same report delivered in the foreground still counts", () => {
+    const state = reviewLoopState([
+      userMessage(),
+      toolMessage("edit", { writesFiles: true }),
+      reviewMessage(LAUNCH_ENVELOPE.replace('state="running"', 'state="completed"'), {
+        delivery: false,
+        ...WITH_REPORT,
+      }),
+    ])
+
+    expect(state.reviews).toBe(1)
+    expect(state.verdict).toBe("approved")
+    expect(state.workSinceReview).toBe(false)
+    expect(finishGateError(state)).toBeUndefined()
+  })
+
+  // A transcript from before the mode was recorded carries only the request, and
+  // back then the request was the outcome: this is why the fallback is safe
+  // rather than merely tolerant.
+  test("a transcript with no recorded mode is judged on its request", () => {
+    const asked = reviewMessage("### Assessment\n\n**Ready to proceed?** Approved", WITH_REPORT)
+    const silent = reviewMessage("### Assessment\n\n**Ready to proceed?** Approved", {
+      background: "omitted",
+      ...WITH_REPORT,
+    })
+
+    expect(reviewLoopState([userMessage(), toolMessage("edit", { writesFiles: true }), asked]).reviews).toBe(1)
+    expect(reviewLoopState([userMessage(), toolMessage("edit", { writesFiles: true }), asked]).verdict).toBe("approved")
+    expect(reviewLoopState([userMessage(), toolMessage("edit", { writesFiles: true }), silent]).reviews).toBe(0)
+    expect(reviewLoopState([userMessage(), toolMessage("edit", { writesFiles: true }), silent]).verdict).toBe("pending")
   })
 
   test("does not treat a synthetic continuation nudge as a new turn", () => {

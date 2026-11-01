@@ -64,6 +64,28 @@ another. A task dispatched by a parent that does not own the child (for
 example, a `task_id` from another parent) neither reads nor writes that child's
 selection, and no effort is published for it in the task metadata.
 
+## TUI default for new sessions
+
+The TUI's home screen owns one extra piece of state: the default a newly created
+session starts from. Selecting a level on home (the selector behind `/effort`)
+persists it to `effort.json` in the app state directory as
+`{"agentEffort": "<level>"}`, and a new session is created with that level in its
+`metadata.agentEffort`. Nothing else changes: enforcement still reads the
+session, so the persisted default becomes the new session's own selection rather
+than a second policy layer.
+
+- Effective default: the persisted `effort.json` value, then `agent.effort`,
+  then `medium`.
+- A selection made on home is stored on the file only — it never overwrites the
+  selection of an existing session, and a selection made inside a session is
+  stored on that session only.
+- A failed write is reported (a warning toast) and the displayed default rolls
+  back to the last value that really landed, so the label never claims a level
+  that was not persisted.
+- The selector marks the level that is in effect and labels its scope
+  ("Default for new sessions" on home, "Stored on this session" inside a
+  session). Level names are always rendered as text next to their hue.
+
 ## Where enforcement lives
 
 `finish` is the only enforcement checkpoint. It evaluates the persisted

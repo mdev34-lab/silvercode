@@ -1,16 +1,20 @@
+import { ToolFailure } from "@opencode-ai/llm"
+import type { SessionID } from "@/session/schema"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { httpClient } from "@opencode-ai/core/effect/app-node-platform"
 import { Ripgrep } from "@opencode-ai/core/ripgrep"
 import { PlanExitTool } from "./plan"
 import { FinishTool } from "./finish"
 import { Session } from "@/session/session"
+import { SessionStatus } from "@/session/status"
 import { QuestionTool } from "./question"
 import { ShellTool } from "./shell"
 import { EditTool } from "./edit"
 import { GlobTool } from "./glob"
 import { GrepTool } from "./grep"
 import { ReadTool } from "./read"
-import { TaskTool } from "./task"
+import { delegatableAgents, describeAgents, makeParameters, subagentTypeDescription, TaskTool } from "./task"
+import { ToolJsonSchema } from "./json-schema"
 import { Database } from "@opencode-ai/core/database/database"
 import { TodoWriteTool } from "./todo"
 import { WebFetchTool } from "./webfetch"
@@ -88,6 +92,7 @@ export interface Interface {
     modelID: ModelV2.ID
     agent: Agent.Info
     permission?: PermissionV1.Ruleset
+    sessionID?: SessionID
   }) => Effect.Effect<Tool.Def[]>
 }
 
@@ -99,6 +104,7 @@ const layer = Layer.effect(
     const config = yield* Config.Service
     const plugin = yield* Plugin.Service
     const agents = yield* Agent.Service
+    const sessions = yield* Session.Service
     const truncate = yield* Truncate.Service
     const flags = yield* RuntimeFlags.Service
     const mcp = yield* MCP.Service
@@ -156,7 +162,7 @@ const layer = Layer.effect(
                 const bridge = yield* EffectBridge.make()
                 const pluginCtx: PluginToolContext = {
                   ...toolCtx,
-                  ask: (req) => bridge.promise(toolCtx.ask(req)),
+                  ask: (req) => bridge.promise(toolCtx.ask(req), { signal: toolCtx.abort }),
                   directory: ctx.directory,
                   worktree: ctx.worktree,
                 }
@@ -279,19 +285,13 @@ const layer = Layer.effect(
       return (yield* all()).map((tool) => tool.id)
     })
 
-    const describeTask = Effect.fn("ToolRegistry.describeTask")(function* (agent: Agent.Info) {
-      const items = (yield* agents.list()).filter((item) => item.mode !== "primary")
-      const filtered = items.filter(
-        (item) => Permission.evaluate("task", item.name, agent.permission).action !== "deny",
-      )
-      const list = filtered.toSorted((a, b) => a.name.localeCompare(b.name))
-      const description = list
-        .map(
-          (item) =>
-            `- ${item.name}: ${item.description ?? "This subagent should only be called manually by the user."}`,
-        )
-        .join("\n")
-      return ["Available agent types and the tools they have access to:", description].join("\n")
+    const delegatable = Effect.fn("ToolRegistry.delegatable")(function* (
+      agent: Agent.Info,
+      permission?: PermissionV1.Ruleset,
+    ) {
+      // Per-call rulesets (session-level task denies) stack on the agent's own.
+      const ruleset = Permission.merge(agent.permission, permission ?? [])
+      return delegatableAgents(yield* agents.list(), ruleset)
     })
 
     const describeCodeMode = Effect.fn("ToolRegistry.describeCodeMode")(function* (input: {
@@ -306,8 +306,12 @@ const layer = Layer.effect(
     })
 
     const tools: Interface["tools"] = Effect.fn("ToolRegistry.tools")(function* (input) {
+      const known = yield* InstanceState.get(state)
       const filtered = (yield* all()).filter((tool) => {
-        if (tool.id === FinishTool.id) return true
+        // Agents that opt out of the finish tool end turns on end-of-stream,
+        // so the model is not offered finish at all (the loop gating in
+        // prompt.ts already skips the requirement for them).
+        if (tool.id === FinishTool.id) return input.agent.finishTool !== false
         if (tool.id === WebSearchTool.id) {
           return webSearchEnabled(input.providerID, { exa: flags.enableExa, parallel: flags.enableParallel })
         }
@@ -338,6 +342,8 @@ const layer = Layer.effect(
         : undefined
       const visible = permissionFiltered.filter((tool) => tool.id !== "execute" || codeModeDescription)
 
+      const taskAgents = yield* delegatable(input.agent, input.permission)
+
       return yield* Effect.forEach(
         visible,
         Effect.fnUntraced(function* (tool: Tool.Def) {
@@ -351,19 +357,31 @@ const layer = Layer.effect(
             output.parameters === tool.parameters || output.jsonSchema !== tool.jsonSchema
               ? output.jsonSchema
               : undefined
+          // The task tool's `subagent_type` parameter enumerates the same
+          // per-caller, permission-filtered agents its description lists, so
+          // the choices are visible where the model fills in the value. A
+          // plugin-replaced parameter shape (parameters or jsonSchema) wins
+          // over this enrichment.
+          const taskParameters =
+            tool.id === TaskTool.id && output.parameters === tool.parameters && output.jsonSchema === tool.jsonSchema
+              ? makeParameters(subagentTypeDescription(taskAgents))
+              : undefined
           return {
             id: tool.id,
             description: [
               output.description,
-              tool.id === TaskTool.id ? yield* describeTask(input.agent) : undefined,
+              tool.id === TaskTool.id ? describeAgents(taskAgents) : undefined,
               tool.id === "execute" ? codeModeDescription : undefined,
             ]
               .filter(Boolean)
               .join("\n"),
-            parameters: output.parameters,
-            jsonSchema,
+            parameters: taskParameters ?? output.parameters,
+            jsonSchema: taskParameters ? ToolJsonSchema.fromSchema(taskParameters) : jsonSchema,
             metadata: tool.metadata,
-            execute: tool.execute,
+            execute: (args: unknown, ctx: Tool.Context) =>
+              Effect.gen(function* () {
+                return yield* tool.execute(args, ctx)
+              }),
             formatValidationError: tool.formatValidationError,
           }
         }),
@@ -467,6 +485,7 @@ export const node = LayerNode.make({
     Agent.node,
     Skill.node,
     Session.node,
+    SessionStatus.node,
     BackgroundJob.node,
     Provider.node,
     LSP.node,

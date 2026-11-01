@@ -1,3 +1,5 @@
+import { Session } from "@/session/session"
+import { Agent } from "@/agent/agent"
 import { Effect, Schema } from "effect"
 import * as Tool from "./tool"
 import { Question } from "../question"
@@ -11,7 +13,11 @@ type Metadata = {
   answers: ReadonlyArray<Question.Answer>
 }
 
-export const QuestionTool = Tool.define<typeof Parameters, Metadata, Question.Service>(
+export const QuestionTool = Tool.define<
+  typeof Parameters,
+  Metadata,
+  Question.Service | Agent.Service | Session.Service
+>(
   "question",
   Effect.gen(function* () {
     const question = yield* Question.Service

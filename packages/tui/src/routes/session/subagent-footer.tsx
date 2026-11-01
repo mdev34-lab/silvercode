@@ -6,9 +6,9 @@ import { useSDK } from "../../context/sdk"
 import { useDialog } from "../../ui/dialog"
 import { SplitBorder } from "../../ui/border"
 import { Spinner } from "../../component/spinner"
-import type { AssistantMessage } from "@opencode-ai/sdk/v2"
 import { Locale } from "../../util/locale"
-import { useTerminalDimensions } from "@opentui/solid"
+import { contextUsage } from "../../util/context-usage"
+import { useTerminalDimensions } from "../../util/terminal-dimensions"
 import { OPENCODE_BASE_MODE, useBindings, useCommandShortcut, useOpencodeKeymap } from "../../keymap"
 import { useTuiConfig } from "../../config"
 import { DOUBLE_PRESS_WINDOW_MS } from "../../util/double-press"
@@ -38,17 +38,18 @@ export function SubagentFooter() {
     return { label, index: index + 1, total: siblings.length }
   })
 
+  // Same measurement as the sidebar context bar (#241); unknown usage shows
+  // no count rather than a figure the bar would contradict.
   const usage = createMemo(() => {
-    const msg = messages()
-    const last = msg.findLast((item): item is AssistantMessage => item.role === "assistant" && item.tokens.output > 0)
-    if (!last) return
+    const measured = contextUsage({
+      report: sync.data.session_context[route.sessionID],
+      messages: messages(),
+      contextLimit: (providerID, modelID) =>
+        sync.data.provider.find((item) => item.id === providerID)?.models[modelID]?.limit.context,
+    })
+    if (!measured) return
 
-    const tokens =
-      last.tokens.input + last.tokens.output + last.tokens.reasoning + last.tokens.cache.read + last.tokens.cache.write
-    if (tokens <= 0) return
-
-    const model = sync.data.provider.find((item) => item.id === last.providerID)?.models[last.modelID]
-    const pct = model?.limit.context ? `${Math.round((tokens / model.limit.context) * 100)}%` : undefined
+    const pct = measured.percent === undefined ? undefined : `${measured.percent}%`
     const cost = session()?.cost ?? 0
 
     const money = new Intl.NumberFormat("en-US", {
@@ -56,8 +57,11 @@ export function SubagentFooter() {
       currency: "USD",
     })
 
+    // #241 owner correction: unknown usage shows no count at all.
+    const context = pct ? `${Locale.number(measured.tokens)} (${pct})` : undefined
+    if (!context && cost <= 0) return
     return {
-      context: pct ? `${Locale.number(tokens)} (${pct})` : Locale.number(tokens),
+      context,
       cost: cost > 0 ? money.format(cost) : undefined,
     }
   })
@@ -188,13 +192,17 @@ export function SubagentFooter() {
         flexShrink={0}
         backgroundColor={theme.backgroundPanel}
       >
-        <box flexDirection="row" justifyContent="space-between" gap={1}>
-          <box flexDirection="row" gap={1}>
-            <text fg={theme.text}>
+        {/* Identity on the left, controls on the right. Both groups refuse to
+            shrink and the row wraps instead (#241), so a narrow terminal
+            stacks the controls under the label rather than word-wrapping
+            "Stop subagent" and "(1 of 2)" into each other. */}
+        <box flexDirection="row" flexWrap="wrap" justifyContent="space-between" gap={1}>
+          <box flexDirection="row" gap={1} flexShrink={0}>
+            <text fg={theme.text} wrapMode="none">
               <b>{subagentInfo().label}</b>
             </text>
             <Show when={subagentInfo().total > 0}>
-              <text style={{ fg: theme.textMuted }}>
+              <text style={{ fg: theme.textMuted }} wrapMode="none">
                 ({subagentInfo().index} of {subagentInfo().total})
               </text>
             </Show>
@@ -213,9 +221,9 @@ export function SubagentFooter() {
               )}
             </Show>
           </box>
-          <box flexDirection="row" gap={2}>
+          <box flexDirection="row" flexWrap="wrap" gap={2} flexShrink={0}>
             <Show when={running()}>
-              <box flexDirection="row" gap={1}>
+              <box flexDirection="row" gap={1} flexShrink={0}>
                 {/* The click target names the action; the shortcut beside it is
                     what advertises the double press. */}
                 <box
@@ -224,9 +232,11 @@ export function SubagentFooter() {
                   onMouseUp={() => keymap.dispatchCommand("session.subagent.stop")}
                   backgroundColor={hover() === "stop" ? theme.backgroundElement : theme.backgroundPanel}
                 >
-                  <text fg={armed() ? theme.primary : theme.text}>Stop subagent</text>
+                  <text fg={armed() ? theme.primary : theme.text} wrapMode="none">
+                    Stop subagent
+                  </text>
                 </box>
-                <text style={{ fg: armed() ? theme.primary : theme.textMuted }}>
+                <text style={{ fg: armed() ? theme.primary : theme.textMuted }} wrapMode="none">
                   {armed() ? `${stopShortcut()} again to stop` : `${stopShortcut()} ${stopShortcut()}`}
                 </text>
               </box>
@@ -237,7 +247,7 @@ export function SubagentFooter() {
               onMouseUp={() => keymap.dispatchCommand("session.parent")}
               backgroundColor={hover() === "parent" ? theme.backgroundElement : theme.backgroundPanel}
             >
-              <text fg={theme.text}>
+              <text fg={theme.text} wrapMode="none">
                 Parent <span style={{ fg: theme.textMuted }}>{parentShortcut()}</span>
               </text>
             </box>
@@ -247,7 +257,7 @@ export function SubagentFooter() {
               onMouseUp={() => keymap.dispatchCommand("session.child.previous")}
               backgroundColor={hover() === "prev" ? theme.backgroundElement : theme.backgroundPanel}
             >
-              <text fg={theme.text}>
+              <text fg={theme.text} wrapMode="none">
                 Prev <span style={{ fg: theme.textMuted }}>{previousShortcut()}</span>
               </text>
             </box>
@@ -257,7 +267,7 @@ export function SubagentFooter() {
               onMouseUp={() => keymap.dispatchCommand("session.child.next")}
               backgroundColor={hover() === "next" ? theme.backgroundElement : theme.backgroundPanel}
             >
-              <text fg={theme.text}>
+              <text fg={theme.text} wrapMode="none">
                 Next <span style={{ fg: theme.textMuted }}>{nextShortcut()}</span>
               </text>
             </box>

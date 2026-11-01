@@ -12,6 +12,7 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { EventV2 } from "@opencode-ai/core/event"
 import { EventTable } from "@opencode-ai/core/event/sql"
 import { PermissionV2 } from "@opencode-ai/core/permission"
+import { PluginInternal } from "@opencode-ai/core/plugin/internal"
 import { AgentV2 } from "@opencode-ai/core/agent"
 import { Config } from "@opencode-ai/core/config"
 import { Project } from "@opencode-ai/core/project"
@@ -64,6 +65,9 @@ const permission = Layer.succeed(
     list: () => Effect.die("unused"),
   }),
 )
+// These runner fixtures isolate orchestration from internal plugin boot; the
+// readiness ordering is covered by session-runner-readiness.test.ts.
+const pluginInternal = Layer.succeed(PluginInternal.Service, PluginInternal.Service.of({ ready: Effect.void }))
 const model = OpenAIChat.route
   .with({
     endpoint: { baseURL: "https://api.openai.com/v1" },
@@ -86,6 +90,7 @@ const runnerLayer = AppNodeBuilder.build(SessionRunnerLLM.node, [
   [ReferenceGuidance.node, referenceGuidance],
   [Config.node, config],
   [PermissionV2.node, permission],
+  [PluginInternal.node, pluginInternal],
   [ToolOutputStore.node, ToolOutputStore.nodeWithoutConfig],
 ])
 const execution = Layer.effect(
@@ -100,6 +105,7 @@ const execution = Layer.effect(
       resume: coordinator.run,
       wake: coordinator.wake,
       interrupt: coordinator.interrupt,
+      stopIfIdle: coordinator.stopIfIdle,
     })
   }),
 ).pipe(Layer.provide(runnerLayer))
@@ -124,6 +130,7 @@ const it = testEffect(
     [
       [LayerNodePlatform.llmClient, client],
       [PermissionV2.node, permission],
+      [PluginInternal.node, pluginInternal],
       [ToolOutputStore.node, ToolOutputStore.nodeWithoutConfig],
       [SessionRunnerModel.node, models],
       [SystemContextRegistry.node, systemContext],

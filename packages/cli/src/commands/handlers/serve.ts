@@ -18,7 +18,7 @@ export default Runtime.handler(
     return yield* Effect.scoped(
       Effect.gen(function* () {
         const daemon = yield* Daemon.Service
-        const address = yield* listen(input.hostname, input.port, yield* daemon.password())
+        const address = yield* listen(input.hostname, input.port, yield* daemon.password(), input.register)
         if (input.register) yield* daemon.register(address)
         console.log(`server listening on ${HttpServer.formatAddress(address)}`)
         return yield* Effect.never
@@ -27,18 +27,18 @@ export default Runtime.handler(
   }),
 )
 
-function listen(hostname: string, port: Option.Option<number>, password: string) {
-  if (Option.isSome(port)) return bind(hostname, port.value, password)
+function listen(hostname: string, port: Option.Option<number>, password: string, register: boolean) {
+  if (Option.isSome(port)) return bind(hostname, port.value, password, register)
   const next = (port: number): ReturnType<typeof bind> =>
-    bind(hostname, port, password).pipe(
+    bind(hostname, port, password, register).pipe(
       Effect.catch((error) => (port === 65_535 ? Effect.fail(error) : next(port + 1))),
     )
   return next(4096)
 }
 
-function bind(hostname: string, port: number, password: string) {
+function bind(hostname: string, port: number, password: string, register: boolean) {
   return Layer.build(
-    HttpRouter.serve(createRoutes(password), { disableListenLog: true, disableLogger: true }).pipe(
+    HttpRouter.serve(createRoutes(password, { daemon: register }), { disableListenLog: true, disableLogger: true }).pipe(
       Layer.provideMerge(NodeHttpServer.layer(() => createServer(), { port, host: hostname })),
       Layer.provide(AppNodeBuilder.build(LayerNode.group([Credential.node, PermissionSaved.node]))),
     ),

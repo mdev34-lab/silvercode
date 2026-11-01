@@ -321,3 +321,142 @@ describe("verdict parsing with the report envelope", () => {
     expect(parseReviewVerdict("The implementation looks good, but no final assessment was emitted.")).toBeUndefined()
   })
 })
+
+for (const mention of [
+  "Mention <silvercode-review> in prose.",
+  "Mention </silvercode-review> in prose.",
+  "Mention <alphacode-review> in prose.",
+]) {
+  test(`render preserves report despite literal tag mention: ${mention}`, () => {
+    const initial = ReviewReport.extract([envelope(), mention])
+    expect(initial.ok).toBe(true)
+    if (!initial.ok) return
+    const reparsed = ReviewReport.extract([ReviewReport.render(initial)])
+    expect(reparsed.ok).toBe(true)
+    if (!reparsed.ok) return
+    expect(reparsed.report).toEqual(report)
+    expect(reparsed.analysis).toContain(mention)
+  })
+}
+test("literal tags inside JSON strings survive extraction", () => {
+  const tagged = { ...report, summary: "Mention <silvercode-review> and </silvercode-review> literally." }
+  const parsed = ReviewReport.extract([ReviewReport.envelope(tagged)])
+  expect(parsed.ok).toBe(true)
+  if (parsed.ok) expect(parsed.report).toEqual(tagged)
+})
+test("a malformed final complete report never falls back to older approval", () => {
+  const parsed = ReviewReport.extract([
+    envelope({ assessment: "approved", findings: [] }),
+    "<silvercode-review>not json</silvercode-review>",
+  ])
+  expect(parsed.ok).toBe(false)
+})
+
+for (const tag of ReviewReport.TAGS) {
+  for (const summary of [
+    `Literal <${tag}> opener`,
+    `Literal </${tag}> closer`,
+    `Escaped quote \" then <${tag}> and </${tag}>`,
+  ]) {
+    test(`literal JSON tag data roundtrips: ${summary}`, () => {
+      const tagged = { ...report, summary }
+      const initial = ReviewReport.extract([
+        `Prose <${tag}> mention.`,
+        ReviewReport.envelope(tagged),
+        `Prose </${tag}> mention.`,
+      ])
+      expect(initial.ok).toBe(true)
+      if (!initial.ok) return
+      expect(initial.report).toEqual(tagged)
+      const next = ReviewReport.extract([ReviewReport.render(initial)])
+      expect(next.ok).toBe(true)
+      if (next.ok) expect(next.report).toEqual(tagged)
+    })
+  }
+}
+
+for (const broken of [
+  '{"summary":"unterminated',
+  '{"summary":"unterminated <silvercode-review>',
+  '{"summary":"trailing\\',
+  '{"summary":"escaped\\"',
+]) {
+  test(`malformed quoted latest report cannot revive older approval: ${broken}`, () => {
+    const parsed = ReviewReport.extract([
+      envelope({ assessment: "approved", findings: [] }),
+      `<silvercode-review>${broken}</silvercode-review>`,
+    ])
+    expect(parsed.ok).toBe(false)
+    if (!parsed.ok) expect(parsed.failure.reason).toBe("malformed")
+  })
+}
+
+for (const suffix of [' " prose <silvercode-review> mention', ' " prose <alphacode-review> mention']) {
+  test(`malformed completed candidate survives later unmatched prose: ${suffix}`, () => {
+    const parsed = ReviewReport.extract([
+      envelope({ assessment: "approved", findings: [] }),
+      '<silvercode-review>{"summary":"unterminated</silvercode-review>' + suffix,
+    ])
+    expect(parsed.ok).toBe(false)
+    if (!parsed.ok) expect(parsed.failure.reason).toBe("malformed")
+  })
+}
+test("a later valid report supersedes a malformed quoted completed candidate", () => {
+  const parsed = ReviewReport.extract([
+    '<silvercode-review>{"summary":"unterminated</silvercode-review> " prose <silvercode-review> mention',
+    envelope(),
+  ])
+  expect(parsed.ok).toBe(true)
+  if (parsed.ok) expect(parsed.report).toEqual(report)
+})
+
+for (const broken of [
+  '{"summary":"unterminated',
+  '{"summary":"bad\\',
+  '{"summary":"bad\\"',
+  '{"summary":"unterminated <silvercode-review>',
+]) {
+  for (const suffix of [
+    "",
+    ' " prose <silvercode-review> mention',
+    ' " prose <alphacode-review> mention',
+    ' " prose <silvercode-review>not json</silvercode-review>',
+    ' " trailing prose',
+    " </alphacode-review>",
+  ]) {
+    test(`latest malformed candidate invariant: ${broken} / ${suffix}`, () => {
+      const latest = `<silvercode-review>${broken}</silvercode-review>${suffix}`
+      const prior = envelope({ assessment: "approved", findings: [] })
+      expect(ReviewReport.extract([prior, latest]).ok).toBe(false)
+      const replaced = ReviewReport.extract([prior, latest, envelope()])
+      expect(replaced.ok).toBe(true)
+      if (replaced.ok) expect(replaced.report).toEqual(report)
+    })
+  }
+}
+
+test("bounded malformed tag spam fails conservatively rather than reviving approval", () => {
+  const spam = "<silvercode-review>{bad</silvercode-review>".repeat(400)
+  const parsed = ReviewReport.extract([envelope({ assessment: "approved", findings: [] }), spam])
+  expect(parsed.ok).toBe(false)
+  if (!parsed.ok) expect(parsed.failure.message).toContain("work limit")
+})
+test("many disjoint valid report copies preserve last complete selection", () => {
+  const parsed = ReviewReport.extract(Array.from({ length: 100 }, (_, i) => envelope({ summary: `copy ${i}` })))
+  expect(parsed.ok).toBe(true)
+  if (parsed.ok) expect(parsed.report.summary).toBe("copy 99")
+})
+
+test("ordinary valid JSON with thirty literal closing tags is parsed once", () => {
+  const tagged = { ...report, summary: "Literal </silvercode-review> tag. ".repeat(30) }
+  const parsed = ReviewReport.extract([ReviewReport.envelope(tagged)])
+  expect(parsed.ok).toBe(true)
+  if (parsed.ok) expect(parsed.report).toEqual(tagged)
+})
+test("mismatched tag spam has bounded scan work and cannot revive approval", () => {
+  const parsed = ReviewReport.extract([
+    envelope({ assessment: "approved", findings: [] }),
+    "<silvercode-review>{bad</alphacode-review>".repeat(4000),
+  ])
+  expect(parsed.ok).toBe(false)
+})

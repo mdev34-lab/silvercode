@@ -1,20 +1,18 @@
-import { mkdtemp, rm, writeFile } from "node:fs/promises"
+import { mkdtemp, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
-import { describe, expect, test } from "bun:test"
+import { afterEach, describe, expect, test } from "bun:test"
 import { commitCount, commitsSince, lastTag, tagAtHead } from "../src/git"
+import { assertNoCleanupFailures, git, removeFixture } from "./helpers/subprocess"
 
-function git(cwd: string, ...args: string[]) {
-  const result = Bun.spawnSync(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe" })
-  if (result.exitCode !== 0) {
-    throw new Error(`git ${args.join(" ")} failed: ${result.stderr.toString()}`)
-  }
-  return result.stdout.toString().trim()
-}
+afterEach(() => assertNoCleanupFailures())
 
 describe("git release metadata", () => {
   // Real git subprocesses (init, commits, two merges): on a contended Windows
   // runner each spawn costs hundreds of ms, so the 5s default is marginal.
+  // The recorded worst case (#549 windows attempts) burned 30s and was SIGTERMed
+  // mid-merge at ~10x spawn latency; 90s covers ~3x that profile and stays below
+  // the 120s cap the release suites already use for real-git flows.
   test("selects stable version tags and reads only first-parent commits", async () => {
     const cwd = await mkdtemp(path.join(tmpdir(), "silvercode-git-test-"))
     try {
@@ -54,9 +52,9 @@ describe("git release metadata", () => {
       expect(commits.map((item) => item.sha)).not.toContain(innerCommit)
       expect(await commitCount("v0.2.0", mergeCommit, cwd)).toBe(2)
     } finally {
-      await rm(cwd, { recursive: true, force: true })
+      await removeFixture(cwd)
     }
-  }, 30_000)
+  }, 90_000)
 
   test("recognizes a release tag at HEAD and ignores unrelated tags", async () => {
     const cwd = await mkdtemp(path.join(tmpdir(), "silvercode-git-tag-"))
@@ -80,7 +78,7 @@ describe("git release metadata", () => {
       expect(await tagAtHead("HEAD", cwd)).toBeNull()
       expect(await tagAtHead("v0.1.0", cwd)).toBe("v0.1.0")
     } finally {
-      await rm(cwd, { recursive: true, force: true })
+      await removeFixture(cwd)
     }
-  }, 30_000)
+  }, 90_000)
 })

@@ -18,7 +18,8 @@ import PROMPT_CODEX from "./prompt/codex.txt"
 import PROMPT_TRINITY from "./prompt/trinity.txt"
 import PROMPT_STE_LITE from "./prompt/ste-lite.txt"
 import type { Provider } from "@/provider/provider"
-import type { Agent } from "@/agent/agent"
+import { Agent } from "@/agent/agent"
+import { subagentWorktreeEditCapability } from "@/agent/subagent-permissions"
 import { Permission } from "@/permission"
 import { Skill } from "@/skill"
 import { AbsolutePath } from "@opencode-ai/core/schema"
@@ -69,9 +70,16 @@ export function provider(model: Provider.Model) {
 }
 
 export interface Interface {
-  readonly environment: (model: Provider.Model) => Effect.Effect<string[]>
+  /**
+   * @param directory the session's working folder, shown instead of the project
+   * directory when a delegated child works somewhere other than where it was
+   * dispatched from. It never replaces the project directory in the prompt: the
+   * child still has to know which project its permissions are measured against.
+   */
+  readonly environment: (model: Provider.Model, directory?: string) => Effect.Effect<string[]>
   readonly skills: (agent: Agent.Info) => Effect.Effect<string | undefined>
   readonly mcp: (agent: Agent.Info, permission?: PermissionV1.Ruleset) => Effect.Effect<string | undefined>
+  readonly delegation: (agent: Agent.Info, permission?: PermissionV1.Ruleset) => Effect.Effect<string | undefined>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/SystemPrompt") {}
@@ -80,14 +88,16 @@ const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const skill = yield* Skill.Service
+    const agents = yield* Agent.Service
     const mcp = yield* MCP.Service
     const locations = yield* LocationServiceMap.Service
     const config = yield* Config.Service
     const global = yield* Global.Service
 
     return Service.of({
-      environment: Effect.fn("SystemPrompt.environment")(function* (model: Provider.Model) {
+      environment: Effect.fn("SystemPrompt.environment")(function* (model: Provider.Model, directory?: string) {
         const ctx = yield* InstanceState.context
+        const cwd = directory ?? ctx.directory
         const shell = Shell.name(Shell.acceptable((yield* config.get()).shell))
         const references = yield* Effect.gen(function* () {
           return (yield* (yield* Reference.Service).list()).filter((reference) => reference.description !== undefined)
@@ -97,7 +107,8 @@ const layer = Layer.effect(
             `You are powered by the model named ${model.api.id}. The exact model ID is ${model.providerID}/${model.api.id}`,
             `Here is some useful information about the environment you are running in:`,
             `<env>`,
-            `  Working directory: ${ctx.directory}`,
+            `  Working directory: ${cwd}`,
+            ...(cwd === ctx.directory ? [] : [`  Project directory: ${ctx.directory}`]),
             `  Desktop directory: ${global.desktop ?? "unavailable (do not infer a path)"}`,
             `  Workspace root folder: ${ctx.worktree}`,
             `  Is directory a git repo: ${ctx.project.vcs === "git" ? "yes" : "no"}`,
@@ -140,6 +151,104 @@ const layer = Layer.effect(
         ].join("\n")
       }),
 
+      delegation: Effect.fn("SystemPrompt.delegation")(function* (
+        agent: Agent.Info,
+        permission?: PermissionV1.Ruleset,
+      ) {
+        // Only primary-style callers drive delegation; subagents execute.
+        if (agent.mode === "subagent") return
+
+        const ctx = yield* InstanceState.context
+        const cfg = yield* config.get()
+
+        const work = yield* agents.get("work")
+        if (work?.native === true && agent === work)
+          return [
+            "Programming requests are best done as Think planning, then Code implementation, then a clean Review. Prefer that route for programming, including small edits; you may do the work yourself when the route is not available or would not help, and say so.",
+            "Non-programming work should not go to Code. At fast effort, medium-sized work may be manual; complex or thorough work goes to General; medium effort balances direct work and General delegation.",
+            "When it is unclear whether a request changes software, carry on with the work (inspect, run commands, delegate); use the question tool only if the answer would change what you do. Do not relabel programming work to avoid its workflow.",
+            "Failed, cancelled or pending children are not successful stage completion. A pass budget cannot excuse reporting success with blocking findings.",
+          ].join("\n")
+
+        // Built from the live registry: any non-primary, non-hidden agent the
+        // merged agent + session permission ruleset may delegate to. The
+        // caller is filtered out only where the guidance is advertised, so
+        // planner identity below can be resolved against the real registry.
+        const ruleset = Permission.merge(agent.permission, permission ?? [])
+        const eligible = (yield* agents.list()).filter(
+          (item) =>
+            item.mode !== "primary" &&
+            item.hidden !== true &&
+            Permission.evaluate("task", item.name, ruleset).action !== "deny",
+        )
+        // A planner plans; an implementer writes software for a living. Both
+        // are identified from registry names and descriptions, never from
+        // hardcoded agent names, so renames and custom agents keep working.
+        // Read-only explorers and reviewers match neither pattern.
+        const planners = eligible.filter((item) => /\bplan/i.test(item.name) || /\bplan/i.test(item.description ?? ""))
+        // Capability check, not just a name match: a read-only candidate
+        // (reviewer, auditor) that the registry forbids to edit can never
+        // implement, whatever its description claims. Evaluated against the
+        // ruleset the spawned child session would actually run under, probed
+        // at real worktree paths, so session-level and worktree-scoped denies
+        // suppress the promise; a deny scoped to a subtree keeps the
+        // advertisement but marks it partial so the guidance stays accurate.
+        const capability = new Map<string, "full" | "partial" | "denied">()
+        const implementers = eligible.filter((item) => {
+          if (planners.includes(item)) return false
+          if (!/\bcode\b/i.test(item.name) && !/\bengineer/i.test(item.description ?? "")) return false
+          const level = subagentWorktreeEditCapability({
+            worktree: ctx.worktree,
+            subagent: item,
+            parentSessionPermission: permission ?? [],
+            primaryTools: cfg.experimental?.primary_tools,
+          })
+          capability.set(item.name, level)
+          return level !== "denied"
+        })
+        // The planning agent itself plans; its own prompt governs it. This is
+        // an identity check against the discovered planners - only non-primary
+        // agents are eligible above, so a primary agent that merely mentions
+        // planning in its description can never lose the guidance here.
+        if (planners.some((item) => item.name === agent.name)) return
+        const delegatable = (list: Agent.Info[]) => list.filter((item) => item.name !== agent.name)
+        const plannersToAdvertise = delegatable(planners)
+        const implementersToAdvertise = delegatable(implementers)
+        if (plannersToAdvertise.length === 0 && implementersToAdvertise.length === 0) return
+
+        // Accurate guidance: when session rules restrict subagent edits to
+        // only part of the worktree, the delegation promise must not read as
+        // unrestricted implementation.
+        const partial = implementersToAdvertise.some((item) => capability.get(item.name) === "partial")
+        const scopeNote = partial
+          ? "Session rules restrict subagent edits in parts of the worktree; scope delegated implementation steps to permitted paths."
+          : undefined
+
+        const names = (list: Agent.Info[]) => list.map((item) => `\`${item.name}\``).join(" or ")
+        if (implementersToAdvertise.length === 0) {
+          return [
+            `When a request needs non-trivial implementation planning, delegate that planning to ${names(plannersToAdvertise)} once, at the start, with the task tool.`,
+            "Then work the plan step by step, carrying it forward instead of re-deriving or re-planning it at every tool call.",
+          ].join("\n")
+        }
+        if (plannersToAdvertise.length === 0) {
+          return [
+            `Delegate by default: you coordinate and ${names(implementersToAdvertise)} implements.`,
+            `For anything beyond a small task, delegate each implementation step to ${names(implementersToAdvertise)} with the task tool.`,
+            ...(scopeNote ? [scopeNote] : []),
+            "Direct work is the exception, reserved for small tasks - a quick lookup, a tiny edit, a short answer.",
+            "You stay responsible for the outcome: give each subagent complete context, then verify and integrate what it returns.",
+          ].join("\n")
+        }
+        return [
+          `Delegate by default: you coordinate, ${names(plannersToAdvertise)} plans, and ${names(implementersToAdvertise)} implements.`,
+          `For anything beyond a small task, delegate planning to ${names(plannersToAdvertise)} once, at the start, with the task tool, then delegate each implementation step to ${names(implementersToAdvertise)}.`,
+          ...(scopeNote ? [scopeNote] : []),
+          "Direct work is the exception, reserved for small tasks - a quick lookup, a tiny edit, a short answer.",
+          "You stay responsible for the outcome: give each subagent complete context, then verify and integrate what it returns instead of re-deriving or re-planning it at every tool call.",
+        ].join("\n")
+      }),
+
       mcp: Effect.fn("SystemPrompt.mcp")(function* (agent: Agent.Info, permission?: PermissionV1.Ruleset) {
         const ruleset = Permission.merge(agent.permission, permission ?? [])
         const instructions = (yield* mcp.instructions()).filter(
@@ -170,7 +279,7 @@ const locationServiceMapNode = LayerNode.make({
 export const node = LayerNode.make({
   service: Service,
   layer: layer,
-  deps: [Skill.node, MCP.node, Config.node, Global.node, locationServiceMapNode],
+  deps: [Skill.node, MCP.node, Config.node, Global.node, Agent.node, locationServiceMapNode],
 })
 
 export * as SystemPrompt from "./system"

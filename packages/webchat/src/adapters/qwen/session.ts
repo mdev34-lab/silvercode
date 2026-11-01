@@ -33,21 +33,27 @@ import {
   CHALLENGE_NO_WINDOW_DETAIL,
   CHALLENGE_WINDOW_OPEN_DETAIL,
   QwenWebError,
+  chatInProgressExhaustedError,
   abortedError,
   challengeError,
+  classifyHttpResponse,
   classifyJsonError,
   classifyStatus,
   classifyStreamError,
   classifyTruncatedJson,
   emptyResponseError,
   isAbortLike,
+  isChatInProgressError,
   isHtmlBody,
+  isStaleAnchorError,
+  isStaleBindingError,
   isStaleChatError,
   isStallTimeout,
-  isWafMessage,
+  isChallengeMessage,
   loginRequiredError,
   nonStreamResponseError,
   sessionExpiredError,
+  withQwenWebErrorPhase,
 } from "./errors"
 import { debug, summarizePayload } from "./log"
 import {
@@ -56,7 +62,7 @@ import {
   buildStopBody,
   formatThinkingSummary,
   incrementalDelta,
-  parseChatNewResponse,
+  parseChatNewOutcome,
   QwenWebSSEParser,
   randomId,
   type QwenNativeTool,
@@ -87,6 +93,8 @@ export interface QwenWebSessionOptions {
   toolMode?: QwenWebToolMode
   /** Persistence for threads; defaults to the data dir. Tests inject a temp store. */
   store?: ThreadStore
+  /** Waits (ms) between re-sends while Qwen reports the chat is still generating. Tests inject short ones. */
+  inProgressBackoffMs?: readonly number[]
 }
 
 /**
@@ -125,6 +133,47 @@ export interface QwenWebTurnInput extends WebChatTurnInput {
   recoveryFiles?: (signal?: AbortSignal) => Promise<QwenWebFileEntry[] | undefined>
 }
 
+/**
+ * Bounded waits (ms) between re-sends of a request Qwen rejected because the
+ * chat is still generating. A rejected request never started upstream, so
+ * re-sending it cannot duplicate a turn. Total wait is capped at 14 seconds.
+ */
+const DEFAULT_IN_PROGRESS_BACKOFF_MS: readonly number[] = [2_000, 4_000, 8_000]
+
+function sleepAbortable(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(abortedError("stop"))
+    const onAbort = () => {
+      clearTimeout(timer)
+      reject(abortedError("stop"))
+    }
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort)
+      resolve()
+    }, ms)
+    signal?.addEventListener("abort", onAbort, { once: true })
+  })
+}
+
+function raceAbort<T>(work: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return work
+  if (signal.aborted) return Promise.reject(abortedError("stop"))
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(abortedError("stop"))
+    signal.addEventListener("abort", onAbort, { once: true })
+    work.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort)
+        resolve(value)
+      },
+      (error) => {
+        signal.removeEventListener("abort", onAbort)
+        reject(error)
+      },
+    )
+  })
+}
+
 export class QwenWebSession implements WebChatProvider {
   readonly id = "qwen-web"
   private readonly transport: QwenWebTransport
@@ -132,8 +181,12 @@ export class QwenWebSession implements WebChatProvider {
   private readonly toolMode: QwenWebToolMode
   private readonly store: ThreadStore
   private readonly running = new Set<string>()
+  private readonly inProgressBackoffMs: readonly number[]
+  /** Latest upstream response id seen per chat; lets a stuck chat be stopped once. */
+  private readonly lastResponseByChat = new Map<string, string>()
 
   constructor(options?: QwenWebSessionOptions) {
+    this.inProgressBackoffMs = options?.inProgressBackoffMs ?? DEFAULT_IN_PROGRESS_BACKOFF_MS
     this.transport = options?.transport ?? sharedTransport()
     this.chatMode = options?.chatMode ?? readChatModeDefault()
     this.toolMode = options?.toolMode ?? readToolModeDefault()
@@ -142,33 +195,53 @@ export class QwenWebSession implements WebChatProvider {
 
   /** Create a fresh Qwen chat for one generation. */
   async createChat(model: string, signal?: AbortSignal): Promise<string> {
-    const response = await this.transport.rawRequestJson("POST", QWEN_WEB_PATHS.chatsNew, {
-      body: JSON.stringify(buildChatNewBody(model, this.chatMode)),
-      signal,
-    })
-    if (response.status === 401 || response.status === 403) throw sessionExpiredError()
-    if (response.status < 200 || response.status >= 300) {
-      throw classifyJsonError(response.body, response.status) ?? classifyStatus(response.status) ?? loginRequiredError()
-    }
-    const chatId = parseChatNewResponse(safeJsonParse(response.body))
-    if (!chatId) {
-      const classified = classifyJsonError(response.body, response.status)
+    try {
+      const response = await this.transport.rawRequestJson("POST", QWEN_WEB_PATHS.chatsNew, {
+        body: JSON.stringify(buildChatNewBody(model, this.chatMode)),
+        signal,
+      })
+      if (response.status < 200 || response.status >= 300) {
+        const error =
+          classifyHttpResponse(response.body, response.status, response.statusText, "chat-create") ??
+          loginRequiredError()
+        if (error.code === "challenge") throw await this.enrichChallenge(error, signal)
+        throw error
+      }
+      const outcome = parseChatNewOutcome(safeJsonParse(response.body))
+      if (outcome.kind === "ok") {
+        debug("session", "chat created", {
+          ...summarizePayload(JSON.stringify({ model })),
+        })
+        return outcome.chatId
+      }
+      // The invalid_response fallback below is never stale-chat evidence: a
+      // chat that was never created proves nothing about an existing binding,
+      // so report it and leave the thread unbound rather than inventing a
+      // recovery the error cannot support. (A classified stale-chat/anchor
+      // error from the same body still propagates as binding evidence, and
+      // deliverTurn's single-recovery cap bounds that path.)
+      const classified = classifyJsonError(response.body, response.status, "chat-create")
+      if (classified?.code === "challenge") throw await this.enrichChallenge(classified, signal)
       if (classified) throw classified
       throw new QwenWebError({
         code: "invalid_response",
+        phase: "chat-create",
         retryable: false,
         status: response.status,
-        message: "Qwen returned an unexpected chat-creation payload.",
+        detail: "The response did not contain a usable chat identifier.",
+        message: `Qwen returned an unexpected chat-creation payload (HTTP ${response.status}, ${
+          outcome.reason === "empty" ? "empty body" : outcome.reason === "blank" ? "blank chat id" : "no chat id"
+        }): nothing to bind to. The thread stays unbound and the next turn creates a new chat.`,
       })
+    } catch (error) {
+      throw withQwenWebErrorPhase(error, "chat-create")
     }
-    debug("session", "chat created", { chatId: chatId.slice(0, 12), ...summarizePayload(JSON.stringify({ model })) })
-    return chatId
   }
 
   /** Start a streaming generation on a fresh chat (legacy single-turn path). */
   async startGeneration(input: StartGenerationInput): Promise<ActiveGeneration> {
     const signal = input.signal
-    if (signal?.aborted) throw abortedError()
+    if (signal?.aborted) throw abortedError("stop")
     const chatId = await this.createChat(input.model, signal)
     const payload = buildCompletionPayload({
       prompt: input.prompt,
@@ -182,14 +255,18 @@ export class QwenWebSession implements WebChatProvider {
     const path = `${QWEN_WEB_PATHS.completions}?chat_id=${encodeURIComponent(chatId)}`
     // Completions run over the raw-node path: page-context fetches to this
     // endpoint are held by the WAF unless driven by the site's own client.
-    const response = await this.transport.rawRequestStream("POST", path, {
-      body: JSON.stringify(payload),
-      signal,
-      reasoning: input.reasoningMode !== "fast",
-      referrer: chatReferrer(chatId),
-    })
-    await this.ensureStreamable(response, chatId, signal)
-    return { chatId, response }
+    try {
+      const response = await this.transport.rawRequestStream("POST", path, {
+        body: JSON.stringify(payload),
+        signal,
+        reasoning: input.reasoningMode !== "fast",
+        referrer: chatReferrer(chatId),
+      })
+      await this.ensureStreamable(response, chatId, signal)
+      return { chatId, response }
+    } catch (error) {
+      throw withQwenWebErrorPhase(error, "setup")
+    }
   }
 
   /**
@@ -198,18 +275,46 @@ export class QwenWebSession implements WebChatProvider {
    */
   async stopGeneration(chatId: string, responseId: string | undefined, abortLocal: () => void): Promise<void> {
     try {
-      if (responseId) {
-        const path = `${QWEN_WEB_PATHS.completionsStop}?chat_id=${encodeURIComponent(chatId)}`
-        await this.transport
-          .requestJson("POST", path, {
-            body: JSON.stringify(buildStopBody(chatId, responseId)),
-            referrer: chatReferrer(chatId),
-            timeoutMs: 15_000,
-          })
-          .catch(() => undefined)
-      }
-    } finally {
       abortLocal()
+    } catch {
+      // Best-effort local cancel; do not block remote stop on cleanup errors.
+    }
+    if (!chatId || !responseId) return
+    try {
+      const path = `${QWEN_WEB_PATHS.completionsStop}?chat_id=${encodeURIComponent(chatId)}`
+      const response = await this.transport
+        .requestJson("POST", path, {
+          body: JSON.stringify(buildStopBody(chatId, responseId)),
+          referrer: chatReferrer(chatId),
+          timeoutMs: 15_000,
+        })
+        .catch((error: unknown) => {
+          const failure = withQwenWebErrorPhase(error, "stop")
+          debug("session", "upstream stop request failed", {
+            phase: failure.phase,
+            code: failure.code,
+            status: failure.status,
+            upstreamCode: failure.upstreamCode,
+            retryable: failure.retryable,
+          })
+          return undefined
+        })
+      if (response) {
+        const failure =
+          classifyJsonError(response.body, response.status, "stop") ??
+          classifyStatus(response.status, response.statusText, "stop")
+        if (failure) {
+          debug("session", "upstream stop request failed", {
+            phase: failure.phase,
+            code: failure.code,
+            status: failure.status,
+            upstreamCode: failure.upstreamCode,
+            retryable: failure.retryable,
+          })
+        }
+      }
+    } catch {
+      // best-effort remote stop ignored
     }
   }
 
@@ -252,18 +357,25 @@ export class QwenWebSession implements WebChatProvider {
    * one is `done` with the persisted thread. The turn chains onto the last
    * assistant response (`parent_id`) so upstream memory is the transcript.
    *
-   * A dead upstream chat (deleted/expired `providerId`) triggers at most ONE
-   * fresh-chat recovery per turn: the failed delivery is fully rolled back
-   * (user node, unconsumed seed, chain anchors, chat binding) and the turn
-   * re-runs on a fresh chat with `recoveryContent` — the caller's full
-   * prompt — because the fresh chat carries no upstream transcript.
+   * A broken binding triggers at most ONE recovery per turn, and the kind of
+   * recovery follows the evidence:
+   * - dead upstream chat (`CHAT_NOT_FOUND`-class): the delivery is fully
+   *   rolled back (user node, unconsumed seed, anchors, chat binding) and the
+   *   turn re-runs on a fresh chat.
+   * - dead anchor only (`parent_id`/response gone, chat still live): the
+   *   anchors are dropped but the chat is kept, and the turn re-runs
+   *   unanchored on the same chat.
+   * Either way the re-run rides on `recoveryContent` — the caller's full
+   * prompt — because neither a fresh chat nor a re-anchored branch carries
+   * the upstream transcript the trimmed tail assumes.
    */
   async *runTurn(input: QwenWebTurnInput): AsyncGenerator<WebChatEvent> {
     const thread = input.thread
-    if (input.signal?.aborted) throw abortedError()
+    if (input.signal?.aborted) throw abortedError("stop")
     if (this.running.has(thread.id)) {
       throw new QwenWebError({
         code: "upstream_error",
+        phase: "setup",
         retryable: true,
         message: `Qwen thread "${thread.id}" already has a turn in progress.`,
       })
@@ -275,25 +387,28 @@ export class QwenWebSession implements WebChatProvider {
       debug("session", `turn timing: ${label}`, { ms: Date.now() - traceStart, ...extra })
 
     try {
-      let recoveredFreshChat = false
+      // One binding recovery per turn, of either kind: a recovery re-sends the
+      // turn, so allowing a second one would risk a silent replay loop.
+      let recoveryUsed = false
       let content = input.content
       let files = input.files
       for (;;) {
-        if (input.signal?.aborted) throw abortedError()
+        if (input.signal?.aborted) throw abortedError("stop")
         const outcome = yield* this.deliverTurn({
           input,
           content,
           files,
-          allowFreshChatRecovery: !recoveredFreshChat,
+          allowRecovery: !recoveryUsed,
           trace,
         })
-        if (outcome !== "recover-fresh-chat") return
-        recoveredFreshChat = true
-        // The fresh chat has no server-side transcript: the recovery must
-        // never ride on a trimmed tail.
+        if (outcome === "finished") return
+        recoveryUsed = true
+        // Both recoveries break the upstream chain: the fresh chat has no
+        // server-side transcript and the re-anchored branch starts a new one,
+        // so the retry must never ride on a trimmed tail.
         content = input.recoveryContent ?? input.content
         files = (await input.recoveryFiles?.(input.signal)) ?? input.files
-        trace("fresh chat recovery")
+        trace(outcome === "recover-anchor" ? "stale anchor recovery" : "fresh chat recovery")
       }
     } finally {
       this.running.delete(thread.id)
@@ -304,17 +419,18 @@ export class QwenWebSession implements WebChatProvider {
    * One delivery attempt of a turn: user-node bookkeeping, pre-stream setup
    * (retried once), stream consumption, and thread commit. Returns
    * `"recover-fresh-chat"` when a dead upstream chat was rolled back and the
-   * caller should re-run the turn on a fresh chat with the full prompt;
-   * `"finished"` when the turn reached its terminal `done` event (gracefully
-   * or with an error event).
+   * caller should re-run the turn on a fresh chat with the full prompt,
+   * `"recover-anchor"` when only the continuation anchor was confirmed dead
+   * and the same chat can be re-anchored, and `"finished"` when the turn
+   * reached its terminal `done` event (gracefully or with an error event).
    */
   private async *deliverTurn(state: {
     input: QwenWebTurnInput
     content: string
     files?: QwenWebFileEntry[]
-    allowFreshChatRecovery: boolean
+    allowRecovery: boolean
     trace: (label: string, extra?: Record<string, unknown>) => void
-  }): AsyncGenerator<WebChatEvent, "recover-fresh-chat" | "finished"> {
+  }): AsyncGenerator<WebChatEvent, "recover-fresh-chat" | "recover-anchor" | "finished"> {
     const input = state.input
     const trace = state.trace
     const thread = input.thread
@@ -322,9 +438,19 @@ export class QwenWebSession implements WebChatProvider {
     const model = thread.model
 
     const toolMode = this.toolMode
+    const lastResponseByChat = this.lastResponseByChat
     const tools = input.tools ?? []
     const declaredTools = new Set(tools.map((tool) => tool.name))
     const nativeTools = toolMode === "native" ? toNativeTools(tools) : undefined
+
+    // Validate the persisted binding pair before it is used. A thread file
+    // written by another process (or an older build) can carry a blank chat id
+    // or a blank anchor; either would be sent upstream as-is and read as a
+    // live binding. Drop them here instead.
+    if (sanitizeBinding(thread)) {
+      debug("session", "sanitized persisted binding state", { thread: thread.id })
+      this.store.put(thread)
+    }
 
     // A fork/compaction seed becomes part of the first turn on the new chat.
     // Track it so a failed delivery can restore it instead of losing it.
@@ -352,17 +478,27 @@ export class QwenWebSession implements WebChatProvider {
       | undefined
     let listener: (() => void) | undefined
 
-    // Drop every local binding to a confirmed-dead upstream chat: future
-    // turns must neither address it (chat id) nor chain onto it (parent ids).
-    const clearChatBinding = () => {
-      thread.providerId = undefined
-      chatId = undefined
+    // Drop every continuation anchor to the upstream chat. The chat itself
+    // stays bound: only the response/parent ids we tried to chain onto are
+    // confirmed unusable. Stop bookkeeping follows suit — a response id
+    // recorded for a dropped anchor must never be sent to stop anything.
+    const clearAnchors = () => {
+      if (chatId) lastResponseByChat.delete(chatId)
+      if (thread.providerId) lastResponseByChat.delete(thread.providerId)
       for (const message of thread.messages) {
         if (message.providerState?.["responseId"] === undefined) continue
         const rest = { ...message.providerState }
         delete rest["responseId"]
         message.providerState = Object.keys(rest).length > 0 ? rest : undefined
       }
+    }
+
+    // Drop the whole binding to a confirmed-dead upstream chat: future turns
+    // must neither address it (chat id) nor chain onto it (parent ids).
+    const clearChatBinding = () => {
+      clearAnchors()
+      thread.providerId = undefined
+      chatId = undefined
     }
 
     // Full rollback of this delivery (user node, seed, chat binding) so a
@@ -375,11 +511,30 @@ export class QwenWebSession implements WebChatProvider {
       debug("session", "dead upstream chat discarded; recovering on a fresh chat", { thread: thread.id })
     }
 
+    // Rollback for a dead anchor: the user node and seed come back, the
+    // anchors go, and the chat stays bound for the unanchored re-run.
+    const discardAnchoredDelivery = () => {
+      removeById(thread, fid)
+      if (seedUsed !== undefined) thread.seedText = seedUsed
+      clearAnchors()
+      this.store.put(thread)
+      debug("session", "stale upstream anchor discarded; re-anchoring on the same chat", { thread: thread.id })
+    }
+
+    // Evidence-based recovery only. A stale anchor can be re-anchored on the
+    // same chat; without a full prompt that re-run would silently drop every
+    // earlier turn the trim had left to upstream memory, so it is not
+    // attempted then — the error surfaces instead.
+    const canRecoverAnchor = Boolean(input.recoveryContent)
+
     try {
       // Pre-stream setup is retried once for transient failures; a confirmed
       // dead chat is handled below without a blind retry.
       let setupError: unknown
       let staleChat = false
+      let staleAnchor = false
+      let inProgressWaits = 0
+      let stopRequested = false
       for (let attempt = 1; attempt <= 2; attempt++) {
         try {
           const chatCreatedNow = !chatId
@@ -414,32 +569,88 @@ export class QwenWebSession implements WebChatProvider {
           response = streamResponse
           break
         } catch (error) {
-          setupError = error
+          const failure = withQwenWebErrorPhase(error, "setup")
+          setupError = failure
           // A confirmed-dead chat never succeeds on a blind retry, even after
           // the one fresh-chat recovery has already been consumed.
-          if (isStaleChatError(error)) {
+          if (isStaleChatError(failure)) {
             staleChat = true
             break
           }
-          if (attempt === 2 || !isPreStreamRetryable(error)) break
+          // Same for a confirmed-dead anchor: re-sending the identical
+          // `parent_id` cannot work. Only the one anchor recovery may retry.
+          if (isStaleAnchorError(failure)) {
+            staleAnchor = true
+            break
+          }
+          // Chat still generating: wait a bounded number of times (without
+          // consuming the setup-retry counter), ask the upstream once to stop
+          // the earlier generation when its id is known, then end terminally.
+          if (isChatInProgressError(failure)) {
+            const wait = this.inProgressBackoffMs[inProgressWaits]
+            if (wait === undefined) {
+              setupError = chatInProgressExhaustedError({
+                status: failure.status,
+                attempts: inProgressWaits,
+              })
+              break
+            }
+            const earlier = chatId ? this.lastResponseByChat.get(chatId) : undefined
+            if (!stopRequested && chatId && earlier) {
+              stopRequested = true
+              // The stop request can take up to its own 15s timeout; the caller's
+              // abort must not wait for it.
+              try {
+                await raceAbort(this.stopGeneration(chatId, earlier, () => {}), signal)
+              } catch (abort) {
+                setupError = abort
+                break
+              }
+            }
+            inProgressWaits++
+            debug("session", "chat still generating; waiting before re-sending", { wait, n: inProgressWaits })
+            try {
+              await sleepAbortable(wait, signal)
+            } catch (abort) {
+              setupError = abort
+              break
+            }
+            attempt--
+            continue
+          }
+          if (attempt === 2 || !isPreStreamRetryable(failure)) break
           debug("session", "turn setup failed; retrying once", {
-            error: error instanceof Error ? error.message : String(error),
+            phase: failure.phase,
+            code: failure.code,
+            status: failure.status,
+            upstreamCode: failure.upstreamCode,
+            retryable: failure.retryable,
           })
         }
       }
-      if (staleChat && state.allowFreshChatRecovery) {
+      // Pre-stream recovery: nothing was delivered, so the rollback is clean.
+      if (staleChat && state.allowRecovery) {
         discardDelivery()
         return "recover-fresh-chat"
+      }
+      if (staleAnchor && state.allowRecovery && canRecoverAnchor) {
+        discardAnchoredDelivery()
+        return "recover-anchor"
       }
       if (!response) {
         // The user node was never delivered upstream: roll it back, and put
         // an unconsumed seed back so the next turn can still carry it.
         removeById(thread, fid)
         if (seedUsed !== undefined) thread.seedText = seedUsed
-        // A chat confirmed dead here must not stay bound to the thread.
+        // A binding confirmed dead here must not stay bound to the thread; a
+        // dead anchor is dropped while the chat itself stays bound.
         if (isStaleChatError(setupError)) clearChatBinding()
+        else if (isStaleAnchorError(setupError)) clearAnchors()
         this.store.put(thread)
         if (QwenWebError.isInstance(setupError) && setupError.code === "challenge") {
+          // A challenge is a manual pause, not evidence of an expired chat.
+          // Preserve its binding/anchor for a user-directed retry, and never
+          // resubmit a prompt that may already have been accepted upstream.
           throw await this.enrichChallenge(setupError, signal)
         }
         throw setupError
@@ -461,9 +672,12 @@ export class QwenWebSession implements WebChatProvider {
       let firstChunkSeen = false
       let firstEventSeen = false
       let deltaLogged = false
-      // True once any output event reached the caller. A fresh-chat recovery
-      // is only seamless while this is false: afterwards the caller has seen
-      // output that a silent re-run would duplicate or contradict.
+      // True once any output or metadata event reached the caller (response-metadata,
+      // usage, thinking, text, or tool-call). A fresh-chat recovery is only seamless
+      // while this is false (pre-stream setup errors or immediate stream error before
+      // any event): once an event like response-metadata is yielded, the caller
+      // (such as LanguageModelV3StreamPart) has already observed stream identity that
+      // a silent re-run would duplicate or contradict (issue 238).
       let emitted = false
       const traceFirstDelta = (kind: string): void => {
         if (deltaLogged) return
@@ -473,15 +687,28 @@ export class QwenWebSession implements WebChatProvider {
       const textParts: string[] = []
       const toolCalls: Array<{ id: string; name: string; args: unknown }> = []
 
+      const teardownUpstream = () => {
+        try { reader.cancel().catch(() => {}) } catch {}
+        try { response?.abort() } catch {}
+      }
       const stopUpstream = () => {
         if (stopping) return
         stopping = true
-        void this.stopGeneration(chatId!, responseId, () => response!.abort()).catch(() => {})
+        teardownUpstream()
+        if (chatId && responseId) {
+          // Remote stop independent; local cleanup already done above.
+          // Passing no-op abortLocal avoids double-cancel; stopGeneration calls its own.
+          void this.stopGeneration(chatId, responseId, () => {}).catch(() => {})
+        }
       }
       const onAbort = () => stopUpstream()
       if (signal) {
-        signal.addEventListener("abort", onAbort, { once: true })
-        listener = onAbort
+        if (signal.aborted) {
+          stopUpstream()
+        } else {
+          signal.addEventListener("abort", onAbort, { once: true })
+          listener = onAbort
+        }
       }
 
       const endThinking = function* (): Generator<WebChatEvent> {
@@ -506,7 +733,34 @@ export class QwenWebSession implements WebChatProvider {
         yield { type: "tool-call", id, name, args }
       }
 
+      // Adopt an authoritative upstream chat id the moment upstream reports
+      // it. When it differs from the id we addressed, the local binding was
+      // stale or the chat was rotated, and every later turn must use what
+      // upstream said. Persisted immediately: a crash mid-turn must not leave
+      // the stale id behind for the next process to pick up.
+      const adoptChatId = (candidate: string | undefined) => {
+        if (!candidate || candidate === thread.providerId) return
+        debug("session", "adopting upstream chat id", {
+          thread: thread.id,
+          from: thread.providerId?.slice(0, 12),
+          to: candidate.slice(0, 12),
+        })
+        // Re-key the stop bookkeeping too: this response belongs to the chat
+        // future turns will address, not to the stale id.
+        if (chatId) lastResponseByChat.delete(chatId)
+        chatId = candidate
+        thread.providerId = candidate
+        clearAnchors()
+        // Carry any response id already seen over to the adopted chat, so a
+        // stop request can still reach this generation.
+        if (responseId) lastResponseByChat.set(candidate, responseId)
+        this.store.put(thread)
+      }
+
       const handleEvent = function* (event: QwenWebStreamEvent): Generator<WebChatEvent> {
+        // A rotated chat id can arrive on any event (chunk-level `chat_id`),
+        // not only on `response.created`.
+        if ("chatId" in event) adoptChatId(event.chatId)
         switch (event.kind) {
           case "done":
           case "answer-finished":
@@ -515,24 +769,14 @@ export class QwenWebSession implements WebChatProvider {
           case "response-created":
             if (!responseId) {
               responseId = event.responseId
+              // Bookkept against the (possibly just adopted) live chat id.
+              if (chatId) lastResponseByChat.set(chatId, event.responseId)
               emitted = true
               yield { type: "response-metadata", responseId: event.responseId }
-              // Adopt the authoritative upstream chat id once: when it
-              // differs from the id we addressed, the local binding was
-              // stale and future turns must use what upstream reported.
-              if (event.chatId && event.chatId !== thread.providerId) {
-                debug("session", "adopting upstream chat id", {
-                  thread: thread.id,
-                  from: thread.providerId?.slice(0, 12),
-                  to: event.chatId.slice(0, 12),
-                })
-                chatId = event.chatId
-                thread.providerId = event.chatId
-              }
             }
             return
           case "error":
-            throw classifyStreamError(event.code, event.message)
+            throw classifyStreamError(event.code, event.message, response?.status)
           case "usage":
             usage = {
               inputTokens: event.inputTokens,
@@ -604,9 +848,15 @@ export class QwenWebSession implements WebChatProvider {
       }
 
       let failure: unknown
+      // A stall ends the turn gracefully, but with no output at all it must still
+      // surface as the retryable timeout rather than an empty-response error.
+      let stall: unknown
       try {
         for (;;) {
-          if (signal?.aborted) throw abortedError()
+          if (signal?.aborted) {
+            teardownUpstream()
+            throw abortedError("stop")
+          }
           const { done, value } = await reader.read()
           if (done || !value) break
           if (!firstChunkSeen) {
@@ -635,32 +885,43 @@ export class QwenWebSession implements WebChatProvider {
       } catch (error) {
         if (QwenWebError.isInstance(error) && error.code === "challenge") {
           // Mid-stream challenge: open a visible window when possible, and
-          // say exactly what happened instead of promising a window.
+          // say exactly what happened instead of promising a window. Keep the
+          // anchor: a challenge does not prove the chat is dead, and this path
+          // never silently replays the possibly accepted prompt.
           failure = await this.enrichChallenge(error, signal)
         } else if (isAbortLike(error) || signal?.aborted) {
-          failure = abortedError()
+          failure = abortedError("stop")
         } else if (isStallTimeout(error)) {
           // The upstream went quiet without a terminating event. Recover the
           // unclosed tail and end gracefully so tool calls already emitted are
           // still usable instead of the turn wedging forever.
+          stall = error
           stopUpstream()
         } else {
-          failure = error
+          failure = withQwenWebErrorPhase(error, "stream")
         }
       }
 
-      if (failure && isStaleChatError(failure)) {
-        // The upstream chat died mid-turn: release the local stream. With no
-        // output emitted yet, roll the delivery back and recover on a fresh
-        // chat. Otherwise surface the error — but still drop the dead
-        // binding, so the next turn starts fresh with the full prompt.
+      if (failure && isStaleBindingError(failure)) {
+        // The upstream binding broke mid-turn: release the local stream. With
+        // no output emitted yet, roll the delivery back and recover — a fresh
+        // chat for a dead chat, an unanchored re-run for a dead anchor.
+        // Otherwise surface the error, but still drop what was confirmed
+        // dead so the next turn starts from a valid binding.
         await reader.cancel().catch(() => {})
         response?.abort()
-        if (!emitted && state.allowFreshChatRecovery) {
-          discardDelivery()
-          return "recover-fresh-chat"
+        if (!emitted && state.allowRecovery) {
+          if (isStaleChatError(failure)) {
+            discardDelivery()
+            return "recover-fresh-chat"
+          }
+          if (canRecoverAnchor) {
+            discardAnchoredDelivery()
+            return "recover-anchor"
+          }
         }
-        clearChatBinding()
+        if (isStaleChatError(failure)) clearChatBinding()
+        else clearAnchors()
         this.store.put(thread)
       }
 
@@ -687,7 +948,7 @@ export class QwenWebSession implements WebChatProvider {
           removeById(thread, fid)
           if (seedUsed !== undefined) thread.seedText = seedUsed
           this.store.put(thread)
-          yield { type: "error", error: failure ?? emptyResponseError() }
+          yield { type: "error", error: failure ?? stall ?? emptyResponseError() }
           trace("turn done", { failure: true, empty: true })
           yield { type: "done", thread }
           return "finished"
@@ -706,9 +967,13 @@ export class QwenWebSession implements WebChatProvider {
           }),
         )
       } else {
+        if (isAbortLike(failure) || signal?.aborted) {
+          teardownUpstream()
+        }
         yield* endThinking()
         yield* endText()
-        yield { type: "error", error: failure }
+        // Abort-like errors should be filtered by caller/ UI; never emit undefined.
+        yield { type: "error", error: failure ?? new Error("session turn failed") }
       }
       this.store.put(thread)
       trace("turn done", { failure: Boolean(failure) })
@@ -814,24 +1079,26 @@ export class QwenWebSession implements WebChatProvider {
     const preview = await readPreview(response.stream, 8192).catch(() => "")
     response.abort()
     debug("session", "non-SSE completion response", {
-      chatId: chatId.slice(0, 12),
       status: response.status,
       contentType,
     })
-    if (isWafMessage(preview) || isHtmlBody(preview) || contentType.includes("text/html")) {
-      if (isWafMessage(preview)) throw await this.enrichChallenge(challengeError(), signal)
-      throw sessionExpiredError("Qwen returned a login page instead of a stream.")
+    if (isChallengeMessage(preview))
+      throw await this.enrichChallenge(
+        challengeError(undefined, response.status, { upstreamCode: "waf_challenge" }),
+        signal,
+      )
+    if (isHtmlBody(preview) || contentType.includes("text/html")) {
+      throw sessionExpiredError("Qwen returned a login page instead of a stream.", response.status === 403 ? 403 : 401)
     }
     if (contentType.includes("application/json") || preview.trimStart().startsWith("{")) {
-      const classified = classifyJsonError(preview, response.status)
+      const classified = classifyJsonError(preview, response.status, "setup")
       if (classified) throw classified
       // The preview is bounded: oversized JSON error bodies arrive truncated
-      // and fail to parse. Salvage what is visible and report it honestly —
-      // an unparseable error payload is never evidence that a login is
-      // required, which is what the old fallback claimed on HTTP 200.
-      throw classifyTruncatedJson(preview, response.status)
+      // and fail to parse. Salvage only a safe, bounded diagnostic — the raw
+      // body may contain request context and is never copied to the error.
+      throw classifyTruncatedJson(preview, response.status, "setup")
     }
-    throw classifyStatus(response.status) ?? nonStreamResponseError(preview, response.status)
+    throw classifyStatus(response.status, undefined, "setup") ?? nonStreamResponseError(preview, response.status, "setup")
   }
 }
 
@@ -888,6 +1155,49 @@ function isPreStreamRetryable(error: unknown): boolean {
   if (!QwenWebError.isInstance(error)) return false
   if (error.code === "login_required" || error.code === "session_expired" || error.code === "challenge") return false
   return error.retryable
+}
+
+/**
+ * Repair a persisted thread's binding pair before the turn uses it.
+ *
+ * Returns `true` when anything changed. A thread file can be written by
+ * another process or an older build, and may carry a blank chat id or a blank
+ * continuation anchor: left alone both look like a live binding and would be
+ * sent upstream as one.
+ */
+function sanitizeBinding(thread: WebChatThread): boolean {
+  let changed = false
+  if (typeof thread.providerId === "string") {
+    const trimmed = thread.providerId.trim()
+    if (!trimmed) {
+      thread.providerId = undefined
+      changed = true
+    } else if (trimmed !== thread.providerId) {
+      thread.providerId = trimmed
+      changed = true
+    }
+  } else if (thread.providerId !== undefined) {
+    thread.providerId = undefined
+    changed = true
+  }
+  for (const message of thread.messages) {
+    const state = message.providerState
+    if (!state) continue
+    const responseId = state["responseId"]
+    if (responseId === undefined) continue
+    if (typeof responseId !== "string" || !responseId.trim()) {
+      const rest = { ...state }
+      delete rest["responseId"]
+      message.providerState = Object.keys(rest).length > 0 ? rest : undefined
+      changed = true
+    } else if (responseId !== responseId.trim()) {
+      // A padded anchor is the same class of junk binding as a blank one:
+      // store the trimmed id rather than sending it upstream verbatim.
+      message.providerState = { ...state, responseId: responseId.trim() }
+      changed = true
+    }
+  }
+  return changed
 }
 
 function parseToolArgs(raw: string | undefined): unknown {
@@ -995,13 +1305,8 @@ export async function consumeQwenStream(
         return
       case "error":
         streamError =
-          classifyJsonError(JSON.stringify({ error: { code: event.code, message: event.message } }), 200) ??
-          new QwenWebError({
-            code: "upstream_error",
-            retryable: true,
-            upstreamCode: event.code,
-            message: `Qwen stream error: ${event.message.slice(0, 300)}`,
-          })
+          classifyJsonError(JSON.stringify({ error: { code: event.code, message: event.message } }), 200, "stream") ??
+          classifyStreamError(event.code, event.message, 200)
         terminated = true
         return
       case "usage":
@@ -1041,7 +1346,7 @@ export async function consumeQwenStream(
 
   try {
     for (;;) {
-      if (signal?.aborted) throw abortedError()
+      if (signal?.aborted) throw abortedError("stop")
       const { done, value } = await reader.read()
       if (done) break
       if (!value) continue

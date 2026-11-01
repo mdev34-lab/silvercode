@@ -2,6 +2,8 @@ import fs from "fs/promises"
 import path from "path"
 import { describe, expect, test } from "bun:test"
 import { Effect, Layer } from "effect"
+import { PlatformError, SystemError } from "effect/PlatformError"
+import { FSUtil } from "@opencode-ai/core/fs-util"
 import { HttpClient, HttpClientResponse } from "effect/unstable/http"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNodePlatform } from "@opencode-ai/core/effect/app-node-platform"
@@ -12,7 +14,12 @@ import { tmpdir } from "./fixture/tmpdir"
 
 const base = "https://skills.example.test/catalog/"
 
-async function pull(skills: unknown[], files: Record<string, string> = {}, cache?: Awaited<ReturnType<typeof tmpdir>>) {
+async function pull(
+  skills: unknown[],
+  files: Record<string, string> = {},
+  cache?: Awaited<ReturnType<typeof tmpdir>>,
+  failures?: { promotion: boolean; rollback: boolean; invalidBackup?: boolean; seen: string[] },
+) {
   const tmp = cache ?? (await tmpdir())
   const requests: string[] = []
   const http = Layer.succeed(
@@ -29,8 +36,48 @@ async function pull(skills: unknown[], files: Record<string, string> = {}, cache
       ),
     ),
   )
+  const filesystem = Layer.effect(
+    FSUtil.Service,
+    Effect.gen(function* () {
+      const fs = yield* FSUtil.Service
+      return {
+        ...fs,
+        rename: (source: string, destination: string) => {
+          if (failures?.promotion && source.includes(".tmp-") && destination.endsWith("deploy")) {
+            failures.promotion = false
+            failures.seen.push("promotion")
+            return Effect.fail(
+              new PlatformError(
+                new SystemError({ _tag: "Busy", module: "FileSystem", method: "rename", cause: { code: "EBUSY" } }),
+              ),
+            )
+          }
+          if (failures?.rollback && source.includes(".old-") && destination.endsWith("deploy")) {
+            failures.rollback = false
+            failures.seen.push("rollback")
+            return (failures.invalidBackup ? fs.remove(path.join(source, "SKILL.md")) : Effect.void).pipe(
+              Effect.andThen(
+                Effect.fail(
+                  new PlatformError(
+                    new SystemError({
+                      _tag: "PermissionDenied",
+                      module: "FileSystem",
+                      method: "rename",
+                      cause: { code: "EPERM" },
+                    }),
+                  ),
+                ),
+              ),
+            )
+          }
+          return fs.rename(source, destination)
+        },
+      }
+    }),
+  ).pipe(Layer.provide(AppNodeBuilder.build(FSUtil.node)))
   const skillDiscoveryLayer = AppNodeBuilder.build(SkillDiscovery.node, [
     [LayerNodePlatform.httpClient, http],
+    [FSUtil.node, filesystem],
     [Global.node, Global.layerWith({ cache: tmp.path })],
   ])
   const directories = await Effect.runPromise(
@@ -163,3 +210,48 @@ describe("SkillDiscovery.pull", () => {
     }
   })
 })
+
+for (const scenario of ["single", "double", "empty-cache", "invalid-backup"] as const) {
+  test(`retains usable core roots after ${scenario} promotion failure`, async () => {
+    const tmp = await tmpdir()
+    try {
+      const files = { [`${base}deploy/SKILL.md`]: "# Old", [`${base}deploy/ref.md`]: "reference" }
+      const old =
+        scenario === "empty-cache"
+          ? undefined
+          : await pull([{ name: "deploy", version: "1", files: ["SKILL.md", "ref.md"] }], files, tmp)
+      const failures = {
+        promotion: true,
+        rollback: scenario === "double" || scenario === "invalid-backup",
+        invalidBackup: scenario === "invalid-backup",
+        seen: [] as string[],
+      }
+      const result = await pull(
+        [{ name: "deploy", version: "2", files: ["SKILL.md"] }],
+        { [`${base}deploy/SKILL.md`]: "# New" },
+        tmp,
+        failures,
+      )
+      expect(failures.seen).toEqual(
+        scenario === "double" || scenario === "invalid-backup" ? ["promotion", "rollback"] : ["promotion"],
+      )
+      if (scenario === "single" || scenario === "double") {
+        expect(result.directories).toHaveLength(1)
+        expect(await fs.readFile(path.join(result.directories[0], "SKILL.md"), "utf8")).toBe("# Old")
+        expect(await fs.readFile(path.join(result.directories[0], "ref.md"), "utf8")).toBe("reference")
+        if (scenario === "single") expect(result.directories[0]).toBe(old!.directories[0])
+        else expect(result.directories[0]).toContain(".old-")
+      } else expect(result.directories).toEqual([])
+      const recovered = await pull(
+        [{ name: "deploy", version: "2", files: ["SKILL.md"] }],
+        { [`${base}deploy/SKILL.md`]: "# New" },
+        tmp,
+      )
+      expect(await fs.readFile(path.join(recovered.directories[0], "SKILL.md"), "utf8")).toBe("# New")
+      if (scenario === "double")
+        expect(await fs.readFile(path.join(result.directories[0], "SKILL.md"), "utf8")).toBe("# Old")
+    } finally {
+      await tmp[Symbol.asyncDispose]()
+    }
+  })
+}

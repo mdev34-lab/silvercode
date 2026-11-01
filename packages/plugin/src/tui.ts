@@ -12,6 +12,7 @@ import type {
   PermissionRequest,
   QuestionRequest,
   Session,
+  SessionNextContextPrepared,
   SessionStatus,
   TextPart,
   Config as SdkConfig,
@@ -177,6 +178,8 @@ export type TuiDialogSelectProps<Value = unknown> = {
   onFilter?: (query: string) => void
   onSelect?: (option: TuiDialogSelectOption<Value>) => void
   skipFilter?: boolean
+  /** Set to false to hide the search field. Defaults to shown. */
+  renderFilter?: boolean
   current?: Value
 }
 
@@ -386,6 +389,8 @@ export type TuiState = {
   session: {
     count: () => number
     get: (sessionID: string) => Session | undefined
+    /** The runtime's own measurement of the last provider request for this session. */
+    context: (sessionID: string) => SessionNextContextPrepared["data"] | undefined
     diff: (sessionID: string) => ReadonlyArray<TuiSidebarFileItem>
     todo: (sessionID: string) => ReadonlyArray<TuiSidebarTodoItem>
     messages: (sessionID: string) => ReadonlyArray<Message>

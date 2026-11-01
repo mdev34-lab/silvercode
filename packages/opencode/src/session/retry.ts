@@ -29,6 +29,7 @@ export const RETRY_INITIAL_DELAY = 2000
 export const RETRY_BACKOFF_FACTOR = 2
 export const RETRY_JITTER_FACTOR = 0.25
 export const RETRY_MAX_DELAY_NO_HEADERS = 30_000 // 30 seconds
+export const RETRY_HEADLESS_MAX_DELAY = 60_000 // 60 seconds
 export const RETRY_MAX_DELAY = 2_147_483_647 // max 32-bit signed integer for setTimeout
 export const RETRY_MAX_RETRIES = 5
 
@@ -225,6 +226,13 @@ export const RETRY_INVALIDATE_POLL_MS = 200
 export function policy(opts: {
   provider: string
   parse: (error: unknown) => Err
+  /**
+   * Optional upper bound (ms) on a single retry wait. When a provider asks for
+   * a longer backoff (e.g. multi-hour quota window resets in headless `run`),
+   * the schedule stops immediately so the original provider error surfaces
+   * instead of hanging the caller.
+   */
+  maxDelay?: number
   set: (input: { attempt: number; message: string; action?: Retryable["action"]; next: number }) => Effect.Effect<void>
   /**
    * Optional check run before and periodically during each retry delay.
@@ -255,6 +263,7 @@ export function policy(opts: {
           if (stale) return yield* Effect.fail(new RetryInvalidated())
         }
         const wait = delay(meta.attempt, SessionV1.APIError.isInstance(error) ? error : undefined)
+        if (opts.maxDelay !== undefined && wait > opts.maxDelay) return yield* Cause.done(meta.attempt)
         const now = yield* Clock.currentTimeMillis
         yield* opts.set({
           attempt: meta.attempt,

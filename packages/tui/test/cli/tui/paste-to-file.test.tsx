@@ -5,6 +5,7 @@ import { testRender, useRenderer } from "@opentui/solid"
 import { describe, expect, test } from "bun:test"
 import { onCleanup, onMount } from "solid-js"
 import { tmpdir } from "../../fixture/fixture"
+import { waitFor } from "../../fixture/frame"
 import { createTuiResolvedConfig } from "../../fixture/tui-runtime"
 import { createEventSource, createFetch, directory, json } from "../../fixture/tui-sdk"
 import { TestTuiContexts } from "../../fixture/tui-environment"
@@ -68,14 +69,15 @@ async function until(fn: () => boolean, timeoutMs = 15_000) {
 
 /** Waits for the rendered frame to satisfy `predicate`, pumping frames. */
 async function untilFrame(app: Setup, predicate: (frame: string) => boolean, maxPasses = 600) {
-  let frame = app.captureCharFrame()
-  for (let pass = 0; pass <= maxPasses; pass++) {
-    frame = app.captureCharFrame()
-    if (predicate(frame)) return frame
-    await app.renderOnce()
-    await Bun.sleep(5)
-  }
-  throw new Error(`frame predicate not satisfied after ${maxPasses} passes:\n${frame}`)
+  return waitFor(
+    app,
+    () => {
+      const frame = app.captureCharFrame()
+      return predicate(frame) ? frame : undefined
+    },
+    maxPasses,
+    `frame predicate not satisfied after ${maxPasses} passes`,
+  )
 }
 
 function agentPayload() {

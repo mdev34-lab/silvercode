@@ -28,7 +28,7 @@ import { useEvent } from "../../context/event"
 import { editorSelectionKey, useEditorContext, type EditorSelection } from "../../context/editor"
 import { normalizePromptContent, openEditor } from "../../editor"
 import { useExit } from "../../context/exit"
-import { promptOffsetWidth } from "../../prompt/display"
+import { displayIndexOf, promptOffsetWidth } from "../../prompt/display"
 import { createStore, produce, unwrap } from "solid-js/store"
 import { usePromptHistory, type PromptInfo } from "../../prompt/history"
 import { computePromptTraits } from "../../prompt/traits"
@@ -37,9 +37,12 @@ import { expandPastedTextPlaceholders, expandTrackedPastedText } from "../../pro
 import { usePromptStash } from "../../prompt/stash"
 import { DialogStash } from "../dialog-stash"
 import { type AutocompleteRef, Autocomplete } from "./autocomplete"
-import { useRenderer, useTerminalDimensions, type JSX } from "@opentui/solid"
-import type { AssistantMessage, FilePart, UserMessage } from "@opencode-ai/sdk/v2"
+import { useRenderer, type JSX } from "@opentui/solid"
+import { useTerminalDimensions } from "../../util/terminal-dimensions"
+import type { FilePart, UserMessage } from "@opencode-ai/sdk/v2"
 import { Locale } from "../../util/locale"
+import { contextUsage } from "../../util/context-usage"
+import { effortColor } from "../../util/agent-effort"
 import { errorMessage } from "../../util/error"
 import { formatDuration } from "../../util/format"
 import { useDialog } from "../../ui/dialog"
@@ -57,6 +60,8 @@ import { usePromptWorkspace } from "./workspace"
 import { usePromptMove } from "./move"
 import { useLocation } from "../../context/location"
 import { DOUBLE_PRESS_WINDOW_MS } from "../../util/double-press"
+import { useOptionalSessionTabs } from "../../context/session-tabs"
+import { SessionTabs } from "../../session-tabs"
 
 registerOpencodeSpinner()
 
@@ -69,10 +74,12 @@ export type PromptProps = {
   hint?: JSX.Element
   right?: JSX.Element
   showPlaceholder?: boolean
+  placeholder?: string
   placeholders?: {
     normal?: string[]
     shell?: string[]
   }
+  centerShortcuts?: boolean
 }
 
 export type PromptRef = {
@@ -127,8 +134,6 @@ function formatEditorContext(selection: EditorSelection) {
   return `<system-reminder>${ranges.join("\n")} This may or may not be relevant to the current task.</system-reminder>\n`
 }
 
-let stashed: { prompt: PromptInfo; cursor: number } | undefined
-
 export function Prompt(props: PromptProps) {
   let input: TextareaRenderable
   let anchor: BoxRenderable
@@ -137,6 +142,10 @@ export function Prompt(props: PromptProps) {
   const leader = useLeaderActive()
   const local = useLocal()
   const args = useArgs()
+  // Drafts and model/agent choices belong to the session that owns them. The
+  // tab context keys them by session; without it, the prompt keeps no draft.
+  const tabs = useOptionalSessionTabs()
+  const draftKey = () => props.sessionID ?? SessionTabs.HOME_DRAFT_KEY
   const paths = useTuiPaths()
   const location = useLocation()
   const clipboard = useClipboard()
@@ -222,18 +231,39 @@ export function Prompt(props: PromptProps) {
   let promptPartTypeId = 0
   const event = useEvent()
 
-  event.on("tui.prompt.append", (evt, { workspace }) => {
+  // Every deferred callback below captures the renderer, the input or the
+  // router; an untracked setTimeout can still fire after the Prompt is
+  // destroyed (tab closed) and navigate or paint into a dead tree (#418).
+  // Track each handle and cancel the survivors on unmount.
+  const timers = new Set<ReturnType<typeof setTimeout>>()
+  function defer(callback: () => void, ms: number) {
+    const handle = setTimeout(() => {
+      timers.delete(handle)
+      callback()
+    }, ms)
+    timers.add(handle)
+    return handle
+  }
+  onCleanup(() => {
+    for (const handle of timers) clearTimeout(handle)
+    timers.clear()
+  })
+
+  // Prompt mounts per session/home and on every tab switch; without the
+  // unsubscribe each stale mount inserts the appended text again (#417).
+  const offPromptAppend = event.on("tui.prompt.append", (evt, { workspace }) => {
     if (workspace !== project.workspace.current()) return
     if (!input || input.isDestroyed) return
     input.insertText(evt.properties.text)
-    setTimeout(() => {
-      // setTimeout is a workaround and needs to be addressed properly
+    defer(() => {
+      // defer is a workaround and needs to be addressed properly
       if (!input || input.isDestroyed) return
-      input.getLayoutNode().markDirty()
+      input.invalidateIntrinsicSize()
       input.gotoBufferEnd()
       renderer.requestRender()
     }, 0)
   })
+  onCleanup(offPromptAppend)
 
   createEffect(() => {
     if (!input || input.isDestroyed) return
@@ -249,25 +279,31 @@ export function Prompt(props: PromptProps) {
     return messages.findLast((m): m is UserMessage => m.role === "user")
   })
 
+  // Optional numeric detail of the sidebar context bar (#241): same measurement,
+  // so the number can never disagree with the bar, and unknown usage shows no
+  // count at all instead of a confident-looking figure.
   const usage = createMemo(() => {
     if (!props.sessionID) return
     const session = sync.session.get(props.sessionID)
     const cost = session?.cost ?? 0
     const spent = cost > 0 ? money.format(cost) : undefined
-    const msg = sync.data.message[props.sessionID] ?? []
-    const last = msg.findLast((item): item is AssistantMessage => item.role === "assistant" && item.tokens.output > 0)
-    if (!last) return
+    const measured = contextUsage({
+      report: sync.data.session_context[props.sessionID],
+      messages: sync.data.message[props.sessionID] ?? [],
+      contextLimit: (providerID, modelID) =>
+        sync.data.provider.find((item) => item.id === providerID)?.models[modelID]?.limit.context,
+    })
+    if (!measured) return
 
-    const tokens =
-      last.tokens.input + last.tokens.output + last.tokens.reasoning + last.tokens.cache.read + last.tokens.cache.write
-    if (tokens <= 0) return
-
-    const model = sync.data.provider.find((item) => item.id === last.providerID)?.models[last.modelID]
-    const pct = model?.limit.context ? `${Math.round((tokens / model.limit.context) * 100)}%` : undefined
+    // #241 owner correction: unknown usage shows no count at all, so a bare
+    // number can never disagree with the bar's "usage unknown".
+    const context =
+      measured.percent === undefined ? undefined : `${Locale.number(measured.tokens)} (${measured.percent}%)`
+    if (!context && !spent) return
     return {
-      context: pct ? `${Locale.number(tokens)} (${pct})` : Locale.number(tokens),
+      context,
       cost: spent,
-      urgent: false,
+      urgent: measured.exhausted,
     }
   })
 
@@ -298,6 +334,15 @@ export function Prompt(props: PromptProps) {
     ),
   )
 
+  // Re-applies the choice the user left a session with. Only a session that has
+  // no saved choice falls back to its last user message.
+  const applySelection = (selection: SessionTabs.TabSelection) => {
+    if (selection.agent && !args.agent) local.agent.set(selection.agent)
+    if (!selection.model) return
+    local.model.set(selection.model)
+    local.model.variant.set(selection.variant, "session")
+  }
+
   // Initialize agent/model/variant from last user message when session changes
   let syncedSessionID: string | undefined
   createEffect(() => {
@@ -305,7 +350,15 @@ export function Prompt(props: PromptProps) {
     const msg = lastUserMessage()
 
     if (sessionID !== syncedSessionID) {
-      if (!sessionID || !msg) return
+      if (!sessionID) return
+
+      const selection = tabs?.selection(sessionID)
+      if (selection) {
+        syncedSessionID = sessionID
+        applySelection(selection)
+        return
+      }
+      if (!msg) return
 
       syncedSessionID = sessionID
 
@@ -400,7 +453,7 @@ export function Prompt(props: PromptProps) {
 
           setStore("interrupt", store.interrupt + 1)
 
-          setTimeout(() => {
+          defer(() => {
             setStore("interrupt", 0)
           }, DOUBLE_PRESS_WINDOW_MS)
 
@@ -441,6 +494,10 @@ export function Prompt(props: PromptProps) {
               paths.cwd,
           })
           if (!content) return
+          // The renderer may have been destroyed while the editor owned the
+          // terminal (#377); touching the input or extmarks would hit native
+          // guards, so drop the edited content instead of crashing teardown.
+          if (renderer.isDestroyed) return
           const normalized = normalizePromptContent(content)
 
           input.setText(normalized)
@@ -460,11 +517,11 @@ export function Prompt(props: PromptProps) {
 
               if (!virtualText) return part
 
-              const newStart = normalized.indexOf(virtualText)
+              const newStart = displayIndexOf(normalized, virtualText)
               // if the virtual text is deleted, remove the part
               if (newStart === -1) return null
 
-              const newEnd = newStart + virtualText.length
+              const newEnd = newStart + promptOffsetWidth(virtualText)
 
               if (part.type === "file" && part.source?.text) {
                 return {
@@ -502,7 +559,7 @@ export function Prompt(props: PromptProps) {
             parts: updatedNonTextParts,
           })
           restoreExtmarksFromParts(updatedNonTextParts)
-          input.cursorOffset = Bun.stringWidth(normalized)
+          input.cursorOffset = promptOffsetWidth(normalized)
         },
       },
       {
@@ -606,8 +663,7 @@ export function Prompt(props: PromptProps) {
   }
 
   onMount(() => {
-    const saved = stashed
-    stashed = undefined
+    const saved = tabs?.draft(draftKey())
     if (store.prompt.input) return
     if (saved && saved.prompt.input) {
       input.setText(saved.prompt.input)
@@ -617,9 +673,17 @@ export function Prompt(props: PromptProps) {
     }
   })
 
+  // Unmount happens on every tab switch, close, or route change. Save this
+  // session's own draft and choice; an empty prompt clears the saved draft.
   onCleanup(() => {
-    if (store.prompt.input) {
-      stashed = { prompt: unwrap(store.prompt), cursor: input.cursorOffset }
+    const cursor = store.prompt.input && !input.isDestroyed ? input.cursorOffset : 0
+    tabs?.setDraft(draftKey(), { prompt: unwrap(store.prompt), cursor })
+    if (props.sessionID) {
+      tabs?.setSelection(props.sessionID, {
+        model: local.model.current(),
+        agent: local.agent.current()?.name,
+        variant: local.model.variant.current(),
+      })
     }
     setInputTarget(undefined)
     props.ref?.(undefined)
@@ -897,12 +961,13 @@ export function Prompt(props: PromptProps) {
           title: "Next prompt history",
           category: "Prompt",
           run() {
-            if (input.cursorOffset !== input.plainText.length) {
+            const endOffset = promptOffsetWidth(input.plainText)
+            if (input.cursorOffset !== endOffset) {
               if (
                 input.scrollY + input.visualCursor.visualRow ===
                 Math.max(0, input.editorView.getTotalVirtualLineCount() - 1)
               )
-                input.cursorOffset = input.plainText.length
+                input.cursorOffset = endOffset
               return false
             }
 
@@ -912,7 +977,7 @@ export function Prompt(props: PromptProps) {
             setStore("prompt", item)
             setStore("mode", item.mode ?? "normal")
             restoreExtmarksFromParts(item.parts)
-            input.cursorOffset = input.plainText.length
+            input.cursorOffset = promptOffsetWidth(item.input)
           },
         },
       ],
@@ -990,6 +1055,10 @@ export function Prompt(props: PromptProps) {
       if (move.pending() && !directory) return false
       finishMoveProgress = Boolean(move.progress())
 
+      // A home default becomes the new session's persisted selection, so the
+      // server enforces the same level the composer shows. Undefined when the
+      // user never picked one, which leaves configuration in charge.
+      const effortMetadata = local.effort.newSessionMetadata()
       const res = await sdk.client.session.create({
         directory,
         workspace: workspaceID,
@@ -999,6 +1068,7 @@ export function Prompt(props: PromptProps) {
           id: selectedModel.modelID,
           variant,
         },
+        metadata: effortMetadata,
       })
 
       if (res.error) {
@@ -1014,6 +1084,7 @@ export function Prompt(props: PromptProps) {
       }
 
       sessionID = res.data.id
+      local.effort.seed(sessionID, effortMetadata)
     }
 
     const inputText = expandTrackedPastedText(
@@ -1127,7 +1198,7 @@ export function Prompt(props: PromptProps) {
     // temporary hack to make sure the message is sent
     if (!props.sessionID) {
       if (editorParts.length > 0) editor.preserveSelectionFromNewSession()
-      setTimeout(() => {
+      defer(() => {
         route.navigate({
           type: "session",
           sessionID,
@@ -1218,9 +1289,9 @@ export function Prompt(props: PromptProps) {
       insertText: (value) => input.insertText(value),
     })
 
-    setTimeout(() => {
+    defer(() => {
       if (!input || input.isDestroyed) return
-      input.getLayoutNode().markDirty()
+      input.invalidateIntrinsicSize()
       renderer.requestRender()
     }, 0)
   }
@@ -1234,7 +1305,7 @@ export function Prompt(props: PromptProps) {
       return x.mime.startsWith("image/")
     }).length
     const virtualText = pdf ? `[PDF ${count + 1}]` : `[Image ${count + 1}]`
-    const extmarkEnd = extmarkStart + virtualText.length
+    const extmarkEnd = extmarkStart + promptOffsetWidth(virtualText)
     const textToInsert = virtualText + " "
 
     input.insertText(textToInsert)
@@ -1319,6 +1390,29 @@ export function Prompt(props: PromptProps) {
   )
   const borderHighlight = createMemo(() => tint(theme.border, highlight(), agentMetaAlpha()))
 
+  // The prompt measures itself: the session sidebar and the home width cap both make it narrower than the terminal.
+  let boxEl: BoxRenderable | undefined
+  const [boxWidth, setBoxWidth] = createSignal(0)
+  const innerWidth = createMemo(() => Math.max(10, (boxWidth() > 0 ? boxWidth() : dimensions().width - 5) - 4))
+  const showProvider = createMemo(() => innerWidth() >= 60)
+  const tagsWidth = createMemo(() => {
+    let width = local.effort.current().length
+    if (showVariant()) width += 3 + (local.model.variant.current()?.length ?? 0)
+    if (showVision()) width += 3 + "vision".length
+    return width
+  })
+  // Room left for the model name on the footer row, with a gap before the tags.
+  const modelRoom = createMemo(() => {
+    const agentName = store.mode === "shell" ? "Shell".length : (local.agent.current()?.name.length ?? 0)
+    const provider = showProvider() ? currentProviderLabel().length + 1 : 0
+    return Math.max(4, innerWidth() - tagsWidth() - 2 - agentName - 3 - provider)
+  })
+  const modelLabel = createMemo(() => Locale.truncate(local.model.parsed().model, modelRoom()))
+  // The placeholder shares its row with the YOLO tag.
+  const placeholderRoom = createMemo(() =>
+    innerWidth() - (store.mode === "normal" && local.permission.mode === "yolo" ? 8 : 0),
+  )
+
   const placeholderText = createMemo(() => {
     if (props.showPlaceholder === false) return undefined
     if (store.mode === "shell") {
@@ -1326,8 +1420,13 @@ export function Prompt(props: PromptProps) {
       const example = shell()[store.placeholder % shell().length]
       return `Run a command... "${example}"`
     }
+    if (props.placeholder) return props.placeholder
     if (!list().length) return undefined
     return `Ask anything... "${list()[store.placeholder % list().length]}"`
+  })
+  const clippedPlaceholder = createMemo(() => {
+    const text = placeholderText()
+    return text ? Locale.truncate(text, placeholderRoom()) : undefined
   })
 
   const spinnerDef = createMemo(() => {
@@ -1357,6 +1456,10 @@ export function Prompt(props: PromptProps) {
           }}
         >
           <box
+            ref={(el: BoxRenderable) => {
+              boxEl = el
+            }}
+            onSizeChange={() => boxEl && setBoxWidth(boxEl.width)}
             paddingLeft={2}
             paddingRight={2}
             paddingTop={1}
@@ -1365,9 +1468,16 @@ export function Prompt(props: PromptProps) {
             flexGrow={1}
             width="100%"
           >
+            <Show when={store.mode === "normal" && local.permission.mode === "yolo"}>
+              <box position="absolute" top={1} right={2} paddingLeft={1} paddingRight={1} backgroundColor={theme.warning}>
+                <text fg={selectedForeground(theme, theme.warning)} attributes={TextAttributes.BOLD}>
+                  YOLO
+                </text>
+              </box>
+            </Show>
             <textarea
               width="100%"
-              placeholder={placeholderText()}
+              placeholder={clippedPlaceholder()}
               placeholderColor={theme.textMuted}
               textColor={leader() ? theme.textMuted : theme.text}
               focusedTextColor={leader() ? theme.textMuted : theme.text}
@@ -1390,7 +1500,7 @@ export function Prompt(props: PromptProps) {
               onSubmit={() => {
                 // IME: double-defer so the last composed character (e.g. Korean
                 // hangul) is flushed to plainText before we read it for submission.
-                setTimeout(() => setTimeout(() => submit(), 0), 0)
+                defer(() => defer(() => submit(), 0), 0)
               }}
               onPaste={async (event: PasteEvent) => {
                 if (props.disabled) {
@@ -1427,8 +1537,8 @@ export function Prompt(props: PromptProps) {
                   promptPartTypeId = input.extmarks.registerType("prompt-part")
                 }
                 props.ref?.(ref)
-                setTimeout(() => {
-                  // setTimeout is a workaround and needs to be addressed properly
+                defer(() => {
+                  // defer is a workaround and needs to be addressed properly
                   if (!input || input.isDestroyed) return
                   input.cursorColor = theme.text
                   if (tuiConfig.cursor) input.cursorStyle = tuiConfig.cursor
@@ -1441,7 +1551,7 @@ export function Prompt(props: PromptProps) {
               syntaxStyle={syntax()}
             />
             <box flexDirection="row" flexShrink={0} paddingTop={1} gap={1} justifyContent="space-between">
-              <box flexDirection="row" gap={1}>
+              <box flexDirection="row" gap={1} flexShrink={1} minWidth={0} height={1} overflow="hidden">
                 <Show when={local.agent.current()} fallback={<box height={1} />}>
                   {(agent) => (
                     <>
@@ -1455,30 +1565,10 @@ export function Prompt(props: PromptProps) {
                             flexShrink={0}
                             fg={fadeColor(leader() ? theme.textMuted : theme.text, modelMetaAlpha())}
                           >
-                            {local.model.parsed().model}
+                            {modelLabel()}
                           </text>
-                          <text fg={fadeColor(theme.textMuted, modelMetaAlpha())}>{currentProviderLabel()}</text>
-                          {/* Agent effort is its own dial and shows even for
-                              models without thinking variants. */}
-                          <text fg={fadeColor(theme.textMuted, modelMetaAlpha())}>·</text>
-                          <text>
-                            <span style={{ fg: fadeColor(theme.info, modelMetaAlpha()), bold: true }}>
-                              {local.effort.current()}
-                            </span>
-                          </text>
-                          <Show when={showVariant()}>
-                            <text fg={fadeColor(theme.textMuted, variantMetaAlpha())}>·</text>
-                            <text>
-                              <span style={{ fg: fadeColor(theme.warning, variantMetaAlpha()), bold: true }}>
-                                {local.model.variant.current()}
-                              </span>
-                            </text>
-                          </Show>
-                          <Show when={showVision()}>
-                            <text fg={fadeColor(theme.textMuted, visionMetaAlpha())}>·</text>
-                            <text>
-                              <span style={{ fg: fadeColor(theme.accent, visionMetaAlpha()), bold: true }}>vision</span>
-                            </text>
+                          <Show when={showProvider()}>
+                            <text fg={fadeColor(theme.textMuted, modelMetaAlpha())}>{currentProviderLabel()}</text>
                           </Show>
                         </box>
                       </Show>
@@ -1486,12 +1576,37 @@ export function Prompt(props: PromptProps) {
                   )}
                 </Show>
               </box>
-              <box flexDirection="row" gap={1} alignItems="center">
-                <Show when={store.mode === "normal" && local.permission.mode === "yolo"}>
-                  <box paddingLeft={1} paddingRight={1} backgroundColor={theme.warning}>
-                    <text fg={selectedForeground(theme, theme.warning)} attributes={TextAttributes.BOLD}>
-                      YOLO
-                    </text>
+              <box flexDirection="row" gap={1} alignItems="center" flexShrink={0}>
+                <Show when={store.mode === "normal"}>
+                  <box flexDirection="row" gap={1} flexShrink={0}>
+                      {/* Agent effort is its own dial and shows even for
+                          models without thinking variants. Its hue (fast
+                          green, medium orange, thorough red) is drawn
+                          beside the always-visible level name. */}
+                      <text>
+                        <span
+                          style={{
+                            fg: fadeColor(effortColor(local.effort.current(), theme), modelMetaAlpha()),
+                            bold: true,
+                          }}
+                        >
+                          {local.effort.current()}
+                        </span>
+                      </text>
+                      <Show when={showVariant()}>
+                        <text fg={fadeColor(theme.textMuted, variantMetaAlpha())}>·</text>
+                        <text>
+                          <span style={{ fg: fadeColor(theme.warning, variantMetaAlpha()), bold: true }}>
+                            {local.model.variant.current()}
+                          </span>
+                        </text>
+                      </Show>
+                      <Show when={showVision()}>
+                        <text fg={fadeColor(theme.textMuted, visionMetaAlpha())}>·</text>
+                        <text>
+                          <span style={{ fg: fadeColor(theme.accent, visionMetaAlpha()), bold: true }}>vision</span>
+                        </text>
+                      </Show>
                   </box>
                 </Show>
                 <Show when={hasRightContent()}>{props.right}</Show>
@@ -1526,6 +1641,9 @@ export function Prompt(props: PromptProps) {
           />
         </box>
         <box width="100%" flexDirection="row" justifyContent="space-between">
+          <Show when={props.centerShortcuts}>
+            <box flexGrow={1} flexBasis={0} />
+          </Show>
           <Switch>
             <Match when={status().type !== "idle"}>
               <box
@@ -1701,6 +1819,9 @@ export function Prompt(props: PromptProps) {
                 </Match>
               </Switch>
             </box>
+          </Show>
+          <Show when={props.centerShortcuts}>
+            <box flexGrow={1} flexBasis={0} />
           </Show>
         </box>
       </box>

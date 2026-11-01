@@ -34,6 +34,7 @@ import fs from "fs/promises"
 import os from "os"
 import { pathToFileURL } from "url"
 import { Global } from "@opencode-ai/core/global"
+import { Flag } from "@opencode-ai/core/flag/flag"
 import { ProjectV2 } from "@opencode-ai/core/project"
 import { Filesystem } from "@/util/filesystem"
 import { ConfigPlugin } from "@/config/plugin"
@@ -1948,6 +1949,74 @@ describe("OPENCODE_CONFIG_CONTENT token substitution", () => {
           expect(config.username).toBe("secret_key_from_file")
         }),
       )
+    }),
+  )
+})
+
+describe("legacy TOML config migration", () => {
+  const toml = 'provider = "openai"\nmodel = "gpt-4o"\n'
+
+  it.instance("migrates the legacy TOML config, writes JSON, and removes the legacy file", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped()
+      yield* FSUtil.use.writeWithDirs(path.join(dir, "config"), toml)
+      const config = yield* withGlobalConfigDir(dir, Config.use.get())
+      expect(config.model).toBe("openai/gpt-4o")
+      const legacyExists = yield* FSUtil.use.existsSafe(path.join(dir, "config"))
+      expect(legacyExists).toBe(false)
+      const written = JSON.parse(yield* Effect.promise(() => fs.readFile(path.join(dir, "config.json"), "utf8")))
+      expect(written.model).toBe("openai/gpt-4o")
+    }),
+  )
+
+  it.instance("keeps the legacy file and un-migrated in-memory config when the converted write fails", () =>
+    Effect.gen(function* () {
+      if (process.platform === "win32") return
+      const dir = yield* tmpdirScoped()
+      yield* FSUtil.use.writeWithDirs(path.join(dir, "config"), toml)
+      // A read-only config dir makes the converted config.json write fail
+      yield* FSUtil.use.chmod(dir, 0o555)
+      yield* Effect.addFinalizer(() => FSUtil.use.chmod(dir, 0o755).pipe(Effect.ignore))
+      const config = yield* withGlobalConfigDir(dir, Config.use.get())
+      expect(config.model).not.toBe("openai/gpt-4o")
+      const legacyExists = yield* FSUtil.use.existsSafe(path.join(dir, "config"))
+      expect(legacyExists).toBe(true)
+    }),
+  )
+})
+
+describe("OPENCODE_CONFIG invalid file fallback", () => {
+  // Flag.OPENCODE_CONFIG is captured at module load, so mutate it directly
+  // and restore after the test.
+  const withCustomConfigFlag = <A, E, R>(value: string | undefined, effect: Effect.Effect<A, E, R>) =>
+    Effect.acquireUseRelease(
+      Effect.sync(() => {
+        const original = Flag.OPENCODE_CONFIG
+        Flag.OPENCODE_CONFIG = value
+        return original
+      }),
+      () => effect,
+      (original) => Effect.sync(() => (Flag.OPENCODE_CONFIG = original)),
+    )
+
+  it.instance("falls back to defaults when OPENCODE_CONFIG file has invalid JSONC", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const bad = path.join(test.directory, "broken.json")
+      yield* FSUtil.use.writeFileString(bad, "{ invalid jsonc ,,, ]")
+      const config = yield* withCustomConfigFlag(bad, Config.use.get())
+      expect(config).toBeDefined()
+    }),
+  )
+
+  it.instance("falls back to defaults when OPENCODE_CONFIG file fails schema validation", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const bad = path.join(test.directory, "wrong-schema.json")
+      yield* FSUtil.use.writeFileString(bad, JSON.stringify({ share: "not-a-valid-share-value", model: 42 }))
+      const config = yield* withCustomConfigFlag(bad, Config.use.get())
+      expect(config).toBeDefined()
+      expect(config.model).not.toBe(42)
     }),
   )
 })

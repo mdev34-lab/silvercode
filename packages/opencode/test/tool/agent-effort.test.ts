@@ -2,7 +2,7 @@ import { afterEach, describe, expect } from "bun:test"
 import { Database } from "@opencode-ai/core/database/database"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
-import { Cause, Effect, Exit, Fiber } from "effect"
+import { Cause, Deferred, Effect, Exit, Fiber } from "effect"
 import { ToolFailure } from "@opencode-ai/llm"
 import { Session, readAgentEffort } from "@/session/session"
 import { NotFoundError } from "@/storage/storage"
@@ -24,6 +24,7 @@ import { ToolRegistry } from "@/tool/registry"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Ripgrep } from "@opencode-ai/core/ripgrep"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
+import { FSUtil } from "@opencode-ai/core/fs-util"
 import { REVIEW_LOOP_METADATA } from "@opencode-ai/core/review-loop"
 import { disposeAllInstances } from "../fixture/fixture"
 import { pollWithTimeout, testEffect } from "../lib/effect"
@@ -53,6 +54,7 @@ const layer = () =>
       EventV2Bridge.node,
       Permission.node,
       CrossSpawnSpawner.node,
+      FSUtil.node,
       BackgroundJob.node,
       SessionRunState.node,
       SessionStatus.node,
@@ -89,6 +91,7 @@ const seedSession = Effect.fn("AgentEffortTest.seedSession")(function* (
     model: { providerID: "test" as never, modelID: "test-model" as never },
     time: { created: Date.now() },
   })
+  yield* session.updatePart({id:PartID.ascending(),sessionID:chat.id,messageID:user.id,type:"text",text:"Research the requested information"})
   const assistant: SessionV1.Assistant = {
     id: MessageID.ascending(),
     role: "assistant",
@@ -168,6 +171,12 @@ const fillAssistantRows = Effect.fn("AgentEffortTest.fillAssistantRows")(functio
 // The medium/thorough block: a successful finish whose reviewer cannot run
 // fails the tool call with the typed `Review blocked (<code>)` message.
 const blockedMessage = (exit: Exit.Exit<unknown, unknown>) => {
+  // A missing or unavailable review delivers UNREVIEWED with the same guidance instead of declining.
+  if (Exit.isSuccess(exit)) {
+    const output = (exit.value as { output: string }).output
+    expect(output).toContain("UNREVIEWED")
+    return output
+  }
   expect(Exit.isFailure(exit)).toBe(true)
   if (!Exit.isFailure(exit)) return ""
   const failure = Cause.squash(exit.cause)
@@ -303,8 +312,11 @@ describe("tool.finish – effort-labelled delivery", () => {
       const gone = yield* missing
         .execute({ reason: "success", result: "done" }, finishContext(chat.id, assistant.id))
         .pipe(Effect.exit)
-      expect(Exit.isFailure(gone)).toBe(true)
-      if (Exit.isFailure(gone)) expect(String(Cause.squash(gone.cause))).toContain("session-unreadable")
+      expect(Exit.isSuccess(gone)).toBe(true)
+      if (Exit.isSuccess(gone)) {
+        expect(gone.value.output).toContain("UNREVIEWED")
+        expect(gone.value.output).toContain("session-unreadable")
+      }
 
       // A storage defect is not "no session": it must reach the caller intact.
       const sentinel = new Error("storage-defect-sentinel")
@@ -410,35 +422,45 @@ describe("tool.finish – reviewer availability matches the dispatch context", (
 
         // Medium requires a reviewer: an unavailable one blocks success on
         // every repeat (no decline loop) and never reads as approval.
-        const first = yield* def.execute({ reason: "success", result: "done" }, finishContext(chat.id, assistant.id)).pipe(Effect.exit)
+        const first = yield* def
+          .execute({ reason: "success", result: "done" }, finishContext(chat.id, assistant.id))
+          .pipe(Effect.exit)
         expect(blockedMessage(first)).toContain("Review blocked (permission-denied)")
-        const second = yield* def.execute({ reason: "success", result: "done" }, finishContext(chat.id, assistant.id)).pipe(Effect.exit)
+        const second = yield* def
+          .execute({ reason: "success", result: "done" }, finishContext(chat.id, assistant.id))
+          .pipe(Effect.exit)
         expect(blockedMessage(second)).toContain("Review blocked (permission-denied)")
 
         // Only an honest failure report can complete the turn.
-        const reported = yield* def.execute({ reason: "failure", result: "Review cannot run" }, finishContext(chat.id, assistant.id))
+        const reported = yield* def.execute(
+          { reason: "failure", result: "Review cannot run" },
+          finishContext(chat.id, assistant.id),
+        )
         expect(present(reported.metadata.review).termination).toBe("review-blocked")
         expect(present(reported.metadata.review).unavailable).toBe("permission-denied")
       }),
     { config: { permission: { task: { review: "deny" } } } },
   )
 
-  it.instance(
-    "a session-scoped task deny also blocks success at medium",
-    () =>
-      Effect.gen(function* () {
-        const { chat, assistant } = yield* seedSession({
-          permission: [{ action: "deny", permission: "task", pattern: "review" }],
-        })
-        yield* addToolPart(chat.id, assistant.id, "edit")
-        const tool = yield* FinishTool
-        const def = yield* tool.init()
+  it.instance("a session-scoped task deny also blocks success at medium", () =>
+    Effect.gen(function* () {
+      const { chat, assistant } = yield* seedSession({
+        permission: [{ action: "deny", permission: "task", pattern: "review" }],
+      })
+      yield* addToolPart(chat.id, assistant.id, "edit")
+      const tool = yield* FinishTool
+      const def = yield* tool.init()
 
-        const exit = yield* def.execute({ reason: "success", result: "done" }, finishContext(chat.id, assistant.id)).pipe(Effect.exit)
-        expect(blockedMessage(exit)).toContain("Review blocked (permission-denied)")
-        const reported = yield* def.execute({ reason: "failure", result: "Review cannot run" }, finishContext(chat.id, assistant.id))
-        expect(present(reported.metadata.review).termination).toBe("review-blocked")
-      }),
+      const exit = yield* def
+        .execute({ reason: "success", result: "done" }, finishContext(chat.id, assistant.id))
+        .pipe(Effect.exit)
+      expect(blockedMessage(exit)).toContain("Review blocked (permission-denied)")
+      const reported = yield* def.execute(
+        { reason: "failure", result: "Review cannot run" },
+        finishContext(chat.id, assistant.id),
+      )
+      expect(present(reported.metadata.review).termination).toBe("review-blocked")
+    }),
   )
 
   it.instance(
@@ -450,9 +472,14 @@ describe("tool.finish – reviewer availability matches the dispatch context", (
         const tool = yield* FinishTool
         const def = yield* tool.init()
 
-        const exit = yield* def.execute({ reason: "success", result: "done" }, finishContext(chat.id, assistant.id)).pipe(Effect.exit)
+        const exit = yield* def
+          .execute({ reason: "success", result: "done" }, finishContext(chat.id, assistant.id))
+          .pipe(Effect.exit)
         expect(blockedMessage(exit)).toContain("Review blocked (subagent-depth)")
-        const reported = yield* def.execute({ reason: "failure", result: "Review cannot run" }, finishContext(chat.id, assistant.id))
+        const reported = yield* def.execute(
+          { reason: "failure", result: "Review cannot run" },
+          finishContext(chat.id, assistant.id),
+        )
         expect(present(reported.metadata.review).termination).toBe("review-blocked")
         expect(present(reported.metadata.review).unavailable).toBe("subagent-depth")
       }),
@@ -505,9 +532,13 @@ describe("tool.finish – availability uses the calling agent's dispatch ruleset
         const caller = yield* agents.get("work")
         expect(Permission.evaluate("task", "review", caller!.permission).action).toBe("deny")
 
-        const first = yield* def.execute({ reason: "success", result: "done" }, finishContext(chat.id, assistant.id)).pipe(Effect.exit)
+        const first = yield* def
+          .execute({ reason: "success", result: "done" }, finishContext(chat.id, assistant.id))
+          .pipe(Effect.exit)
         expect(blockedMessage(first)).toContain("Review blocked (permission-denied)")
-        const second = yield* def.execute({ reason: "success", result: "done" }, finishContext(chat.id, assistant.id)).pipe(Effect.exit)
+        const second = yield* def
+          .execute({ reason: "success", result: "done" }, finishContext(chat.id, assistant.id))
+          .pipe(Effect.exit)
         expect(blockedMessage(second)).toContain("Review blocked (permission-denied)")
 
         // The real dispatch gate reaches the same verdict: the routed pair
@@ -515,7 +546,10 @@ describe("tool.finish – availability uses the calling agent's dispatch ruleset
         const exit = yield* dispatchGate(chat, caller!, ["review", "work-review"])
         expectDenied(exit)
 
-        const reported = yield* def.execute({ reason: "failure", result: "Review cannot run" }, finishContext(chat.id, assistant.id))
+        const reported = yield* def.execute(
+          { reason: "failure", result: "Review cannot run" },
+          finishContext(chat.id, assistant.id),
+        )
         expect(present(reported.metadata.review).termination).toBe("review-blocked")
         expect(present(reported.metadata.review).unavailable).toBe("permission-denied")
       }),
@@ -559,12 +593,12 @@ describe("tool.finish – availability uses the calling agent's dispatch ruleset
             },
           )
           .pipe(Effect.exit)
-        expect(Exit.isFailure(declined)).toBe(true)
-        if (!Exit.isFailure(declined)) return
-        expect(Cause.squash(declined.cause)).toBeInstanceOf(ToolFailure)
-        expect(attempts).toHaveLength(1)
-        expect(attempts[0]?.review).toMatchObject({ nudged: true, disposition: "unreviewed" })
-        expect("unavailableReason" in (attempts[0]?.review ?? {})).toBe(false)
+        // Delivered UNREVIEWED with the review guidance, never as approved.
+        expect(Exit.isSuccess(declined)).toBe(true)
+        if (!Exit.isSuccess(declined)) return
+        expect(declined.value.output).toContain("UNREVIEWED")
+        expect(declined.value.metadata.review).toMatchObject({ disposition: "unreviewed" })
+        expect(declined.value.metadata.review).not.toMatchObject({ termination: "approved" })
       }),
     { config: { agent: { review: { permission: { task: { "*": "deny" } } } } } },
   )
@@ -585,13 +619,18 @@ describe("tool.finish – availability uses the calling agent's dispatch ruleset
         expect(Permission.evaluate("task", "review", caller!.permission).action).toBe("allow")
         expect(Permission.evaluate("task", "work-review", caller!.permission).action).toBe("deny")
 
-        const exit = yield* def.execute({ reason: "success", result: "done" }, finishContext(chat.id, assistant.id)).pipe(Effect.exit)
+        const exit = yield* def
+          .execute({ reason: "success", result: "done" }, finishContext(chat.id, assistant.id))
+          .pipe(Effect.exit)
         expect(blockedMessage(exit)).toContain("Review blocked (permission-denied)")
 
         const gate = yield* dispatchGate(chat, caller!, ["review", "work-review"])
         expectDenied(gate)
 
-        const reported = yield* def.execute({ reason: "failure", result: "Review cannot run" }, finishContext(chat.id, assistant.id))
+        const reported = yield* def.execute(
+          { reason: "failure", result: "Review cannot run" },
+          finishContext(chat.id, assistant.id),
+        )
         expect(present(reported.metadata.review).termination).toBe("review-blocked")
         expect(present(reported.metadata.review).unavailable).toBe("permission-denied")
       }),
@@ -660,22 +699,22 @@ describe("tool.finish – availability uses the calling agent's dispatch ruleset
             },
           )
           .pipe(Effect.exit)
-        expect(Exit.isFailure(declined)).toBe(true)
-        if (!Exit.isFailure(declined)) return
-        expect(Cause.squash(declined.cause)).toBeInstanceOf(ToolFailure)
-        expect(attempts).toHaveLength(1)
-        expect(attempts[0]?.review).toMatchObject({ nudged: true, disposition: "unreviewed" })
-        expect("unavailableReason" in (attempts[0]?.review ?? {})).toBe(false)
+        // Delivered UNREVIEWED with the review guidance, never as approved.
+        expect(Exit.isSuccess(declined)).toBe(true)
+        if (!Exit.isSuccess(declined)) return
+        expect(declined.value.output).toContain("UNREVIEWED")
+        expect(declined.value.metadata.review).toMatchObject({ disposition: "unreviewed" })
+        expect(declined.value.metadata.review).not.toMatchObject({ termination: "approved" })
       }),
     30_000,
   )
 })
 
-describe("tool.finish – newest-50 routing window parity with task dispatch", () => {
-  // task's unpinned reviewer fallback reads only the newest 50 messages
-  // (sessions.messages({limit:50})); finish takes its fallback from the same
-  // window. These fixtures push the newest user row outside that window the
-  // way a long turn does: one user message, then >50 assistant rows.
+describe("tool.finish – review dispatch permission parity with task dispatch", () => {
+  // Reviewer resolution no longer depends on the parent or the message
+  // window after the specialist consolidation, so task's dispatch and
+  // finish's availability gate must agree on one pattern set: the single
+  // reviewer plus its retired specialist aliases.
   const APPROVED = [
     "<silvercode-review>",
     JSON.stringify({
@@ -761,10 +800,10 @@ describe("tool.finish – newest-50 routing window parity with task dispatch", (
           },
         )
 
-        // task's actual routing: its window holds no user row, so the request
-        // stayed generic — exactly one ask under ["review"] — and task itself
-        // recorded the delivered report for the generic reviewer.
-        expect(asked).toEqual([["review"]])
+        // task's actual ask: the single reviewer plus the retired specialist
+        // aliases that still gate it — and task itself recorded the delivered
+        // report for the reviewer.
+        expect(asked).toEqual([["review", "work-review", "code-review"]])
         expect(present(result.metadata.review).revision).toBe("uncommitted")
         const child = yield* sessions.get(result.metadata.sessionId as SessionID)
         expect(child.agent).toBe("review")
@@ -782,9 +821,9 @@ describe("tool.finish – newest-50 routing window parity with task dispatch", (
           .pipe(Effect.exit)
         expect(Exit.isSuccess(gate)).toBe(true)
 
-        // finish must demand its required review — not claim the specialist
-        // is unavailable while the actual dispatch would ask only generic
-        // review, which the same ruleset allows.
+        // finish must demand its required review — not claim the reviewer is
+        // unavailable while the actual dispatch, which the same ruleset
+        // allows, would run it.
         const attempts: Array<{ review?: Record<string, unknown> }> = []
         const finishTool = yield* FinishTool
         const fdef = yield* finishTool.init()
@@ -800,14 +839,23 @@ describe("tool.finish – newest-50 routing window parity with task dispatch", (
             },
           )
           .pipe(Effect.exit)
-        expect(Exit.isFailure(declined)).toBe(true)
-        if (!Exit.isFailure(declined)) return
-        expect(Cause.squash(declined.cause)).toBeInstanceOf(ToolFailure)
-        expect(attempts).toHaveLength(1)
-        expect(attempts[0]?.review).toMatchObject({ nudged: true, disposition: "unreviewed" })
-        expect("unavailableReason" in (attempts[0]?.review ?? {})).toBe(false)
+        // Delivered UNREVIEWED with the review guidance, never as approved.
+        expect(Exit.isSuccess(declined)).toBe(true)
+        if (!Exit.isSuccess(declined)) return
+        expect(declined.value.output).toContain("UNREVIEWED")
+        expect(declined.value.metadata.review).toMatchObject({ disposition: "unreviewed" })
+        expect(declined.value.metadata.review).not.toMatchObject({ termination: "approved" })
       }),
-    { config: { agent: { work: { permission: { task: { "work-review": "deny" } } } } } },
+    {
+      config: {
+        agent: {
+          // An unrelated deny: the review dispatch must stay allowed so the
+          // probe measures finish's demand, not a permission block.
+          work: { permission: { task: { general: "deny" } } },
+          review: { background: false },
+        },
+      },
+    },
   )
 
   it.instance(
@@ -824,13 +872,18 @@ describe("tool.finish – newest-50 routing window parity with task dispatch", (
 
         const tool = yield* FinishTool
         const def = yield* tool.init()
-        const exit = yield* def.execute({ reason: "success", result: "done" }, finishContext(chat.id, assistant.id)).pipe(Effect.exit)
+        const exit = yield* def
+          .execute({ reason: "success", result: "done" }, finishContext(chat.id, assistant.id))
+          .pipe(Effect.exit)
 
         // The window holds no user row, so only the pinned tier can route:
         // the specialist deny blocks honestly instead of degrading to the
         // generic reviewer.
         expect(blockedMessage(exit)).toContain("Review blocked (permission-denied)")
-        const reported = yield* def.execute({ reason: "failure", result: "Review cannot run" }, finishContext(chat.id, assistant.id))
+        const reported = yield* def.execute(
+          { reason: "failure", result: "Review cannot run" },
+          finishContext(chat.id, assistant.id),
+        )
         expect(present(reported.metadata.review).termination).toBe("review-blocked")
         expect(present(reported.metadata.review).unavailable).toBe("permission-denied")
       }),
@@ -849,9 +902,14 @@ describe("tool.finish – newest-50 routing window parity with task dispatch", (
 
         const tool = yield* FinishTool
         const def = yield* tool.init()
-        const exit = yield* def.execute({ reason: "success", result: "done" }, finishContext(chat.id, assistant.id)).pipe(Effect.exit)
+        const exit = yield* def
+          .execute({ reason: "success", result: "done" }, finishContext(chat.id, assistant.id))
+          .pipe(Effect.exit)
         expect(blockedMessage(exit)).toContain("Review blocked (permission-denied)")
-        const reported = yield* def.execute({ reason: "failure", result: "Review cannot run" }, finishContext(chat.id, assistant.id))
+        const reported = yield* def.execute(
+          { reason: "failure", result: "Review cannot run" },
+          finishContext(chat.id, assistant.id),
+        )
         expect(present(reported.metadata.review).termination).toBe("review-blocked")
         expect(present(reported.metadata.review).unavailable).toBe("permission-denied")
       }),
@@ -920,10 +978,9 @@ describe("tool.finish – background child accounting", () => {
         const exit = yield* def
           .execute({ reason: "success", result: "done" }, finishContext(chat.id, assistant.id))
           .pipe(Effect.exit)
-        expect(Exit.isFailure(exit)).toBe(true)
-        if (!Exit.isFailure(exit)) return
-        const failure = exit.cause.reasons.find(Cause.isFailReason)?.error
-        expect(failure).toBeInstanceOf(ToolFailure)
+        expect(Exit.isSuccess(exit)).toBe(true)
+        if (!Exit.isSuccess(exit)) return
+        expect(exit.value.output).toContain("UNREVIEWED")
       }),
     { config: { agent: { effort: "medium" } } },
   )
@@ -1124,3 +1181,80 @@ describe("tool.task – effort selection lifecycle", () => {
     30_000,
   )
 })
+
+for (const effort of ["medium", "thorough"] as const) {
+  it.instance(
+    `explicit background reviewer cannot satisfy ${effort} finish even after approval`,
+    () =>
+      Effect.gen(function* () {
+        const { chat, assistant } = yield* seedSession({ metadata: { agentEffort: effort } })
+        yield* addToolPart(chat.id, assistant.id, "edit")
+        const sessions = yield* Session.Service
+        const jobs = yield* BackgroundJob.Service
+        const task = yield* TaskTool
+        const def = yield* task.init()
+        const report = `<silvercode-review>\n${JSON.stringify({ version: 1, revision: "uncommitted", assessment: "approved", summary: "No findings.", findings: [] })}\n</silvercode-review>`
+        const notified = yield* Deferred.make<SessionPrompt.PromptInput>()
+        const result = yield* def.execute(
+          { description: "Review file", prompt: "Review file", subagent_type: "review", background: false },
+          {
+            ...finishContext(chat.id, assistant.id),
+            extra: {
+              promptOps: {
+                ...stubOps(),
+                prompt: (input: SessionPrompt.PromptInput) =>
+                  input.sessionID === chat.id
+                    ? Deferred.succeed(notified, input).pipe(Effect.as(reply(input)))
+                    : Effect.sync(() => {
+                        const response = reply(input)
+                        response.parts = [
+                          { ...response.parts[0], type: "text", text: report } as SessionV1.TextPart,
+                          {
+                            id: PartID.ascending(),
+                            messageID: response.info.id,
+                            sessionID: input.sessionID,
+                            type: "tool",
+                            tool: "finish",
+                            callID: "review-finish",
+                            state: {
+                              status: "completed",
+                              input: { reason: "success", result: report },
+                              output: report,
+                              title: "finish",
+                              metadata: {},
+                              time: { start: 1, end: 2 },
+                            },
+                          },
+                        ]
+                        return response
+                      }),
+              },
+            },
+          },
+        )
+        expect(result.metadata.background).toBe(true)
+        const child = yield* sessions.get(result.metadata.sessionId)
+        expect(child.agent).toBe("review")
+        // Even a finished, approved background result is not foreground delivery.
+        const completed = yield* jobs.wait({ id: result.metadata.sessionId })
+        expect(completed?.info?.status).toBe("completed")
+        yield* addToolPart(
+          chat.id,
+          assistant.id,
+          "task",
+          { subagent_type: "review", background: false },
+          result.output,
+          result.metadata,
+        )
+        const notification = yield* Deferred.await(notified)
+        expect(notification.parts.some((part) => part.type === "text" && part.text.includes('"approved"'))).toBe(true)
+        const finish = yield* FinishTool
+        const final = yield* finish.init()
+        const exit = yield* final
+          .execute({ reason: "success", result: "done" }, finishContext(chat.id, assistant.id))
+          .pipe(Effect.exit)
+        expect(blockedMessage(exit)).toMatch(/Review required|requires a successful General/)
+      }),
+    { config: { agent: { effort, "work-review": { background: true } } } },
+  )
+}

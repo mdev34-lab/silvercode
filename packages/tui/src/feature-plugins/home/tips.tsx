@@ -1,11 +1,13 @@
 import type { TuiPlugin, TuiPluginApi } from "@opencode-ai/plugin/tui"
 import type { BuiltinTuiPlugin } from "../builtins"
-import { createMemo, Show } from "solid-js"
-import { Tips } from "./tips-view"
+import { createEffect, createMemo, onCleanup } from "solid-js"
+import { createTipList } from "./tips-view"
 import { useBindings } from "../../keymap"
+import { useHomeTipPlaceholder } from "../../routes/home/tip-placeholder"
 
 const id = "internal:home-tips"
 
+// Tips no longer render as a row; the home prompt rotates them as its placeholder.
 function View(props: { api: TuiPluginApi; hidden: boolean; show: boolean; connected: boolean }) {
   useBindings(() => ({
     commands: [
@@ -23,13 +25,13 @@ function View(props: { api: TuiPluginApi; hidden: boolean; show: boolean; connec
     bindings: props.api.tuiConfig.keybinds.get("tips.toggle"),
   }))
 
-  return (
-    <box width="100%" maxWidth={75} alignItems="center" paddingTop={3} flexShrink={1}>
-      <Show when={props.show}>
-        <Tips api={props.api} connected={props.connected} />
-      </Show>
-    </box>
-  )
+  const placeholder = useHomeTipPlaceholder()
+  const list = createTipList({ api: props.api, connected: () => props.connected })
+  createEffect(() => {
+    placeholder?.setTips(props.show ? list() : undefined)
+  })
+  onCleanup(() => placeholder?.setTips(undefined))
+  return null
 }
 
 const tui: TuiPlugin = async (api) => {

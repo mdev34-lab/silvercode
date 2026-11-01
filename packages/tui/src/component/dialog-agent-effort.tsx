@@ -3,7 +3,7 @@ import { useLocal } from "../context/local"
 import { useTheme } from "../context/theme"
 import { DialogSelect } from "../ui/dialog-select"
 import { useDialog } from "../ui/dialog"
-import type { Level } from "../util/agent-effort"
+import { effortBadge, type Level } from "../util/agent-effort"
 
 const ENTRIES: {
   value: Level
@@ -20,7 +20,10 @@ const ENTRIES: {
   {
     value: "medium",
     title: "Medium",
-    description: "up to 2 review passes · default",
+    // No "· default" here: on home the persisted selection decides the
+    // default now, so a static claim on one row would contradict it. The
+    // cursor and the footer carry that meaning instead.
+    description: "up to 2 review passes",
     details: ["Independent review for code changes; only blocking findings force another pass, then an honest status"],
   },
   {
@@ -37,16 +40,27 @@ export function DialogAgentEffort() {
   const { theme } = useTheme()
 
   const options = createMemo(() =>
-    ENTRIES.map((entry) => ({
-      value: entry.value,
-      title: entry.title,
-      description: entry.description,
-      details: entry.details,
-      onSelect: () => {
-        dialog.clear()
-        local.effort.set(entry.value)
-      },
-    })),
+    ENTRIES.map((entry) => {
+      // Level names always stay visible; the hue only reinforces them (fast
+      // green, medium orange, thorough red). It is painted as a filled chip so
+      // it keeps its contrast on both the panel and a highlighted row.
+      const badge = effortBadge(entry.value, theme)
+      return {
+        value: entry.value,
+        title: entry.title,
+        titleView: (
+          <>
+            <span style={{ fg: badge.fg, bg: badge.bg, bold: true }}>{` ${entry.title} `}</span>
+          </>
+        ),
+        description: entry.description,
+        details: entry.details,
+        onSelect: () => {
+          dialog.clear()
+          local.effort.set(entry.value)
+        },
+      }
+    }),
   )
 
   return (
@@ -57,9 +71,7 @@ export function DialogAgentEffort() {
       flat={true}
       footer={
         <text fg={theme.textMuted}>
-          {local.effort.scoped()
-            ? "Stored on this session · separate from model thinking"
-            : "Config default · open a session to change it"}
+          {local.effort.scoped() ? "Stored on this session" : "Default for new sessions"}
         </text>
       }
     />

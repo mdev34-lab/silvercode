@@ -1,13 +1,9 @@
 import type { Part, TextPart, ReasoningPart, ToolState } from "@opencode-ai/sdk/v2"
 
-// This reconciler is coupled to the event-ordering guarantees produced by
-// `packages/opencode/src/session/processor.ts` (append-only deltas, a single
-// non-cumulative text write at `text-end`, one terminal tool transition,
-// immutable `time.start`). There is no revision/sequence number on the wire,
-// so those guarantees are the only source of causality. If the processor
-// changes them (e.g. adds per-part revisions, re-publishes terminal rows, or
-// introduces a new non-cumulative write), this reconciler must be updated and
-// its invariants re-tested.
+// Reconciliation relies on append-only deltas and the processor's terminal
+// text-end rewrite, as well as prompt-loop orphan settlement, which publishes
+// terminal snapshots from durable rows that may not include streamed deltas.
+// There is no sequence number; changes to these publishers require retesting.
 
 type PartTime = { start: number; end?: number }
 
@@ -38,12 +34,16 @@ function isTextLike(part: Part): part is TextPart | ReasoningPart {
 // (`packages/opencode/src/session/processor.ts`):
 // - `message.part.delta` text evolves only by append (`text-delta`,
 //   `reasoning-delta`), so a snapshot that is a strict prefix of what is
-//   already rendered is necessarily older — keep the longer streamed text;
+//   already rendered is older — keep the longer streamed text, except for
+//   the first terminal text snapshot described below;
 // - a snapshot that extends the rendered text accumulated more deltas — adopt;
-// - the only legitimate non-cumulative text write is the `text-end` snapshot
+// - the legitimate non-cumulative text write is the `text-end` snapshot
 //   (the `experimental.text.complete` plugin rewrites the final text) and it
-//   is published together with `time.end`; that snapshot is adopted;
-// - a part reaches its terminal snapshot exactly once, so once `time.end` is
+//   is published together with `time.end`; adopt it even if it is a prefix or
+//   empty. Orphan settlement instead marks a potentially incomplete durable
+//   snapshot; keep local content unless that snapshot extends it. Reasoning
+//   snapshots retain the existing prefix behavior;
+// - after the first observed terminal snapshot, once `time.end` is
 //   set the part is a sink: a replayed row without `time.end` — even one that
 //   "extends" the final text — is older and must not reopen the part, and a
 //   second terminal row with different text cannot be causally newer either;
@@ -65,6 +65,15 @@ export function mergePartText(current: Part | undefined, incoming: Part): Part {
     return { ...incoming, text: currentText }
   }
 
+  // Settlement never observed the lost stream buffer; it cannot authorize a
+  // truncation or conflicting rewrite. A newer cumulative extension is safe.
+  if (incomingTerminal && incoming.recovery === "orphaned") {
+    return incomingText.startsWith(currentText) ? incoming : { ...incoming, text: currentText }
+  }
+
+  // text-end may rewrite text to a strict prefix or even an empty string.
+  // Reasoning has no corresponding plugin rewrite and keeps prefix protection.
+  if (current.type === "text" && incoming.type === "text" && incomingTerminal) return incoming
   if (currentText.startsWith(incomingText)) return { ...incoming, text: currentText }
   if (incomingText.startsWith(currentText)) return incoming
   if (incomingTerminal) return incoming
@@ -208,6 +217,12 @@ export function mergePartInPlace(target: Part, source: Part): Part {
 
   if (isTextLike(target) && isTextLike(source)) {
     target.text = source.text
+    // Provenance belongs to the first terminal snapshot, not to an earlier
+    // row or a later replay. In particular it cannot leak into text-end.
+    if (target.time?.end === undefined && source.time?.end !== undefined) {
+      if (source.recovery === "orphaned") target.recovery = source.recovery
+      else delete target.recovery
+    }
   }
   if (target.type === "tool" && source.type === "tool") {
     target.state = mergeToolState(target.state, source.state)
@@ -223,6 +238,7 @@ export function mergePartInPlace(target: Part, source: Part): Part {
   for (const key of Object.keys(incoming)) {
     if (key === "type" || key === "id" || key === "sessionID" || key === "messageID") continue
     if (key === "text" || key === "state" || key === "time") continue
+    if (key === "recovery" && isTextLike(target) && isTextLike(source)) continue
     destination[key] = incoming[key]
   }
   return target
@@ -262,7 +278,9 @@ export function applyPartDelta(
   if (!parts) return undefined
   const result = searchPart(parts, partID)
   if (!result.found) return undefined
-  const part = parts[result.index] as Record<string, unknown>
+  const found = parts[result.index]
+  if (isTextLike(found) && found.time?.end !== undefined && field === "text") return parts
+  const part = found as Record<string, unknown>
   const current = part[field]
   if (current !== undefined && typeof current !== "string") return parts
   part[field] = ((current as string | undefined) ?? "") + delta

@@ -78,7 +78,7 @@ exports[`tool parameters JSON Schema (wire shape) glob 1`] = `
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "properties": {
     "path": {
-      "description": "The directory to search in. If not specified, the current working directory will be used. IMPORTANT: Omit this field to use the default directory. DO NOT enter "undefined" or "null" - simply omit it for the default behavior. Must be a valid directory path if provided.",
+      "description": "Directory to search; omit for the working directory.",
       "type": "string",
     },
     "pattern": {
@@ -302,15 +302,28 @@ exports[`tool parameters JSON Schema (wire shape) task 1`] = `
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "properties": {
     "background": {
-      "description": "Run the agent in the background. You will be notified when it completes. DO NOT sleep, poll, or proactively check on its progress",
+      "description": "Run asynchronously and get notified on completion (default). Agents configured with \`background: false\` in opencode.json run in the foreground and wait for the result; true forces a background launch; false on any other agent still launches it in the background.",
       "type": "boolean",
     },
     "command": {
-      "description": "The command that triggered this task",
+      "description": "Triggering command",
       "type": "string",
     },
     "description": {
       "description": "A short (3-5 words) description of the task",
+      "type": "string",
+    },
+    "directory": {
+      "description": "Working folder for the child; relative paths resolve from it. Omit to inherit this session's folder. A resumed task keeps the folder it was created with. Choosing a folder is not an authorization: paths outside the project still ask the usual permissions.",
+      "type": "string",
+    },
+    "effort": {
+      "description": "Override the child's effort policy; omit to inherit.",
+      "enum": [
+        "fast",
+        "medium",
+        "thorough",
+      ],
       "type": "string",
     },
     "prompt": {
@@ -322,7 +335,7 @@ exports[`tool parameters JSON Schema (wire shape) task 1`] = `
       "type": "string",
     },
     "task_id": {
-      "description": "This should only be set if you mean to resume a previous task (you can pass a prior task_id and the task will continue the same subagent session as before instead of creating a fresh one)",
+      "description": "Resume a previous subagent session by its task_id",
       "type": "string",
     },
   },

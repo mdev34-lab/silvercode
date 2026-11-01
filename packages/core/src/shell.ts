@@ -1,6 +1,7 @@
 export * as Shell from "./shell"
 
 import path from "path"
+import { windowsPowerShellCommand } from "./shell-encoding"
 import { spawn, type ChildProcess } from "child_process"
 import { readFile } from "fs/promises"
 import { statSync } from "fs"
@@ -174,10 +175,11 @@ export function args(file: string, command: string, cwd: string) {
         [[ -f ~/.zshenv ]] && source ~/.zshenv >/dev/null 2>&1 || true
         [[ -f "\${ZDOTDIR:-$HOME}/.zshrc" ]] && source "\${ZDOTDIR:-$HOME}/.zshrc" >/dev/null 2>&1 || true
         cd -- "$1"
-        eval ${JSON.stringify(command)}
+        eval "$2"
       `,
       "silvercode",
       cwd,
+      command,
     ]
   }
   if (n === "bash") {
@@ -188,14 +190,15 @@ export function args(file: string, command: string, cwd: string) {
         shopt -s expand_aliases
         [[ -f ~/.bashrc ]] && source ~/.bashrc >/dev/null 2>&1 || true
         cd -- "$1"
-        eval ${JSON.stringify(command)}
+        eval "$2"
       `,
       "silvercode",
       cwd,
+      command,
     ]
   }
   if (n === "cmd") return ["/c", command]
-  if (ps(file)) return ["-NoProfile", "-Command", command]
+  if (ps(file)) return ["-NoProfile", "-Command", windowsPowerShellCommand(file, command)]
   return ["-c", command]
 }
 

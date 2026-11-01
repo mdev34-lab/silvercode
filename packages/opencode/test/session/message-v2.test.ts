@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { APICallError } from "ai"
+import * as ProviderError from "../../src/provider/error"
 import { MessageV2 } from "../../src/session/message-v2"
 import { ProviderTransform } from "@/provider/transform"
 import type { Provider } from "@/provider/provider"
@@ -1426,6 +1427,122 @@ describe("session.message-v2.toModelMessage", () => {
 })
 
 describe("session.message-v2.fromError", () => {
+  test("persists only safe interruption cause labels through serialization", () => {
+    const secret = "https://private.invalid/?token=SECRET response=PRIVATE auth=BEARER"
+    const network = Object.assign(new Error(secret), { code: "ECONNRESET", response: secret })
+    const input = new ProviderError.StreamInterruptedAfterToolCallError("Interrupted", {
+      cause: new ProviderError.ResponseStreamError(secret, { cause: network }),
+    })
+    const result = JSON.parse(JSON.stringify(MessageV2.fromError(input, { providerID })))
+    expect(result.data.metadata).toEqual({
+      code: "ProviderStreamInterruptedAfterToolCallError",
+      causeChain: "response_stream>network",
+      causeCode: "ECONNRESET",
+    })
+    expect(result.data.isRetryable).toBe(false)
+    expect(JSON.stringify(result)).not.toContain("SECRET")
+    expect(JSON.stringify(result)).not.toContain("PRIVATE")
+    expect(JSON.stringify(result)).not.toContain("stack")
+  })
+
+  test("bounds unknown, cyclic and deep interruption causes without invoking accessors", () => {
+    const serialize = (cause: unknown) =>
+      JSON.parse(
+        JSON.stringify(
+          MessageV2.fromError(new ProviderError.StreamInterruptedAfterToolCallError("Interrupted", { cause }), {
+            providerID,
+          }),
+        ),
+      ).data.metadata
+    expect(serialize("SECRET").causeChain).toBe("unknown")
+    expect(serialize(undefined).causeChain).toBe("unknown")
+    const cycle = new Error("SECRET")
+    cycle.cause = cycle
+    expect(serialize(cycle).causeChain).toBe("unknown>cycle")
+    let deep: Error = new Error("SECRET")
+    for (let i = 0; i < 10; i++) deep = new Error("SECRET", { cause: deep })
+    expect(serialize(deep).causeChain).toBe("unknown>unknown>unknown>unknown>truncated")
+    const accessor = new Error("SECRET")
+    Object.defineProperties(accessor, {
+      code: {
+        get() {
+          throw new Error("must not read code")
+        },
+      },
+      cause: {
+        get() {
+          throw new Error("must not read cause")
+        },
+      },
+    })
+    expect(serialize(accessor).causeChain).toBe("unknown")
+    expect(serialize(Object.assign(new Error("SECRET"), { code: "PRIVATE" }))).not.toHaveProperty("causeCode")
+    expect(serialize(new ProviderError.HeaderTimeoutError(1200)).causeChain).toBe("header_timeout")
+    expect(serialize(Object.assign(new Error("SECRET"), { name: "ProviderResponseStreamError" })).causeChain).toBe(
+      "unknown",
+    )
+    for (const code of ["ECONNRESET", "ECONNREFUSED", "ETIMEDOUT", "EPIPE", "ENOTFOUND", "EAI_AGAIN"]) {
+      expect(serialize(Object.assign(new Error("SECRET"), { code }))).toEqual({
+        code: "ProviderStreamInterruptedAfterToolCallError",
+        causeChain: "network",
+        causeCode: code,
+      })
+    }
+  })
+
+  test("contains failed introspection and denies inherited or arbitrary cause data", () => {
+    const serialize = (cause: unknown) =>
+      JSON.parse(
+        JSON.stringify(
+          MessageV2.fromError(new ProviderError.StreamInterruptedAfterToolCallError("Interrupted", { cause }), {
+            providerID,
+          }),
+        ),
+      )
+    const expected = {
+      name: "APIError",
+      data: {
+        message: "Interrupted",
+        isRetryable: false,
+        metadata: { code: "ProviderStreamInterruptedAfterToolCallError", causeChain: "unknown" },
+      },
+    }
+    const descriptorProxy = new Proxy(new Error("SECRET"), {
+      getOwnPropertyDescriptor() {
+        throw new Error("SECRET")
+      },
+    })
+    const prototypeProxy = new Proxy(new Error("SECRET"), {
+      getPrototypeOf() {
+        throw new Error("SECRET")
+      },
+    })
+    const revoked = Proxy.revocable(new Error("SECRET"), {})
+    revoked.revoke()
+    const inherited = Object.create(
+      Object.assign(new Error("SECRET"), {
+        code: "ECONNRESET",
+        cause: new ProviderError.ResponseStreamError("SECRET"),
+      }),
+    )
+    for (const cause of [descriptorProxy, prototypeProxy, revoked.proxy, inherited]) {
+      expect(serialize(cause)).toEqual(expected)
+    }
+    for (const code of ["PRIVATE", "https://private.invalid", "Bearer SECRET", "ECONNRESET SECRET", "", "econnreset"]) {
+      const cause = Object.assign(new Error("SECRET"), {
+        code,
+        stack: "STACK_SECRET",
+        response: "RESPONSE_SECRET",
+        responseBody: "BODY_SECRET",
+        url: "https://private.invalid",
+        headers: { authorization: "Bearer SECRET" },
+      })
+      expect(serialize(cause)).toEqual(expected)
+    }
+    // A trap deeper in an otherwise classifiable chain must also be contained.
+    expect(serialize(new ProviderError.ResponseStreamError("SECRET", { cause: descriptorProxy }))).toEqual(expected)
+  })
+
   test("serializes context_length_exceeded as ContextOverflowError", () => {
     const input = {
       type: "error",
@@ -1442,6 +1559,14 @@ describe("session.message-v2.fromError", () => {
         responseBody: JSON.stringify(input),
       },
     })
+  })
+
+  test("passes through named session errors thrown upstream", () => {
+    const overflow = new SessionV1.ContextOverflowError({ message: "too many tokens" })
+    expect(MessageV2.fromError(overflow, { providerID })).toBe(overflow)
+
+    const api = new SessionV1.APIError({ message: "rate limited", isRetryable: true })
+    expect(MessageV2.fromError(api, { providerID })).toBe(api)
   })
 
   test("serializes response error codes", () => {

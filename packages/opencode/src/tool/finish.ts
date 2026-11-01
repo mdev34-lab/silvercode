@@ -1,3 +1,5 @@
+import { route as workRoute } from "@/session/work-flow"
+import { WorkFlow } from "@opencode-ai/core/work-flow"
 import * as Tool from "./tool"
 import { ToolFailure } from "@opencode-ai/llm"
 import { ReviewReport } from "@opencode-ai/core/review-report"
@@ -8,14 +10,14 @@ import { Effect, Option, Schema } from "effect"
 import { Todo } from "../session/todo"
 import { Session, readAgentEffort } from "../session/session"
 import { NotFoundError } from "@/storage/storage"
-import { ROUTING_WINDOW, routedAgent } from "../session/session-agent"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Config } from "@/config/config"
 import { reviewLoopState } from "../session/review-loop"
 import { BackgroundJob } from "@/background/job"
-import { isReviewAgent, resolveReviewer } from "../agent/review-agents"
+import { isReviewAgent, LEGACY_REVIEW_AGENTS, resolveReviewer } from "../agent/review-agents"
 import { Agent } from "../agent/agent"
 import { Permission } from "@/permission"
+import { resultChunks, textResult, TEXT_RESULT_TAG } from "@/session/subagent-result"
 
 const DeclaredReasons = ["success", "waiting_for_subagent", "subagent_wait", "failure"] as const
 
@@ -33,10 +35,11 @@ export type Reason = Schema.Schema.Type<typeof Reason>
  * instead of forcing the reason through a tool input the model never supplied.
  *
  * The delivered set is deliberately narrower than the declared one:
- * `waiting_for_subagent` is not in it. A child's run ends at its yield, so an
+ * `waiting_for_subagent` is not in it. A yield ends the child's turn, so an
  * envelope naming that reason would present a provisional result as a terminal
- * one. {@link deliveredReason} drops it, and #222 replaces the gap with a
- * nested yield that has a delivery of its own.
+ * one; {@link deliveredReason} drops it. A nested yield (#222) delivers nothing
+ * at all: the child's job stays running and its terminal result is the only
+ * delivery.
  */
 export const TerminationReason = Schema.Literals(["success", "subagent_wait", "failure", "cancelled"])
 
@@ -45,11 +48,10 @@ export type TerminationReason = Schema.Schema.Type<typeof TerminationReason>
 export const Parameters = Schema.Struct({
   reason: Reason.annotate({
     description:
-      "Why the agent is ending this turn: success when the task is complete, waiting_for_subagent when yielding the turn while background subagents you launched are still running (main session only — a subagent's run ends at its yield, so it must deliver its own result), subagent_wait when progress depends on a subagent that will not report back on its own, or failure when the task could not be completed.",
+      "Why the turn ends: success, waiting_for_subagent (yield while your own background subagents run, including from a subagent session), subagent_wait, or failure.",
   }),
   result: Schema.String.annotate({
-    description:
-      "The final result of the task: a concise summary of what was accomplished, presented to the user as the task outcome.",
+    description: "Concise summary of the outcome, shown to the user.",
   }),
   validation: Schema.optional(
     Schema.Struct({
@@ -62,8 +64,7 @@ export const Parameters = Schema.Struct({
       ),
     }),
   ).annotate({
-    description:
-      "Optional agent-reported validation evidence: one entry per check. finish records it and never executes checks itself.",
+    description: "Optional validation evidence, one entry per check.",
   }),
 })
 
@@ -95,11 +96,12 @@ export function readTermination(part: SessionV1.ToolPart): Reason | undefined {
  * The declared reason as it is delivered to a parent.
  *
  * A declared `waiting_for_subagent` has no delivered counterpart. The finish
- * tool refuses the wait for a session that is itself a subagent, so a task child
- * cannot declare it, and a transcript that still does must not put a provisional
- * envelope on the wire as a terminal one: it delivers like a legacy record with
- * no declared reason — a plain result with no `<termination>` element. #222
- * gives a nested yield a termination of its own.
+ * tool accepts the wait only while a background subagent of that session is
+ * running - for a task child, one it launched itself, which keeps its job alive
+ * (#222) - so a transcript carrying the reason without one behind it must not
+ * put a provisional envelope on the wire as a terminal one: it delivers like a
+ * legacy record with no declared reason — a plain result with no
+ * `<termination>` element.
  */
 export function deliveredReason(reason: Reason | undefined): TerminationReason | undefined {
   if (reason === "waiting_for_subagent") return undefined
@@ -171,6 +173,23 @@ export const FinishTool = Tool.define(
           const messages = yield* sessions
             .messages({ sessionID: ctx.sessionID })
             .pipe(Effect.mapError((error) => new ToolFailure({ message: error.message })))
+          const currentMessage = messages.find((message) => message.info.id === ctx.messageID)
+          const chunks = currentMessage ? resultChunks(messages, currentMessage) : []
+          const ownerSession = yield* sessions
+            .get(ctx.sessionID)
+            .pipe(Effect.catchIf(NotFoundError.isInstance, () => Effect.succeed(undefined)))
+          const isChild =
+            ownerSession?.parentID !== undefined ||
+            (yield* background.list()).some(
+              (job) => job.type === "task" && BackgroundJob.runsSession(job, ctx.sessionID),
+            )
+          if (isChild && !isReviewAgent(ctx.agent) && !textResult([...chunks, params.result]).ok) {
+            return yield* Effect.fail(
+              new ToolFailure({
+                message: `Subagent finish rejected: emit a non-empty <${TEXT_RESULT_TAG}>final text result</${TEXT_RESULT_TAG}> envelope in this execution, or include it in finish.result, then call finish again. Progress text and tool output are not a delivered result.`,
+              }),
+            )
+          }
           // The Review subagent completes its run through this same finish
           // tool, so the structured review result is gated here, at the
           // control-flow boundary: without a parseable report envelope the
@@ -179,11 +198,7 @@ export const FinishTool = Tool.define(
           // never recursively reviewed by the effort policy below — their
           // own report contract is the whole gate.
           if (isReviewAgent(ctx.agent)) {
-            const currentMessage = messages.find((message) => message.info.id === ctx.messageID)
-            const delivery = ReviewReport.extract([
-              ...(currentMessage?.parts ?? []).flatMap((part) => (part.type === "text" ? [part.text] : [])),
-              params.result,
-            ])
+            const delivery = ReviewReport.extract([...chunks, params.result])
             if (!delivery.ok) {
               yield* Effect.logWarning("finish declined: review result missing or unparseable", {
                 sessionID: ctx.sessionID,
@@ -210,12 +225,6 @@ export const FinishTool = Tool.define(
           //
           if (params.reason === "waiting_for_subagent") {
             const jobs = yield* background.list()
-            // A subagent cannot yield. `runTask` is a single prompt, so a
-            // child's run ends at its yield and this provisional result would
-            // be the parent's only delivery: the work the child waits on would
-            // never reach it, and a child's job that has ended cannot be waited
-            // on again. Only a session that is not itself a task can yield;
-            // #222 tracks keeping a child's job alive so a nested yield works.
             const session = yield* sessions
               .get(ctx.sessionID)
               .pipe(Effect.mapError((error) => new ToolFailure({ message: error.message })))
@@ -225,20 +234,6 @@ export const FinishTool = Tool.define(
                 (job) =>
                   job.type === "task" && job.status === "running" && BackgroundJob.runsSession(job, ctx.sessionID),
               )
-            if (isSubagentRun) {
-              yield* Effect.logWarning("finish declined: a subagent session cannot yield for its own subagents", {
-                sessionID: ctx.sessionID,
-              })
-              return yield* Effect.fail(
-                new ToolFailure({
-                  message:
-                    "Cannot wait: this session is itself a subagent, and a subagent's run ends at its yield — " +
-                    "the parent would receive this provisional result as the run's only delivery, and whatever " +
-                    "this session waits on would never reach it. " +
-                    'Deliver your own result with reason: "success", or "failure" if the task could not be completed.',
-                }),
-              )
-            }
             // The filter below is a snapshot, not a reservation (#222): a job
             // whose cancellation is already in flight still reads `running`
             // here, so a wait can be accepted whose child never notifies.
@@ -250,6 +245,28 @@ export const FinishTool = Tool.define(
                 job.type === "task" && job.status === "running" && BackgroundJob.isSubagentOf(job, ctx.sessionID),
             )
             if (running.length === 0) {
+              // A subagent that launched its own background subagents may yield
+              // for them: `task` keeps its job running through the wait and
+              // resumes it when they report, so the session is woken by exactly
+              // the work it declared (#222). What it must not do is yield with
+              // nothing of its own in flight - its run ends at the yield, so the
+              // parent would receive this provisional result as the run's only
+              // delivery and whatever it waits on would never reach it.
+              if (isSubagentRun) {
+                yield* Effect.logWarning("finish declined: a subagent yielded with no subagents of its own running", {
+                  sessionID: ctx.sessionID,
+                })
+                return yield* Effect.fail(
+                  new ToolFailure({
+                    message:
+                      "Cannot wait: this session is itself a subagent and has no background subagents of its own " +
+                      "running. A subagent may yield only for a task it launched itself, because that is the work " +
+                      "that can wake it; a yield with nothing of its own in flight would end its run here and " +
+                      'deliver this provisional result as the run\'s only delivery. Deliver your own result with reason: "success", ' +
+                      'or "failure" if the task could not be completed.',
+                  }),
+                )
+              }
               return yield* Effect.fail(
                 new ToolFailure({
                   message:
@@ -260,6 +277,9 @@ export const FinishTool = Tool.define(
                 }),
               )
             }
+            // Accepted for a subagent too, when the running jobs are its own:
+            // `task` keeps its job running through the wait and resumes it as
+            // they report, so the wait is woken by work that belongs to it.
             yield* Effect.logInfo("finish yielded while background subagents run", {
               sessionID: ctx.sessionID,
               subagents: running.length,
@@ -284,10 +304,54 @@ export const FinishTool = Tool.define(
           const configEffort = typeof cfg.agent?.effort === "string" ? cfg.agent.effort : undefined
           const effort = AgentEffort.resolve(readAgentEffort(session?.metadata), AgentEffort.resolve(configEffort))
           const reviewState = reviewLoopState(messages, { effort })
+          const workIdentity = yield* agents.get("work")
+          const workflowNotes: string[] = []
+          if (
+            session !== undefined &&
+            WorkFlow.ownsRole(yield* agents.list(), workIdentity, ctx.agent) &&
+            params.reason === "success"
+          ) {
+            const workflow = WorkFlow.state(messages, ctx.sessionID)
+            const admission = yield* workRoute(ctx.sessionID).pipe(
+              Effect.provideService(Session.Service, sessions),
+              Effect.mapError((error) => new ToolFailure({ message: error.message })),
+            )
+            const original = WorkFlow.request(messages)
+            const requestText =
+              original?.parts
+                .flatMap((part) => (part.type === "text" ? [(part as { text: string }).text] : []))
+                .join("\n") ?? ""
+            // Workflow stages are not action or completion gates: a missing stage is reported
+            // truthfully in the result instead of blocking, and never claimed as done.
+            if (
+              admission.kind === "nonprogramming" &&
+              (effort === "thorough" || WorkFlow.complex(requestText)) &&
+              !workflow.delegated
+            )
+              workflowNotes.push("complex or thorough non-programming work had no successful General delivery")
+            if (admission.kind === "programming" && !workflow.implemented)
+              workflowNotes.push("programming work was not delivered through successful Think planning and Code implementation")
+            // Blocking findings come from a Review that actually ran: reporting success over them
+            // would misstate the delivered work, so that one stays a delivery-integrity refusal.
+            if (reviewState.blockingFindings > 0)
+              return yield* Effect.fail(
+                new ToolFailure({
+                  message:
+                    "Work cannot report success while a Review has blocking findings. Fix them and obtain a clean Review, or report failure honestly; a review budget is not approval.",
+                }),
+              )
+            if (
+              admission.kind === "programming" &&
+              (reviewState.workSinceReview || reviewState.lastReviewVerdict !== "approved")
+            )
+              workflowNotes.push(
+                `no clean Review of the current work (blocking findings ${reviewState.blockingFindings}, ${reviewState.workSinceReview ? "work after the last review, " : ""}last verdict ${reviewState.lastReviewVerdict ?? "none"}); treat it as unreviewed`,
+              )
+          }
 
           // Reviewer availability is dispatch evidence taken from the same
-          // context a real `task` dispatch would use: the routed reviewer for
-          // this session's agent, its existence/primary status, the CALLING
+          // context a real `task` dispatch would use: the reviewer's
+          // existence/primary status, the CALLING
           // agent's permission ruleset exactly as `ctx.ask` composes it, the
           // session's rules, and the subagent depth limit. It is only
           // consulted when the policy could actually need a review.
@@ -297,33 +361,25 @@ export const FinishTool = Tool.define(
               : yield* Effect.gen(function* () {
                   if (!session)
                     return {
-                      available: false as const, code: "session-unreadable" as const,
+                      available: false as const,
+                      code: "session-unreadable" as const,
                       reason: "the session could not be read to verify reviewer dispatch context",
                     }
-                  // Same routing tier as task(): the pinned session agent,
-                  // falling back to the newest user message's agent — read
-                  // over task's dispatch window: task's fallback reads
-                  // sessions.messages({limit:50}), the newest 50 rows. The
-                  // full-history read above is ascending, so its final 50
-                  // entries are exactly that newest page (same rows, same
-                  // (time_created, id) order), keeping this verdict on the
-                  // window dispatch actually routes from; reviewLoopState
-                  // above still consumes the full history.
-                  const routed = routedAgent(session, messages.slice(-ROUTING_WINDOW))
-                  const resolved = resolveReviewer("review", routed)
-                  // Dispatch parity with task(): only the RESOLVED reviewer must
-                  // exist. The generic `review` request is a routing input, not a
-                  // dispatch target, so a disabled generic reviewer must not block
-                  // a usable specialist.
+                  // One reviewer exists after the specialist consolidation:
+                  // resolution is the identity for a `review` dispatch, so the
+                  // availability check reads the reviewer directly.
+                  const resolved = resolveReviewer("review")
                   const reviewer = yield* agents.get(resolved)
                   if (!reviewer)
                     return {
-                      available: false as const, code: "reviewer-missing" as const,
+                      available: false as const,
+                      code: "reviewer-missing" as const,
                       reason: `reviewer agent "${resolved}" is not available`,
                     }
                   if (reviewer.mode === "primary")
                     return {
-                      available: false as const, code: "reviewer-missing" as const,
+                      available: false as const,
+                      code: "reviewer-missing" as const,
                       reason: `reviewer agent "${resolved}" is a primary agent and cannot be delegated to`,
                     }
                   // The dispatch permission gate asks through `ctx.ask`,
@@ -337,11 +393,16 @@ export const FinishTool = Tool.define(
                   const caller = yield* agents.get(ctx.agent)
                   if (!caller)
                     return {
-                      available: false as const, code: "caller-unreadable" as const,
+                      available: false as const,
+                      code: "caller-unreadable" as const,
                       reason: `running agent "${ctx.agent}" could not be read to verify its dispatch permissions`,
                     }
                   const ruleset = Permission.merge(caller.permission, session.permission ?? [])
-                  const patterns = resolved === "review" ? ["review"] : ["review", resolved]
+                  // The retired specialist names stay valid deny targets: a
+                  // rule written against `work-review`/`code-review` gated the
+                  // reviewer before the consolidation, and there is exactly one
+                  // reviewer to gate now, so it must keep gating.
+                  const patterns = ["review", ...LEGACY_REVIEW_AGENTS]
                   // Same deny verdict as the real dispatch: `Permission.denies`
                   // evaluates this ruleset against the instance-approved grants
                   // exactly as `Permission.ask` does, so an always-grant that
@@ -354,7 +415,8 @@ export const FinishTool = Tool.define(
                   const bypassAgentCheck = ctx.extra?.bypassAgentCheck === true
                   if (!bypassAgentCheck && (yield* permission.denies({ permission: "task", patterns, ruleset })))
                     return {
-                      available: false as const, code: "permission-denied" as const,
+                      available: false as const,
+                      code: "permission-denied" as const,
                       reason: `permission config denies task "${resolved}"`,
                     }
                   let depth = 0
@@ -366,7 +428,8 @@ export const FinishTool = Tool.define(
                       .pipe(Effect.catchIf(NotFoundError.isInstance, () => Effect.succeed(undefined)))
                     if (!parent)
                       return {
-                        available: false as const, code: "session-unreadable" as const,
+                        available: false as const,
+                        code: "session-unreadable" as const,
                         reason: "session ancestry could not be read to verify the subagent depth limit",
                       }
                     current = parent
@@ -376,13 +439,15 @@ export const FinishTool = Tool.define(
                   const latestUser = messages.findLast((message) => message.info.role === "user")
                   if (latestUser?.info.role === "user" && latestUser.info.tools?.task === false)
                     return {
-                      available: false as const, code: "task-hidden" as const,
+                      available: false as const,
+                      code: "task-hidden" as const,
                       reason: "the newest user message hides the task tool for this turn",
                     }
                   const depthLimit = cfg.subagent_depth ?? 1
                   if (depth >= depthLimit)
                     return {
-                      available: false as const, code: "subagent-depth" as const,
+                      available: false as const,
+                      code: "subagent-depth" as const,
                       reason: `subagent depth limit reached (${depthLimit})`,
                     }
                   return { available: true as const }
@@ -397,10 +462,25 @@ export const FinishTool = Tool.define(
             ...(availability.available ? {} : { unavailableCode: availability.code }),
             // #233 handoff: a child that cannot dispatch review because of the depth limit hands
             // its unreviewed writes to its parent (review-pending), never claims approval.
-            handoff: !availability.available && session?.parentID !== undefined && availability.code === "subagent-depth",
+            handoff:
+              !availability.available && session?.parentID !== undefined && availability.code === "subagent-depth",
           })
 
-          if (!outcome.deliver) {
+          // A missing, stale or unavailable review is not a completion gate: the result is delivered
+          // with an explicit UNREVIEWED label and never as approved. Known blocking findings from a
+          // Review that ran, and a review still in progress, keep declining.
+          const softened =
+            !outcome.deliver &&
+            params.reason !== "subagent_wait" &&
+            reviewState.blockingFindings === 0 &&
+            !reviewState.reviewInProgress
+          if (softened)
+            workflowNotes.push(
+              `UNREVIEWED: effort ${effort} asks for a clean current Review and none is in place; this is not an approval. ${
+                outcome.feedback ?? ""
+              }`.trim(),
+            )
+          if (!outcome.deliver && !softened) {
             yield* Effect.logWarning("finish declined by effort policy", {
               sessionID: ctx.sessionID,
               effort,
@@ -487,7 +567,9 @@ export const FinishTool = Tool.define(
 
           return {
             title: "Task completed",
-            output: `${params.result}\n\n[${status}]`,
+            output: `${params.result}\n\n[${status}]${
+              workflowNotes.length > 0 ? `\n\nWorkflow status (not blocking): ${workflowNotes.join("; ")}.` : ""
+            }`,
             metadata: {
               termination: { reason: params.reason },
               review: {

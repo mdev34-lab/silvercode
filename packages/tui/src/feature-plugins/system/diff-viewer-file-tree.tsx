@@ -1,8 +1,9 @@
 /** @jsxImportSource @opentui/solid */
 import type { ColorInput, RGBA, ScrollBoxRenderable } from "@opentui/core"
+import { useRenderer } from "@opentui/solid"
 import { Locale } from "../../util/locale"
 import { tint } from "../../context/theme"
-import { createEffect, createMemo, For, Match, Switch } from "solid-js"
+import { createEffect, createMemo, For, Match, onCleanup, Switch } from "solid-js"
 import { buildFileTree, flattenFileTree, type FileTreeItem, type FileTreeRow } from "./diff-viewer-file-tree-utils"
 import { Panel } from "./diff-viewer-ui"
 
@@ -35,18 +36,35 @@ export type DiffViewerFileTreeProps = {
 }
 
 export function DiffViewerFileTree(props: DiffViewerFileTreeProps) {
+  const renderer = useRenderer()
   const tree = createMemo(() => buildFileTree(props.files))
   const rows = createMemo(() => flattenFileTree(tree(), props.expandedNodes))
   let scroll: ScrollBoxRenderable | undefined
 
+  // Every selection move queues a frame; with no id or guard the queued
+  // frames pile up while holding j and still run after unmount (#422). The
+  // renderer has no cancelAnimationFrame, so stale frames check the
+  // generation and live ones replace it.
+  let scrollGeneration = 0
+  onCleanup(() => {
+    scrollGeneration++
+  })
+
   createEffect(() => {
     const node = props.highlightedNode
+    // Advance the generation before any early return: every re-run must
+    // invalidate a frame queued by the previous run, even when this run
+    // queues nothing (selection cleared or not yet in the rows).
+    const generation = ++scrollGeneration
     if (node === undefined) return
     const selectedIndex = rows().findIndex((row) => row.id === node)
     if (selectedIndex === -1) return
     const scrollSelectedIntoView = () => scrollFileTreeRowIntoView(scroll, selectedIndex)
     scrollSelectedIntoView()
-    requestAnimationFrame(scrollSelectedIntoView)
+    renderer.requestAnimationFrame(() => {
+      if (generation !== scrollGeneration) return
+      scrollSelectedIntoView()
+    })
   })
 
   const fadedColor = () => tint(props.theme.text, props.theme.background, 0.75)

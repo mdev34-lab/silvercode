@@ -11,10 +11,14 @@ export type GenerationMetrics = {
   tokensPerSecond?: number
 }
 
-// TTFT is time to first text token received: a non-empty text-delta.
-// Tool-call, tool-input-delta, and reasoning-delta do not start TTFT or tok/s.
-export function isReceivedTextToken(event: GenerationStreamEvent) {
-  return event.type === "text-delta" && typeof event.text === "string" && event.text.length > 0
+// TTFT is the time to the first generated token of any kind: reasoning, text or
+// streamed tool arguments. The provider's output token count includes all of
+// them, so the tok/s window has to open on the first of them too. Counting only
+// from the first text token divides thinking tokens by a window that does not
+// contain the thinking time.
+export function isReceivedToken(event: GenerationStreamEvent) {
+  const generated = event.type === "text-delta" || event.type === "reasoning-delta" || event.type === "tool-input-delta"
+  return generated && typeof event.text === "string" && event.text.length > 0
 }
 
 function reportedOutputTokens(event: GenerationStreamEvent) {
@@ -76,7 +80,7 @@ export function createGenerationClock() {
       sawStepUsage = false
     },
     observe(event: GenerationStreamEvent, at: number) {
-      if (isReceivedTextToken(event)) {
+      if (isReceivedToken(event)) {
         if (firstOutputAt === undefined) firstOutputAt = at
         if (generatingSince === undefined) generatingSince = at
       }

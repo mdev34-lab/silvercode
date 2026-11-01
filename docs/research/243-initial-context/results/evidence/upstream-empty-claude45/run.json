@@ -1,0 +1,13 @@
+{
+  "scenario": {
+    "id": "upstream-empty-claude45",
+    "engine": "upstream",
+    "model": "probe/claude-sonnet-4-5",
+    "prompt": "Say hello in one word."
+  },
+  "exitCode": 0,
+  "elapsedMs": 3024,
+  "project": "/tmp/opencode-243-initial-context/upstream-empty-claude45/project",
+  "stdout": "ok\n",
+  "stderr": "\u001b[0m\n> build · claude-sonnet-4-5\n\u001b[0m\n"
+}

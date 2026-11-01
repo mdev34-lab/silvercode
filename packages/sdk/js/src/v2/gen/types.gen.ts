@@ -45,6 +45,7 @@ export type Event =
   | EventSessionNextCompactionStarted
   | EventSessionNextCompactionDelta
   | EventSessionNextCompactionEnded
+  | EventSessionNextContextPrepared
   | EventSessionNextRevertStaged
   | EventSessionNextRevertCleared
   | EventSessionNextRevertCommitted
@@ -93,6 +94,7 @@ export type Event =
   | EventWorktreeFailed
   | EventServerConnected
   | EventGlobalDisposed
+  | EventServerResync
   | EventServerInstanceDisposed
 
 export type QuestionReplied = {
@@ -383,6 +385,7 @@ export type TextPart = {
   messageID: string
   type: "text"
   text: string
+  recovery?: "orphaned"
   synthetic?: boolean
   ignored?: boolean
   time?: {
@@ -415,6 +418,7 @@ export type ReasoningPart = {
   messageID: string
   type: "reasoning"
   text: string
+  recovery?: "orphaned"
   metadata?: {
     [key: string]: unknown
   }
@@ -1170,6 +1174,20 @@ export type GlobalEvent = {
       }
     | {
         id: string
+        type: "session.next.context.prepared"
+        properties: {
+          timestamp: number
+          sessionID: string
+          tokens: number
+          overheadTokens: number
+          reclaimedTokens: number
+          limit?: number
+          utilization: number
+          outcome: "untouched" | "reduced" | "exhausted"
+        }
+      }
+    | {
+        id: string
         type: "session.next.revert.staged"
         properties: {
           timestamp: number
@@ -1605,6 +1623,13 @@ export type GlobalEvent = {
           [key: string]: unknown
         }
       }
+    | {
+        id: string
+        type: "server.resync"
+        properties: {
+          reason: "resume-cursor-expired"
+        }
+      }
     | EventServerInstanceDisposed
     | SyncEventSessionCreated
     | SyncEventSessionUpdated
@@ -1711,6 +1736,7 @@ export type AgentConfig = {
   steps?: number
   maxSteps?: number
   finishTool?: boolean
+  background?: boolean
   permission?: PermissionConfig
   [key: string]:
     | unknown
@@ -2391,6 +2417,7 @@ export type Agent = {
   }
   steps?: number
   finishTool?: boolean
+  background?: boolean
 }
 
 export type LspStatus = {
@@ -2918,6 +2945,7 @@ export type V2Event =
   | SessionNextCompactionStarted
   | SessionNextCompactionDelta
   | SessionNextCompactionEnded
+  | SessionNextContextPrepared
   | SessionNextRevertStaged
   | SessionNextRevertCleared
   | SessionNextRevertCommitted
@@ -3209,6 +3237,14 @@ export type ProjectTime = {
   created: number
   updated: number
   initialized?: number
+}
+
+export type EventServerResync = {
+  id: string
+  type: "server.resync"
+  properties: {
+    reason: "resume-cursor-expired"
+  }
 }
 
 export type EventServerInstanceDisposed = {
@@ -5342,6 +5378,30 @@ export type SessionNextCompactionDelta = {
   }
 }
 
+export type SessionNextContextPrepared = {
+  id: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  type: "session.next.context.prepared"
+  durable?: {
+    aggregateID: string
+    seq: number
+    version: number
+  }
+  location?: LocationRef
+  data: {
+    timestamp: number
+    sessionID: string
+    tokens: number
+    overheadTokens: number
+    reclaimedTokens: number
+    limit?: number
+    utilization: number
+    outcome: "untouched" | "reduced" | "exhausted"
+  }
+}
+
 export type MessagePartDelta = {
   id: string
   metadata?: {
@@ -6674,6 +6734,21 @@ export type EventSessionNextCompactionEnded = {
     reason: "auto" | "manual"
     text: string
     recent: string
+  }
+}
+
+export type EventSessionNextContextPrepared = {
+  id: string
+  type: "session.next.context.prepared"
+  properties: {
+    timestamp: number
+    sessionID: string
+    tokens: number
+    overheadTokens: number
+    reclaimedTokens: number
+    limit?: number
+    utilization: number
+    outcome: "untouched" | "reduced" | "exhausted"
   }
 }
 
@@ -9416,6 +9491,40 @@ export type ProviderAuthResponses = {
 }
 
 export type ProviderAuthResponse = ProviderAuthResponses[keyof ProviderAuthResponses]
+
+export type ProviderProbeData = {
+  body?: {
+    providerID: string
+    modelID: string
+  }
+  path?: never
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/provider/probe"
+}
+
+export type ProviderProbeErrors = {
+  /**
+   * InvalidRequestError
+   */
+  400: InvalidRequestError
+}
+
+export type ProviderProbeError = ProviderProbeErrors[keyof ProviderProbeErrors]
+
+export type ProviderProbeResponses = {
+  /**
+   * Probe outcome
+   */
+  200: {
+    outcome: "ok" | "transient" | "error"
+    latencyMs: number
+  }
+}
+
+export type ProviderProbeResponse = ProviderProbeResponses[keyof ProviderProbeResponses]
 
 export type ProviderOauthAuthorizeData = {
   body?: {

@@ -39,6 +39,10 @@ const AgentSchema = Schema.StructWithRest(
       description:
         "Require the finish tool to complete a task (default: true). When false, tasks also end whenever the model stops responding.",
     }),
+    background: Schema.optional(Schema.Boolean).annotate({
+      description:
+        "Run this subagent in the background (default: true). Set to false to opt this subagent into synchronous execution: its delegating agent then waits for the result unless it explicitly asks for background execution. Agents that are not opted in always run in the background, so a caller's request to wait for the result is ignored.",
+    }),
     permission: Schema.optional(ConfigPermissionV1.Info),
   }),
   [Schema.Record(Schema.String, Schema.Any)],
@@ -58,6 +62,7 @@ const KNOWN_KEYS = new Set([
   "steps",
   "maxSteps",
   "finishTool",
+  "background",
   "options",
   "permission",
   "disable",

@@ -44,6 +44,9 @@ export type AttentionSoundPaths = Schema.Schema.Type<typeof AttentionSounds>
 export const Attention = Schema.Struct({
   enabled: Schema.optional(Schema.Boolean),
   notifications: Schema.optional(Schema.Boolean),
+  notification_backend: Schema.optional(Schema.Literals(["auto", "native", "terminal"])).annotate({
+    description: "Notification delivery: native desktop with terminal fallback (auto), native only, or terminal only.",
+  }),
   sound: Schema.optional(Schema.Boolean),
   sound_when: Schema.optional(Schema.Literals(["blurred", "always"])).annotate({
     description: "When to play attention sounds: only when the TUI is blurred (default), or always.",
@@ -81,6 +84,7 @@ export type Info = Schema.Schema.Type<typeof Info>
 export type Resolved = Omit<Info, "attention" | "keybinds" | "leader_timeout" | "mouse" | "cursor"> & {
   attention: {
     enabled: boolean
+    notification_backend: "auto" | "native" | "terminal"
     notifications: boolean
     sound: boolean
     sound_when: "blurred" | "always"
@@ -119,6 +123,7 @@ export function resolve(input: Info, options: ResolveOptions): Resolved {
     attention: {
       enabled: input.attention?.enabled ?? false,
       notifications: input.attention?.notifications ?? true,
+      notification_backend: input.attention?.notification_backend ?? "auto",
       sound: input.attention?.sound ?? true,
       sound_when: input.attention?.sound_when ?? "blurred",
       volume: input.attention?.volume ?? 0.4,

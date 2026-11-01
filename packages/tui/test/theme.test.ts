@@ -1,8 +1,8 @@
 import { expect, test } from "bun:test"
 import { mkdir, writeFile } from "node:fs/promises"
 import path from "node:path"
-import type { TerminalColors } from "@opentui/core"
-import { DEFAULT_THEMES, addTheme, allThemes, hasTheme, resolveTheme, terminalMode } from "../src/theme"
+import { TextAttributes, type TerminalColors } from "@opentui/core"
+import { DEFAULT_THEMES, addTheme, allThemes, hasTheme, resolveTheme, terminalMode, textAttributes } from "../src/theme"
 import { discoverThemes } from "../src/context/theme"
 import { tmpdir } from "./fixture/fixture"
 
@@ -35,6 +35,51 @@ test("hasTheme checks theme presence", () => {
   expect(hasTheme(name)).toBe(false)
   expect(addTheme(name, DEFAULT_THEMES.opencode)).toBe(true)
   expect(hasTheme(name)).toBe(true)
+})
+
+// #241: reasoning label colours/styles are theme keys with a backward-compatible default.
+test("resolveTheme defaults the thinking labels to warning with no text style", () => {
+  for (const name of ["opencode", "github", "gruvbox"]) {
+    const theme = resolveTheme(DEFAULT_THEMES[name]!, "dark")
+    expect(theme.thinkingStreaming).toEqual(theme.warning)
+    expect(theme.thinkingCompleted).toEqual(theme.warning)
+    expect(theme.thinkingStreamingStyle).toEqual({})
+    expect(theme.thinkingCompletedStyle).toEqual({})
+    expect(theme.thinkingOpacity).toBe(0.6)
+  }
+})
+
+test("resolveTheme reads thinking colours as hex, defs refs or theme refs, and styles as objects", () => {
+  const item = structuredClone(DEFAULT_THEMES.opencode!)
+  item.defs = { ...item.defs, mint: "#00ff99" }
+  item.theme.thinkingStreaming = "mint"
+  item.theme.thinkingStreamingStyle = { italic: true, dim: true }
+  item.theme.thinkingCompleted = "primary"
+  item.theme.thinkingCompletedStyle = { bold: true }
+  const theme = resolveTheme(item, "dark")
+  expect(theme.thinkingStreaming.toInts().slice(0, 3)).toEqual([0, 255, 153])
+  expect(theme.thinkingCompleted).toEqual(theme.primary)
+  expect(theme.thinkingStreamingStyle).toEqual({ italic: true, dim: true })
+  expect(theme.thinkingCompletedStyle).toEqual({ bold: true })
+  // Every other key is still a colour: the style objects never reach the colour loop.
+  const plain = new Set([
+    "thinkingStreamingStyle",
+    "thinkingCompletedStyle",
+    "thinkingOpacity",
+    "_hasSelectedListItemText",
+  ])
+  for (const [key, value] of Object.entries(theme)) {
+    if (plain.has(key)) continue
+    expect(typeof (value as { toInts?: unknown }).toInts).toBe("function")
+  }
+})
+
+test("textAttributes maps a theme text style onto renderer attribute bits", () => {
+  expect(textAttributes(undefined)).toBe(TextAttributes.NONE)
+  expect(textAttributes({})).toBe(TextAttributes.NONE)
+  expect(textAttributes({ bold: true })).toBe(TextAttributes.BOLD)
+  expect(textAttributes({ italic: true, underline: true })).toBe(TextAttributes.ITALIC | TextAttributes.UNDERLINE)
+  expect(textAttributes({ dim: true, bold: false })).toBe(TextAttributes.DIM)
 })
 
 test("resolveTheme rejects circular color refs", () => {

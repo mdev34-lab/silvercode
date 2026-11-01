@@ -1,12 +1,22 @@
+import { measureEditText } from "@opentui/core"
+
 const graphemes = new Intl.Segmenter(undefined, { granularity: "grapheme" })
 
 export function promptOffsetWidth(value: string) {
-  let width = 0
-  for (const part of graphemes.segment(value)) {
-    // Textarea offsets count newlines as one position; Bun.stringWidth counts them as zero.
-    width += part.segment === "\n" ? 1 : Bun.stringWidth(part.segment)
-  }
-  return width
+  // Match the prompt Textarea's EditBuffer exactly (#372): cells under
+  // widthMethod "unicode" with the default tab width, control notation, and
+  // one position per line break. Hand-rolling this with Bun.stringWidth
+  // undercounts tabs (default tab width) and control chars (caret notation).
+  return measureEditText(value, { widthMethod: "unicode" })
+}
+
+// indexOf returns a UTF-16 index, but prompt/extmark offsets are display
+// columns (Textarea measures with widthMethod "unicode"); convert so a token
+// sitting after wide chars lands on the right extmark range (#372).
+export function displayIndexOf(value: string, search: string) {
+  const index = value.indexOf(search)
+  if (index === -1) return -1
+  return promptOffsetWidth(value.slice(0, index))
 }
 
 function displayOffsetIndex(value: string, offset: number) {

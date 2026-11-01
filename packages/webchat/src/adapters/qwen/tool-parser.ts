@@ -136,6 +136,140 @@ function tryOpenlessBlock(
   return undefined
 }
 
+/**
+ * Built per call: the `exec` loop in `tryParameterBlock` moves `lastIndex`,
+ * so a shared module-level instance would carry state between calls.
+ */
+const parameterPattern = () => /<parameter=([A-Za-z_][\w-]*)>([\s\S]*?)<\/parameter>/g
+const XML_CALL_START = /<function=([^>\s]+)>\s*(?=<parameter=)/g
+const HYBRID_CALL_START = /\{\s*"name"\s*:\s*"([^"]+)"\s*,\s*"arguments"\s*:\s*\{\s*"([A-Za-z_][\w-]*)"\s*:\s*"/g
+const FUNCTION_OPEN = "<function="
+const PARAMETER_OPEN = "<parameter="
+
+/**
+ * Where a parameter-style call may start. Contract: it is recognized only
+ * outside a markdown code fence (``` or ~~~), at the start of a line (at most
+ * 3 spaces of indentation: deeper is indented code), and
+ * (when the caller declared its tools) with a declared tool name. This keeps
+ * an example of the format, quoted or explained in prose or a code block,
+ * from becoming a call.
+ */
+export interface ParameterContext {
+  /** Fence/line state of the text already emitted before this buffer. */
+  state: FenceState
+  declared?: Set<string>
+}
+
+interface FenceState {
+  open: { ch: string; len: number } | null
+  /** Content of the current (unfinished) output line. */
+  line: string
+}
+
+const FENCE_LINE = /^ {0,3}(`{3,}|~{3,})(.*)$/
+
+function fenceStep(open: FenceState["open"], line: string): FenceState["open"] {
+  const m = FENCE_LINE.exec(line)
+  if (!open) {
+    if (!m) return null
+    // The info string of a backtick fence cannot contain a backtick.
+    if (m[1]![0] === "`" && m[2]!.includes("`")) return null
+    return { ch: m[1]![0]!, len: m[1]!.length }
+  }
+  if (m && m[1]![0] === open.ch && m[1]!.length >= open.len && m[2]!.trim() === "") return null
+  return open
+}
+
+function advanceFence(state: FenceState, text: string): FenceState {
+  const parts = (state.line + text).split("\n")
+  const line = parts.pop()!
+  let open = state.open
+  // CRLF input: the carriage return is part of the line break, not the line.
+  for (const part of parts) open = fenceStep(open, part.replace(/\r$/, ""))
+  return { open, line }
+}
+
+function startAllowed(buffer: string, index: number, ctx: ParameterContext): boolean {
+  const state = advanceFence(ctx.state, buffer.slice(0, index))
+  // Up to 3 leading spaces are fine. 4+ spaces or a tab is Markdown indented
+  // code, so a call written there is an example, not a call.
+  return state.open === null && /^ {0,3}$/.test(state.line.replace(/\r$/, ""))
+}
+
+function trimOneNewline(value: string): string {
+  return value.replace(/^\r?\n/, "").replace(/\r?\n$/, "")
+}
+
+function parameterValue(value: string): unknown {
+  const trimmed = trimOneNewline(value)
+  const structured = /^\s*[\[{]/.test(trimmed) ? tryParse(trimmed) : undefined
+  return structured !== undefined && typeof structured === "object" ? structured : trimmed
+}
+
+interface ParameterBlock {
+  prefix: string
+  call: ParsedToolCall
+  /** Offset just past the last closed parameter. */
+  end: number
+}
+
+/**
+ * Recover a call written as `<function=NAME><parameter=KEY>VALUE</parameter>...</function>`,
+ * or the observed hybrid that starts as JSON (`{"name":"write","arguments":{"content":"`),
+ * carries the first value RAW (unescaped, multi-line) and finishes with
+ * `</parameter><parameter=KEY>VALUE</parameter></function>`. `prefix` is the
+ * text before the call; `end` lets the caller keep any text after it.
+ */
+function tryParameterBlock(text: string, ctx: ParameterContext): ParameterBlock | undefined {
+  const starts: Array<{ index: number; xml: RegExpExecArray | null; hybrid: RegExpExecArray | null }> = []
+  for (const m of text.matchAll(XML_CALL_START)) starts.push({ index: m.index!, xml: m, hybrid: null })
+  for (const m of text.matchAll(HYBRID_CALL_START)) starts.push({ index: m.index!, xml: null, hybrid: m })
+  starts.sort((x, y) => x.index - y.index)
+  for (const start of starts) {
+    if (!startAllowed(text, start.index, ctx)) continue
+    const name = (start.xml ?? start.hybrid)![1]!
+    if (ctx.declared && !ctx.declared.has(name)) continue
+    const args: Record<string, unknown> = {}
+    let end: number
+    if (start.xml) {
+      end = start.index + start.xml[0].length
+    } else {
+      const hybrid = start.hybrid!
+      const valueStart = start.index + hybrid[0].length
+      const firstEnd = text.indexOf("</parameter>", valueStart)
+      if (firstEnd === -1) continue
+      // The value opens right after the JSON quote, so a leading newline is
+      // real content. Only the one newline Qwen writes before `</parameter>`
+      // (the same delimiter the XML form uses) is dropped.
+      args[hybrid[2]!] = text.slice(valueStart, firstEnd).replace(/\r?\n$/, "")
+      end = firstEnd + "</parameter>".length
+    }
+    const parameters = parameterPattern()
+    parameters.lastIndex = end
+    let gapFrom = end
+    for (let m = parameters.exec(text); m; m = parameters.exec(text)) {
+      // Only whitespace may sit between parameters; anything else is not this call.
+      if (text.slice(gapFrom, m.index).trim() !== "") break
+      args[m[1]!] = parameterValue(m[2]!)
+      gapFrom = m.index + m[0].length
+    }
+    end = gapFrom
+    if (Object.keys(args).length === 0) continue
+    return { prefix: text.slice(0, start.index), call: { id: `call_${randomId()}`, name, input: JSON.stringify(args) }, end }
+  }
+  return undefined
+}
+
+/** True when `tail` could still grow into `<function=NAME>\s*<parameter=`. */
+function viableFunctionPrefix(tail: string): boolean {
+  if (tail.length < FUNCTION_OPEN.length) return FUNCTION_OPEN.startsWith(tail)
+  if (!tail.startsWith(FUNCTION_OPEN)) return false
+  const rest = /^([^>\s]*)(?:>(\s*)(.*))?$/s.exec(tail.slice(FUNCTION_OPEN.length))
+  if (!rest) return false
+  if (rest[3] === undefined) return rest[2] === undefined
+  return PARAMETER_OPEN.startsWith(rest[3])
+}
+
 /** Best-effort JSON recovery: fences, trailing commas, truncation. */
 export function repairJsonPayload(raw: string): unknown {
   const trimmed = raw.trim()
@@ -285,10 +419,57 @@ export class StreamingToolParser {
   private readonly maxCalls: number
   private readonly declared?: Set<string>
   private capped = false
+  /** Fence and line state of everything emitted so far. */
+  private fenceState: FenceState = { open: null, line: "" }
 
   constructor(options?: ToolParserOptions) {
     this.maxCalls = options?.maxToolCalls ?? MAX_TOOL_CALLS_DEFAULT
     this.declared = options?.declared
+  }
+
+  private get ctx(): ParameterContext {
+    return { state: this.fenceState, declared: this.declared }
+  }
+
+  /** Record text as emitted (fence and line state) and pass it through. */
+  private note(emitted: string): string {
+    this.fenceState = advanceFence(this.fenceState, emitted)
+    return emitted
+  }
+
+  /**
+   * Offset of a parameter-style call that has started (or may still be
+   * starting) in the buffer but cannot be resolved yet, or -1.
+   */
+  private pendingParameterStart(): number {
+    const buffer = this.buffer
+    const ctx = this.ctx
+    const found: number[] = []
+    for (const m of buffer.matchAll(XML_CALL_START)) found.push(m.index!)
+    for (const m of buffer.matchAll(HYBRID_CALL_START)) found.push(m.index!)
+    // A start still arriving: the last `<function` may be a partial prefix.
+    const partial = buffer.lastIndexOf("<function")
+    if (partial !== -1 && viableFunctionPrefix(buffer.slice(partial))) found.push(partial)
+    const trailingFunction = /<(?:f(?:u(?:n(?:c(?:t(?:i(?:o(?:n)?)?)?)?)?)?)?)?$/.exec(buffer)
+    if (trailingFunction) found.push(trailingFunction.index)
+    return found.sort((x, y) => x - y).find((index) => startAllowed(buffer, index, ctx)) ?? -1
+  }
+
+  /**
+   * Resolve a parameter-style call at the front of the buffer. A call is
+   * complete with its `</function>` close; at end of stream (`final`) it is
+   * also complete once its last parameter closed, unless it was cut off
+   * inside a parameter. Text after the call stays in the buffer.
+   */
+  private drainParameterBlock(final: boolean): { text: string; call: ParsedToolCall } | undefined {
+    const block = tryParameterBlock(this.buffer, this.ctx)
+    if (!block) return undefined
+    const after = this.buffer.slice(block.end)
+    const close = /^\s*<\/function>/.exec(after)
+    if (!close && (!final || /<parameter=/.test(after))) return undefined
+    const text = stripStrayCloses(block.prefix)
+    this.buffer = after.slice(close ? close[0].length : 0)
+    return { text, call: block.call }
   }
 
   get toolCallCount(): number {
@@ -307,6 +488,14 @@ export class StreamingToolParser {
     for (;;) {
       const open = findOpen(this.buffer)
       if (!open) {
+        const parameterCall = this.capped ? undefined : this.drainParameterBlock(false)
+        if (parameterCall) {
+          text += this.note(parameterCall.text)
+          this.calls++
+          if (this.calls > this.maxCalls) this.capped = true
+          else toolCalls.push(parameterCall.call)
+          continue
+        }
         // The model sometimes drops the opening tag on a batch of calls
         // (degenerate multi-call output). If a stray close tag follows a
         // tool-call JSON object, reconstruct the block instead of pasting it.
@@ -342,7 +531,7 @@ export class StreamingToolParser {
         continue
       }
       // Emit text preceding the block, holding back a partial tag at the end.
-      text += stripStrayCloses(this.buffer.slice(0, open.index))
+      text += this.note(stripStrayCloses(this.buffer.slice(0, open.index)))
       const afterOpen = open.index + open.length
       const close = findClose(this.buffer, afterOpen)
       if (!close) {
@@ -362,9 +551,18 @@ export class StreamingToolParser {
         }
       } else if (!call) {
         // Unparseable: preserve the content as text rather than dropping it.
-        text += raw.trim() ? `${raw.trim()}\n` : ""
+        text += this.note(raw.trim() ? `${raw.trim()}\n` : "")
       }
       // `text` keeps accumulating; loop to find further blocks.
+    }
+
+    // A parameter-style call (see `tryParameterBlock`) that has started but not
+    // closed yet: keep it buffered so its raw multi-line body is not emitted as text.
+    const pending = this.pendingParameterStart()
+    if (pending !== -1) {
+      text += this.note(stripStrayCloses(this.buffer.slice(0, pending)))
+      this.buffer = this.buffer.slice(pending)
+      return { text, toolCalls }
     }
 
     // No (more) open tags: emit everything except a trailing partial tag and a
@@ -381,10 +579,10 @@ export class StreamingToolParser {
       const candidate = contentLf === -1 ? content : content.slice(contentLf + 1)
       if (candidate.length > 0 && /^[ \t]*[\[{]/.test(candidate)) {
         const holdFrom = content.length - candidate.length
-        text += stripStrayCloses(head.slice(0, holdFrom))
+        text += this.note(stripStrayCloses(head.slice(0, holdFrom)))
         this.buffer = head.slice(holdFrom) + partial
       } else {
-        text += stripStrayCloses(head)
+        text += this.note(stripStrayCloses(head))
         this.buffer = partial
       }
     } else {
@@ -392,10 +590,10 @@ export class StreamingToolParser {
       const lineStart = lastLf === this.buffer.length - 1 ? this.buffer.lastIndexOf("\n", lastLf - 1) : lastLf
       const tail = lineStart === -1 ? this.buffer : this.buffer.slice(lineStart + 1)
       if (tail.length > 0 && /^[ \t]*[\[{]/.test(tail)) {
-        text += stripStrayCloses(this.buffer.slice(0, this.buffer.length - tail.length))
+        text += this.note(stripStrayCloses(this.buffer.slice(0, this.buffer.length - tail.length)))
         this.buffer = tail
       } else {
-        text += stripStrayCloses(this.buffer)
+        text += this.note(stripStrayCloses(this.buffer))
         this.buffer = ""
       }
     }
@@ -417,6 +615,15 @@ export class StreamingToolParser {
       this.calls++
       if (this.calls > this.maxCalls) this.capped = true
       else toolCalls.push(repaired.call)
+    }
+
+    while (!findOpen(this.buffer) && !this.capped) {
+      const parameterCall = this.drainParameterBlock(true)
+      if (!parameterCall) break
+      text += this.note(parameterCall.text)
+      this.calls++
+      if (this.calls > this.maxCalls) this.capped = true
+      else toolCalls.push(parameterCall.call)
     }
 
     let open = findOpen(this.buffer)
@@ -444,17 +651,17 @@ export class StreamingToolParser {
       const raw = stripStrayCloses(this.buffer.slice(open.index + open.length))
         .replace(/<\/?(?:qw_call|tool_calls?)\b[^>]*$/i, "")
         .trim()
-      text += stripStrayCloses(this.buffer.slice(0, open.index))
+      text += this.note(stripStrayCloses(this.buffer.slice(0, open.index)))
       const call = raw ? toToolCall(repairJsonPayload(raw), open.nameAttr, this.declared) : undefined
       if (call) {
         this.calls++
         if (this.calls <= this.maxCalls) toolCalls.push(call)
         else this.capped = true
       } else if (raw) {
-        text += raw
+        text += this.note(raw)
       }
     } else {
-      text += stripStrayCloses(this.buffer)
+      text += this.note(stripStrayCloses(this.buffer))
     }
     this.buffer = ""
     return { text, toolCalls }

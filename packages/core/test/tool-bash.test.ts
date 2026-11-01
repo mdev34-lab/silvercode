@@ -1,7 +1,7 @@
 import fs from "fs/promises"
 import { realpathSync } from "node:fs"
 import path from "path"
-import { describe, expect, test } from "bun:test"
+import { describe, expect, spyOn, test } from "bun:test"
 import { Effect, Layer } from "effect"
 import { ChildProcess } from "effect/unstable/process"
 import { FSUtil } from "@opencode-ai/core/fs-util"
@@ -15,6 +15,7 @@ import { AppProcess } from "@opencode-ai/core/process"
 import { AbsolutePath } from "@opencode-ai/core/schema"
 import { SessionV2 } from "@opencode-ai/core/session"
 import { BashTool } from "@opencode-ai/core/tool/bash"
+import * as ShellEncoding from "@opencode-ai/core/shell-encoding"
 import { NarrationDetector } from "@opencode-ai/core/tool/narration"
 import { ToolRegistry } from "@opencode-ai/core/tool/registry"
 import { ToolOutputStore } from "@opencode-ai/core/tool-output-store"
@@ -310,6 +311,31 @@ describe("BashTool", () => {
         Effect.promise(() =>
           Promise.all([active[Symbol.asyncDispose](), outside[Symbol.asyncDispose]()]).then(() => undefined),
         ),
+    ),
+  )
+
+  it.live("renders decoder warnings in model-visible output", () =>
+    Effect.acquireUseRelease(
+      Effect.promise(() => tmpdir()),
+      (tmp) =>
+        Effect.gen(function* () {
+          reset()
+          const original = ShellEncoding.shellOutputDecoder
+          const decoder = spyOn(ShellEncoding, "shellOutputDecoder").mockImplementation((shell, options) => ({
+            ...original(shell, options),
+            warning: "synthetic decoder warning",
+          }))
+          try {
+            const settled = yield* withTool(tmp.path, (registry) => settleTool(registry, call({ command: "pwd" })))
+            expect(settled.output?.content[1]).toMatchObject({
+              type: "text",
+              text: expect.stringContaining("Warnings:\n- synthetic decoder warning"),
+            })
+          } finally {
+            decoder.mockRestore()
+          }
+        }),
+      (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
     ),
   )
 

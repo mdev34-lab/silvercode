@@ -4,7 +4,7 @@ import path from "path"
 import { mergeDeep, unique } from "remeda"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
-import { Cause, Context, Effect, Fiber, Layer } from "effect"
+import { Cause, Context, Duration, Effect, Exit, Fiber, Layer } from "effect"
 import { ConfigParse } from "@/config/parse"
 import * as ConfigPaths from "@/config/paths"
 import { migrateTuiConfig } from "./tui-migrate"
@@ -16,7 +16,6 @@ import { FSUtil } from "@opencode-ai/core/fs-util"
 import { CurrentWorkingDirectory } from "./tui-cwd"
 import { ConfigPlugin } from "@/config/plugin"
 import { TuiKeybind } from "@opencode-ai/tui/config/keybind"
-import { InstallationLocal, InstallationVersion } from "@opencode-ai/core/installation/version"
 import { makeRuntime } from "@opencode-ai/core/effect/runtime"
 import { Filesystem } from "@/util/filesystem"
 import { ConfigVariable } from "@/config/variable"
@@ -42,6 +41,8 @@ export interface Interface {
   readonly get: () => Effect.Effect<Resolved>
   readonly pluginOrigins: () => Effect.Effect<ConfigPlugin.Origin[]>
   readonly waitForDependencies: () => Effect.Effect<void>
+  /** Install again every directory whose background install failed. */
+  readonly retryDependencies: () => Effect.Effect<void>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/TuiConfig") {}
@@ -225,29 +226,69 @@ const loadState = Effect.fn("TuiConfig.loadState")(function* (ctx: { directory: 
   }
 })
 
+// Non-timeout background install failures, one short message each. Module state so the TUI can read
+// them without instantiating the config service again.
+const failures = new Map<string, string>()
+
+function failureMessage(cause: Cause.Cause<unknown>) {
+  const error = Cause.squash(cause)
+  if (error instanceof Npm.InstallFailedError && error.add?.length) return `Could not install ${error.add.join(", ")}`
+  return "Could not install dependencies"
+}
+
 const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const directory = yield* CurrentWorkingDirectory
     const npm = yield* Npm.Service
     const data = yield* loadState({ directory })
-    const deps = yield* Effect.forEach(
-      data.dirs,
-      (dir) =>
-        npm
+    failures.clear()
+    // Same bounded policy as the server config loader: a stalled registry
+    // install must not keep waitForDependencies (or scope close, which
+    // interrupts forkScoped fibers) waiting on it.
+    const timeoutMs = Flag.OPENCODE_CONFIG_DEP_INSTALL_TIMEOUT_MS
+    const installDir = (dir: string) =>
+      Effect.suspend(() => {
+        if (Flag.OPENCODE_DISABLE_CONFIG_DEP_INSTALL) return Effect.void
+        return npm
           .install(dir, {
             add: [
               {
                 name: "@opencode-ai/plugin",
-                version: InstallationLocal ? undefined : InstallationVersion,
+                // SilverCode versions are never published as @opencode-ai/plugin (a dev or dirty build
+                    // version 404s and fails every start), so resolve the registry dist-tag instead.
+                    version: undefined,
               },
             ],
           })
-          .pipe(Effect.forkScoped),
-      {
-        concurrency: "unbounded",
-      },
-    )
+          .pipe(
+            Effect.timeout(Duration.millis(timeoutMs)),
+            Effect.catchTag("TimeoutError", () =>
+              Effect.logWarning("background dependency install timed out, continuing without it", {
+                dir,
+                timeoutMs,
+              }),
+            ),
+            Effect.exit,
+            Effect.tap((exit) =>
+              Exit.isFailure(exit)
+                ? Effect.sync(() => {
+                    failures.set(dir, failureMessage(exit.cause))
+                  }).pipe(
+                    Effect.andThen(
+                      Effect.logWarning("background dependency install failed", { dir, error: String(exit.cause) }),
+                    ),
+                  )
+                : Effect.sync(() => {
+                    failures.delete(dir)
+                  }),
+            ),
+            Effect.asVoid,
+          )
+      })
+    const deps = yield* Effect.forEach(data.dirs, (dir) => Effect.forkScoped(installDir(dir)), {
+      concurrency: "unbounded",
+    })
 
     const get = Effect.fn("TuiConfig.get")(() => Effect.succeed(data.config))
     const pluginOrigins = Effect.fn("TuiConfig.pluginOrigins")(() => Effect.succeed(data.pluginOrigins))
@@ -255,7 +296,10 @@ const layer = Layer.effect(
     const waitForDependencies = Effect.fn("TuiConfig.waitForDependencies")(() =>
       Effect.forEach(deps, Fiber.join, { concurrency: "unbounded" }).pipe(Effect.ignore(), Effect.asVoid),
     )
-    return Service.of({ get, pluginOrigins, waitForDependencies })
+    const retryDependencies = Effect.fn("TuiConfig.retryDependencies")(() =>
+      Effect.forEach([...failures.keys()], installDir, { concurrency: "unbounded", discard: true }),
+    )
+    return Service.of({ get, pluginOrigins, waitForDependencies, retryDependencies })
   }).pipe(Effect.withSpan("TuiConfig.layer")),
 )
 
@@ -265,6 +309,14 @@ const { runPromise } = makeRuntime(Service, AppNodeBuilder.build(node))
 
 export async function waitForDependencies() {
   await runPromise((svc) => svc.waitForDependencies())
+}
+
+export function installFailures(): readonly string[] {
+  return [...failures.values()]
+}
+
+export async function retryDependencies() {
+  await runPromise((svc) => svc.retryDependencies())
 }
 
 export async function get() {

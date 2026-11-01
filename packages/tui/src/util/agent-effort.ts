@@ -1,4 +1,5 @@
 import { AgentEffort } from "@opencode-ai/schema/agent-effort"
+import { RGBA } from "@opentui/core"
 
 export type Level = AgentEffort.Level
 
@@ -75,13 +76,67 @@ export function resolveEffort(input: { metadata?: unknown; config?: unknown; fal
 }
 
 /**
+ * The TUI-level default new sessions start from: the selection persisted on
+ * home, then the configured `agent.effort`, then the schema fallback. The
+ * caller validates whatever it read from disk, so `selected` is already a
+ * level or nothing.
+ */
+export function defaultLevel(input: { selected?: Level; config?: unknown }): Level {
+  return input.selected ?? configLevel(input.config) ?? AgentEffort.resolve(undefined)
+}
+
+/**
+ * A metadata record carrying exactly one persisted selection, used both for
+ * the session metadata write and for the TUI's persisted home default.
+ */
+export function effortRecord(level: Level): Record<string, unknown> {
+  return { [METADATA_KEY]: level }
+}
+
+/**
  * `session.update` replaces the metadata record wholesale, so every effort
  * write merges over the current record to preserve unrelated keys. A
  * non-record base (missing/corrupted metadata) collapses to the single key.
  */
 export function mergeEffortMetadata(current: unknown, level: Level): Record<string, unknown> {
   const base = isRecord(current) ? current : {}
-  return { ...base, [METADATA_KEY]: level }
+  return { ...base, ...effortRecord(level) }
+}
+
+// Effort hues: fast is green, medium is orange, thorough is red. Each level
+// keeps two variants so the hue stays legible on both dark and light surfaces
+// (the level names are always rendered next to the color, so the levels never
+// depend on color alone).
+const TONES: Record<Level, { dark: string; light: string }> = {
+  fast: { dark: "#3fb950", light: "#116329" },
+  medium: { dark: "#f0883e", light: "#9a3412" },
+  thorough: { dark: "#f85149", light: "#b3121f" },
+}
+
+function luminance(color: RGBA) {
+  return 0.299 * color.r + 0.587 * color.g + 0.114 * color.b
+}
+
+/**
+ * The effort hue for a level, picked for the surface it is drawn on. A
+ * transparent surface means the terminal supplies the background, so the
+ * theme's text color stands in for it: readable light text implies a dark
+ * surface and therefore the bright hue variant.
+ */
+export function effortColor(level: Level, theme: { background: RGBA; text: RGBA }): RGBA {
+  const lightSurface =
+    theme.background.a === 0 ? luminance(theme.text) < 0.5 : luminance(theme.background) > 0.5
+  return RGBA.fromHex(TONES[level][lightSurface ? "light" : "dark"])
+}
+
+/**
+ * The level's hue as a filled indicator plus the ink that stays readable on
+ * it, for surfaces (like a highlighted selector row) where the surrounding
+ * colors are not ours to choose.
+ */
+export function effortBadge(level: Level, theme: { background: RGBA; text: RGBA }): { fg: RGBA; bg: RGBA } {
+  const bg = effortColor(level, theme)
+  return { bg, fg: luminance(bg) > 0.5 ? RGBA.fromInts(0, 0, 0) : RGBA.fromInts(255, 255, 255) }
 }
 
 /**

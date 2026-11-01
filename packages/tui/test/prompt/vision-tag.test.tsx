@@ -4,6 +4,7 @@ import { testRender, useRenderer } from "@opentui/solid"
 import { describe, expect, test } from "bun:test"
 import { onCleanup, onMount } from "solid-js"
 import { tmpdir } from "../fixture/fixture"
+import { captureFrame } from "../fixture/frame"
 import { createFetch, directory, json } from "../fixture/tui-sdk"
 import { TestTuiContexts } from "../fixture/tui-environment"
 import { ArgsProvider } from "../../src/context/args"
@@ -244,7 +245,7 @@ describe("prompt vision tag", () => {
       await setup.ready
       await wait(() => setup.getSync().status === "complete")
       await app.renderOnce()
-      const frame = app.captureCharFrame()
+      const frame = await captureFrame(app)
       expect(frame).toContain("vision")
       expect(frame).toContain("VisionCapableModel")
       expect(setup.getLocal().model.parsed().vision).toBe(true)
@@ -273,7 +274,7 @@ describe("prompt vision tag", () => {
       await setup.ready
       await wait(() => setup.getSync().status === "complete")
       await app.renderOnce()
-      const frame = app.captureCharFrame()
+      const frame = await captureFrame(app)
       expect(frame).toContain("TextOnlyModel")
       expect(frame).not.toContain("vision")
       expect(setup.getLocal().model.parsed().vision).toBe(false)
@@ -302,7 +303,7 @@ describe("prompt vision tag", () => {
       await setup.ready
       await wait(() => setup.getSync().status === "complete")
       await app.renderOnce()
-      const frame = app.captureCharFrame()
+      const frame = await captureFrame(app)
       expect(frame).toContain("UnknownCapsModel")
       expect(frame).not.toContain("vision")
       expect(setup.getLocal().model.parsed().vision).toBe(false)
@@ -334,7 +335,7 @@ describe("prompt vision tag", () => {
       await setup.ready
       await wait(() => setup.getSync().status === "complete")
       await app.renderOnce()
-      const frame = app.captureCharFrame()
+      const frame = await captureFrame(app)
       expect(frame).toContain("No provider selected")
       expect(frame).not.toContain("vision")
       expect(setup.getLocal().model.parsed().vision).toBe(false)
@@ -365,7 +366,7 @@ describe("prompt vision tag", () => {
       await app.renderOnce()
 
       // Model A (vision) -> vision tag visible
-      let frame = app.captureCharFrame()
+      let frame = await captureFrame(app)
       expect(frame).toContain("VisionCapableModel")
       expect(frame).toContain("vision")
       expect(setup.getLocal().model.parsed().vision).toBe(true)
@@ -373,7 +374,7 @@ describe("prompt vision tag", () => {
       // Switch to Model B (text-only) -> vision tag disappears
       setup.getLocal().model.set({ providerID: "test-provider", modelID: "text-model" })
       await app.renderOnce()
-      frame = app.captureCharFrame()
+      frame = await captureFrame(app)
       expect(frame).toContain("TextOnlyModel")
       expect(frame).not.toContain("vision")
       expect(setup.getLocal().model.parsed().vision).toBe(false)
@@ -381,7 +382,7 @@ describe("prompt vision tag", () => {
       // Switch back to Model C / Model A (vision) -> vision tag visible again
       setup.getLocal().model.set({ providerID: "test-provider", modelID: "vision-model" })
       await app.renderOnce()
-      frame = app.captureCharFrame()
+      frame = await captureFrame(app)
       expect(frame).toContain("VisionCapableModel")
       expect(frame).toContain("vision")
       expect(setup.getLocal().model.parsed().vision).toBe(true)
@@ -414,7 +415,7 @@ describe("prompt vision tag", () => {
       setup.getLocal().model.variant.set("high")
       await new Promise((r) => setTimeout(r, 50))
       await app.renderOnce()
-      let frame = app.captureCharFrame()
+      let frame = await captureFrame(app)
       expect(frame).toContain("VisionCapableModel")
       expect(frame).toContain("high")
       expect(frame).toContain("vision")
@@ -433,7 +434,7 @@ describe("prompt vision tag", () => {
       // the same meta row: effort and explicit HIGH thinking are both shown
       // and stay distinct.
       const highRow = frame.split("\n").find((line) => line.includes("VisionCapableModel")) ?? ""
-      expect(highRow).toContain("· medium")
+      expect(highRow).toContain("medium · high")
       expect(highRow).toContain("· high")
 
       // Set variant to "medium" on text-only model -> "medium" visible, "vision" absent
@@ -441,7 +442,7 @@ describe("prompt vision tag", () => {
       setup.getLocal().model.variant.set("medium")
       await new Promise((r) => setTimeout(r, 50))
       await app.renderOnce()
-      frame = app.captureCharFrame()
+      frame = await captureFrame(app)
       expect(frame).toContain("TextOnlyModel")
       expect(frame).toContain("medium")
       expect(frame).not.toContain("vision")
@@ -462,7 +463,7 @@ describe("prompt vision tag", () => {
       setup.getLocal().model.variant.set(undefined)
       await new Promise((r) => setTimeout(r, 50))
       await app.renderOnce()
-      frame = app.captureCharFrame()
+      frame = await captureFrame(app)
       expect(frame).toContain("VisionCapableModel")
       expect(frame).toContain("vision")
       expect(frame).not.toContain("high")

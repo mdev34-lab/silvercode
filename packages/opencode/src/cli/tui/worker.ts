@@ -1,5 +1,6 @@
 import { Server } from "@/server/server"
 import { InstanceRuntime } from "@/project/instance-runtime"
+import { probeOwnerAlive, watchOwnerProcess } from "@/cli/tui/owner-watch"
 import { Rpc } from "@/util/rpc"
 import { Config } from "@/config/config"
 import { GlobalBus } from "@/bus/global"
@@ -10,9 +11,53 @@ import { AppRuntime } from "@/effect/app-runtime"
 import { Effect } from "effect"
 import { disposeAllInstancesAndEmitGlobalDisposed } from "@/server/global-lifecycle"
 
-const onUnhandledRejection = (_error: unknown) => {}
+// Surface worker defects instead of swallowing them (#396): every
+// unhandledRejection/uncaughtException is logged and emitted to the main
+// thread, which shows it as a TUI toast instead of letting an RPC hang look
+// like a freeze. An uncaughtException in the subprocess also exits abnormally
+// so the supervisor's crash-restart engages (see createDefectHandlers).
+export type WorkerErrorReport = { message: string; stack?: string; fatal: boolean }
 
-const onUncaughtException = (_error: Error) => {}
+function toWorkerErrorReport(error: unknown, fatal: boolean): WorkerErrorReport {
+  const err = error instanceof Error ? error : new Error(String(error))
+  return { message: err.message || "unknown error", stack: err.stack, fatal }
+}
+
+export function createDefectHandlers(deps: {
+  processWorker: boolean
+  report: (report: WorkerErrorReport, done: () => void) => void
+  exit: (code: number) => void
+}) {
+  let exited = false
+  const exitOnce = (code: number) => {
+    if (exited) return
+    exited = true
+    deps.exit(code)
+  }
+  return {
+    onUnhandledRejection(error: unknown) {
+      deps.report(toWorkerErrorReport(error, false), () => {})
+    },
+    onUncaughtException(error: Error) {
+      const report = toWorkerErrorReport(error, true)
+      // Only a subprocess can crash-restart; a thread worker shares the UI
+      // process and must not exit it. 134 is the exit-code counterpart of
+      // SIGABRT and classifies as a crash on every platform (isCrash in
+      // worker-process.ts). Exit only after the report's flush ack so the
+      // parent reliably receives the final worker.error before we die; the
+      // fallback timer covers a dead IPC channel, where the ack never comes.
+      if (!deps.processWorker) {
+        deps.report(report, () => {})
+        return
+      }
+      const fallback = setTimeout(() => exitOnce(134), 5000)
+      deps.report(report, () => {
+        clearTimeout(fallback)
+        exitOnce(134)
+      })
+    },
+  }
+}
 
 // Subscribe to global events and forward them via RPC
 const onGlobalEvent = (event: Parameters<typeof GlobalBus.emitEvent>[0]) => {
@@ -35,6 +80,43 @@ const processWorker = typeof process.send === "function"
 // reliable signal: a compiled Bun binary runs every secondary entrypoint
 // (the thread worker) with `import.meta.main === false`.
 const isTuiWorker = resolveIsTuiWorker(process.env, processWorker)
+
+// Report a defect over the worker's RPC channel. `done` fires only when the
+// report was actually flushed to the parent: on a failed process.send ack the
+// callback carries an error and done stays uncalled, so a caller waiting on
+// the ack (the crash-exit path) falls through to its fallback timer instead
+// of exiting early as if the report had been delivered. Exported for tests.
+export function createRpcReporter(deps: {
+  processWorker: boolean
+  emitProcess: (event: string, data: unknown, cb?: (error: Error | null) => void) => void
+  emit: (event: string, data: unknown) => void
+}) {
+  return (report: WorkerErrorReport, done: () => void) => {
+    console.error(
+      `[silvercode-worker] ${report.fatal ? "uncaughtException" : "unhandledRejection"}: ${report.message}\n${report.stack ?? ""}`,
+    )
+    if (deps.processWorker) {
+      deps.emitProcess("worker.error", report, (err) => {
+        if (!err) done()
+      })
+    } else {
+      deps.emit("worker.error", report)
+      done()
+    }
+  }
+}
+
+const defectHandlers = createDefectHandlers({
+  processWorker,
+  report: createRpcReporter({
+    processWorker,
+    emitProcess: Rpc.emitProcess,
+    emit: Rpc.emit,
+  }),
+  exit: (code) => process.exit(code),
+})
+const onUnhandledRejection = defectHandlers.onUnhandledRejection
+const onUncaughtException = defectHandlers.onUncaughtException
 
 // Worker identity and transport selection are independent concerns (see
 // `processWorker` above). Exporting the identity decision keeps the gating
@@ -106,7 +188,43 @@ if (isTuiWorker) {
 
   if (processWorker) {
     stopRpcListener = Rpc.listenProcess(rpc)
+    // Owner-death cleanup for the subprocess worker (see worker-process.ts).
+    // On Windows the primary guarantee is the parent-side job object: the OS
+    // kills the worker when the owner dies. This watchdog stays installed
+    // there only as a fallback for a failed job assignment - #480 showed
+    // neither IPC disconnect nor the signal-0 probe observes a hard-killed
+    // owner on win32, so it cannot be the mechanism there. A thread worker
+    // shares the owner's process and needs neither.
+    const ownerPID = Number.parseInt(process.env["SILVERCODE_TUI_WORKER_OWNER_PID"] ?? "", 10)
+    watchOwnerProcess({
+      subscribeDisconnect: (handler) => {
+        process.on("disconnect", handler)
+        return () => {
+          process.off("disconnect", handler)
+        }
+      },
+      ownerAlive: Number.isFinite(ownerPID) && ownerPID > 0 ? () => probeOwnerAlive(ownerPID) : undefined,
+      onOrphan() {
+        // A hard exit bounds the graceful path so a hung dispose cannot
+        // leave the orphan alive anyway.
+        const force = setTimeout(() => process.exit(0), 5000)
+        force.unref?.()
+        // .then with two branches, not .finally: a shutdown that failed
+        // must not exit 0 and look graceful to a supervisor.
+        void rpc.shutdown().then(
+          () => process.exit(0),
+          () => process.exit(1),
+        )
+      },
+    })
   } else {
     stopRpcListener = Rpc.listen(rpc)
+    // Bootstrap beacon (#398): a thread worker's identity rests entirely on
+    // SILVERCODE_TUI_WORKER surviving into the thread's env, which Bun's
+    // Worker env option does not guarantee. Emitting ready proves to the
+    // parent that the RPC listener registered; the parent fails fast with a
+    // clear error when no message ever arrives instead of hanging on the
+    // first RPC call.
+    Rpc.emit("worker.ready", {})
   }
 }

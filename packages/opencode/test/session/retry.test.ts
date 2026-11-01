@@ -146,6 +146,84 @@ describe("session.retry.delay", () => {
       expect(attempts).toStrictEqual([1, 2, 3, 4, 5])
     }),
   )
+
+  it.instance("policy stops immediately when delay exceeds maxDelay", () =>
+    Effect.gen(function* () {
+      let calls = 0
+      const setCalls: number[] = []
+      const longHeader = apiError({ "retry-after": "42504" })
+      const futureDate = apiError({ "retry-after": new Date(Date.now() + 3_600_000).toUTCString() })
+      const schedule = SessionRetry.policy({
+        provider: "opencode",
+        parse: Schema.decodeUnknownSync(SessionV1.APIError.Schema),
+        maxDelay: SessionRetry.RETRY_HEADLESS_MAX_DELAY,
+        set: (info) =>
+          Effect.sync(() => {
+            setCalls.push(info.attempt)
+          }),
+      })
+
+      const first = yield* Effect.suspend(() => {
+        calls++
+        return Effect.fail(longHeader)
+      }).pipe(Effect.retry(schedule), Effect.exit)
+      expect(first._tag).toBe("Failure")
+      expect(calls).toBe(1)
+
+      calls = 0
+      const second = yield* Effect.suspend(() => {
+        calls++
+        return Effect.fail(futureDate)
+      }).pipe(Effect.retry(schedule), Effect.exit)
+      expect(second._tag).toBe("Failure")
+      expect(calls).toBe(1)
+      expect(setCalls).toEqual([])
+    }),
+  )
+
+  it.instance("policy still retries when delay is within maxDelay", () =>
+    Effect.gen(function* () {
+      const setCalls: number[] = []
+      const withinCap = apiError({ "retry-after-ms": "50" })
+      const step = yield* Schedule.toStepWithMetadata(
+        SessionRetry.policy({
+          provider: "opencode",
+          parse: Schema.decodeUnknownSync(SessionV1.APIError.Schema),
+          maxDelay: 50,
+          set: (info) =>
+            Effect.sync(() => {
+              setCalls.push(info.attempt)
+            }),
+        }),
+      )
+
+      const result = yield* step(withinCap)
+      expect(result.attempt).toBe(1)
+      expect(setCalls).toEqual([1])
+    }),
+  )
+
+  it.instance("policy checks invalidate before refusing wait exceeding maxDelay", () =>
+    Effect.gen(function* () {
+      const longHeader = apiError({ "retry-after": "42504" })
+      const step = yield* Schedule.toStepWithMetadata(
+        SessionRetry.policy({
+          provider: "opencode",
+          parse: Schema.decodeUnknownSync(SessionV1.APIError.Schema),
+          maxDelay: SessionRetry.RETRY_HEADLESS_MAX_DELAY,
+          set: () => Effect.void,
+          invalidate: () => Effect.succeed(true),
+        }),
+      )
+
+      const exit = yield* step(longHeader).pipe(Effect.exit)
+      expect(exit._tag).toBe("Failure")
+      if (exit._tag === "Failure") {
+        const error = Option.getOrUndefined(Cause.findErrorOption(exit.cause))
+        expect(SessionRetry.isRetryInvalidated(error)).toBe(true)
+      }
+    }),
+  )
 })
 
 describe("session.retry.retryable", () => {

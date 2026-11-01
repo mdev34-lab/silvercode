@@ -1,7 +1,7 @@
 import fs from "fs/promises"
 import os from "os"
 import { Effect } from "effect"
-import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
+import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { EffectFlock } from "@opencode-ai/core/util/effect-flock"
 import { Global } from "@opencode-ai/core/global"
 
@@ -30,7 +30,10 @@ const testGlobal = Global.layerWith({
   log: os.tmpdir(),
 })
 
-const testLayer = AppNodeBuilder.build(EffectFlock.node, [[Global.node, testGlobal]])
+// This worker needs only the global flock graph. AppNodeBuilder also loads
+// the entire location-services graph before checking whether it is needed;
+// avoid that unrelated module-loading cost in every contention child.
+const testLayer = LayerNode.compile(EffectFlock.node, [[Global.node, testGlobal]])
 
 async function job() {
   if (msg.ready) await fs.writeFile(msg.ready, String(process.pid))

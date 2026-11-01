@@ -20,6 +20,14 @@ function run(target) {
   const forwarders = {}
   for (const signal of forwardedSignals) {
     forwarders[signal] = () => {
+      // Windows has no POSIX signals: Ctrl+C is a console event that the
+      // console already delivered to every attached process, the child
+      // included, so there is nothing to forward. child.kill("SIGINT") cannot
+      // deliver a signal there - it maps to TerminateProcess and kills the
+      // child before its handlers can clean up (an external editor left
+      // running mid-session, #441). The listener still keeps the launcher
+      // alive, so the child decides what Ctrl+C means.
+      if (signal === "SIGINT" && process.platform === "win32") return
       try {
         child.kill(signal)
       } catch {

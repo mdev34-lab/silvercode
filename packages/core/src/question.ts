@@ -99,9 +99,15 @@ const layer = Layer.effect(
           pending.set(id, { request, deferred })
           return yield* events.publish(Event.Asked, request).pipe(
             Effect.andThen(restore(Deferred.await(deferred))),
+            // Still pending here means the ask was aborted unanswered. Clients only drop a prompt on
+            // a replied/rejected event, so announce it, detached because this runs while the ask ends.
             Effect.ensuring(
-              Effect.sync(() => {
-                pending.delete(id)
+              Effect.suspend(() => {
+                if (!pending.delete(id)) return Effect.void
+                return events.publish(Event.Rejected, { sessionID: request.sessionID, requestID: id }).pipe(
+                  Effect.ignoreCause({ log: true, message: "failed to announce the abandoned question" }),
+                  Effect.forkDetach,
+                )
               }),
             ),
           )

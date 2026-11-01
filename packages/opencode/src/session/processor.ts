@@ -20,9 +20,14 @@ import { SessionStatus } from "./status"
 import { SessionSummary } from "./summary"
 import type { Provider } from "@/provider/provider"
 import { Question } from "@/question"
+import { ProviderError } from "@/provider/error"
+import { GenerationLimit } from "./llm/generation-limit"
+import { RepetitionGuard } from "./llm/repetition-guard"
 import { errorMessage } from "@/util/error"
 import { isRecord } from "@/util/record"
 import { EventV2Bridge } from "@/event-v2-bridge"
+import { HeadlessRunRef } from "@/effect/instance-ref"
+import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Database } from "@opencode-ai/core/database/database"
 import { Usage, type LLMEvent } from "@opencode-ai/llm"
 import { createGenerationClock } from "./generation-metrics"
@@ -75,6 +80,8 @@ interface ProcessorContext extends Input {
   needsCompaction: boolean
   currentText: SessionV1.TextPart | undefined
   reasoningMap: Record<string, SessionV1.ReasoningPart>
+  // Time of the last reasoning delta per part, so a thought ends when the model stopped thinking, not when the next chunk arrived.
+  reasoningLast: Record<string, number>
 }
 
 type StreamEvent = LLMEvent
@@ -96,6 +103,7 @@ const layer = Layer.effect(
     const status = yield* SessionStatus.Service
     const image = yield* Image.Service
     const events = yield* EventV2Bridge.Service
+    const flags = yield* RuntimeFlags.Service
     const database = yield* Database.Service
 
     const create = Effect.fn("SessionProcessor.create")(function* (input: Input) {
@@ -114,8 +122,26 @@ const layer = Layer.effect(
         needsCompaction: false,
         currentText: undefined,
         reasoningMap: {},
+        reasoningLast: {},
       }
       let aborted = false
+      // Set from every step-finish event. A stream that ends with no
+      // step-finish died instead of completing - without this check the turn
+      // ends silently with no error and no retry. An "unknown" reason is NOT
+      // death: it means the provider transmitted no finish reason (per the
+      // provider-spec contract), which a completed response may legitimately
+      // do, and retrying a completed response replays its tool calls. Genuine
+      // interruptions must be detected at the provider's transport layer
+      // (e.g. the Zen adapter's [DONE]-framing guard), which surfaces them as
+      // stream errors this pipeline already retries.
+      let stepFinishReason: string | undefined = undefined
+      // Set when this attempt's stream carried any tool activity. A retry
+      // re-issues THIS step's request; results from already-completed steps
+      // ride that request's history, but a result produced mid-step never
+      // lands in it, so the provider would issue the call again and repeat
+      // its side effects. An attempt that touched tools is therefore never
+      // retried; a text-only attempt is always safe to.
+      let sawToolActivity = false
       const clock = createGenerationClock()
 
       const parse = (e: unknown) =>
@@ -261,9 +287,13 @@ const layer = Layer.effect(
         if (!(reasoningID in ctx.reasoningMap)) return
         // oxlint-disable-next-line no-self-assign -- reactivity trigger
         ctx.reasoningMap[reasoningID].text = ctx.reasoningMap[reasoningID].text
-        ctx.reasoningMap[reasoningID].time = { ...ctx.reasoningMap[reasoningID].time, end: Date.now() }
+        ctx.reasoningMap[reasoningID].time = {
+          ...ctx.reasoningMap[reasoningID].time,
+          end: ctx.reasoningLast[reasoningID] ?? Date.now(),
+        }
         yield* session.updatePart(ctx.reasoningMap[reasoningID])
         delete ctx.reasoningMap[reasoningID]
+        delete ctx.reasoningLast[reasoningID]
       })
 
       const ensureToolCall = Effect.fn("SessionProcessor.ensureToolCall")(function* (input: {
@@ -330,7 +360,7 @@ const layer = Layer.effect(
       }
 
       const handleEvent = Effect.fnUntraced(function* (value: StreamEvent) {
-        switch (value.type) {
+                switch (value.type) {
           case "reasoning-start":
             if (value.id in ctx.reasoningMap) return
             ctx.reasoningMap[value.id] = {
@@ -342,6 +372,7 @@ const layer = Layer.effect(
               time: { start: Date.now() },
               metadata: value.providerMetadata,
             }
+            ctx.reasoningLast[value.id] = Date.now()
             yield* session.updatePart(ctx.reasoningMap[value.id])
             return
 
@@ -349,6 +380,7 @@ const layer = Layer.effect(
             // Match dev: silently drop orphan deltas (no preceding reasoning-start).
             if (!(value.id in ctx.reasoningMap)) return
             ctx.reasoningMap[value.id].text += value.text
+            ctx.reasoningLast[value.id] = Date.now()
             if (value.providerMetadata) ctx.reasoningMap[value.id].metadata = value.providerMetadata
             yield* session.updatePartDelta({
               sessionID: ctx.reasoningMap[value.id].sessionID,
@@ -383,6 +415,7 @@ const layer = Layer.effect(
           }
 
           case "tool-call": {
+            sawToolActivity = true
             if (ctx.assistantMessage.summary) {
               throw new Error(`Tool call not allowed while generating summary: ${value.name}`)
             }
@@ -440,6 +473,7 @@ const layer = Layer.effect(
           }
 
           case "tool-result": {
+            sawToolActivity = true
             const toolCall = yield* readToolCall(value.id)
             if (!toolCall && value.result.type === "error") return
             if (value.result.type === "error") {
@@ -473,14 +507,26 @@ const layer = Layer.effect(
           }
 
           case "tool-error": {
+            sawToolActivity = true
             yield* failToolCall(value.id, value.error ?? new Error(value.message))
             return
           }
 
           case "provider-error":
-            throw new Error(value.message)
+            // Preserve the provider's structured classification: a generic
+            // Error would degrade to Unknown in fromError, dropping
+            // context-overflow from the compaction path and explicit
+            // retryability from the retry policy (#409).
+            if (value.classification === "context-overflow")
+              throw new SessionV1.ContextOverflowError({ message: value.message })
+            throw new SessionV1.APIError({ message: value.message, isRetryable: value.retryable ?? false })
 
           case "step-start":
+            // A new step resets the finish witness: without this, a prior
+            // step's finish reason survives into a step whose stream dies
+            // before its own step-finish, and the no-finish backstop below
+            // mistakes the dead step for a completed one.
+            stepFinishReason = undefined
             if (!ctx.snapshot) ctx.snapshot = yield* snapshot.track()
             yield* session.updatePart({
               id: PartID.ascending(),
@@ -492,6 +538,7 @@ const layer = Layer.effect(
             return
 
           case "step-finish": {
+            stepFinishReason = value.reason
             const completedSnapshot = yield* snapshot.track()
             yield* Effect.forEach(Object.keys(ctx.reasoningMap), finishReasoning)
             const usage = Session.getUsage({
@@ -622,14 +669,15 @@ const layer = Layer.effect(
           ctx.currentText = undefined
         }
 
-        for (const part of Object.values(ctx.reasoningMap)) {
-          const end = Date.now()
+        for (const [id, part] of Object.entries(ctx.reasoningMap)) {
+          const end = ctx.reasoningLast[id] ?? Date.now()
           yield* session.updatePart({
             ...part,
             time: { start: part.time.start ?? end, end },
           })
         }
         ctx.reasoningMap = {}
+        ctx.reasoningLast = {}
 
         yield* Effect.forEach(
           Object.values(ctx.toolcalls),
@@ -699,11 +747,37 @@ const layer = Layer.effect(
         // the processor returns "continue" (not "stop") so the outer
         // runLoop can pick up the new selection on the next iteration.
         const retryInvalidated = yield* Ref.make(false)
+        // Counts scheduled retries so a terminal error can say the turn did
+        // not die on the first failure.
+        const retryAttempts = yield* Ref.make(0)
+        const headless = yield* HeadlessRunRef
+        const maxDelay = headless
+          ? (headless.maxDelayMs ?? flags.retryMaxDelayMs ?? SessionRetry.RETRY_HEADLESS_MAX_DELAY)
+          : undefined
 
         return yield* Effect.gen(function* () {
           yield* Effect.gen(function* () {
+            // Argument-only calls from a failed attempt never executed. A safe
+            // retry must discard these drafts and settle their rendezvous before
+            // the next finish call waits for siblings. Executed calls are never
+            // retried and must keep their persisted evidence.
+            for (const toolCallID of Object.keys(ctx.toolcalls)) {
+              const match = yield* readToolCall(toolCallID)
+              if (!match || match.part.state.status !== "pending") continue
+              yield* session.removePart({
+                sessionID: match.call.sessionID,
+                messageID: match.call.messageID,
+                partID: match.call.partID,
+              })
+              yield* settleToolCall(toolCallID)
+            }
             ctx.currentText = undefined
+            stepFinishReason = undefined
+            sawToolActivity = false
+            // A retry after a stalled or failed stream must not leave the previous attempt's thought open.
+            yield* Effect.forEach(Object.keys(ctx.reasoningMap), finishReasoning)
             ctx.reasoningMap = {}
+            ctx.reasoningLast = {}
             yield* status.set(ctx.sessionID, { type: "busy" })
             const stream = llm.stream(streamInput)
             clock.startRequest(Date.now())
@@ -716,6 +790,16 @@ const layer = Layer.effect(
               Stream.takeUntil(() => ctx.needsCompaction),
               Stream.runDrain,
             )
+            // A stream that ended without any step-finish died
+            // mid-generation. Route it into the retry pipeline as a stream
+            // error; aborts and compaction takeUntil are legitimate early
+            // ends and stay untouched, and an "unknown" finish reason is a
+            // completed response whose provider omitted metadata, not a death.
+            if (!aborted && !ctx.needsCompaction && stepFinishReason === undefined) {
+              return yield* Effect.fail(
+                new ProviderError.ResponseStreamError("response stream ended without a finish reason"),
+              )
+            }
           }).pipe(
             Effect.onInterrupt(() =>
               Effect.gen(function* () {
@@ -727,20 +811,51 @@ const layer = Layer.effect(
             ),
             Effect.catchCauseIf(
               (cause) => !Cause.hasInterruptsOnly(cause),
-              (cause) => Effect.fail(Cause.squash(cause)),
+              (cause) => {
+                const squashed = Cause.squash(cause)
+                // A stream that dies mid-step after tool activity must
+                // surface as a terminal interruption, not a retry: the retry
+                // re-issues this step's request without the results those
+                // calls produced, so the provider would issue them again and
+                // repeat their side effects. Text-only attempts stay on the
+                // normal retry path - replaying them regenerates words, never
+                // actions. Classifications the rest of the pipeline depends
+                // on (context overflow drives compaction; the generation cap
+                // and repetition guard must keep their own messages; aborts
+                // are the caller's own) are never re-labeled.
+                const message = squashed instanceof Error ? squashed.message : String(squashed)
+                if (
+                  sawToolActivity &&
+                  !(squashed instanceof DOMException && squashed.name === "AbortError") &&
+                  !SessionV1.ContextOverflowError.isInstance(squashed) &&
+                  !message.includes(GenerationLimit.GENERATION_LIMIT_MESSAGE) &&
+                  !message.includes(RepetitionGuard.REPETITION_MESSAGE)
+                ) {
+                  return Effect.fail(
+                    new ProviderError.StreamInterruptedAfterToolCallError(
+                      "Response stream interrupted after tool calls were issued; the turn was not retried so tool side effects are not repeated. Continue the conversation to resume.",
+                      { cause: squashed },
+                    ),
+                  )
+                }
+                return Effect.fail(squashed)
+              },
             ),
             Effect.retry(
               SessionRetry.policy({
                 provider: input.model.providerID,
                 parse,
+                maxDelay,
                 set: (info) => {
-                  return status.set(ctx.sessionID, {
-                    type: "retry",
-                    attempt: info.attempt,
-                    message: info.message,
-                    action: info.action,
-                    next: info.next,
-                  })
+                  return Effect.flatMap(Ref.update(retryAttempts, (n) => n + 1), () =>
+                    status.set(ctx.sessionID, {
+                      type: "retry",
+                      attempt: info.attempt,
+                      message: info.message,
+                      action: info.action,
+                      next: info.next,
+                    }),
+                  )
                 },
                 // Cancel stale retries when the user has switched to a
                 // different model/provider since this turn started. The
@@ -768,7 +883,20 @@ const layer = Layer.effect(
                   })
                 }),
             ),
-            Effect.catch(halt),
+            Effect.catch((e) =>
+              Effect.gen(function* () {
+                // After real retries, say so in the terminal error: a bare
+                // "stream timed out" reads as if the turn died on the first
+                // failure with no retry marker left behind.
+                const attempts = yield* Ref.get(retryAttempts)
+                if (attempts > 0 && e instanceof ProviderError.ResponseStreamError) {
+                  return yield* halt(
+                    new ProviderError.ResponseStreamError(`${e.message} (gave up after ${attempts} retries)`),
+                  )
+                }
+                return yield* halt(e)
+              }),
+            ),
             Effect.ensuring(cleanup()),
           )
 
@@ -812,6 +940,7 @@ export const node = LayerNode.make({
     SessionStatus.node,
     Image.node,
     EventV2Bridge.node,
+    RuntimeFlags.node,
     Database.node,
   ],
 })

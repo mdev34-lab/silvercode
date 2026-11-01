@@ -21,6 +21,7 @@ import {
 } from "../src/release"
 import { bumpVersion, devVersion, type BumpInput } from "../src/version"
 import { rewriteVersion } from "../src/bump"
+import { git } from "./helpers/subprocess"
 
 const repoRoot = path.resolve(import.meta.dir, "../../..")
 const packageVersion = (await Bun.file(path.join(repoRoot, "package.json")).json()).version as string
@@ -415,11 +416,10 @@ describe("release scripts", () => {
 })
 
 describe("implicit release builds from a tag checkout", () => {
-  const gitRoot = (...args: string[]) => {
-    const result = Bun.spawnSync(["git", ...args], { cwd: repoRoot, stdout: "pipe", stderr: "pipe" })
-    if (result.exitCode !== 0) throw new Error(`git ${args.join(" ")} failed: ${result.stderr.toString()}`)
-    return result.stdout.toString().trim()
-  }
+  // Tag setup/teardown on the real checkout goes through the shared diagnostic
+  // runner, so a git fault here names its exit code, signal, spawn error and
+  // stderr instead of throwing a bare `... failed:` with empty stderr (#286).
+  const gitRoot = (...args: string[]) => git(repoRoot, ...args)
   // The clean-tree assertions only hold in a clean checkout (CI); a developer
   // with uncommitted changes exercises the dirty-marking test instead.
   const rootDirty =

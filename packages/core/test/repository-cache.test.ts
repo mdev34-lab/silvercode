@@ -1,4 +1,9 @@
-import { describe, expect } from "bun:test"
+import { describe, expect, setDefaultTimeout } from "bun:test"
+
+// These fixtures run several real Git operations; Windows runners exceed Bun's 5s default.
+// Fixture setup carries a 30s budget (test/fixture/git.ts); every test
+// here must outlive it, or the runner cancels mid-setup and reopens #278.
+setDefaultTimeout(45_000)
 import fs from "fs/promises"
 import path from "path"
 import { pathToFileURL } from "url"
@@ -8,8 +13,7 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Global } from "@opencode-ai/core/global"
 import { Repository } from "@opencode-ai/core/repository"
 import { RepositoryCache } from "@opencode-ai/core/repository-cache"
-import { branch, git, gitRemote } from "./fixture/git"
-import { tmpdir } from "./fixture/tmpdir"
+import { withRemote } from "./fixture/git"
 import { testEffect } from "./lib/effect"
 
 const it = testEffect(Layer.empty)
@@ -31,7 +35,7 @@ describe("RepositoryCache", () => {
         expect(yield* read(path.join(localPath, "README.md"))).toBe("one\n")
       }).pipe(Effect.provide(cacheLayer(fixture.root))),
     ),
-    { timeout: 20000 },
+    { timeout: 45_000 },
   )
 
   it.live("serializes concurrent materialization for the same checkout", () =>
@@ -47,7 +51,7 @@ describe("RepositoryCache", () => {
         expect(results[0].localPath).toBe(results[1].localPath)
       }).pipe(Effect.provide(cacheLayer(fixture.root))),
     ),
-    { timeout: 20000 },
+    { timeout: 45_000 },
   )
 
   it.live("replaces an existing checkout whose origin does not match", () =>
@@ -56,7 +60,7 @@ describe("RepositoryCache", () => {
         const cache = yield* RepositoryCache.Service
         const initial = yield* cache.ensure({ reference: fixture.reference })
         yield* Effect.promise(async () => {
-          await git(initial.localPath, "config", "remote.origin.url", "https://github.com/other/repo.git")
+          await fixture.git(initial.localPath, "config", "remote.origin.url", "https://github.com/other/repo.git")
           await fs.writeFile(path.join(initial.localPath, "stale.txt"), "stale")
         })
 
@@ -66,13 +70,13 @@ describe("RepositoryCache", () => {
         expect(yield* exists(path.join(replaced.localPath, "stale.txt"))).toBe(false)
       }).pipe(Effect.provide(cacheLayer(fixture.root))),
     ),
-    { timeout: 20000 },
+    { timeout: 45_000 },
   )
 
   it.live("keeps branch checkouts isolated from branchless refreshes", () =>
     withRemote((fixture) =>
       Effect.gen(function* () {
-        yield* Effect.promise(() => branch(fixture.source, "feature", "two\n"))
+        yield* Effect.promise(() => fixture.branch("feature", "two\n"))
         const cache = yield* RepositoryCache.Service
 
         const featured = yield* cache.ensure({ reference: fixture.reference, branch: "feature" })
@@ -89,13 +93,15 @@ describe("RepositoryCache", () => {
         expect(yield* read(path.join(cached.localPath, "README.md"))).toBe("two\n")
       }).pipe(Effect.provide(cacheLayer(fixture.root))),
     ),
-    { timeout: 20000 },
+    { timeout: 45_000 },
   )
 
   it.live("does not mistake an enclosing repository for the cache checkout", () =>
     withRemote((fixture) =>
       Effect.gen(function* () {
-        yield* Effect.promise(() => git(fixture.root, "clone", fixture.remote, path.join(fixture.root, "repos")))
+        yield* Effect.promise(() =>
+          fixture.git(fixture.root, "clone", fixture.remote, path.join(fixture.root, "repos")),
+        )
 
         const result = yield* (yield* RepositoryCache.Service).ensure({ reference: fixture.reference })
 
@@ -103,7 +109,7 @@ describe("RepositoryCache", () => {
         expect(yield* read(path.join(result.localPath, "README.md"))).toBe("one\n")
       }).pipe(Effect.provide(cacheLayer(fixture.root))),
     ),
-    { timeout: 20000 },
+    { timeout: 45_000 },
   )
 
   it.live("returns typed validation and clone failures", () =>
@@ -124,7 +130,7 @@ describe("RepositoryCache", () => {
         expect(cloneFailure).toBeInstanceOf(RepositoryCache.CloneFailedError)
       }).pipe(Effect.provide(cacheLayer(fixture.root))),
     ),
-    { timeout: 20000 },
+    { timeout: 45_000 },
   )
 })
 
@@ -132,17 +138,6 @@ function cacheLayer(root: string) {
   return AppNodeBuilder.build(RepositoryCache.node, [
     [Global.node, Global.layerWith({ state: path.join(root, "state"), repos: path.join(root, "repos") })],
   ])
-}
-
-function withRemote<A, E, R>(body: (fixture: Awaited<ReturnType<typeof gitRemote>>) => Effect.Effect<A, E, R>) {
-  return Effect.acquireUseRelease(
-    Effect.promise(async () => {
-      const root = await tmpdir()
-      return { root, fixture: await gitRemote(root.path) }
-    }),
-    (input) => body(input.fixture),
-    (input) => Effect.promise(() => input.root[Symbol.asyncDispose]()),
-  )
 }
 
 function read(file: string) {

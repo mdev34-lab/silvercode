@@ -12,6 +12,7 @@ import type {
 } from "@opencode-ai/plugin/tui"
 import { AttentionSoundName, type TuiConfig } from "./config"
 import { Schema } from "effect"
+import { notifyNative } from "./notification"
 import stripAnsi from "strip-ansi"
 import * as TuiAudio from "./audio"
 import defaultSoundPath from "./assets/audio/bip-bop-01.mp3" with { type: "file" }
@@ -116,9 +117,11 @@ export function createTuiAttention(input: {
   config: Pick<TuiConfig.Resolved, "attention">
   kv?: TuiKV
   audio?: Pick<typeof TuiAudio, "loadSoundFile" | "play">
+  nativeNotification?: typeof notifyNative
 }): TuiAttentionHost {
   let focus: FocusState = "unknown"
   let disposed = false
+  const lifetime = new AbortController()
   let activePackID: string | undefined
   const packs = new Map<string, RegisteredSoundPack>([[BUILTIN_PACK.id, BUILTIN_PACK]])
   const audio = input.audio ?? TuiAudio
@@ -155,7 +158,7 @@ export function createTuiAttention(input: {
           console.debug("failed to load attention sound", { file, error })
           return null
         })
-        if (disposed) return false
+        if (disposed || input.renderer.isDestroyed) return false
         if (current == null) continue
         if (audio.play(current, { volume }) != null) return true
       }
@@ -179,25 +182,44 @@ export function createTuiAttention(input: {
         const notificationSkip = focusSkip(requestedNotification?.when ?? "blurred", focus)
         const notificationRequested = input.config.attention.notifications && request.notification !== false
         const shouldNotify = notificationRequested && !notificationSkip
-        const notification = shouldNotify
-          ? (() => {
-              try {
-                return input.renderer.triggerNotification(
-                  message,
-                  normalizeText(request.title, DEFAULT_TITLE, TITLE_LIMIT),
-                )
-              } catch (error) {
-                console.debug("failed to trigger attention notification", { error })
-                return false
-              }
-            })()
-          : false
+        const title = normalizeText(request.title, DEFAULT_TITLE, TITLE_LIMIT)
+        const backend = input.config.attention.notification_backend
+        const nativeTask =
+          shouldNotify && backend !== "terminal"
+            ? (input.nativeNotification ?? notifyNative)(title, message, lifetime.signal).catch(() => false)
+            : Promise.resolve(false)
         const volume = soundVolume(request, input.config)
         const requestedSound = typeof request.sound === "object" ? request.sound : undefined
         const soundSkip = volume === undefined ? undefined : focusSkip(requestedSound?.when ?? "always", focus)
         const soundName =
           requestedSound?.name && Schema.is(AttentionSoundName)(requestedSound.name) ? requestedSound.name : "default"
-        const sound = volume === undefined || soundSkip ? false : await playSound(soundName, volume)
+        const sound =
+          disposed || input.renderer.isDestroyed || volume === undefined || soundSkip
+            ? false
+            : await playSound(soundName, volume)
+
+        const native = await nativeTask
+        if (disposed || input.renderer.isDestroyed) return skipped("renderer_destroyed")
+        // Focus or renderer lifetime can change while a native helper is running.
+        const terminal =
+          shouldNotify &&
+          !native &&
+          backend !== "native" &&
+          !disposed &&
+          !input.renderer.isDestroyed &&
+          !focusSkip(requestedNotification?.when ?? "blurred", focus)
+        const notification =
+          native ||
+          (terminal
+            ? (() => {
+                try {
+                  return input.renderer.triggerNotification(message, title)
+                } catch (error) {
+                  console.debug("failed to trigger attention notification", { error })
+                  return false
+                }
+              })()
+            : false)
 
         if (!notification && !sound) {
           if (notificationRequested && notificationSkip) return skipped(notificationSkip)
@@ -253,6 +275,7 @@ export function createTuiAttention(input: {
     dispose() {
       if (disposed) return
       disposed = true
+      lifetime.abort()
       input.renderer.off("focus", onFocus)
       input.renderer.off("blur", onBlur)
     },

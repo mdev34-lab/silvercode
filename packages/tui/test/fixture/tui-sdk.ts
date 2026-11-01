@@ -59,14 +59,40 @@ export function createEventSource() {
   }
 }
 
-export type FetchHandler = (url: URL) => Response | Promise<Response> | undefined
+// What the client actually sent, recorded per request so tests can assert on
+// the wire contract (which endpoint, which verb, which payload) instead of
+// inferring it from the rendered frame.
+export type FetchRequest = {
+  method: string
+  pathname: string
+  search: string
+  body?: string
+}
+
+export type FetchHandler = (url: URL, request: FetchRequest) => Response | Promise<Response> | undefined
 
 export function createFetch(override?: FetchHandler, events?: ReturnType<typeof createEventSource>) {
   const session = [] as URL[]
-  const fetch = (async (input: RequestInfo | URL) => {
-    const url = new URL(input instanceof Request ? input.url : String(input))
+  const requests: FetchRequest[] = []
+  const fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const original = input instanceof Request ? input : undefined
+    const url = new URL(original ? original.url : String(input))
+    // The generated client hands `fetch` a fully built Request (body and all),
+    // so the payload is read from a clone of that rather than from `init`.
+    const request: FetchRequest = {
+      method: init?.method ?? original?.method ?? "GET",
+      pathname: url.pathname,
+      search: url.search,
+      body:
+        typeof init?.body === "string"
+          ? init.body
+          : original?.body
+            ? await original.clone().text()
+            : undefined,
+    }
+    requests.push(request)
     if (url.pathname === "/session") session.push(url)
-    const overridden = await override?.(url)
+    const overridden = await override?.(url, request)
     if (overridden) return overridden
     if (url.pathname === "/api/event" && events) return events.response()
 
@@ -101,9 +127,12 @@ export function createFetch(override?: FetchHandler, events?: ReturnType<typeof 
     if (url.pathname === "/api/reference")
       return json({ location: { directory, project: { id: "proj_test", directory } }, data: [] })
     if (url.pathname === "/provider") return json({ all: [], default: {}, connected: [] })
-    if (url.pathname === "/session") return json([])
+    // Read route: the session collection only answers GET. A write here (e.g. session
+    // creation) is a session mutation no fixture accounts for, so it must reach the
+    // unexpected-request throw below rather than read as an empty list.
+    if (url.pathname === "/session" && request.method === "GET") return json([])
     if (url.pathname === "/vcs") return json({ branch: "main" })
     throw new Error(`unexpected request: ${url.pathname}`)
   }) as typeof globalThis.fetch
-  return { fetch, session }
+  return { fetch, session, requests }
 }

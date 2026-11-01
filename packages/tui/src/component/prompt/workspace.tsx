@@ -93,14 +93,23 @@ export function usePromptWorkspace(sessionID?: string) {
     if (warped) showNotice(workspace.name)
   }
 
+  let noticeTimer: ReturnType<typeof setTimeout> | undefined
+
   function showNotice(name: string) {
     setNotice(`Warped to ${name}`)
-    setTimeout(() => setNotice(undefined), 4000)
+    if (noticeTimer) clearTimeout(noticeTimer)
+    noticeTimer = setTimeout(() => setNotice(undefined), 4000)
   }
 
   function clearNotice() {
+    if (noticeTimer) clearTimeout(noticeTimer)
+    noticeTimer = undefined
     setNotice(undefined)
   }
+
+  onCleanup(() => {
+    if (noticeTimer) clearTimeout(noticeTimer)
+  })
 
   function open() {
     void openWorkspaceSelect({ dialog, sdk, sync, project, toast, onSelect: warp })

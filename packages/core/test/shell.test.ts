@@ -60,7 +60,25 @@ describe("shell", () => {
     const zsh = Shell.args("/bin/zsh", "echo hi", "/tmp")
     expect(zsh[0]).toBe("-l")
     expect(zsh[1]).toBe("-c")
-    expect(zsh.at(-1)).toBe("/tmp")
+    // cwd and the command arrive as positional args ($1, $2), not spliced into the script
+    expect(zsh.at(-2)).toBe("/tmp")
+    expect(zsh.at(-1)).toBe("echo hi")
+  })
+
+  const realBash = process.platform === "win32" ? undefined : Bun.which("bash")
+  ;(realBash ? test : test.skip)("bash args preserve dollars, backticks, quotes and newlines (#388)", () => {
+    const run = (command: string) => {
+      const argv = Shell.args(realBash!, command, "/tmp")
+      const out = Bun.spawnSync([realBash!, ...argv], { stdout: "pipe", stderr: "pipe" })
+      return out.stdout.toString()
+    }
+    // Before the fix the command was spliced into eval ${JSON.stringify(...)}:
+    // the outer double quotes expanded $HOME and mangled backslash escapes.
+    expect(run("echo '$HOME'").trim()).toBe("$HOME")
+    expect(run("printf 'a\nb\n'")).toBe("a\nb\n")
+    expect(run("echo one\necho two")).toBe("one\ntwo\n")
+    expect(run("echo `echo tick`").trim()).toBe("tick")
+    expect(run('echo "double $HOME quotes"').trim()).toBe("double " + (process.env.HOME ?? "") + " quotes")
   })
 
   if (process.platform === "win32") {

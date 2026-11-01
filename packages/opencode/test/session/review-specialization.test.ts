@@ -1,10 +1,11 @@
+import { scriptWorkStages, stageMatch } from "../fixture/work-flow"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { expect } from "bun:test"
 import { Effect, Layer } from "effect"
 import path from "path"
 import { Agent as AgentSvc } from "../../src/agent/agent"
-import { REVIEW_AGENTS, REVIEW_ROUTING, type ReviewAgent } from "../../src/agent/review-agents"
+import { LEGACY_REVIEW_AGENTS, REVIEW_AGENTS, resolveReviewer } from "../../src/agent/review-agents"
 import { BackgroundJob } from "@/background/job"
 import { Command } from "../../src/command"
 import { Config } from "@/config/config"
@@ -175,6 +176,13 @@ const cfg = {
     // conceding it here would not leave the routing untested.
     custom: { finishTool: false, mode: "primary" as const },
     plan: { finishTool: false },
+    // Waiting on a subagent is opt-in per agent (#173). The arms below assert the
+    // blocking review handoff, including requests that name a retired specialist:
+    // the legacy config keys alias to `review` too, so these three entries all
+    // opt the same single reviewer in - kept as a live check of that aliasing.
+    review: { background: false },
+    "work-review": { background: false },
+    "code-review": { background: false },
   },
   provider: {
     test: {
@@ -301,7 +309,7 @@ const REPORT = [
   "</silvercode-review>",
 ].join("\n")
 
-const USER_REQUEST = "fix the off-by-one in the cache key and add a test"
+const USER_REQUEST = "Fix the software bug in the cache key and add a test"
 
 const TASK_PROMPT = [
   "What was requested: fix the off-by-one in the cache key and add a test.",
@@ -342,10 +350,9 @@ type CompletedToolPart = SessionV1.ToolPart & { state: SessionV1.ToolStateComple
 // part plus the reviewer session id, so callers can assert routing and gating
 // against one another.
 //
-// `parentAgents` is the agent named by each user message, in order. A session
-// row pins no agent here, so the runtime has to read the running agent off the
-// messages - and which message it reads is exactly what the ordering tests below
-// pin. Passing more than one models a session that switched agents mid-thread.
+// `parentAgents` is the agent named by each user message, in order. Reviewer
+// resolution no longer depends on the parent, but passing the parent keeps the
+// dispatch context realistic for the gate and envelope assertions.
 const runReview = Effect.fn("test.runReview")(function* (parentAgents: string | string[], subagentType: string) {
   const { llm } = yield* useServerConfig
   const prompt = yield* SessionPrompt.Service
@@ -354,6 +361,17 @@ const runReview = Effect.fn("test.runReview")(function* (parentAgents: string | 
     title: "Pinned",
     permission: [{ permission: "*", pattern: "*", action: "allow" }],
   })
+  if ((Array.isArray(parentAgents) ? parentAgents.at(-1) : parentAgents) === "work") {
+    const fs=yield* FSUtil.Service
+    const {directory}=yield* TestInstance
+    const file=path.join(directory,"opencode.json")
+    const config=JSON.parse(yield* Effect.promise(()=>Bun.file(file).text()))
+    config.agent.think={finishTool:true}
+    config.agent.code={finishTool:true}
+    delete config.agent.plan
+    yield* fs.writeWithDirs(file,JSON.stringify(config))
+  }
+  if ((Array.isArray(parentAgents) ? parentAgents.at(-1) : parentAgents) === "work") yield* scriptWorkStages(parentMatch)
   yield* script({ subagent_type: subagentType })
   for (const agent of typeof parentAgents === "string" ? [parentAgents] : parentAgents)
     yield* user(chat.id, USER_REQUEST, agent)
@@ -363,7 +381,7 @@ const runReview = Effect.fn("test.runReview")(function* (parentAgents: string | 
 
   const msgs = yield* MessageV2.filterCompactedEffect(chat.id)
   const toolParts = msgs.flatMap((msg) => msg.parts).filter((part): part is SessionV1.ToolPart => part.type === "tool")
-  const taskPart = toolParts.find((part) => part.tool === "task")
+  const taskPart = toolParts.find((part) => part.tool === "task" && resolveReviewer(String(part.state.input.subagent_type)) === "review")
   if (!taskPart || taskPart.state.status !== "completed")
     expect(
       JSON.stringify(
@@ -410,69 +428,67 @@ it.instance(
   10_000,
 )
 
-// The other direction between the two tables. The value side is a compile-time
-// invariant now (`ReviewAgent` is the element type of both), but the compiler
-// cannot see that the runtime `Set` and the type union still agree, and a
-// reviewer added to one and not the other would route into a name the report
-// gate does not know - the exact silent degradation the set's own docblock warns
-// about. Pin it here, where the roster is already checked.
+// The consolidation retired the specialist reviewers into aliases of the
+// single `review` agent. Pin both resolution paths here, where the roster is
+// already checked: a stored session row or config that still names a specialist
+// must keep working, and it must land on an agent the report gate knows.
 it.instance(
-  "every REVIEW_ROUTING target is a member of REVIEW_AGENTS",
+  "legacy specialist reviewer names resolve to the single reviewer",
   () =>
     Effect.gen(function* () {
       const agent = yield* AgentSvc.Service
-      const registered = yield* agent.list()
-      for (const [parent, reviewer] of Object.entries(REVIEW_ROUTING)) {
-        expect(REVIEW_AGENTS.has(reviewer as ReviewAgent)).toBe(true)
-        expect(registered.map((item) => item.name)).toContain(reviewer)
-        // A table entry that routes a parent to itself buys nothing over the
-        // generic fallback and hides a copy-paste error in the entry above it.
-        expect(reviewer).not.toBe(parent)
+      expect(LEGACY_REVIEW_AGENTS.size).toBeGreaterThan(0)
+      for (const legacy of LEGACY_REVIEW_AGENTS) {
+        // Dispatch resolution rewrites the name...
+        expect(resolveReviewer(legacy)).toBe("review")
+        // ...and lookup answers the same agent through the schema's legacy-id
+        // table, so a config written against the specialist configures the
+        // reviewer that actually runs.
+        const resolved = yield* agent.get(legacy)
+        expect(resolved?.name).toBe("review")
+        expect(REVIEW_AGENTS.has("review")).toBe(true)
       }
+      // A non-reviewer name always passes through untouched.
+      expect(resolveReviewer("general")).toBe("general")
     }),
   10_000,
 )
 
-// Issue #113's premise: Work and Code get distinct reviewers. The prompts must
-// actually differ, or the split buys nothing.
+// The consolidation merged the specialist prompts into one reviewer whose
+// prompt is the union of the code and work checklists. Pin the union markers:
+// code-review's integration/regression checklist and work-review's non-code
+// domain must both survive, or the merge silently dropped a review standard.
 it.instance(
-  "Work and Code review agents have distinct prompts in the agent registry",
+  "the single reviewer's prompt is the union of the retired specialist prompts",
   () =>
     Effect.gen(function* () {
       const agent = yield* AgentSvc.Service
-      const workReview = yield* agent.get("work-review")
-      const codeReview = yield* agent.get("code-review")
-      const genericReview = yield* agent.get("review")
+      const review = yield* agent.get("review")
 
-      expect(workReview?.name).toBe("work-review")
-      expect(codeReview?.name).toBe("code-review")
-      expect(genericReview?.name).toBe("review")
-
-      // The two prompts must actually differ, or the split buys nothing. The
-      // load-bearing claim is the inequality: the assertions on which lines the
-      // framing differs from would only restate the prompt files.
-      expect(workReview?.prompt?.includes(REVIEW_PROMPT_MARKER)).toBe(true)
-      expect(codeReview?.prompt?.includes(REVIEW_PROMPT_MARKER)).toBe(true)
-      expect(workReview?.prompt).not.toBe(codeReview?.prompt)
-      expect(genericReview?.prompt).not.toBe(codeReview?.prompt)
+      expect(review?.name).toBe("review")
+      expect(review?.prompt?.includes(REVIEW_PROMPT_MARKER)).toBe(true)
+      // code-review's contribution.
+      expect(review?.prompt).toContain("Integration & regressions")
+      // work-review's contribution: non-code units are in scope.
+      expect(review?.prompt).toContain("mixed workspace work")
+      expect(review?.prompt).toContain("configurations validate")
     }),
   10_000,
 )
 
 // #165 gave `review` plan-equivalent inspection permissions, including bash,
-// with edit denial enforced at the permission seam. The new reviewers inherit
-// that capability boundary, so a fourth reviewer cannot quietly become
-// read-only, and `code-review` can still verify the correctness/tests/types/
-// regressions its own description promises.
+// with edit denial enforced at the permission seam. The single reviewer keeps
+// that boundary, and reaching it through a retired specialist name must land
+// on exactly the same ruleset.
 it.instance(
-  "new reviewers inherit the review agent's #165-equivalent permission boundary",
+  "the single reviewer keeps the #165 permission boundary, through legacy names too",
   () =>
     Effect.gen(function* () {
       const agent = yield* AgentSvc.Service
       const registry = yield* ToolRegistry.Service
       const generic = yield* agent.get("review")
 
-      for (const name of ["review", "work-review", "code-review"]) {
+      for (const name of ["review", ...LEGACY_REVIEW_AGENTS]) {
         const reviewer = yield* agent.get(name)
         expect(reviewer).toBeDefined()
 
@@ -500,24 +516,17 @@ it.instance(
   10_000,
 )
 
-const ROUTING: { parent: string; expected: string }[] = [
-  { parent: "work", expected: "work-review" },
-  { parent: "code", expected: "code-review" },
-  { parent: "custom", expected: "review" },
-  { parent: "plan", expected: "review" },
-]
-
-// The routing claim, end to end: the parent dispatches `subagent_type:
-// "review"` and the runtime resolves it to the reviewer matching the parent
-// agent. A parent with no specialization keeps the generic reviewer.
-for (const { parent, expected } of ROUTING) {
+// After the consolidation there is exactly one reviewer: every parent -
+// specialist or not - dispatches `review`, and the review plan-equivalent
+// toolset and envelope delivery behave identically for each.
+for (const parent of ["work", "code", "custom", "plan"]) {
   it.instance(
-    `review requested by ${parent} dispatches ${expected}`,
+    `review requested by ${parent} dispatches the single reviewer`,
     () =>
       Effect.gen(function* () {
         const { child, taskPart, reviewerRequests, parentFollowUps } = yield* runReview(parent, "review")
 
-        expect(child.agent).toBe(expected)
+        expect(child.agent).toBe("review")
         expect(child.parentID).toBeDefined()
         // The reviewer that actually ran is the one the child session records,
         // and it ran with the plan-equivalent toolset #165 gave `review`.
@@ -535,15 +544,13 @@ for (const { parent, expected } of ROUTING) {
   )
 }
 
-// The report gate, for all three reviewer names. The parent is `custom`, which
-// has no review specialization, so the name dispatched here reaches the gate
-// unchanged instead of being rewritten by the routing above. Without the gate
-// the first, envelope-less finish would complete the review with no verdict, so
-// the child transcript must record a rejected finish followed by the accepted
-// one.
-for (const reviewer of ["review", "work-review", "code-review"]) {
+// The report gate, for the single reviewer reached directly and through each
+// retired specialist name. Without the gate the first, envelope-less finish
+// would complete the review with no verdict, so the child transcript must
+// record a rejected finish followed by the accepted one.
+for (const reviewer of ["review", ...LEGACY_REVIEW_AGENTS]) {
   it.instance(
-    `${reviewer} cannot complete without a report envelope`,
+    `review requested as ${reviewer} cannot complete without a report envelope`,
     () =>
       Effect.gen(function* () {
         const { child, taskPart } = yield* runReview("custom", reviewer)
@@ -558,9 +565,9 @@ for (const reviewer of ["review", "work-review", "code-review"]) {
         if (finishParts[0]?.state.status === "error")
           expect(finishParts[0].state.error).toContain("Review finish rejected")
 
-        // The gate ran under the dispatched name, and the accepted report was
-        // extracted into the parent's envelope and result metadata.
-        expect(child.agent).toBe(reviewer)
+        // The gate ran under the resolved single reviewer, and the accepted
+        // report was extracted into the parent's envelope and result metadata.
+        expect(child.agent).toBe("review")
         expect(taskPart.state.status).toBe("completed")
         expect(taskPart.state.output).toContain("Needs fixes")
         expect(taskPart.state.metadata?.review).toBeDefined()
@@ -568,71 +575,3 @@ for (const reviewer of ["review", "work-review", "code-review"]) {
     20_000,
   )
 }
-
-// Which user message names the running agent.
-//
-// The session row pins no agent here, so the runtime resolves it from the
-// messages. `MessageV2.page` returns them oldest-first, so the agent currently
-// driving the session is the LAST user message, not the first: a session whose
-// first turn named Work and whose latest turn names Code is being driven as
-// Code, and must be reviewed by the Code reviewer. Reading the oldest message
-// inverts the routing in exactly the mid-session agent switch the routing exists
-// to handle, and it is invisible to any session with a single user message.
-for (const [agents, expected] of [
-  [["work", "code"], "code-review"],
-  [["code", "work"], "work-review"],
-  [["code", "custom"], "review"],
-  [["work", "work"], "work-review"],
-] as const) {
-  it.instance(
-    `review requested by a ${agents.join(" then ")} session dispatches ${expected}`,
-    () =>
-      Effect.gen(function* () {
-        const { child } = yield* runReview([...agents], "review")
-        expect(child.agent).toBe(expected)
-      }),
-    20_000,
-  )
-}
-
-// The requesting context is never a source for the routing decision. `ctx.agent`
-// is the CHILD's agent on the subtask path, so consulting it could select a
-// reviewer by the child's identity; the parent session is the only input.
-//
-// The nested shape that would expose it - a subagent dispatching its own review
-// - is not constructible here: `general` carries no `task` rule, so
-// `deriveSubagentSessionPermission` denies `task` in every subagent session the
-// task tool creates, and the only other task-capable subagents are the
-// reviewers themselves. So this pins the reachable half of the same rule: a
-// session row that pins an agent is authoritative, and the messages beneath it
-// cannot override it in either direction.
-it.instance(
-  "a session row pinning an agent outranks the agent named in its user messages",
-  () =>
-    Effect.gen(function* () {
-      yield* useServerConfig
-      const prompt = yield* SessionPrompt.Service
-      const sessions = yield* Session.Service
-      const chat = yield* sessions.create({
-        title: "Anchored",
-        agent: "code",
-        permission: [{ permission: "*", pattern: "*", action: "allow" }],
-      })
-      yield* script({ subagent_type: "review" })
-      // A stale Work message underneath a session that is pinned to Code.
-      yield* user(chat.id, USER_REQUEST, "work")
-      yield* prompt.loop({ sessionID: chat.id })
-
-      const msgs = yield* MessageV2.filterCompactedEffect(chat.id)
-      const taskPart = msgs
-        .flatMap((msg) => msg.parts)
-        .find((part): part is SessionV1.ToolPart => part.type === "tool" && part.tool === "task")
-      if (!taskPart || taskPart.state.status !== "completed")
-        expect(JSON.stringify(msgs.flatMap((msg) => msg.parts.map((part) => part.type)))).toBe("completed")
-      const child = yield* sessions.get(
-        SessionID.make((taskPart as CompletedToolPart).state.metadata!.sessionId as string),
-      )
-      expect(child.agent).toBe("code-review")
-    }),
-  20_000,
-)

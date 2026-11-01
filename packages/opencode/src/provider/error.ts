@@ -20,6 +20,64 @@ export class ResponseStreamError extends Error {
   }
 }
 
+/**
+ * A response stream that died after the provider issued tool calls. Retrying
+ * would re-issue the same request and replay those calls' side effects, so
+ * this is always classified non-retryable; the user continues the turn
+ * manually instead.
+ */
+export class StreamInterruptedAfterToolCallError extends Error {
+  public override readonly name = "ProviderStreamInterruptedAfterToolCallError"
+
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options)
+  }
+}
+
+/** Fixed labels only: never serialize provider messages, stack traces or payloads. */
+export function interruptedStreamCause(error: unknown): Record<string, string> {
+  try {
+    const kinds: string[] = []
+    const codes = new Set(["ECONNRESET", "ECONNREFUSED", "ETIMEDOUT", "EPIPE", "ENOTFOUND", "EAI_AGAIN"])
+    const seen = new Set<unknown>()
+    let code: string | undefined
+    let current = error
+    for (let depth = 0; depth < 4 && current !== undefined; depth++) {
+      if (seen.has(current)) {
+        kinds.push("cycle")
+        break
+      }
+      seen.add(current)
+      if (!(current instanceof Error)) {
+        kinds.push("unknown")
+        break
+      }
+      // Read data properties only. Accessors can throw or expose unrelated data.
+      const descriptor = Object.getOwnPropertyDescriptor(current, "code")
+      const value = descriptor && "value" in descriptor ? descriptor.value : undefined
+      const networkCode = typeof value === "string" && codes.has(value) ? value : undefined
+      kinds.push(
+        current instanceof HeaderTimeoutError
+          ? "header_timeout"
+          : current instanceof ResponseStreamError
+            ? "response_stream"
+            : networkCode
+              ? "network"
+              : "unknown",
+      )
+      code ??= networkCode
+      const cause = Object.getOwnPropertyDescriptor(current, "cause")
+      current = cause && "value" in cause ? cause.value : undefined
+      if (depth === 3 && current !== undefined) kinds.push("truncated")
+    }
+    return { causeChain: kinds.join(">") || "unknown", ...(code ? { causeCode: code } : {}) }
+  } catch {
+    // Diagnostics must never replace the original interruption. Proxies can throw
+    // even from instanceof or descriptor inspection. Drop any partial enrichment.
+    return { causeChain: "unknown" }
+  }
+}
+
 function isOpenAiErrorRetryable(e: APICallError) {
   const status = e.statusCode
   if (!status) return e.isRetryable

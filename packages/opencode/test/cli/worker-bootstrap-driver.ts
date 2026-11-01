@@ -30,7 +30,13 @@ worker.addEventListener("error", (event) => {
 let requestId = 0
 const deadline = Date.now() + windowMs
 while (Date.now() < deadline && !sawSnapshot && !error) {
-  worker.postMessage(JSON.stringify({ type: "rpc.request", id: ++requestId, method: "snapshot", input: undefined }))
+  try {
+    worker.postMessage(JSON.stringify({ type: "rpc.request", id: ++requestId, method: "snapshot", input: undefined }))
+  } catch {
+    // A worker that exited on its own (no launch marker) rejects postMessage:
+    // that is the "never booted" outcome this probe reports as RESULT:none.
+    break
+  }
   // Wait for the thread to handle the request and write the snapshot file.
   for (let i = 0; i < 20; i++) {
     await new Promise((resolve) => setTimeout(resolve, 100))

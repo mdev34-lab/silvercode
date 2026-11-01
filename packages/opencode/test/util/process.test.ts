@@ -16,6 +16,24 @@ describe("util.process", () => {
     expect(out.stderr.toString()).toBe("err")
   })
 
+  test("caps oversized stdout at the run output limit", async () => {
+    const out = await Process.run(
+      node(`process.stdout.write("x".repeat(${Process.RUN_OUTPUT_LIMIT + 1024 * 1024}))`),
+    )
+    expect(out.code).toBe(0)
+    expect(out.stdout.length).toBe(Process.RUN_OUTPUT_LIMIT)
+  })
+
+  test("abort kills a hanging run", async () => {
+    const started = Date.now()
+    const out = await Process.run(node("setInterval(() => {}, 1000)"), {
+      nothrow: true,
+      abort: AbortSignal.timeout(500),
+    })
+    expect(Date.now() - started).toBeLessThan(20_000)
+    expect(out.code).not.toBe(0)
+  }, 25_000)
+
   test("returns code when nothrow is enabled", async () => {
     const out = await Process.run(node("process.exit(7)"), { nothrow: true })
     expect(out.code).toBe(7)
@@ -31,24 +49,31 @@ describe("util.process", () => {
 
   test("aborts a running process", async () => {
     const abort = new AbortController()
-    const started = Date.now()
-    setTimeout(() => abort.abort(), 25)
+    let abortedAt = 0
+    setTimeout(() => {
+      abortedAt = Date.now()
+      abort.abort()
+    }, 25)
 
     const out = await Process.run(node("setInterval(() => {}, 1000)"), {
       abort: abort.signal,
       nothrow: true,
     })
 
+    expect(abortedAt).toBeGreaterThan(0)
     expect(out.code).not.toBe(0)
-    expect(Date.now() - started).toBeLessThan(1000)
+    expect(Date.now() - abortedAt).toBeLessThan(1000)
   }, 3000)
 
   test("kills after timeout when process ignores terminate signal", async () => {
     if (process.platform === "win32") return
 
     const abort = new AbortController()
-    const started = Date.now()
-    setTimeout(() => abort.abort(), 25)
+    let abortedAt = 0
+    setTimeout(() => {
+      abortedAt = Date.now()
+      abort.abort()
+    }, 25)
 
     const out = await Process.run(node('process.on("SIGTERM", () => {}); setInterval(() => {}, 1000)'), {
       abort: abort.signal,
@@ -56,8 +81,9 @@ describe("util.process", () => {
       timeout: 25,
     })
 
+    expect(abortedAt).toBeGreaterThan(0)
     expect(out.code).not.toBe(0)
-    expect(Date.now() - started).toBeLessThan(1000)
+    expect(Date.now() - abortedAt).toBeLessThan(1000)
   }, 3000)
 
   test("uses cwd when spawning commands", async () => {

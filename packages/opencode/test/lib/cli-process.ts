@@ -32,6 +32,32 @@ import { it } from "./effect"
 
 const opencodeRoot = path.resolve(import.meta.dir, "../../")
 const cliEntry = path.join(opencodeRoot, "src/index.ts")
+// Preloaded into spawned CLI children only when a test opts in via
+// SpawnOpts.clockScale — see clock-scale.preload.ts.
+const clockScalePreload = path.join(import.meta.dir, "clock-scale.preload.ts")
+
+// The accelerated clock is only active above 1; anything else runs real time.
+function activeClockScale(opts?: SpawnOpts) {
+  const scale = opts?.clockScale
+  return scale !== undefined && Number.isFinite(scale) && scale > 1 ? scale : undefined
+}
+
+// argv for bun so clock-scale opting tests preload the virtual clock before
+// the CLI entry module loads (see clock-scale.preload.ts).
+function bunArgv(args: string[], opts?: SpawnOpts) {
+  return [
+    "run",
+    ...(activeClockScale(opts) ? ["--preload", clockScalePreload] : []),
+    "--conditions=browser",
+    cliEntry,
+    ...args,
+  ]
+}
+
+function clockScaleEnv(opts?: SpawnOpts): Record<string, string> {
+  const scale = activeClockScale(opts)
+  return scale === undefined ? {} : { OPENCODE_TEST_CLOCK_SCALE: String(scale) }
+}
 
 export const testModelID = "test/test-model"
 
@@ -69,6 +95,7 @@ function isolatedEnv(home: string, configJson: string): Record<string, string> {
     XDG_CACHE_HOME: path.join(home, ".cache"),
     OPENCODE_CONFIG_CONTENT: configJson,
     OPENCODE_DISABLE_PROJECT_CONFIG: "1",
+    OPENCODE_DISABLE_CONFIG_DEP_INSTALL: "1",
     OPENCODE_PURE: "1",
     OPENCODE_DISABLE_AUTOUPDATE: "1",
     OPENCODE_DISABLE_AUTOCOMPACT: "1",
@@ -89,7 +116,18 @@ export type RunHandle = {
   readonly result: Effect.Effect<RunResult>
 }
 
-export type SpawnOpts = { readonly timeoutMs?: number; readonly env?: Record<string, string> }
+export type SpawnOpts = {
+  readonly timeoutMs?: number
+  readonly env?: Record<string, string>
+  // Run the spawned CLI child on an accelerated clock: the child observes
+  // time `clockScale` times faster than wall time (Date.now + timers scaled
+  // together, see clock-scale.preload.ts). Long provider retry waits then
+  // cost real_seconds / clockScale while still exercising the full notice /
+  // ordering / recovery path at production values. Omit (or leave <= 1) for
+  // the real clock; at least one end-to-end long-retry test should stay on
+  // it so wall-clock behavior remains covered.
+  readonly clockScale?: number
+}
 
 // Typed equivalent of constructing argv for `opencode run`. New flags should
 // land here so tests stay grep-able and refactor-safe.
@@ -211,9 +249,9 @@ export function withCliFixture<A, E>(
       // on `Bun.stdin.text()` (see src/cli/cmd/run.ts — non-TTY stdin is
       // consumed as the prompt). The old Process.run wrapper defaulted to
       // ignore; ChildProcess.make defaults to pipe, so we set it explicitly.
-      const command = ChildProcess.make("bun", ["run", "--conditions=browser", cliEntry, ...args], {
+      const command = ChildProcess.make("bun", bunArgv(args, opts), {
         cwd: home,
-        env: { ...env, ...opts?.env },
+        env: { ...env, ...clockScaleEnv(opts), ...opts?.env },
         extendEnv: true,
         stdin: "ignore",
       })
@@ -283,9 +321,9 @@ export function withCliFixture<A, E>(
       const options = runOpts(opts)
       const proc = yield* Effect.acquireRelease(
         Effect.sync(() =>
-          Bun.spawn(["bun", "run", "--conditions=browser", cliEntry, ...runArgs(message, opts)], {
+          Bun.spawn(["bun", ...bunArgv(runArgs(message, opts), options)], {
             cwd: home,
-            env: { ...process.env, ...env, ...options?.env },
+            env: { ...process.env, ...env, ...clockScaleEnv(options), ...options?.env },
             stdin: "ignore",
             stdout: "pipe",
             stderr: "pipe",
@@ -324,9 +362,9 @@ export function withCliFixture<A, E>(
       // as a finalizer error during test teardown.
       const proc = yield* Effect.acquireRelease(
         Effect.sync(() =>
-          Bun.spawn(["bun", "run", "--conditions=browser", cliEntry, ...argv], {
+          Bun.spawn(["bun", ...bunArgv(argv, opts)], {
             cwd: home,
-            env: { ...process.env, ...env, ...opts?.env },
+            env: { ...process.env, ...env, ...clockScaleEnv(opts), ...opts?.env },
             stdout: "pipe",
             stderr: "pipe",
           }),
@@ -395,9 +433,9 @@ export function withCliFixture<A, E>(
       // Either way we await proc.exited so the test scope doesn't leak.
       const proc = yield* Effect.acquireRelease(
         Effect.sync(() =>
-          Bun.spawn(["bun", "run", "--conditions=browser", cliEntry, ...argv], {
+          Bun.spawn(["bun", ...bunArgv(argv, opts)], {
             cwd: opts?.cwd ?? home,
-            env: { ...process.env, ...env, ...opts?.env },
+            env: { ...process.env, ...env, ...clockScaleEnv(opts), ...opts?.env },
             stdin: "pipe",
             stdout: "pipe",
             stderr: "pipe",
@@ -510,9 +548,13 @@ function expectExit(result: RunResult, expected: number, label = "opencode") {
 // `it.live(name, () => withCliFixture(fixture))` — one fewer nesting level at
 // every call site. Use this for any test that needs the opencode CLI fixture.
 //
-// Subprocess tests must run against the real clock — a TestClock-paused
-// environment can't drive a child process. If you need `.only` or `.skip`, fall
-// back to `it.live` + `withCliFixture` directly.
+// Subprocess tests run against the real clock by default — a TestClock-paused
+// environment can't drive a child process. Tests that only need a long delay
+// to be *observed* (notice, ordering, recovery) can opt into the accelerated
+// child clock with SpawnOpts.clockScale (see clock-scale.preload.ts); keep at
+// least one genuinely wall-clock delayed case per behavior when doing so. If
+// you need `.only` or `.skip`, fall back to `it.live` + `withCliFixture`
+// directly.
 // Body's R is `Scope.Scope | never` so tests can yield* scope-requiring
 // resources (e.g. `opencode.serve`) without an extra `Effect.scoped` wrapper —
 // `withCliFixture`'s outer scope is the natural lifetime.

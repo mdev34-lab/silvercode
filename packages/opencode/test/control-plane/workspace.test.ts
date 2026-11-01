@@ -17,6 +17,7 @@ import { Session as SessionNs } from "@/session/session"
 import { SessionID } from "@/session/schema"
 import { SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
+import { EventV2 } from "@opencode-ai/core/event"
 import { EventSequenceTable } from "@opencode-ai/core/event/sql"
 import { resetDatabase } from "../fixture/db"
 import { disposeAllInstances, provideTmpdirInstance, requireInstance, TestInstance } from "../fixture/fixture"
@@ -147,6 +148,17 @@ function captureGlobalEvents() {
       GlobalBus.off("event", handler)
     },
   }
+}
+
+// GlobalBus has one replay log for the whole test process and compares cursors
+// as strings, so an id a fixture publishes must be a real event id (`evt_` plus
+// the time-ordered prefix) to sort before cursors that later test files
+// generate. A hand-built id such as `evt_sse-...` sorts after every generated id
+// and makes another file's replay look non-empty (#679).
+const eventIDPattern = /^evt_[0-9a-f]{12}[0-9A-Za-z]{14}$/
+
+function expectEventID(id: unknown) {
+  expect(id).toMatch(eventIDPattern)
 }
 
 function expectExitContains(exit: Exit.Exit<unknown, unknown>, ...messages: string[]) {
@@ -1010,7 +1022,7 @@ describe("workspace CRUD", () => {
           if (call.url.pathname === "/warp-source/sync/history") {
             return yield* HttpServerResponse.json([
               {
-                id: `evt_${unique("warp-source-history")}`,
+                id: EventV2.ID.create(),
                 aggregate_id: historySessionID!,
                 seq: historyNextSeq,
                 type: "session.updated.1",
@@ -1068,6 +1080,7 @@ describe("workspace CRUD", () => {
                   type: "session.created.1",
                 },
                 {
+                  id: expect.stringMatching(eventIDPattern),
                   aggregateID: session.id,
                   seq: historyNextSeq,
                   type: "session.updated.1",
@@ -1374,7 +1387,7 @@ describe("workspace sync state", () => {
             return HttpServerResponse.fromWeb(
               Response.json([
                 {
-                  id: `evt_${unique("history")}`,
+                  id: EventV2.ID.create(),
                   aggregate_id: historySessionID!,
                   seq: historyNextSeq,
                   type: "session.updated.1",
@@ -1423,6 +1436,10 @@ describe("workspace sync state", () => {
                 ),
               ).toBe(true)
               yield* workspace.remove(info.id)
+              const replayed = captured.events.find(
+                (event) => event.workspace === info.id && event.payload.type === "session.updated",
+              )
+              expectEventID(replayed?.payload.id)
             } finally {
               captured.dispose()
             }
@@ -1523,7 +1540,7 @@ describe("workspace sync state", () => {
                     payload: {
                       type: "sync",
                       syncEvent: {
-                        id: `evt_${unique("sse")}`,
+                        id: EventV2.ID.create(),
                         aggregateID: sseSessionID!,
                         seq: sseNextSeq,
                         type: "session.updated.1",
@@ -1574,6 +1591,10 @@ describe("workspace sync state", () => {
                 ),
               ).toBe(true)
               yield* workspace.remove(info.id)
+              const forwarded = captured.events.find(
+                (event) => event.workspace === info.id && event.payload.type === "sync",
+              )
+              expectEventID(forwarded?.payload.id)
             } finally {
               captured.dispose()
             }

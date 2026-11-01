@@ -2,19 +2,20 @@ import { describe, expect, test } from "bun:test"
 import {
   computeGenerationMetrics,
   createGenerationClock,
-  isReceivedTextToken,
+  isReceivedToken,
 } from "../../src/session/generation-metrics"
 
-describe("generation-metrics.isReceivedTextToken", () => {
-  test("counts only non-empty text-delta as a received token", () => {
-    expect(isReceivedTextToken({ type: "text-start" })).toBe(false)
-    expect(isReceivedTextToken({ type: "text-delta", text: "" })).toBe(false)
-    expect(isReceivedTextToken({ type: "text-delta", text: "hi" })).toBe(true)
-    expect(isReceivedTextToken({ type: "reasoning-start" })).toBe(false)
-    expect(isReceivedTextToken({ type: "reasoning-delta", text: "think" })).toBe(false)
-    expect(isReceivedTextToken({ type: "tool-input-delta", text: "{" })).toBe(false)
-    expect(isReceivedTextToken({ type: "tool-call" })).toBe(false)
-    expect(isReceivedTextToken({ type: "step-finish" })).toBe(false)
+describe("generation-metrics.isReceivedToken", () => {
+  test("counts non-empty text, reasoning and tool-input deltas as received tokens", () => {
+    expect(isReceivedToken({ type: "text-start" })).toBe(false)
+    expect(isReceivedToken({ type: "text-delta", text: "" })).toBe(false)
+    expect(isReceivedToken({ type: "text-delta", text: "hi" })).toBe(true)
+    expect(isReceivedToken({ type: "reasoning-start" })).toBe(false)
+    expect(isReceivedToken({ type: "reasoning-delta", text: "think" })).toBe(true)
+    expect(isReceivedToken({ type: "reasoning-delta", text: "" })).toBe(false)
+    expect(isReceivedToken({ type: "tool-input-delta", text: "{" })).toBe(true)
+    expect(isReceivedToken({ type: "tool-call" })).toBe(false)
+    expect(isReceivedToken({ type: "step-finish" })).toBe(false)
   })
 })
 
@@ -113,19 +114,33 @@ describe("generation-metrics.createGenerationClock", () => {
     })
   })
 
-  test("does not start TTFT or tok/s from reasoning or tool-input deltas", () => {
+  test("starts TTFT and tok/s at the first reasoning or tool-input delta", () => {
     const clock = createGenerationClock()
     clock.startRequest(0)
     clock.observe({ type: "reasoning-delta", text: "hmm" }, 50)
     clock.observe({ type: "tool-input-delta", text: "{" }, 60)
     clock.observe({ type: "tool-call" }, 70)
     clock.observe({ type: "text-delta", text: "ok" }, 180)
-    clock.observe({ type: "step-finish", usage: { outputTokens: 10 } }, 280)
+    clock.observe({ type: "step-finish", usage: { outputTokens: 10 } }, 250)
 
     expect(clock.finish(300)).toEqual({
-      ttft: 180,
-      tokensPerSecond: 100,
+      ttft: 50,
+      tokensPerSecond: 50,
     })
+  })
+
+  test("a long thought is inside the tok/s window, so the rate stays plausible", () => {
+    // 13 minutes of thinking, a short text, 26000 output tokens in total.
+    const clock = createGenerationClock()
+    clock.startRequest(0)
+    clock.observe({ type: "reasoning-delta", text: "a" }, 2000)
+    clock.observe({ type: "text-delta", text: "ok" }, 780_000)
+    clock.observe({ type: "step-finish", usage: { outputTokens: 26_000 } }, 790_000)
+
+    const metrics = clock.finish(790_000)
+    expect(metrics.ttft).toBe(2000)
+    expect(metrics.tokensPerSecond).toBeCloseTo(26_000 / 788, 5)
+    expect(metrics.tokensPerSecond!).toBeLessThan(100)
   })
 
   test("omits both metrics when only a tool-call is produced", () => {

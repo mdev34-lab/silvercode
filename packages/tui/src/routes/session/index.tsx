@@ -25,7 +25,13 @@ import { useEvent } from "../../context/event"
 import { SplitBorder } from "../../ui/border"
 import { useTuiPaths, useTuiTerminalEnvironment } from "../../context/runtime"
 import { Spinner } from "../../component/spinner"
-import { createSyntaxStyleMemo, generateSubtleSyntax, selectedForeground, useTheme } from "../../context/theme"
+import {
+  createSyntaxStyleMemo,
+  generateSubtleSyntax,
+  selectedForeground,
+  textAttributes,
+  useTheme,
+} from "../../context/theme"
 import { BoxRenderable, ScrollBoxRenderable, addDefaultParsers, TextAttributes, RGBA } from "@opentui/core"
 import { Prompt, type PromptRef } from "../../component/prompt"
 import type {
@@ -42,8 +48,8 @@ import { ReviewReport } from "@opencode-ai/core/review-report"
 import { useLocal } from "../../context/local"
 import { Locale } from "../../util/locale"
 import { webSearchProviderLabel } from "../../util/tool-display"
-import { finishStatus, finishStatusLines } from "../../util/agent-effort"
-import { useRenderer, useTerminalDimensions, type JSX } from "@opentui/solid"
+import { useRenderer, type JSX } from "@opentui/solid"
+import { useTerminalDimensions } from "../../util/terminal-dimensions"
 import { useSDK } from "../../context/sdk"
 import { useEditorContext } from "../../context/editor"
 import { openEditor } from "../../editor"
@@ -71,6 +77,8 @@ import { PermissionPrompt } from "./permission"
 import { QuestionPrompt } from "./question"
 import { DialogExportOptions } from "../../ui/dialog-export-options"
 import * as Model from "../../util/model"
+import { pauseMarker } from "../../util/pause"
+import { elapsed, useClock } from "../../util/clock"
 import { formatTranscript } from "../../util/transcript"
 import { formatGenerationMetrics } from "../../util/generation-metrics"
 import { sessionEpilogue } from "../../util/presentation"
@@ -82,8 +90,10 @@ import { getScrollAcceleration } from "../../util/scroll"
 import { collapseToolOutput } from "../../util/collapse-tool-output"
 import { capOutputLines } from "../../util/cap-lines"
 import {
-  activityHeader,
   computeActivityGroups,
+  computeActivitySubGroups,
+  countActivityTargets,
+  typedActivityHeader,
   resolveActivityExpanded,
   summarizeActivity,
   toggleActivityOverride,
@@ -372,7 +382,9 @@ export function Session() {
   })
 
   let lastSwitch: string | undefined = undefined
-  event.on("message.part.updated", (evt) => {
+  // Session mounts on every sessionID switch; without the unsubscribe the
+  // handlers pile up on the global emitter (#416).
+  const offPartUpdated = event.on("message.part.updated", (evt) => {
     const part = evt.properties.part
     if (part.type !== "tool") return
     if (part.sessionID !== route.sessionID) return
@@ -383,13 +395,32 @@ export function Session() {
       local.agent.set("work")
       lastSwitch = part.id
     } else if (part.tool === "plan_enter") {
-      local.agent.set("plan")
+      local.agent.set("think")
       lastSwitch = part.id
     }
   })
+  onCleanup(offPartUpdated)
 
   let seeded = false
   let scroll: ScrollBoxRenderable
+  // "Jump to latest" (#241): true while the transcript is scrolled away from
+  // its end. Derived from the scrollbar's own change event, so it follows
+  // every scroll source (wheel, keys, sticky re-engage, session switch) and
+  // stays put while new output lands under a reader who scrolled up.
+  const [scrolledAway, setScrolledAway] = createSignal(false)
+  const lastShortcut = useCommandShortcut("session.last")
+  function watchScroll(r: ScrollBoxRenderable) {
+    scroll = r
+    const update = () =>
+      queueMicrotask(() => {
+        if (r.isDestroyed) return
+        const max = Math.max(0, r.scrollHeight - r.viewport.height)
+        // Same threshold the scrollbox uses to re-engage sticky scrolling.
+        setScrolledAway(max > 1 && r.scrollTop < max - 1)
+      })
+    r.verticalScrollBar.on("change", update)
+    onCleanup(() => r.verticalScrollBar.off("change", update))
+  }
   let prompt: PromptRef | undefined
   const bind = (r: PromptRef | undefined) => {
     prompt = r
@@ -402,7 +433,7 @@ export function Session() {
   const dialog = useDialog()
   const renderer = useRenderer()
 
-  event.on("session.status", (evt) => {
+  const offSessionStatus = event.on("session.status", (evt) => {
     if (evt.properties.sessionID !== route.sessionID) return
     if (evt.properties.status.type !== "retry") return
     if (!evt.properties.status.action) return
@@ -421,6 +452,7 @@ export function Session() {
       kv.set(keys.lastSeenAt, Date.now())
     })
   })
+  onCleanup(offSessionStatus)
 
   // Helper: Find next visible message boundary in direction
   const findNextVisibleMessage = (direction: "next" | "prev"): string | null => {
@@ -1268,7 +1300,7 @@ export function Session() {
           <box flexGrow={1} minHeight={0} paddingBottom={1} paddingLeft={2} paddingRight={2} gap={1}>
             <Show when={session()}>
               <scrollbox
-                ref={(r) => (scroll = r)}
+                ref={watchScroll}
                 viewportOptions={{
                   paddingRight: showScrollbar() ? 1 : 0,
                 }}
@@ -1384,6 +1416,26 @@ export function Session() {
                 </For>
               </scrollbox>
               <box flexShrink={0}>
+                {/* Sits in the gap row between transcript and prompt, so it
+                    covers no output and shifts nothing when it appears. */}
+                <Show when={scrolledAway()}>
+                  <box
+                    position="absolute"
+                    top={-1}
+                    right={showScrollbar() ? 2 : 0}
+                    paddingLeft={1}
+                    paddingRight={1}
+                    backgroundColor={theme.backgroundElement}
+                    onMouseUp={() => scroll.scrollTo(scroll.scrollHeight)}
+                  >
+                    <text fg={theme.text} wrapMode="none">
+                      ↓ Jump to latest
+                      <Show when={lastShortcut()}>
+                        <span style={{ fg: theme.textMuted }}>{" · " + lastShortcut()}</span>
+                      </Show>
+                    </text>
+                  </box>
+                </Show>
                 <Show when={permissions().length > 0}>
                   <PermissionPrompt
                     request={permissions()[0]}
@@ -1418,6 +1470,19 @@ export function Session() {
                       }}
                       sessionID={route.sessionID}
                       right={<pluginRuntime.Slot name="session_prompt_right" session_id={route.sessionID} />}
+                      hint={
+                        // Session identity lives in the sidebar; when that is
+                        // hidden (narrow terminal or toggled off) the status
+                        // line names the session instead of the directory the
+                        // sidebar footer would otherwise repeat (#241).
+                        sidebarVisible() ? undefined : (
+                          <box marginLeft={1} flexShrink={1} minWidth={0}>
+                            <text fg={theme.text} wrapMode="none">
+                              {session()?.title}
+                            </text>
+                          </box>
+                        )
+                      }
                     />
                   </pluginRuntime.Slot>
                 </Show>
@@ -1596,13 +1661,58 @@ export function AssistantMessageRow(props: { message: AssistantMessage; parts: P
     return props.parts.length > 0 && !props.parts.some((p) => p.type === "text" || p.type === "reasoning")
   })
 
-  const duration = createMemo(() => {
-    if (!final()) return 0
-    if (!props.message.time.completed) return 0
-    const user = messages().find((x) => x.role === "user" && x.id === props.message.parentID)
-    if (!user || !user.time) return 0
-    return props.message.time.completed - user.time.created
+  const completedFinish = createMemo(() =>
+    props.parts.some(
+      (part) =>
+        part.type === "tool" &&
+        part.tool === "finish" &&
+        part.state.status === "completed" &&
+        finishBlockView(part, part.state.input)?.tone === "success",
+    ),
+  )
+
+  // Synthetic user messages (background deliveries and finish retries) resume
+  // the same request. Anchor elapsed time to the latest real request at or
+  // before this message's parent, not a later user turn in the transcript.
+  const requestStart = createMemo(() => {
+    const rows = messages()
+    const parent = rows.findIndex((message) => message.id === props.message.parentID)
+    if (parent < 0) return undefined
+    for (let index = parent; index >= 0; index--) {
+      const message = rows[index]
+      if (message.role !== "user") continue
+      const parts = sync.data.part[message.id]
+      // Missing parts cannot establish whether this is a real request.
+      if (!parts) return undefined
+      if (parts.some((part) => part.type === "file" || (part.type === "text" && !part.synthetic && !part.ignored)))
+        return message.time.created
+      // Only known synthetic continuations may be crossed. Empty, ignored
+      // or other part-only user rows do not prove the earlier request owns it.
+      if (!parts.length || !parts.every((part) => part.type === "text" && part.synthetic === true)) return undefined
+    }
+    return undefined
   })
+
+  const duration = createMemo(() => {
+    if (!final() && !completedFinish()) return 0
+    if (!props.message.time.completed) return 0
+    const start = requestStart()
+    if (start === undefined) return 0
+    return Math.max(0, props.message.time.completed - start)
+  })
+
+  // The last turn counts up while it runs, and stays highlighted until it ends.
+  const running = createMemo(
+    () => props.last && !final() && !props.message.time.completed && !props.message.error && !isFinishOnly(),
+  )
+  const clock = useClock(running)
+  const liveDuration = createMemo(() => {
+    if (!running()) return undefined
+    const start = requestStart()
+    if (start === undefined) return undefined
+    return elapsed(Math.max(0, clock() - start))
+  })
+  const footerMuted = createMemo(() => (running() ? theme.text : theme.textMuted))
 
   const metrics = createMemo(() => formatGenerationMetrics(props.message))
 
@@ -1648,7 +1758,20 @@ export function AssistantMessageRow(props: { message: AssistantMessage; parts: P
             return { groupID, owner: info.parts[0]?.part.id === part.id }
           })
           const component = createMemo(() => PART_MAPPING[part.type as keyof typeof PART_MAPPING])
+          const pause = createMemo(() => (group() && !group()!.owner ? undefined : pauseMarker(props.parts, index())))
           return (
+            <>
+            <Show when={pause()}>
+              {(text) => (
+                <box
+                  marginTop={1}
+                  border={["top"]}
+                  title={` ↻ ${text()} `}
+                  titleAlignment="center"
+                  borderColor={theme.border}
+                />
+              )}
+            </Show>
             <Switch>
               <Match when={group()?.owner === true}>
                 <ActivityGroup groupID={group()!.groupID} />
@@ -1667,6 +1790,7 @@ export function AssistantMessageRow(props: { message: AssistantMessage; parts: P
                 </Show>
               </Match>
             </Switch>
+            </>
           )
         }}
       </For>
@@ -1714,7 +1838,10 @@ export function AssistantMessageRow(props: { message: AssistantMessage; parts: P
                 ▣{" "}
               </span>{" "}
               <span style={{ fg: theme.text }}>{Locale.titlecase(props.message.mode)}</span>
-              <span style={{ fg: theme.textMuted }}> · {model()}</span>
+              <span style={{ fg: footerMuted() }}> · {model()}</span>
+              <Show when={liveDuration()}>
+                <span style={{ fg: footerMuted() }}> · {liveDuration()}</span>
+              </Show>
               <Show when={duration()}>
                 <span style={{ fg: theme.textMuted }}> · {Locale.duration(duration())}</span>
               </Show>
@@ -1802,7 +1929,7 @@ function ReasoningPart(props: { last: boolean; part: ReasoningPart; message: Ass
     return end === undefined ? 0 : Math.max(0, end - props.part.time.start)
   })
   const summary = createMemo(() => reasoningSummary(content()))
-  const syntax = createSyntaxStyleMemo(() => generateSubtleSyntax(theme))
+  const syntax = createSyntaxStyleMemo((owner) => generateSubtleSyntax(theme, owner))
   // The block stays open while the reasoning stream is active so the streamed
   // content is readable (regardless of the display mode). It only transitions
   // to its completed/collapsed state when the reasoning stream actually ends
@@ -1860,10 +1987,15 @@ function ReasoningHeader(props: {
   encrypted?: boolean
 }) {
   const { theme } = useTheme()
-  const fg = () =>
-    props.open
-      ? RGBA.fromValues(theme.warning.r, theme.warning.g, theme.warning.b, theme.thinkingOpacity)
-      : theme.warning
+  // The streaming "Thinking" and completed "Thought" labels take their colour
+  // and style from the theme file (#241). `thinkingOpacity` keeps its meaning:
+  // the label dims while the reasoning body is shown underneath it.
+  const color = () => (props.done ? theme.thinkingCompleted : theme.thinkingStreaming)
+  const fg = () => {
+    const base = color()
+    return props.open ? RGBA.fromValues(base.r, base.g, base.b, theme.thinkingOpacity) : base
+  }
+  const attributes = () => textAttributes(props.done ? theme.thinkingCompletedStyle : theme.thinkingStreamingStyle)
   const completed = () => {
     if (props.encrypted) return `Thought${props.duration ? ` · ${props.duration}` : ""}`
     const detail = [props.title, props.duration].filter(Boolean).join(" · ")
@@ -1874,11 +2006,13 @@ function ReasoningHeader(props: {
     <Switch>
       <Match when={!props.done}>
         <box flexDirection="row">
-          <Spinner color={fg()}>{props.title ? "Thinking: " + props.title : "Thinking"}</Spinner>
+          <Spinner color={fg()} attributes={attributes()}>
+            {props.title ? "Thinking: " + props.title : "Thinking"}
+          </Spinner>
         </box>
       </Match>
       <Match when={true}>
-        <text fg={fg()} wrapMode="none">
+        <text fg={fg()} attributes={attributes()} wrapMode="none">
           {completed()}
         </text>
       </Match>
@@ -1912,32 +2046,13 @@ function TextPart(props: { last: boolean; part: TextPart; message: AssistantMess
 // Exported so tests can mount the activity block outside the full Session route.
 export function ActivityGroup(props: { groupID: string }) {
   const ctx = use()
-  const renderer = useRenderer()
-  const { theme } = useTheme()
-  const [hover, setHover] = createSignal(false)
-
   const group = createMemo(() => ctx.activity().byID.get(props.groupID))
-  const items = createMemo(() => group()?.items ?? [])
-  const parts = createMemo(() => group()?.parts ?? [])
-  const summary = createMemo(() => summarizeActivity(items().map((item) => item.part)))
-  const expanded = createMemo(() => ctx.activityExpanded(props.groupID))
-  const header = createMemo(() =>
-    activityHeader(summary(), {
-      expanded: expanded(),
-      duration: summary().durationMs === undefined ? undefined : Locale.duration(summary().durationMs!),
-    }),
-  )
-  const baseFg = createMemo(() => {
-    if (hover()) return theme.text
-    if (summary().working) return theme.text
-    return theme.textMuted
+  // Keyed by block id (strings) so streamed updates never remount a block:
+  // remounting would reset local row state (hover, nested reasoning toggles).
+  const subIDs = createMemo(() => {
+    const g = group()
+    return g ? computeActivitySubGroups(g).map((sub) => sub.id) : []
   })
-
-  const toggle = () => {
-    if (renderer.getSelection()?.getSelectedText()) return
-    ctx.toggleActivity(props.groupID)
-  }
-
   return (
     <box
       ref={(el: BoxRenderable) => {
@@ -1949,6 +2064,68 @@ export function ActivityGroup(props: { groupID: string }) {
       paddingLeft={3}
       flexShrink={0}
     >
+      <For each={subIDs()}>{(id) => <ActivitySubGroupBlock groupID={props.groupID} subID={id} />}</For>
+    </box>
+  )
+}
+
+// One typed working block ("Explored N files", "Ran N commands", "Edited N
+// files", or the unchanged misc "Working..." block) inside an activity group.
+// The header is clickable: collapsed shows the summary, expanded renders each
+// call with its native full row.
+function ActivitySubGroupBlock(props: { groupID: string; subID: string }) {
+  const ctx = use()
+  const renderer = useRenderer()
+  const { theme } = useTheme()
+  const [hover, setHover] = createSignal(false)
+
+  const sub = createMemo(() => {
+    const g = ctx.activity().byID.get(props.groupID)
+    if (!g) return undefined
+    return computeActivitySubGroups(g).find((s) => s.id === props.subID)
+  })
+  const kind = createMemo(() => sub()?.kind ?? "misc")
+  const items = createMemo(() => sub()?.items ?? [])
+  const parts = createMemo(() => sub()?.parts ?? [])
+  const summary = createMemo(() => summarizeActivity(items().map((item) => item.part)))
+  const targets = createMemo(() => countActivityTargets(items()))
+  const expanded = createMemo(() => ctx.activityExpanded(props.subID))
+  // A running block counts up once a second, from its first started tool call.
+  const startedAt = createMemo(() => {
+    let start: number | undefined
+    for (const item of items()) {
+      const state = item.part.state
+      if (state.status === "pending") continue
+      start = start === undefined ? state.time.start : Math.min(start, state.time.start)
+    }
+    return start
+  })
+  const clock = useClock(() => summary().working && startedAt() !== undefined)
+  const header = createMemo(() =>
+    typedActivityHeader(kind(), summary(), targets(), {
+      expanded: expanded(),
+      duration: summary().working
+        ? startedAt() === undefined
+          ? undefined
+          : elapsed(clock() - startedAt()!)
+        : summary().durationMs === undefined
+          ? undefined
+          : Locale.duration(summary().durationMs!),
+    }),
+  )
+  const baseFg = createMemo(() => {
+    if (hover()) return theme.text
+    if (summary().working) return theme.text
+    return theme.textMuted
+  })
+
+  const toggle = () => {
+    if (renderer.getSelection()?.getSelectedText()) return
+    ctx.toggleActivity(props.subID)
+  }
+
+  return (
+    <box>
       <box onMouseOver={() => setHover(true)} onMouseOut={() => setHover(false)} onMouseUp={toggle}>
         <Switch>
           <Match when={summary().working}>
@@ -2156,6 +2333,7 @@ function Invalid(props: ToolProps) {
 
 function Finish(props: ToolProps) {
   const ctx = use()
+  const { theme } = useTheme()
   const result = createMemo(() => finishResult(props.input, props.output))
   // A completed review subagent delivers its report through a tagged
   // `<silvercode-review>` envelope in the finish result. Render that
@@ -2164,42 +2342,137 @@ function Finish(props: ToolProps) {
   // gate and must not pre-announce its verdict.
   const review = createMemo(() => (props.part.state.status === "completed" ? parseReviewReport(result()) : undefined))
   const [expanded, setExpanded] = createSignal(false)
+  const [errorExpanded, setErrorExpanded] = createSignal(false)
+  // The block shows the agent's own summary; the tool output also carries
+  // runtime bookkeeping lines that are not part of what the agent said.
+  const shown = createMemo(() => stringValue(props.input.result)?.trim() || result())
   const collapsed = createMemo(() =>
     collapseToolOutput(
-      result() ?? "",
+      shown() ?? "",
       COLLAPSED_TOOL_PREVIEW_LINES,
       COLLAPSED_TOOL_PREVIEW_LINES * Math.max(20, ctx.width - 6),
     ),
   )
-  const visible = createMemo(() => (expanded() || !collapsed().overflow ? result() : collapsed().output))
+  const visible = createMemo(() => (expanded() || !collapsed().overflow ? shown() : collapsed().output))
   const view = createMemo(() => finishToolViewForPart(props.part, visible()))
-  const content = createMemo(() => {
-    if (!collapsed().overflow) return view().children
-    return `${view().children}
-  ${expanded() ? "Click to collapse" : "Click to expand"}`
-  })
+  const block = createMemo(() => finishBlockView(props.part, props.input, visible()))
+  const toggle = () => setExpanded((prev) => !prev)
+  const toneColor = (tone: "success" | "waiting" | "failure") =>
+    tone === "success" ? theme.success : tone === "waiting" ? theme.warning : theme.error
 
   return (
     <Show
       when={review()}
       fallback={
-        <InlineTool
-          icon={view().icon}
-          pending={view().pending}
-          complete={view().complete}
-          spinner={view().spinner}
-          failure={view().failure}
-          separate={true}
-          part={props.part}
-          onClick={collapsed().overflow ? () => setExpanded((prev) => !prev) : undefined}
-        >
-          {content()}
-        </InlineTool>
+        <Switch>
+          <Match when={block()?.tone === "quiet"}>
+            <InlineToolRow
+              icon="✕"
+              color={theme.textMuted}
+              errorColor={theme.textMuted}
+              failed={true}
+              complete={true}
+              pending=""
+              separate={false}
+              error={props.part.state.status === "error" ? props.part.state.error : undefined}
+              errorExpanded={errorExpanded()}
+              onMouseUp={() => setErrorExpanded((prev) => !prev)}
+            >
+              Finish call failed
+            </InlineToolRow>
+          </Match>
+          <Match when={block()}>
+            {(item) => (
+              <FinishBlock
+                color={toneColor(item().tone as "success" | "waiting" | "failure")}
+                title={item().title}
+                detail={item().detail}
+                hint={collapsed().overflow ? (expanded() ? "Click to collapse" : "Click to expand") : undefined}
+                onClick={collapsed().overflow ? toggle : undefined}
+              />
+            )}
+          </Match>
+          <Match when={true}>
+            <InlineTool
+              icon={view().icon}
+              pending={view().pending}
+              complete={view().complete}
+              spinner={view().spinner}
+              failure={view().failure}
+              separate={true}
+              part={props.part}
+            >
+              {view().children}
+            </InlineTool>
+          </Match>
+        </Switch>
       }
     >
       {(item) => <ReviewFinish review={item()} part={props.part} />}
     </Show>
   )
+}
+
+/** Blend `color` over `base` so a block gets a dark tint of its own hue. */
+export function tintColor(color: RGBA, base: RGBA, amount: number) {
+  return RGBA.fromValues(
+    base.r + (color.r - base.r) * amount,
+    base.g + (color.g - base.g) * amount,
+    base.b + (color.b - base.b) * amount,
+    base.a,
+  )
+}
+
+function FinishBlock(props: { color: RGBA; title: string; detail?: string; hint?: string; onClick?: () => void }) {
+  const { theme } = useTheme()
+  const renderer = useRenderer()
+  return (
+    <box
+      ref={(el: BoxRenderable) => alwaysSeparate.add(el)}
+      border={["left"]}
+      paddingTop={1}
+      paddingBottom={1}
+      paddingLeft={2}
+      paddingRight={2}
+      marginTop={1}
+      customBorderChars={SplitBorder.customBorderChars}
+      borderColor={props.color}
+      backgroundColor={tintColor(props.color, theme.backgroundPanel, 0.14)}
+      onMouseUp={() => {
+        if (renderer.getSelection()?.getSelectedText()) return
+        props.onClick?.()
+      }}
+    >
+      <text fg={props.color} attributes={TextAttributes.BOLD}>
+        {props.title}
+      </text>
+      <Show when={props.detail}>
+        <text fg={props.color}>{`↳ ${props.detail}`}</text>
+      </Show>
+      <Show when={props.hint}>
+        <text fg={props.color}>{props.hint}</text>
+      </Show>
+    </box>
+  )
+}
+
+/**
+ * How a finished finish call is shown. A failed tool call is a quiet one-line
+ * row; the colored blocks follow the reason the agent declared. Pending and
+ * running calls keep the spinner row (no block).
+ */
+export function finishBlockView(part: ToolPart, input: Record<string, unknown>, result?: string) {
+  if (part.state.status === "error") return { tone: "quiet" as const, title: "Finish call failed", detail: undefined }
+  if (part.state.status !== "completed") return undefined
+  const reason = stringValue(input.reason)
+  const metadata = "metadata" in part.state ? part.state.metadata : undefined
+  const waiting =
+    metadata?.waiting === true || reason === "waiting_for_subagent" || reason === "subagent_wait"
+  if (waiting) return { tone: "waiting" as const, title: `${WAITING_ICON} ${WAITING_LABEL}`, detail: result }
+  if (reason === "failure") return { tone: "failure" as const, title: "✗ Task failed", detail: result }
+  if (reason !== undefined && reason !== "success")
+    return { tone: "waiting" as const, title: `◌ Finish: ${reason}`, detail: result }
+  return { tone: "success" as const, title: "✓ Task completed", detail: result }
 }
 
 type FinishToolStatus = ToolPart["state"]["status"]
@@ -2256,18 +2529,14 @@ export function finishToolView(
       children: "Completing task...",
     }
   }
-  // Completed (or failed) finish results expose their honest review and
-  // validation status inline; transcripts without those fields keep the
-  // original rendering.
   const summary = result ? `${completed}\n↳ ${result}` : completed
-  const statusLines = finishStatus(metadata)
   return {
     icon: waiting ? WAITING_ICON : "✓",
     pending: "Completing task...",
     complete: status === "completed",
     spinner: false,
     failure: "Finish failed",
-    children: statusLines ? `${summary}\n${finishStatusLines(statusLines).join("\n")}` : summary,
+    children: summary,
   }
 }
 
@@ -2914,6 +3183,10 @@ function Task(props: ToolProps) {
     return assistant - first
   })
 
+  const delivered = createMemo(() =>
+    props.part.state.status === "completed" ? subagentDeliveredState(props.part.state.output) : undefined,
+  )
+
   const content = createMemo(() => {
     const description = stringValue(props.input.description)
     if (!description) return ""
@@ -2937,7 +3210,9 @@ function Task(props: ToolProps) {
     }
 
     if (!isRunning() && props.part.state.status === "completed") {
-      content.push(`↳ ${formatCompletedSubagentDetail(tools().length, Locale.duration(duration()))}`)
+      const outcome = delivered()
+      if (outcome === "cancelled" || outcome === "error") content.push(`↳ ${formatUndeliveredSubagentDetail(outcome)}`)
+      else content.push(`↳ ${formatCompletedSubagentDetail(tools().length, Locale.duration(duration()))}`)
     }
 
     return content.join("\n")
@@ -2945,7 +3220,15 @@ function Task(props: ToolProps) {
 
   return (
     <InlineTool
-      icon={props.part.state.status === "completed" ? "✓" : "│"}
+      icon={
+        props.part.state.status !== "completed"
+          ? "│"
+          : delivered() === "cancelled"
+            ? "○"
+            : delivered() === "error"
+              ? "✗"
+              : "✓"
+      }
       separate={true}
       color={retry() ? theme.error : undefined}
       spinner={isRunning()}
@@ -2975,6 +3258,16 @@ export function formatSubagentTitle(agent: string, description: string, backgrou
 
 export function formatSubagentRetry(attempt: number, message: string) {
   return `Retrying (attempt ${attempt}) · ${message}`
+}
+
+/** The child's own outcome. A completed Task tool call is not a delivered result. */
+export function subagentDeliveredState(output: string): "completed" | "cancelled" | "error" | undefined {
+  const match = output.match(/^<task\b[^>\n]*\sstate="(completed|cancelled|error)"/m)
+  return match?.[1] as "completed" | "cancelled" | "error" | undefined
+}
+
+export function formatUndeliveredSubagentDetail(state: "cancelled" | "error") {
+  return state === "cancelled" ? "Cancelled before delivering a result" : "Failed before delivering a result"
 }
 
 export function formatCompletedSubagentDetail(toolcalls: number, duration: string) {
@@ -3132,7 +3425,7 @@ function PlanExit(props: ToolProps) {
   const declined = createMemo(() => props.part.state.status === "error")
   return (
     <InlineTool icon="✓" pending="Requesting plan approval..." complete={true} part={props.part}>
-      {declined() ? "Plan approval declined — staying in plan mode" : "Plan complete — switching to Work agent"}
+      {declined() ? "Plan approval declined — staying with the Think agent" : "Plan complete — switching to Work agent"}
     </InlineTool>
   )
 }

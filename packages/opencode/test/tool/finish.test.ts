@@ -5,7 +5,7 @@ import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { Cause, Effect, Exit } from "effect"
 import { ToolFailure } from "@opencode-ai/llm"
 import { ReviewReport } from "@opencode-ai/core/review-report"
-import { Session } from "@/session/session"
+import { Session, withAgentEffort } from "@/session/session"
 import { Todo } from "@/session/todo"
 import { MessageID, PartID, SessionID } from "@/session/schema"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
@@ -66,6 +66,7 @@ const seedSession = Effect.fn("FinishTest.seedSession")(function* (
     model: { providerID: "test" as any, modelID: "test-model" as any },
     time: { created: Date.now() },
   })
+  yield* session.updatePart({id:PartID.ascending(),sessionID:chat.id,messageID:user.id,type:"text",text:"Research the requested information"})
   const assistant: SessionV1.Assistant = {
     id: MessageID.ascending(),
     role: "assistant",
@@ -81,6 +82,10 @@ const seedSession = Effect.fn("FinishTest.seedSession")(function* (
     time: { created: Date.now() },
   }
   yield* session.updateMessage(assistant)
+  if (parentID) yield* session.updatePart({
+    id: PartID.ascending(), messageID: assistant.id, sessionID: chat.id, type: "text",
+    text: "<silvercode-result>Fixture outcome.</silvercode-result>",
+  })
   return { chat, assistant }
 })
 
@@ -141,17 +146,18 @@ const declineOf = Effect.fn("FinishTest.declineOf")(function* (
   const tool = yield* FinishTool
   const def = yield* tool.init()
   const recorded: Record<string, unknown>[] = []
-  const failure = reviewFailure(
-    yield* def
-      .execute(
-        input,
-        workCtx(sessionID, messageID, (value) => {
-          recorded.push(value.metadata ?? {})
-          return Effect.void
-        }),
-      )
-      .pipe(Effect.exit),
-  )
+  const exit = yield* def
+    .execute(
+      input,
+      workCtx(sessionID, messageID, (value) => {
+        recorded.push(value.metadata ?? {})
+        return Effect.void
+      }),
+    )
+    .pipe(Effect.exit)
+  // A softened (UNREVIEWED) delivery carries its review metadata on the result.
+  if (Exit.isSuccess(exit)) recorded.push((exit.value as { metadata?: Record<string, unknown> }).metadata ?? {})
+  const failure = reviewFailure(exit)
   return { message: failure?.message ?? "", metadata: recorded.at(-1) ?? {}, recorded }
 })
 
@@ -164,7 +170,7 @@ const addReview = (sessionID: SessionID, messageID: MessageID, assessment: "Appr
 // waiver: a retried finish - whatever its result says about the work - is
 // declined again until a review approves the current work.
 describe("tool.finish – review requirement", () => {
-  it.instance("declines a finish for unreviewed file writes and names the Review subagent", () =>
+  it.instance("delivers a finish for unreviewed file writes as UNREVIEWED and names the Review subagent", () =>
     Effect.gen(function* () {
       const { chat, assistant } = yield* seedSession()
       yield* addToolPart(chat.id, assistant.id, "edit")
@@ -182,34 +188,21 @@ describe("tool.finish – review requirement", () => {
           )
           .pipe(Effect.exit)
 
-      expect(Exit.isFailure(exit)).toBe(true)
-      if (!Exit.isFailure(exit)) return
-      const failure = exit.cause.reasons.find(Cause.isFailReason)?.error
-      expect(failure).toBeInstanceOf(ToolFailure)
-      if (!(failure instanceof ToolFailure)) return
+      expect(Exit.isSuccess(exit)).toBe(true)
+      if (!Exit.isSuccess(exit)) return
+      const failure = { message: exit.value.output }
+      expect(failure.message).toContain("UNREVIEWED")
       expect(failure.message).toContain("requires at least one independent review")
       expect(failure.message).toContain('subagent_type: "review"')
       // The old skip-on-repeat hint is gone: repeating finish is never the way out.
       expect(failure.message).not.toContain("skip")
-      expect(recorded).toEqual([
-        {
-          review: {
-            nudged: true,
-            effort: "medium",
-            disposition: "unreviewed",
-            verdict: "pending",
-            reviews: 0,
-            maxIterations: 2,
-            openFindings: 0,
-            blockingFindings: 0,
-            workSinceReview: true,
-          },
-        },
-      ])
+      expect(recorded).toEqual([])
+      expect(exit.value.metadata.review).toMatchObject({ disposition: "unreviewed" })
+      expect(exit.value.metadata.review).not.toMatchObject({ termination: "approved" })
     }),
   )
 
-  it.instance("declines a repeated finish call too: the persisted nudge is not a skip path", () =>
+  it.instance("a repeated finish call is delivered UNREVIEWED again, never approved", () =>
     Effect.gen(function* () {
       const { chat, assistant } = yield* seedSession()
       yield* addToolPart(chat.id, assistant.id, "edit")
@@ -259,11 +252,11 @@ describe("tool.finish – review requirement", () => {
         )
         .pipe(Effect.exit)
 
-      expect(Exit.isFailure(exit)).toBe(true)
-      if (!Exit.isFailure(exit)) return
-      const failure = exit.cause.reasons.find(Cause.isFailReason)?.error
-      expect(failure).toBeInstanceOf(ToolFailure)
-      if (!(failure instanceof ToolFailure)) return
+      expect(Exit.isSuccess(exit)).toBe(true)
+      if (!Exit.isSuccess(exit)) return
+      const failure = { message: exit.value.output }
+      expect(failure.message).toContain("UNREVIEWED")
+      expect(exit.value.metadata.review).not.toMatchObject({ termination: "approved" })
       expect(failure.message).toContain("requires at least one independent review")
       expect(failure.message).not.toContain("skip")
     }),
@@ -295,8 +288,8 @@ describe("tool.finish – review requirement", () => {
       const failure = reviewFailure(
         yield* def.execute({ reason: "success", result: "done" }, workCtx(chat.id, assistant.id)).pipe(Effect.exit),
       )
-      expect(failure?.message).toContain("returned Needs fixes")
-      expect(failure?.message).toContain("run the Review subagent again")
+      expect(failure?.message).toContain("blocking findings")
+      expect(failure?.message).toContain("obtain a clean Review")
 
       yield* addToolPart(chat.id, assistant.id, "edit")
       yield* addReview(chat.id, assistant.id, "Approved")
@@ -308,7 +301,7 @@ describe("tool.finish – review requirement", () => {
 
   // Every reason except a yield is a delivery, and a failed attempt still
   // leaves its writes behind, so a failure cannot be used to step around review.
-  it.instance("declines a failure finish for unreviewed file writes too", () =>
+  it.instance("a failure finish for unreviewed file writes is delivered too, labelled UNREVIEWED", () =>
     Effect.gen(function* () {
       const { chat, assistant } = yield* seedSession()
       yield* addToolPart(chat.id, assistant.id, "edit")
@@ -349,7 +342,7 @@ describe("tool.finish – review requirement exemptions", () => {
   )
 
   it.instance(
-    "the review cap completes as budget-exhausted, not as an approval",
+    "the review cap cannot convert blocking findings into success",
     () =>
       Effect.gen(function* () {
         const { chat, assistant } = yield* seedSession()
@@ -361,8 +354,13 @@ describe("tool.finish – review requirement exemptions", () => {
         const tool = yield* FinishTool
         const def = yield* tool.init()
 
-        const result = yield* def.execute(
+        const blocked = yield* def.execute(
           { reason: "success", result: "Stopped at the review cap with one open finding." },
+          workCtx(chat.id, assistant.id),
+        ).pipe(Effect.exit)
+        expect(Exit.isFailure(blocked)).toBe(true)
+        const result = yield* def.execute(
+          { reason: "failure", result: "Stopped at the review cap with one open finding." },
           workCtx(chat.id, assistant.id),
         )
 
@@ -502,25 +500,6 @@ describe("tool.finish – review requirement exemptions", () => {
         expect(failure?.message).toContain("no explicit Approved review")
       }),
     { config: { agent: { work: { permission: { task: { review: "deny" } } } } } },
-  )
-
-  it.instance(
-    "a disabled generic review agent does not block a usable specialist reviewer",
-    () =>
-      Effect.gen(function* () {
-        const { chat, assistant } = yield* seedSession("owner", "work")
-        yield* addToolPart(chat.id, assistant.id, "edit")
-        const def = yield* (yield* FinishTool).init()
-
-        const failure = reviewFailure(
-          yield* def.execute({ reason: "success", result: "done" }, workCtx(chat.id, assistant.id)).pipe(Effect.exit),
-        )
-        // Declines for the missing verdict, exactly as dispatch would allow a
-        // review: never the false reviewer-missing block.
-        expect(failure?.message).toContain("no explicit Approved review")
-        expect(failure?.message).not.toContain("Review blocked")
-      }),
-    { config: { agent: { review: { disable: true } } } },
   )
 
   it.instance(
@@ -887,17 +866,46 @@ describe("tool.finish – waiting for a background subagent", () => {
     }),
   )
 
-  // A session that is itself a subagent cannot yield: its run ends at the
-  // yield, so the parent would get this provisional result as the run's only
-  // delivery and whatever the child waits on would never reach it. The child
-  // has to deliver its own result instead. #222 makes a nested yield real.
-  it.instance("refuses a wait from a child session with a running subagent of its own", () =>
+  // A subagent may yield for background subagents it launched itself: `task`
+  // keeps its job running through the wait and resumes it as they report, so
+  // the wait is woken by work that belongs to the session (#222). Yielding for
+  // anything else - its parent's work, or nothing at all - would end its run
+  // here and deliver a provisional result as the run's only delivery.
+  it.instance("accepts a wait from a child session with a running subagent of its own", () =>
     Effect.gen(function* () {
       const sessions = yield* Session.Service
       const parent = yield* sessions.create({ title: "parent" })
       const { chat, assistant } = yield* seedSession("child", "work", parent.id)
-      // A wait would otherwise be accepted for this session.
       yield* startRunningChild(chat.id)
+      const tool = yield* FinishTool
+      const def = yield* tool.init()
+      const recorded: Record<string, unknown>[] = []
+
+      const result = yield* def.execute(
+        { reason: "waiting_for_subagent", result: "waiting" },
+        workCtx(chat.id, assistant.id, (input) => {
+          recorded.push(input.metadata ?? {})
+          return Effect.void
+        }),
+      )
+
+      expect(result.title).toBe("Waiting for 1 background subagent(s)")
+      expect(result.output).toBe("waiting")
+      expect(result.metadata.waiting).toBe(true)
+      expect(result.metadata).not.toHaveProperty("review")
+      // Non-terminal: the wait persists nothing for the eventual finish to read.
+      expect(recorded).toEqual([])
+    }),
+  )
+
+  it.instance("refuses a wait from a child session with nothing of its own running", () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const parent = yield* sessions.create({ title: "parent" })
+      const { chat, assistant } = yield* seedSession("child", "work", parent.id)
+      // A wait would otherwise be accepted: the parent itself has a child
+      // running, but that child is not work this session launched.
+      yield* startRunningChild(parent.id)
       const tool = yield* FinishTool
       const def = yield* tool.init()
       const recorded: Record<string, unknown>[] = []
@@ -915,6 +923,7 @@ describe("tool.finish – waiting for a background subagent", () => {
       )
 
       expect(failure?.message).toContain("this session is itself a subagent")
+      expect(failure?.message).toContain("has no background subagents of its own running")
       expect(failure?.message).toContain('Deliver your own result with reason: "success"')
       // Model feedback, not a nudge persisted for the eventual finish.
       expect(recorded).toEqual([])
@@ -922,12 +931,12 @@ describe("tool.finish – waiting for a background subagent", () => {
   )
 
   // A resumed task (`task_id`) can run a session that never had a parentID, so
-  // the task job running the session is the signal that it is a subagent.
-  it.instance("refuses a wait from a session running as a task job", () =>
+  // the task job running the session is the signal that it is a subagent. With
+  // nothing of its own running, the wait is refused for that reason.
+  it.instance("refuses a wait from a session running as a task job with nothing of its own running", () =>
     Effect.gen(function* () {
       const { chat, assistant } = yield* seedSession()
       const background = yield* BackgroundJob.Service
-      yield* startRunningChild(chat.id)
       yield* background.start({
         id: `${chat.id}-task-run`,
         type: "task",
@@ -939,7 +948,7 @@ describe("tool.finish – waiting for a background subagent", () => {
 
       const failure = reviewFailure(
         yield* def
-          .execute({ reason: "waiting_for_subagent", result: "waiting" }, workCtx(chat.id, assistant.id))
+          .execute({ reason: "waiting_for_subagent", result: "<silvercode-result>Waiting for delegated work.</silvercode-result>" }, workCtx(chat.id, assistant.id))
           .pipe(Effect.exit),
       )
 
@@ -1196,7 +1205,14 @@ const reviewCtx = (sessionID: SessionID, messageID: MessageID) => ({
   ask: () => Effect.void,
 })
 
+// A missing, stale or unavailable review no longer declines: it delivers with an UNREVIEWED note
+// carrying the same guidance. This returns that note in `message` so the guidance stays asserted.
 const reviewFailure = (exit: Exit.Exit<unknown, unknown>) => {
+  if (Exit.isSuccess(exit)) {
+    const output = (exit.value as { output: string }).output
+    expect(output).toContain("UNREVIEWED")
+    return { message: output } as unknown as ToolFailure
+  }
   expect(Exit.isFailure(exit)).toBe(true)
   if (!Exit.isFailure(exit)) return undefined
   const failure = exit.cause.reasons.find(Cause.isFailReason)?.error
@@ -1367,80 +1383,8 @@ describe("tool.finish – review dispatch owner", () => {
     return { chat, assistant }
   })
 
-  // Newer than the seeded user message, and owned by a different agent: the
-  // message a "newest message of any role" rule would read.
-  const addNewerAssistant = Effect.fn("FinishTest.addNewerAssistant")(function* (
-    sessionID: SessionID,
-    parentID: MessageID,
-    agent: string,
-  ) {
-    const session = yield* Session.Service
-    yield* session.updateMessage({
-      id: MessageID.ascending(),
-      role: "assistant",
-      parentID,
-      sessionID,
-      mode: "work",
-      agent,
-      cost: 0,
-      path: { cwd: "/tmp", root: "/tmp" },
-      tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
-      modelID: "test-model" as any,
-      providerID: "test" as any,
-      time: { created: Date.now() },
-    } as SessionV1.Assistant)
-  })
-
-  // The session is unpinned, so its owner is the newest USER message ("work",
-  // which routes to work-review). The tool runs as "code", which routes to
-  // code-review - the agent disabled here. The old resolver fell back to
-  // `ctx.agent`, resolved the disabled reviewer, and reported the session
-  // blocked; this one resolves the owner's reviewer and declines normally.
-  it.instance(
-    "the newest user message owns the reviewer, not the agent running finish",
-    () =>
-      Effect.gen(function* () {
-        const { chat, assistant } = yield* seedSession("owner", "work")
-        yield* addToolPart(chat.id, assistant.id, "edit")
-        const def = yield* (yield* FinishTool).init()
-
-        const failure = reviewFailure(
-          yield* def
-            .execute({ reason: "success", result: "done" }, workCtx(chat.id, assistant.id, undefined, "code"))
-            .pipe(Effect.exit),
-        )
-        expect(failure?.message).toContain("no explicit Approved review")
-        expect(failure?.message).not.toContain("Review blocked")
-      }),
-    { config: { agent: { "code-review": { disable: true } } } },
-  )
-
-  // Same discrimination, with a newer assistant message owned by the agent
-  // whose reviewer is disabled. A resolver that read the newest message of any
-  // role - or the agent running the tool - would resolve code-review here.
-  it.instance(
-    "a newer assistant message does not own the reviewer",
-    () =>
-      Effect.gen(function* () {
-        const { chat, assistant } = yield* seedSession("owner", "work")
-        yield* addNewerAssistant(chat.id, assistant.parentID!, "code")
-        yield* addToolPart(chat.id, assistant.id, "edit")
-        const def = yield* (yield* FinishTool).init()
-
-        const failure = reviewFailure(
-          yield* def
-            .execute({ reason: "success", result: "done" }, workCtx(chat.id, assistant.id, undefined, "code"))
-            .pipe(Effect.exit),
-        )
-        expect(failure?.message).toContain("no explicit Approved review")
-        expect(failure?.message).not.toContain("Review blocked")
-      }),
-    { config: { agent: { "code-review": { disable: true } } } },
-  )
-
-  // The pinned owner outranks the newest USER message. Pinned "code" routes to
-  // the disabled code-review, so this session is blocked even though its newest
-  // user message would route to an available reviewer.
+  // Disabling a retired specialist name disables the single reviewer it now
+  // aliases, so this session is blocked with reviewer-missing.
   it.instance(
     "a pinned session owner outranks the newest user message",
     () =>
@@ -1460,11 +1404,11 @@ describe("tool.finish – review dispatch owner", () => {
   )
 
   // Permission, both directions. The ruleset is read from the agent running the
-  // tool, but the *pattern* it is matched against is the resolved reviewer - so
-  // a deny only bites when it names the reviewer this session actually routes
-  // to. Owner "work" routes to work-review while the tool runs as "code".
+  // tool, and the patterns it is matched against are the single reviewer plus
+  // the retired specialist names that still alias to it - so a deny written
+  // against `work-review` before the consolidation keeps gating review now.
   it.instance(
-    "a deny aimed at the resolved reviewer blocks success",
+    "a deny aimed at a retired specialist name blocks the single reviewer",
     () =>
       Effect.gen(function* () {
         const { chat, assistant } = yield* seedSession("owner", "work")
@@ -1490,7 +1434,7 @@ describe("tool.finish – review dispatch owner", () => {
   )
 
   it.instance(
-    "a deny aimed at a reviewer this session does not route to does not block",
+    "a deny aimed at an unrelated agent does not block the reviewer",
     () =>
       Effect.gen(function* () {
         const { chat, assistant } = yield* seedSession("owner", "work")
@@ -1505,7 +1449,7 @@ describe("tool.finish – review dispatch owner", () => {
         expect(failure?.message).toContain("no explicit Approved review")
         expect(failure?.message).not.toContain("Review blocked")
       }),
-    { config: { agent: { code: { permission: { task: { "code-review": "deny" } } } } } },
+    { config: { agent: { code: { permission: { task: { general: "deny" } } } } } },
   )
 })
 
@@ -1807,11 +1751,15 @@ describe("tool.finish – stale approval after later work and an errored attempt
   )
 
   it.instance(
-    "thorough: declines again, never delivered as approved",
+    "thorough: delivered UNREVIEWED again, never as approved",
     () =>
       Effect.gen(function* () {
         const { chat, assistant } = yield* seedSession()
         yield* staleSetup(chat.id, assistant.id)
+        const sessions = yield* Session.Service
+        const history = yield* sessions.messages({ sessionID: chat.id })
+        const request = history.find(message=>message.info.role === "user")!
+        yield* sessions.updatePart({id:PartID.ascending(),messageID:assistant.id,sessionID:chat.id,type:"tool",tool:"task",callID:"general",state:{status:"completed",input:{subagent_type:"general"},output:"Research delivered",title:"research",time:{start:Date.now(),end:Date.now()},metadata:{background:false,workFlow:{agent:"general",terminal:"success",requestID:request.info.id,parentID:chat.id}}}})
         const declined = yield* declineOf({ reason: "success", result: "done" }, chat.id, assistant.id)
         expect(declined.message).toContain('effort is "thorough"')
         expect(declined.metadata.review).not.toMatchObject({ termination: "approved" })
@@ -1833,3 +1781,167 @@ describe("tool.finish – stale approval after later work and an errored attempt
     { config: { agent: { effort: "fast" } } },
   )
 })
+
+describe("tool.finish - mandatory generic subagent result", () => {
+  for (const reason of ["success", "failure", "waiting_for_subagent"] as const) {
+    it.instance(`rejects missing envelope before ${reason}`, () =>
+      Effect.gen(function* () {
+        const { chat, assistant } = yield* seedSession()
+        const jobs = yield* BackgroundJob.Service
+        yield* jobs.start({
+          id: `${chat.id}-task`,
+          type: "task",
+          metadata: { sessionId: chat.id, parentSessionId: "ses_parent" },
+          run: Effect.never,
+        })
+        const def = yield* (yield* FinishTool).init()
+        const failure = reviewFailure(
+          yield* def.execute({ reason, result: "Task completed" }, workCtx(chat.id, assistant.id)).pipe(Effect.exit),
+        )
+        expect(failure?.message).toContain("Subagent finish rejected")
+      }),
+    )
+  }
+  it.instance("accepts a model-authored text envelope in finish.result", () =>
+    Effect.gen(function* () {
+      const { chat, assistant } = yield* seedSession("child", "general", SessionID.make("ses_parent"))
+      const def = yield* (yield* FinishTool).init()
+      const result = yield* def.execute(
+        { reason: "failure", result: "<silvercode-result>Cannot inspect the missing input.</silvercode-result>" },
+        { ...workCtx(chat.id, assistant.id), agent: "general" },
+      )
+      expect(result.title).toBe("Task completed")
+      expect(result.output).toContain("Cannot inspect the missing input.")
+    }),
+  )
+  it.instance("accepts a prior assistant result in the current execution", () =>
+    Effect.gen(function* () {
+      const { chat, assistant } = yield* seedSession("child", "general", SessionID.make("ses_parent"))
+      const sessions = yield* Session.Service
+      const next = { ...assistant, id: MessageID.ascending() }
+      yield* sessions.updateMessage(next)
+      const def = yield* (yield* FinishTool).init()
+      const result = yield* def.execute(
+        { reason: "failure", result: "done" },
+        { ...workCtx(chat.id, next.id), agent: "general" },
+      )
+      expect(result.title).toBe("Task completed")
+    }),
+  )
+  it.instance("preserves Review's specialized envelope across assistant turns", () =>
+    Effect.gen(function* () {
+      const { chat, assistant } = yield* seedSession("review", "review")
+      const sessions = yield* Session.Service
+      yield* sessions.updatePart({
+        id: PartID.ascending(),
+        messageID: assistant.id,
+        sessionID: chat.id,
+        type: "text",
+        text: reviewEnvelope(REVIEW_APPROVED),
+      })
+      const next = { ...assistant, id: MessageID.ascending() }
+      yield* sessions.updateMessage(next)
+      const def = yield* (yield* FinishTool).init()
+      const result = yield* def.execute({ reason: "success", result: "done" }, reviewCtx(chat.id, next.id))
+      expect(result.title).toBe("Task completed")
+    }),
+  )
+})
+
+it.instance("a subagent can correct a rejected malformed result through finish.result", () =>
+  Effect.gen(function* () {
+    const { chat, assistant } = yield* seedSession("child", "general", SessionID.make("ses_parent"))
+    const sessions = yield* Session.Service
+    const next = { ...assistant, id: MessageID.ascending() }
+    yield* sessions.updateMessage(next)
+    yield* sessions.updatePart({ id: PartID.ascending(), messageID: next.id, sessionID: chat.id,
+      type: "text", text: "<silvercode-result>unfinished" })
+    const def = yield* (yield* FinishTool).init()
+    const ctx = { ...workCtx(chat.id, next.id), agent: "general" }
+    const failure = reviewFailure(yield* def.execute({ reason: "failure", result: "done" }, ctx).pipe(Effect.exit))
+    expect(failure?.message).toContain("Subagent finish rejected")
+    const corrected = yield* def.execute({ reason: "failure", result: "<silvercode-result>Corrected final result.</silvercode-result>" }, ctx)
+    expect(corrected.title).toBe("Task completed")
+  }),
+)
+
+it.instance("programming Work success without Think and Code is allowed, with a truthful workflow note", () =>
+  Effect.gen(function* () {
+    const { chat, assistant } = yield* seedSession()
+    const sessions = yield* Session.Service
+    const messages = yield* sessions.messages({ sessionID: chat.id })
+    const user = messages.find((message) => message.info.role === "user")!
+    yield* sessions.updatePart({
+      id: PartID.ascending(),
+      messageID: user.info.id,
+      sessionID: chat.id,
+      type: "text",
+      text: "Implement an API endpoint",
+    })
+    const def = yield* (yield* FinishTool).init()
+    const blocked = yield* def
+      .execute({ reason: "success", result: "done" }, workCtx(chat.id, assistant.id))
+      .pipe(Effect.exit)
+    expect(Exit.isSuccess(blocked)).toBe(true)
+    if (Exit.isSuccess(blocked)) expect(blocked.value.output).toContain("Workflow status (not blocking)")
+    const failed = yield* def.execute(
+      { reason: "failure", result: "Could not implement" },
+      workCtx(chat.id, assistant.id),
+    )
+    expect(failed.metadata.termination?.reason).toBe("failure")
+  }),
+)
+
+it.instance("non-programming thorough work without General finishes with a workflow note", () => Effect.gen(function* () {
+  const {chat,assistant}=yield* seedSession()
+  const sessions=yield* Session.Service
+  const messages=yield* sessions.messages({sessionID:chat.id})
+  const user=messages.find((message)=>message.info.role === "user")!
+  yield* sessions.updatePart({id:PartID.ascending(),messageID:user.info.id,sessionID:chat.id,type:"text",text:"Research hotels and write a report"})
+  yield* sessions.setMetadata({sessionID:chat.id,metadata:withAgentEffort({},"thorough")})
+  const def=yield* (yield* FinishTool).init()
+  // Persist through the supported effort helper rather than a model finish argument.
+  const cfg=yield* Config.Service
+  yield* cfg.update({agent:{effort:"thorough"}})
+  const blocked=yield* def.execute({reason:"success",result:"done"},workCtx(chat.id,assistant.id)).pipe(Effect.exit)
+  expect(Exit.isSuccess(blocked)).toBe(true)
+  if (Exit.isSuccess(blocked)) expect(blocked.value.output).toContain("no successful General delivery")
+  yield* sessions.setMetadata({sessionID:chat.id,metadata:withAgentEffort({},"fast")})
+  yield* cfg.update({agent:{effort:"fast"}})
+  const manual=yield* def.execute({reason:"success",result:"Hotels researched"},workCtx(chat.id,assistant.id))
+  expect(manual.metadata.termination?.reason).toBe("success")
+}))
+
+it.instance("programming fast: missing or stale Review is a note, blocking findings still refuse", () => Effect.gen(function* () {
+  const {chat,assistant}=yield* seedSession()
+  const sessions=yield* Session.Service
+  const messages=yield* sessions.messages({sessionID:chat.id})
+  const user=messages.find((message)=>message.info.role === "user")!
+  yield* sessions.updatePart({id:PartID.ascending(),messageID:user.info.id,sessionID:chat.id,type:"text",text:"Fix software bug"})
+  yield* sessions.setMetadata({sessionID:chat.id,metadata:withAgentEffort({},"fast")})
+  for (const agent of ["think","code"]) yield* sessions.updatePart({id:PartID.ascending(),messageID:assistant.id,sessionID:chat.id,type:"tool",tool:"task",callID:agent,state:{status:"completed",input:{subagent_type:agent},output:"delivered",title:agent,time:{start:Date.now(),end:Date.now()},metadata:{background:false,workFlow:{agent,terminal:"success",planned:agent==="code",requestID:user.info.id,parentID:chat.id}}}})
+  const def=yield* (yield* FinishTool).init()
+  const finish=()=>def.execute({reason:"success",result:"done"},workCtx(chat.id,assistant.id)).pipe(Effect.exit)
+  const unreviewed=yield* finish()
+  expect(Exit.isSuccess(unreviewed)).toBe(true)
+  if (Exit.isSuccess(unreviewed)) expect(unreviewed.value.output).toContain("treat it as unreviewed")
+  yield* addReview(chat.id,assistant.id,"Needs fixes")
+  expect(Exit.isFailure(yield* finish())).toBe(true)
+  yield* addReview(chat.id,assistant.id,"Approved")
+  expect(Exit.isSuccess(yield* finish())).toBe(true)
+  yield* addToolPart(chat.id,assistant.id,"edit")
+  const stale=yield* finish()
+  expect(Exit.isSuccess(stale)).toBe(true)
+  if (Exit.isSuccess(stale)) expect(stale.value.output).toContain("work after the last review")
+}))
+
+it.instance("uncertain read-only Work can finish without forcing a scope question", () => Effect.gen(function* () {
+ const {chat,assistant}=yield* seedSession()
+ const sessions=yield* Session.Service
+ const history=yield* sessions.messages({sessionID:chat.id})
+ const user=history.find((message)=>message.info.role === "user")!
+ yield* sessions.updatePart({id:PartID.ascending(),messageID:user.info.id,sessionID:chat.id,type:"text",text:"Fix this"})
+ const def=yield* (yield* FinishTool).init()
+ const blocked=yield* def.execute({reason:"success",result:"done"},workCtx(chat.id,assistant.id)).pipe(Effect.exit)
+ expect(Exit.isSuccess(blocked)).toBe(true)
+}))

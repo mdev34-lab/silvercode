@@ -7,7 +7,8 @@ import { useHomeSessionDestination } from "../../routes/home/session-destination
 
 const id = "internal:home-footer"
 
-function Directory(props: { api: TuiPluginApi }) {
+// Path and version share one centered text element, separated like the model settings in the prompt.
+function Location(props: { api: TuiPluginApi }) {
   const theme = () => props.api.theme.current
   const destination = useHomeSessionDestination()
   const paths = useTuiPaths()
@@ -20,8 +21,9 @@ function Directory(props: { api: TuiPluginApi }) {
     if (branch) return out + ":" + branch
     return out
   })
+  const text = createMemo(() => [dir(), props.api.app.version].filter(Boolean).join(" · "))
 
-  return <Show when={dir()}>{(value) => <text fg={theme().textMuted}>{value()}</text>}</Show>
+  return <text fg={theme().textMuted}>{text()}</text>
 }
 
 function Mcp(props: { api: TuiPluginApi }) {
@@ -51,16 +53,6 @@ function Mcp(props: { api: TuiPluginApi }) {
   )
 }
 
-function Version(props: { api: TuiPluginApi }) {
-  const theme = () => props.api.theme.current
-
-  return (
-    <box flexShrink={0}>
-      <text fg={theme().textMuted}>{props.api.app.version}</text>
-    </box>
-  )
-}
-
 function View(props: { api: TuiPluginApi }) {
   return (
     <box
@@ -73,10 +65,12 @@ function View(props: { api: TuiPluginApi }) {
       flexShrink={0}
       gap={2}
     >
-      <Directory api={props.api} />
-      <Mcp api={props.api} />
-      <box flexGrow={1} />
-      <Version api={props.api} />
+      {/* Equal-width sides keep the location text centered; MCP status stays on the left. */}
+      <box flexGrow={1} flexBasis={0}>
+        <Mcp api={props.api} />
+      </box>
+      <Location api={props.api} />
+      <box flexGrow={1} flexBasis={0} />
     </box>
   )
 }

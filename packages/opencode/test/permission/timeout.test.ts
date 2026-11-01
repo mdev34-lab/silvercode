@@ -1,9 +1,10 @@
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
-import { expect } from "bun:test"
+import { afterEach, beforeEach, expect } from "bun:test"
 import { Cause, Deferred, Effect, Exit, Fiber, Layer } from "effect"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+import { Npm } from "@opencode-ai/core/npm"
 import { EventV2Bridge } from "../../src/event-v2-bridge"
 import { Permission } from "../../src/permission"
 import { InstanceBootstrap } from "../../src/project/bootstrap"
@@ -12,11 +13,48 @@ import { SessionID } from "../../src/session/schema"
 import { testEffect } from "../lib/effect"
 
 const noopBootstrap = Layer.succeed(InstanceBootstrap.Service, InstanceBootstrap.Service.of({ run: Effect.void }))
+
+// #579: every fixture below builds a fresh tmpdir instance, and its first config load
+// forkDetach'es an in-process `npm install @opencode-ai/plugin` (Arborist reify) per
+// config directory — always including the process-wide global config dir. A detached
+// fiber outlives the test scope it started in, so one test's Arborist import/tree-build/
+// extraction CPU bursts can run on the same single thread while the NEXT test's
+// waitForPending window is open. Locally that interference reproduced the same starvation
+// signature as the reported 2074ms failure (readiness poll and its timeout both delayed);
+// it is not established that it caused the originally reported run. The flag keeps these
+// fixtures out of the preseed (none of them configure plugins); the stub additionally records calls so the readiness guard
+// test below can prove no fixture in this file ever kicks an install off.
+const depInstalls: string[] = []
+const stubNpm = Layer.succeed(
+  Npm.Service,
+  Npm.Service.of({
+    add: () => Effect.die(new Error("permission timeout fixtures must not install packages")),
+    install: (dir) => Effect.sync(() => void depInstalls.push(dir)),
+    which: () => Effect.die(new Error("permission timeout fixtures must not install packages")),
+  }),
+)
+
 const env = AppNodeBuilder.build(
   LayerNode.group([Permission.node, EventV2Bridge.node, CrossSpawnSpawner.node, InstanceStore.node]),
-  [[InstanceStore.bootstrapNode, noopBootstrap]],
+  [
+    [InstanceStore.bootstrapNode, noopBootstrap],
+    [Npm.node, stubNpm],
+  ],
 )
 const it = testEffect(env)
+
+let priorDepInstallFlag: string | undefined
+beforeEach(() => {
+  priorDepInstallFlag = process.env.OPENCODE_DISABLE_CONFIG_DEP_INSTALL
+  // Same convention as test/project/instance-bootstrap.test.ts: keep the countdown
+  // contract independent from npm dependency preseed timing. Evaluated at access time
+  // during instance config load, so setting it per test is enough.
+  process.env.OPENCODE_DISABLE_CONFIG_DEP_INSTALL = "1"
+})
+afterEach(() => {
+  if (priorDepInstallFlag === undefined) delete process.env.OPENCODE_DISABLE_CONFIG_DEP_INSTALL
+  else process.env.OPENCODE_DISABLE_CONFIG_DEP_INSTALL = priorDepInstallFlag
+})
 
 // One second is the shortest countdown the config accepts, so every test here outlives
 // it: a request that is still pending afterwards proves the timer was cancelled rather
@@ -51,19 +89,40 @@ const bash = (id: string, session = "session_timeout") => ({
   ruleset: [],
 })
 
+// On a timeout the error carries what was observed: how long the wait actually ran, how
+// many polls got to run (a starved event loop runs few), the worst gap between polls, and
+// the pending requests. A slow runner and a request that never arrived look different here.
+// The 1 second bound is unchanged.
 const waitForPending = (count: number) =>
   Effect.gen(function* () {
-    while (true) {
-      const pending = yield* list()
-      if (pending.length === count) return pending
-      yield* Effect.sleep("10 millis")
-    }
-  }).pipe(
-    Effect.timeoutOrElse({
-      duration: "1 second",
-      orElse: () => Effect.fail(new Error(`timed out waiting for ${count} pending permission request(s)`)),
-    }),
-  )
+    const started = Date.now()
+    let polls = 0
+    let last = started
+    let worstGap = 0
+    let seen = -1
+    return yield* Effect.gen(function* () {
+      while (true) {
+        const now = Date.now()
+        worstGap = Math.max(worstGap, now - last)
+        last = now
+        polls++
+        const pending = yield* list()
+        seen = pending.length
+        if (pending.length === count) return pending
+        yield* Effect.sleep("10 millis")
+      }
+    }).pipe(
+      Effect.timeoutOrElse({
+        duration: "1 second",
+        orElse: () =>
+          Effect.fail(
+            new Error(
+              `timed out waiting for ${count} pending permission request(s): elapsed=${Date.now() - started}ms polls=${polls} worstPollGap=${worstGap}ms lastSeenPending=${seen}`,
+            ),
+          ),
+      }),
+    )
+  })
 
 const rejectAll = () =>
   Effect.gen(function* () {
@@ -180,6 +239,37 @@ it.instance(
       yield* Fiber.await(fiber)
     }),
   { git: true },
+)
+
+// Guards the #579 quarantine: every fixture in this file routes through a fresh instance
+// config load, and none of them may fork the background dependency install — its
+// in-process Arborist work is the interference that overlapped the readiness windows. Without the beforeEach flag (or if loadInstanceState stops honoring
+// it), the stubbed Npm.install records the attempt and this fails, instead of the flake
+// sneaking back as an intermittent 1s timeout.
+it.instance(
+  "readiness - config startup never forks a background dependency install",
+  () =>
+    Effect.gen(function* () {
+      const fiber = yield* ask(bash("per_timeout_no_dep_install")).pipe(Effect.forkScoped)
+
+      const [request] = yield* waitForPending(1)
+      // The deadline is stamped from the loaded config (this instance sets the 1s
+      // countdown), so observing it proves the ask really went through config load and
+      // the assertion below is not vacuously passing on a config path that never ran.
+      const expiresAt = request.expiresAt ?? 0
+      expect(expiresAt - Date.now()).toBeLessThanOrEqual(1000)
+      expect(expiresAt - Date.now()).toBeGreaterThan(0)
+
+      // A detached install fiber records synchronously when it starts; it is forked
+      // inside the config load that just completed, so a short beat is enough for a
+      // regressed fork to surface here.
+      yield* Effect.sleep("100 millis")
+      expect(depInstalls).toEqual([])
+
+      yield* rejectAll()
+      yield* Fiber.await(fiber)
+    }),
+  { git: true, config: countdown },
 )
 
 for (const answer of ["once", "always", "reject"] as const) {
@@ -339,23 +429,33 @@ it.instance(
     Effect.gen(function* () {
       const events = yield* EventV2Bridge.Service
       const release = yield* Deferred.make<void, never>()
+      const announced = yield* Deferred.make<number>()
       const unsub = yield* events.listen((event) =>
-        event.type === Permission.Event.Asked.type ? Deferred.await(release) : Effect.void,
+        Effect.gen(function* () {
+          if (event.type !== Permission.Event.Asked.type) return
+          const request = event.data as PermissionV1.Request
+          if (request.id !== PermissionV1.ID.make("per_timeout_slow_asked")) return
+          yield* Deferred.succeed(announced, request.expiresAt ?? 0)
+          yield* Deferred.await(release)
+        }),
       )
       yield* Effect.addFinalizer(() => unsub)
 
-      const fiber = yield* ask(bash("per_timeout_slow_asked")).pipe(Effect.forkScoped)
-      // A request is registered before it is announced, so it is observable here even
-      // though the ask fiber is still sitting inside the publish.
-      yield* waitForPending(1)
+      return yield* Effect.gen(function* () {
+        const fiber = yield* ask(bash("per_timeout_slow_asked")).pipe(Effect.forkScoped)
+        // Unlike pending membership, this signal survives the deadline. A delayed
+        // observer must not miss the request it is trying to test.
+        const expiresAt = yield* Deferred.await(announced).pipe(Effect.timeout("1 second"))
+        expect(expiresAt).toBeGreaterThan(0)
+        yield* Effect.sleep(Math.max(0, expiresAt - Date.now()) + 500)
+        expect(yield* list()).toHaveLength(0)
+        expect(fiber.pollUnsafe()).toBeUndefined()
 
-      yield* Effect.sleep("1500 millis")
-      expect(yield* list()).toHaveLength(0)
-
-      yield* Deferred.succeed(release, undefined)
-      const exit = yield* Fiber.await(fiber)
-      if (Exit.isSuccess(exit)) throw new Error("expected the unanswered prompt to be denied")
-      expect(Cause.squash(exit.cause)).toBeInstanceOf(PermissionV1.TimedOutError)
+        yield* Deferred.succeed(release, undefined)
+        const exit = yield* Fiber.await(fiber)
+        if (Exit.isSuccess(exit)) throw new Error("expected the unanswered prompt to be denied")
+        expect(Cause.squash(exit.cause)).toBeInstanceOf(PermissionV1.TimedOutError)
+      }).pipe(Effect.ensuring(Deferred.succeed(release, undefined)))
     }),
   { git: true, config: countdown },
 )
@@ -444,4 +544,37 @@ it.instance(
       expect(yield* list()).toHaveLength(0)
     }),
   { git: true, config: countdown },
+)
+
+// An ask abandoned by an abort never got an answer, but clients only drop a prompt on
+// `permission.replied`; without the event the modal outlives the request and every later
+// reply for it is a not-found error.
+it.instance(
+  "ask - an aborted request is announced as settled so clients drop the prompt",
+  () =>
+    Effect.gen(function* () {
+      const replies = yield* collectReplies()
+      const fiber = yield* ask(bash("per_abort_announced")).pipe(Effect.forkScoped)
+      yield* waitForPending(1)
+      yield* Fiber.interrupt(fiber)
+      yield* waitForReplies(replies, 1)
+      expect(replies).toEqual(["reject"])
+      expect(yield* list()).toHaveLength(0)
+    }),
+  { git: true },
+)
+
+it.instance(
+  "ask - an answered request is announced once, not again when the ask ends",
+  () =>
+    Effect.gen(function* () {
+      const replies = yield* collectReplies()
+      const fiber = yield* ask(bash("per_answered_once")).pipe(Effect.forkScoped)
+      yield* waitForPending(1)
+      yield* reply({ requestID: PermissionV1.ID.make("per_answered_once"), reply: "once" })
+      yield* Fiber.join(fiber)
+      yield* Effect.sleep("200 millis")
+      expect(replies).toEqual(["once"])
+    }),
+  { git: true },
 )

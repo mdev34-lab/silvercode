@@ -1,13 +1,15 @@
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
-import { describe, expect } from "bun:test"
+import { describe, expect, spyOn } from "bun:test"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Cause, Effect, Exit, Layer } from "effect"
 import type * as Scope from "effect/Scope"
+import { writeFileSync } from "node:fs"
 import fs from "node:fs/promises"
 import os from "os"
 import path from "path"
 import { Config } from "@/config/config"
 import { Shell } from "@opencode-ai/core/shell"
+import * as ShellEncoding from "@opencode-ai/core/shell-encoding"
 import { ShellTool } from "../../src/tool/shell"
 import { Filesystem } from "@/util/filesystem"
 import { provideInstance, testInstanceStoreLayer, tmpdirScoped } from "../fixture/fixture"
@@ -138,6 +140,11 @@ const fill = (mode: "lines" | "bytes", n: number) => {
   if (PS.has(sh())) return `& ${text}`
   return text
 }
+const emit = (hex: string) => {
+  const text = `${bin} -e ${evalarg(`process.stdout.write(Buffer.from("${hex}","hex"))`)}`
+  if (PS.has(sh())) return `& ${text}`
+  return text
+}
 const glob = (p: string) =>
   process.platform === "win32" ? Filesystem.normalizePathPattern(p) : p.replaceAll("\\", "/")
 
@@ -197,6 +204,27 @@ const mustTruncate = (result: {
 }
 
 describe("tool.shell", () => {
+  for (const item of ps) {
+    it.live(`preserves non-ASCII PowerShell stdout/stderr and nonzero exit (#543) [${item.label}]`, () =>
+      withShell(
+        item,
+        runIn(
+          projectRoot,
+          Effect.gen(function* () {
+            const result = yield* run({
+              command:
+                "[Console]::Write('Área de Trabalho ação 日本語 😀'); [Console]::Error.Write('saída de erro'); exit 7",
+            })
+            expect(result.metadata.exit).toBe(7)
+            expect(result.output).toContain("Área de Trabalho ação 日本語 😀")
+            expect(result.output).toContain("saída de erro")
+            expect(result.output).not.toContain("\ufffd")
+          }),
+        ),
+      ),
+    )
+  }
+
   each("basic", () =>
     runIn(
       projectRoot,
@@ -209,6 +237,40 @@ describe("tool.shell", () => {
       }),
     ),
   )
+
+  it.live("surfaces decoder warnings in model-facing metadata", () =>
+    runIn(
+      projectRoot,
+      Effect.gen(function* () {
+        const original = ShellEncoding.shellOutputDecoder
+        const decoder = spyOn(ShellEncoding, "shellOutputDecoder").mockImplementation((shell, options) => ({
+          ...original(shell, options),
+          warning: "synthetic decoder warning",
+        }))
+        try {
+          const result = yield* run({ command: "echo test" })
+          expect(result.output).toContain("synthetic decoder warning")
+          expect(result.output).toContain("<shell_metadata>")
+          expect(result.metadata.output).not.toContain("<shell_metadata>")
+        } finally {
+          decoder.mockRestore()
+        }
+      }),
+    ),
+  )
+
+  if (process.platform !== "win32") {
+    it.live("flushes a trailing incomplete UTF-8 sequence", () =>
+      runIn(
+        projectRoot,
+        Effect.gen(function* () {
+          const result = yield* run({ command: emit("61c3") })
+          expect(result.metadata.exit).toBe(0)
+          expect(result.output).toBe("a�")
+        }),
+      ),
+    )
+  }
 
   it.live("falls back from terminal-only configured shell", () =>
     Effect.gen(function* () {
@@ -1023,6 +1085,49 @@ describe("tool.shell permissions", () => {
 })
 
 describe("tool.shell abort", () => {
+  if (process.platform !== "win32") {
+    it.live("flushes a trailing incomplete UTF-8 sequence when aborted", () =>
+      runIn(
+        projectRoot,
+        Effect.gen(function* () {
+          const dir = yield* tmpdirScoped()
+          const pidFile = path.join(dir, "daemon.pid")
+          // Keep stdout open in a detached descendant so aborting the shell
+          // closes the output scope without a normal EOF on the output stream.
+          const code =
+            'const cp=require("node:child_process");const fs=require("node:fs");' +
+            'const d=cp.spawn(process.execPath,["-e","await new Promise(()=>{})"],{detached:true,stdio:"inherit"});' +
+            "d.unref();fs.writeFileSync(Bun.argv[1],String(d.pid));" +
+            'process.stdout.write(Buffer.from("61c3","hex"));await new Promise(()=>{})'
+          const controller = new AbortController()
+          const result = yield* run(
+            { command: `${bin} -e ${squote(code)} ${squote(pidFile)}` },
+            {
+              ...ctx,
+              abort: controller.signal,
+              metadata: (input) =>
+                Effect.sync(() => {
+                  const metadata = input.metadata
+                  const output = metadata && "output" in metadata ? metadata.output : undefined
+                  if (output === "a" && !controller.signal.aborted) controller.abort()
+                }),
+            },
+          )
+
+          const pid = yield* readPid(pidFile)
+          yield* Effect.sync(() => {
+            try {
+              process.kill(pid, "SIGKILL")
+            } catch {}
+          })
+
+          expect(result.output).toContain("a�")
+          expect(result.output).toContain("User aborted the command")
+        }),
+      ),
+    )
+  }
+
   it.live(
     "preserves output when aborted",
     () =>
@@ -1151,21 +1256,47 @@ describe("tool.shell abort", () => {
       projectRoot,
       Effect.gen(function* () {
         const updates: string[] = []
+        const dir = yield* tmpdirScoped()
+        const gate1 = path.join(dir, "gate1")
+        const gate2 = path.join(dir, "gate2")
+        // Deterministic progressive streaming (#468): the command cannot
+        // print "second" until a metadata update containing "first" was
+        // delivered (the callback opens the gate), and cannot finish until
+        // one containing "second" was delivered too. A flush-only-at-exit
+        // regression now fails instead of flaking on a 0.1s race.
+        const wait =
+          'const fs=require("node:fs");const p=Bun.argv[1];const t=Date.now();' +
+          "while(!fs.existsSync(p)){if(Date.now()-t>2000)process.exit(1);Bun.sleepSync(10)}"
+        // evalarg() quoting plus the PowerShell call operator, same as fill()
+        const waitFor = (file: string) => {
+          const text = `${bin} -e ${evalarg(wait)} ${evalarg(file)}`
+          if (PS.has(sh())) return `& ${text}`
+          return text
+        }
         const result = yield* run(
           {
-            command: `echo first && sleep 0.1 && echo second`,
+            command: `echo first && ${waitFor(gate1)} && echo second && ${waitFor(gate2)} && echo done`,
           },
           {
             ...ctx,
             metadata: (input) =>
               Effect.sync(() => {
                 const output = (input.metadata as { output?: string })?.output
-                if (output) updates.push(output)
+                if (!output) return
+                updates.push(output)
+                if (output.includes("second")) writeFileSync(gate2, "")
+                else if (output.includes("first")) writeFileSync(gate1, "")
               }),
           },
         )
+        expect(result.metadata.exit).toBe(0)
         expect(result.output).toContain("first")
         expect(result.output).toContain("second")
+        expect(result.output).toContain("done")
+        expect(
+          updates.some((output) => output.includes("first") && !output.includes("second")),
+          `expected an intermediate flush containing "first" before "second" arrived, observed flushes: ${JSON.stringify(updates)}`,
+        ).toBe(true)
         expect(updates.length).toBeGreaterThan(1)
       }),
     ),

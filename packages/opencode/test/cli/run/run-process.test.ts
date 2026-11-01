@@ -5,10 +5,142 @@
 // `OPENCODE_CONFIG_CONTENT` providing the test provider config inline.
 import { describe, expect } from "bun:test"
 import { Effect } from "effect"
-import { reply } from "../../lib/llm-server"
+import fs from "node:fs/promises"
+import path from "node:path"
+import { raw, reply } from "../../lib/llm-server"
 import { cliIt } from "../../lib/cli-process"
 
 describe("opencode run (non-interactive subprocess)", () => {
+  cliIt.live(
+    "Zen quota SSE rejection on a continued session exits nonzero",
+    ({ llm, opencode }) =>
+      Effect.gen(function* () {
+        yield* llm.text("initial session response")
+        const first = yield* opencode.run("initial request", {
+          timeoutMs: 20_000,
+          model: "opencode/local-quota-test",
+          env: {
+            OPENCODE_CONFIG_CONTENT: JSON.stringify({
+              agent: { work: { finishTool: false } },
+              provider: {
+                opencode: {
+                  npm: "@ai-sdk/openai-compatible",
+                  options: { baseURL: llm.url, apiKey: "public" },
+                  models: {
+                    "local-quota-test": {
+                      name: "local quota test",
+                      limit: { context: 128000, output: 4096 },
+                      cost: { input: 0, output: 0 },
+                    },
+                  },
+                },
+              },
+              permission: { "*": "allow" },
+            }),
+          },
+        })
+        expect(first.exitCode).toBe(0)
+        yield* llm.push(
+          raw({
+            chunks: [
+              { error: { message: "Free usage limit reached", type: "quota_exceeded", code: "FreeUsageLimitError" } },
+            ],
+          }),
+        )
+        const result = yield* opencode.run("quota rejection", {
+          timeoutMs: 20_000,
+          extraArgs: ["--continue"],
+          model: "opencode/local-quota-test",
+          env: {
+            OPENCODE_CONFIG_CONTENT: JSON.stringify({
+              agent: { work: { finishTool: false } },
+              provider: {
+                opencode: {
+                  npm: "@ai-sdk/openai-compatible",
+                  options: { baseURL: llm.url, apiKey: "public" },
+                  models: {
+                    "local-quota-test": {
+                      name: "local quota test",
+                      limit: { context: 128000, output: 4096 },
+                      cost: { input: 0, output: 0 },
+                    },
+                  },
+                },
+              },
+              permission: { "*": "allow" },
+            }),
+          },
+        })
+        expect(result.exitCode).not.toBe(0)
+        expect(result.stderr).toContain("Free usage limit reached")
+        expect(result.durationMs).toBeLessThan(20_000)
+      }),
+    30_000,
+  )
+
+  for (const status of [403, 429]) {
+    cliIt.live(
+      `Zen HTTP ${status} quota rejection on a continued session exits nonzero`,
+      ({ llm, opencode }) =>
+        Effect.gen(function* () {
+          const env = {
+            OPENCODE_CONFIG_CONTENT: JSON.stringify({
+              agent: { work: { finishTool: false } },
+              provider: {
+                opencode: {
+                  npm: "@ai-sdk/openai-compatible",
+                  options: { baseURL: llm.url, apiKey: "public" },
+                  models: {
+                    "local-quota-test": {
+                      name: "local quota test",
+                      limit: { context: 128000, output: 4096 },
+                      cost: { input: 0, output: 0 },
+                    },
+                  },
+                },
+              },
+              permission: { "*": "allow" },
+            }),
+          }
+          yield* llm.text("initial session response")
+          const first = yield* opencode.run("initial request", {
+            timeoutMs: 20_000,
+            model: "opencode/local-quota-test",
+            env,
+          })
+          expect(first.exitCode).toBe(0)
+          const before = (yield* llm.hits).length
+          // Exercise HTTP failure before SSE headers, not an in-band error frame.
+          // 429 follows the existing bounded retry policy. Short server-provided
+          // retry delays keep this local test fast without changing that policy.
+          const attempts = status === 429 ? 6 : 1
+          for (let i = 0; i < attempts; i++)
+            yield* llm.error(
+              status,
+              { error: { message: "Free usage limit reached", type: "quota_exceeded", code: "FreeUsageLimitError" } },
+              { "retry-after-ms": "1" },
+            )
+          const result = yield* opencode.run("quota rejection", {
+            timeoutMs: 20_000,
+            extraArgs: ["--continue"],
+            model: "opencode/local-quota-test",
+            env,
+          })
+          expect(result.exitCode).not.toBe(0)
+          expect(result.stderr).toContain("Free usage limit reached")
+          expect(result.durationMs).toBeLessThan(20_000)
+          const newHits = (yield* llm.hits).slice(before)
+          const primary = newHits.filter(
+            (hit) => !JSON.stringify(hit.body).includes("Generate a title for this conversation"),
+          )
+          expect(primary.length).toBe(attempts)
+          expect(yield* llm.misses).toEqual([])
+          expect(yield* llm.pending).toBe(0)
+        }),
+      60_000,
+    )
+  }
+
   // Happy path: prompt completes, output reaches stdout, process exits 0.
   // If this fails, all the others likely will too — debug here first.
   cliIt.live(
@@ -81,11 +213,11 @@ describe("opencode run (non-interactive subprocess)", () => {
     30_000,
   )
 
-  // The test provider's SSE error item is interpreted by the SDK as an unknown
-  // finish, not a fatal provider/session error. Lock that distinction in so it
-  // is not accidentally used as the failure compatibility oracle.
+  // The test provider's in-band error frame is the shape the Zen adapter
+  // emits for a stream cut before completion; it is a retriable stream
+  // failure, not a fatal provider/session error.
   cliIt.live(
-    "unknown stream finish preserves partial output and exits 0",
+    "provider stream error retries, preserves partial output, and exits 0",
     ({ llm, opencode }) =>
       Effect.gen(function* () {
         yield* llm.push(
@@ -94,10 +226,12 @@ describe("opencode run (non-interactive subprocess)", () => {
             description: "Print deterministic output",
           }),
         )
-        yield* llm.fail("upstream provider exploded mid-stream")
-        const result = yield* opencode.run("trigger midstream error", { timeoutMs: 30_000 })
+        yield* llm.cut("upstream provider exploded mid-stream")
+        // The stream death is retried; the recovery reply completes the turn.
+        yield* llm.text("recovered response")
+        const result = yield* opencode.run("Generate a report with a midstream error", { timeoutMs: 30_000 })
         expect(result.exitCode).toBe(0)
-        expect(result.stdout).toBe("partial response\n")
+        expect(result.stdout).toBe("partial response\nrecovered response\n")
         expect(result.stderr).not.toContain("upstream provider exploded mid-stream")
       }),
     60_000,
@@ -175,7 +309,7 @@ describe("opencode run (non-interactive subprocess)", () => {
         )
         yield* llm.text("after")
 
-        const result = yield* opencode.run("exercise json records", {
+        const result = yield* opencode.run("Generate a report of json records", {
           format: "json",
           extraArgs: ["--thinking", "--dangerously-skip-permissions"],
         })
@@ -222,8 +356,10 @@ describe("opencode run (non-interactive subprocess)", () => {
             description: "Print deterministic output",
           }),
         )
-        yield* llm.fail("provider failed")
-        const result = yield* opencode.run("fail after output", { format: "json" })
+        yield* llm.cut("provider failed")
+        // The in-band stream error is retried; the recovery reply completes the turn.
+        yield* llm.text("recovered json")
+        const result = yield* opencode.run("Generate a report after output", { format: "json" })
 
         const events = opencode.parseJsonEvents(result.stdout)
         expect(result.exitCode).toBe(0)
@@ -233,10 +369,16 @@ describe("opencode run (non-interactive subprocess)", () => {
           "tool_use",
           "step_finish",
           "step_start",
+          "step_start",
+          "text",
           "step_finish",
         ])
         expect(events[1]?.part).toEqual(expect.objectContaining({ type: "text", text: "partial json" }))
-        expect(events.at(-1)?.part).toEqual(expect.objectContaining({ type: "step-finish", reason: "unknown" }))
+        // The failed attempt emits its step_start and then dies on the
+        // in-band error frame - no synthesized step-finish is recorded for it.
+        expect(events[4]?.part).toEqual(expect.objectContaining({ type: "step-start" }))
+        expect(events[6]?.part).toEqual(expect.objectContaining({ type: "text", text: "recovered json" }))
+        expect(events.at(-1)?.part).toEqual(expect.objectContaining({ type: "step-finish", reason: "stop" }))
       }),
     60_000,
   )
@@ -247,7 +389,7 @@ describe("opencode run (non-interactive subprocess)", () => {
       Effect.gen(function* () {
         yield* llm.tool("bash", { command: "rm -f denied-file", description: "Remove a test file" })
         yield* llm.text("continued after rejection")
-        const denied = yield* opencode.run("request permission", { permission: { bash: "ask" } })
+        const denied = yield* opencode.run("Generate a report with permission", { permission: { bash: "ask" } })
         opencode.expectExit(denied, 0)
         expect(denied.stderr).toContain("permission requested: bash")
         expect(denied.stdout).toBe("")
@@ -255,7 +397,7 @@ describe("opencode run (non-interactive subprocess)", () => {
         yield* llm.reset
         yield* llm.tool("bash", { command: "rm -f allowed-file", description: "Remove a test file" })
         yield* llm.text("continued after approval")
-        const allowed = yield* opencode.run("request permission", {
+        const allowed = yield* opencode.run("Generate a report with permission", {
           permission: { bash: "ask" },
           extraArgs: ["--dangerously-skip-permissions"],
         })
@@ -266,7 +408,7 @@ describe("opencode run (non-interactive subprocess)", () => {
         yield* llm.reset
         yield* llm.tool("bash", { command: "touch explicitly-denied", description: "Create a denied marker" })
         yield* llm.text("continued after explicit denial")
-        const explicitlyDenied = yield* opencode.run("request denied permission", {
+        const explicitlyDenied = yield* opencode.run("Generate a report with denied permission", {
           permission: { bash: "deny" },
           extraArgs: ["--dangerously-skip-permissions"],
         })
@@ -327,5 +469,35 @@ describe("opencode run (non-interactive subprocess)", () => {
         expect(result.durationMs).toBeLessThan(30_000)
       }),
     30_000,
+  )
+
+  cliIt.live(
+    "skips background .opencode dependency installation in isolated CLI runs",
+    ({ home, llm, opencode }) =>
+      Effect.gen(function* () {
+        const toolDir = path.join(home, ".opencode", "tool")
+        yield* Effect.promise(() => fs.mkdir(toolDir, { recursive: true }))
+        yield* Effect.promise(() =>
+          fs.writeFile(
+            path.join(toolDir, "noop.ts"),
+            'export default { description: "noop", args: {}, execute: async () => "ok" }\n',
+          ),
+        )
+        yield* llm.text("isolated ok")
+
+        const result = yield* opencode.run("check isolated config deps", {
+          extraArgs: ["--dir", home],
+          printLogs: true,
+          timeoutMs: 25_000,
+        })
+
+        opencode.expectExit(result, 0)
+        expect(result.stdout).toContain("isolated ok")
+        const installedPkg = yield* Effect.promise(() =>
+          Bun.file(path.join(home, ".opencode", "package.json")).exists(),
+        )
+        expect(installedPkg).toBe(false)
+      }),
+    60_000,
   )
 })

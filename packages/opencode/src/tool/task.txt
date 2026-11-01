@@ -1,27 +1,9 @@
-Launch a new agent to handle complex, multistep tasks autonomously.
+Launch a subagent for complex, multistep tasks (`subagent_type` required). Not for reading a known file or searching a few files; use Read, Glob or Grep.
 
-When using the Task tool, you must specify a subagent_type parameter to select which agent type to use.
+Review handoffs: when a unit of your own work changed files, hand it to the `review` subagent instead of reviewing your own diff (see the review-loop policy): `subagent_type: "review"` (the runtime picks the matching reviewer). Pass `background: false` to ask for the verdict before you continue: the tool waits only for a reviewer whose agent is configured with `"background": false` in opencode.json, and otherwise launches the review as a background task and notifies you when the verdict is ready. When the user asks for a code review, dispatch `review` with the requirements and the diff. No review for turns that changed no files.
 
-When NOT to use the Task tool:
-- If you want to read a specific file path, use the Read or Glob tool instead of the Task tool, to find the match more quickly
-- If you are searching for a specific class definition like "class Foo", use the Grep tool instead, to find the match more quickly
-- If you are searching for code within a specific file or set of 2-3 files, use the Read tool instead of the Task tool, to find the match more quickly
-- If no available agent is a good fit for the task, use other tools directly
-- If the turn is conversational and changed no files, do not dispatch a review agent for it
+Launch independent agents in one message. Subagents run in the background by default; do not poll or duplicate their work. The result is not shown to the user; summarize it. Pass `task_id` to resume a session; otherwise give a detailed prompt (write code or research only, how to verify, what to return). Do not delegate edits to files you are editing.
 
-## Review handoffs
+Pass `directory` to give a child a working folder of its own: its relative paths resolve from there instead of from yours, and leaving it out inherits your folder. A folder outside the project is not an unlocked door - the child still asks for the same permission a direct access would - and a resumed task keeps the folder it was created with.
 
-When a unit of your own work is complete and changed files, hand it to the `review` subagent for independent verification instead of reviewing your own diff (follow the review-loop policy in your instructions). Dispatch `subagent_type: "review"`; the runtime resolves it to the reviewer matching your agent (`work-review` for Work, `code-review` for Code, generic `review` otherwise). Every one of those reviewers enforces the same standard with the same permissions — they differ only in which domain they are pointed at, never in how strictly they judge. Pass `background: false` so the verdict returns before you claim completion. When the user explicitly asks for a code review, dispatch `review` with the requirements and the diff rather than reviewing the code yourself.
-
-
-Usage notes:
-1. Launch multiple agents concurrently whenever possible, to maximize performance; to do that, use a single message with multiple tool uses
-2. Subagents run asynchronously by default: the tool launches the subagent and returns immediately. Once you have delegated work to an agent, do not duplicate that work yourself. Continue with non-overlapping tasks, or briefly tell the user what you launched and end your response. You will be notified automatically when the result is ready. Do not sleep, poll for progress, or ask the task for status.
-3. Set background=false only when you need the child's result before you can continue; then the tool waits for it synchronously. Avoid this unless the next step genuinely depends on the result.
-4. When the agent is done, it will return a single message back to you. The result returned by the agent is not visible to the user. To show the user the result, you should send a text message back to the user with a concise summary of the result. The output includes a task_id you can reuse later to continue the same subagent session.
-5. Each agent invocation starts with a fresh context unless you provide task_id to resume the same subagent session (which continues with its previous messages and tool outputs). When starting fresh, your prompt should contain a highly detailed task description for the agent to perform autonomously and you should specify exactly what information the agent should return back to you in its final and only message to you.
-6. The agent's outputs should generally be trusted
-7. Clearly tell the agent whether you expect it to write code or just to do research (search, file reads, web fetches, etc.), since it is not aware of the user's intent. Tell it how to verify its work if possible (e.g., relevant test commands).
-8. Avoid delegating work that modifies the same files or areas you are also working on; concurrent edits to the same files can conflict.
-9. If the agent description mentions that it should be used proactively, then you should try your best to use it without the user having to ask for it first. Use your judgement.
-10. The optional `effort` parameter selects the child's agent-effort policy (fast, medium, or thorough). Omit it to reuse this child's persisted selection on resume, otherwise inherit your own/root selection, then the configured `agent.effort`, then medium. The resolved level persists on the child session before it runs and governs the child's review and validation requirements at its `finish` checkpoint; it never changes routing, permissions, or progress behavior.
+For multi-step work, consider planning first: `subagent_type: "think"` researches the codebase and the web and drafts the approach before you edit. It is a nudge, not a requirement - skip it when the change is small or the path is already clear.

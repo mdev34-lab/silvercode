@@ -83,8 +83,16 @@ const layer = Layer.effect(
         const { Arborist } = yield* Effect.promise(() => import("@npmcli/arborist"))
         const add = input.add ?? []
         const npmOptions = yield* NpmConfig.load(input.dir)
+        // Arborist has no Effect-aware cancellation: interrupting the fiber alone would
+        // abandon the reify promise while registry fetches keep running in the
+        // background. Thread an AbortSignal through Arborist -> pacote ->
+        // npm-registry-fetch -> make-fetch-happen so interrupting this fiber also
+        // aborts in-flight registry work. Lifecycle scripts stay disabled
+        // (ignoreScripts), so no child processes are spawned that could outlive it.
+        const controller = new AbortController()
+        const fetchOptions: Record<string, unknown> = { ...npmOptions, signal: controller.signal }
         const arborist = new Arborist({
-          ...npmOptions,
+          ...fetchOptions,
           path: input.dir,
           binLinks: true,
           progress: false,
@@ -94,7 +102,7 @@ const layer = Layer.effect(
         return yield* Effect.tryPromise({
           try: () =>
             arborist.reify({
-              ...npmOptions,
+              ...fetchOptions,
               add,
               save: true,
               saveType: "prod",
@@ -105,7 +113,10 @@ const layer = Layer.effect(
               add,
               dir: input.dir,
             }),
-        }) as Effect.Effect<ArboristTree, InstallFailedError>
+        }).pipe(Effect.onInterrupt(() => Effect.sync(() => controller.abort()))) as Effect.Effect<
+          ArboristTree,
+          InstallFailedError
+        >
       }).pipe(
         Effect.withSpan("Npm.reify", {
           attributes: input,

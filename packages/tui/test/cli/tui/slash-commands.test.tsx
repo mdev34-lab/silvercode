@@ -1,5 +1,7 @@
 /** @jsxImportSource @opentui/solid */
 import { afterEach, describe, expect, test } from "bun:test"
+import { captureFrame } from "../../fixture/frame"
+import path from "node:path"
 import { createDefaultOpenTuiKeymap } from "@opentui/keymap/opentui"
 import { testRender, useRenderer } from "@opentui/solid"
 import { onCleanup } from "solid-js"
@@ -39,6 +41,11 @@ import { PromptStashProvider } from "../../../src/prompt/stash"
 import { Session } from "../../../src/routes/session"
 import { DialogProvider } from "../../../src/ui/dialog"
 import { ToastProvider } from "../../../src/ui/toast"
+
+// Tool rows render the path with platform-native separators (path.relative
+// yields backslashes on win32), so row-text expectations must join with the
+// platform separator instead of hardcoding "/" (#318).
+const readRow = (rel: string) => `Read ${rel.split("/").join(path.sep)}`
 
 const SESSION_ID = "ses_slash_commands"
 const BASE = 1_700_000_000_000
@@ -272,7 +279,7 @@ describe("session slash commands", () => {
   test("dispatches /details and globally toggles /working without affecting assistant text or thinking", async () => {
     const harness = await mountSlashHarness()
     const entries = harness.slashes()
-    const frame = () => harness.app.captureCharFrame()
+    const frame = () => captureFrame(harness.app)
 
     const details = entries.find((entry) => entry.display === "/details")
     const working = entries.find((entry) => entry.display === "/working")
@@ -281,15 +288,15 @@ describe("session slash commands", () => {
 
     await harness.app.waitForFrame(
       (value: string) =>
-        value.split("\n").filter((line) => line.includes("Working... 2 tool calls")).length === 2 &&
+        value.split("\n").filter((line) => line.includes("Exploring files...")).length === 2 &&
         value.includes("Assistant answer remains visible.") &&
         value.includes("Another ordinary assistant output.") &&
         value.includes("Thought: Planning"),
     )
-    const collapsed = frame()
-    expect(collapsed).not.toContain("Read src/a.ts")
+    const collapsed = await frame()
+    expect(collapsed).not.toContain(readRow("src/a.ts"))
     expect(collapsed).not.toContain('Grep "todo"')
-    expect(collapsed).not.toContain("Read src/c.ts")
+    expect(collapsed).not.toContain(readRow("src/c.ts"))
     expect(collapsed).not.toContain("Private reasoning body.")
 
     const commandTitle = (name: string) => harness.keymap.getCommands().find((command) => command.name === name)?.title
@@ -303,13 +310,13 @@ describe("session slash commands", () => {
     working?.onSelect()
     await harness.app.waitForFrame(
       (value: string) =>
-        value.includes("Read src/a.ts") && value.includes('Grep "todo"') && value.includes("Read src/c.ts"),
+        value.includes(readRow("src/a.ts")) && value.includes('Grep "todo"') && value.includes(readRow("src/c.ts")),
     )
     expect(commandTitle("session.toggle.activity")).toBe("Collapse working blocks")
-    const expanded = frame()
-    expect(expanded).toContain("Read src/a.ts")
+    const expanded = await frame()
+    expect(expanded).toContain(readRow("src/a.ts"))
     expect(expanded).toContain('Grep "todo"')
-    expect(expanded).toContain("Read src/c.ts")
+    expect(expanded).toContain(readRow("src/c.ts"))
     expect(expanded).toContain("Assistant answer remains visible.")
     expect(expanded).toContain("Another ordinary assistant output.")
     expect(expanded).toContain("Thought: Planning")
@@ -317,13 +324,13 @@ describe("session slash commands", () => {
 
     working?.onSelect()
     await harness.app.waitForFrame(
-      (value: string) => !value.includes("Read src/a.ts") && !value.includes("Read src/c.ts"),
+      (value: string) => !value.includes(readRow("src/a.ts")) && !value.includes(readRow("src/c.ts")),
     )
     expect(commandTitle("session.toggle.activity")).toBe("Expand working blocks")
-    expect(frame()).not.toContain('Grep "todo"')
-    expect(frame()).toContain("Assistant answer remains visible.")
-    expect(frame()).toContain("Another ordinary assistant output.")
-    expect(frame()).toContain("Thought: Planning")
-    expect(frame()).not.toContain("Private reasoning body.")
+    expect(await frame()).not.toContain('Grep "todo"')
+    expect(await frame()).toContain("Assistant answer remains visible.")
+    expect(await frame()).toContain("Another ordinary assistant output.")
+    expect(await frame()).toContain("Thought: Planning")
+    expect(await frame()).not.toContain("Private reasoning body.")
   })
 })

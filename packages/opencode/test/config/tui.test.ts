@@ -150,6 +150,7 @@ it.instance("resolves attention config defaults and overrides", () =>
       expect((yield* getTuiConfig(test.directory)).attention).toEqual({
         enabled: false,
         notifications: true,
+        notification_backend: "auto",
         sound: true,
         sound_when: "blurred",
         volume: 0.4,
@@ -161,6 +162,7 @@ it.instance("resolves attention config defaults and overrides", () =>
         attention: {
           enabled: false,
           notifications: false,
+          notification_backend: "auto",
           sound: false,
           sound_when: "always",
           volume: 0.7,
@@ -177,6 +179,7 @@ it.instance("resolves attention config defaults and overrides", () =>
       expect((yield* getTuiConfig(test.directory)).attention).toEqual({
         enabled: false,
         notifications: false,
+        notification_backend: "auto",
         sound: false,
         sound_when: "always",
         volume: 0.7,

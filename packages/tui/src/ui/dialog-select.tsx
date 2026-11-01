@@ -11,7 +11,8 @@ import { useTheme, selectedForeground } from "../context/theme"
 import { entries, filter, flatMap, groupBy, pipe } from "remeda"
 import { batch, createEffect, createMemo, createSignal, For, Show, type JSX, on, onCleanup } from "solid-js"
 import { createStore } from "solid-js/store"
-import { useTerminalDimensions } from "@opentui/solid"
+import { useRenderer } from "@opentui/solid"
+import { useTerminalDimensions } from "../util/terminal-dimensions"
 import * as fuzzysort from "fuzzysort"
 import { isDeepEqual } from "remeda"
 import { useDialog, type DialogContext } from "./dialog"
@@ -83,6 +84,7 @@ export function DialogSelect<T>(props: DialogSelectProps<T>) {
   type VisibleAction = (Action & { label: string }) | FooterHint
 
   const dialog = useDialog()
+  const renderer = useRenderer()
   const { theme } = useTheme()
   const tuiConfig = useTuiConfig()
   const scrollAcceleration = createMemo(() => getScrollAcceleration(tuiConfig))
@@ -250,8 +252,8 @@ export function DialogSelect<T>(props: DialogSelectProps<T>) {
           if (!moved) return
           const value = option.value
           const generation = ++visibilityGeneration
-          requestAnimationFrame(() => {
-            requestAnimationFrame(() => {
+          renderer.requestAnimationFrame(() => {
+            renderer.requestAnimationFrame(() => {
               if (generation !== visibilityGeneration) return
               if (!props.preserveSelection || store.filter.length > 0) return
               if (!isDeepEqual(selected()?.value, value)) return
@@ -271,10 +273,23 @@ export function DialogSelect<T>(props: DialogSelectProps<T>) {
     visibilityGeneration++
   })
 
+  // The deferred filter reset kept no handle, so closing the dialog inside
+  // the tick still moved selection on a destroyed scrollbox (#422).
+  let filterTimer: ReturnType<typeof setTimeout> | undefined
+  // The deferred input focus below kept no handle either; closing the dialog
+  // inside the tick still focused a destroyed input (#422).
+  let focusTimer: ReturnType<typeof setTimeout> | undefined
+  onCleanup(() => {
+    if (filterTimer !== undefined) clearTimeout(filterTimer)
+    if (focusTimer !== undefined) clearTimeout(focusTimer)
+  })
+
   createEffect(
     on([() => store.filter, () => props.current], ([filter, current]) => {
       if (filter.length > 0) resetSelection = true
-      setTimeout(() => {
+      if (filterTimer !== undefined) clearTimeout(filterTimer)
+      filterTimer = setTimeout(() => {
+        filterTimer = undefined
         if (filter.length > 0) {
           moveTo(0, true, false)
         } else if (current) {
@@ -584,7 +599,9 @@ export function DialogSelect<T>(props: DialogSelectProps<T>) {
               ref={(r) => {
                 input = r
                 input.traits = { status: "FILTER" }
-                setTimeout(() => {
+                if (focusTimer !== undefined) clearTimeout(focusTimer)
+                focusTimer = setTimeout(() => {
+                  focusTimer = undefined
                   if (!input) return
                   if (input.isDestroyed) return
                   input.focus()

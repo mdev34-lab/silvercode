@@ -363,12 +363,15 @@ function child(id: string): SessionChild {
   }
 }
 
-function globalEvent(payload: GlobalEvent["payload"]): GlobalEvent {
+function globalEvent(payload: GlobalEvent["payload"], workspace?: string): GlobalEvent {
   return {
     directory: "/tmp",
     project: "project-1",
+    // The SDK type lags the wire envelope, which also carries the emitting
+    // workspace (undefined for the default workspace).
+    ...(workspace === undefined ? {} : { workspace }),
     payload,
-  }
+  } as GlobalEvent
 }
 
 function footer(fn?: (commit: StreamCommit) => void) {
@@ -2271,6 +2274,61 @@ describe("run stream transport", () => {
     }
   })
 
+  test("rejects the active turn when the buffered event queue overflows", async () => {
+    const ui = footer()
+    const ready = defer()
+
+    const transport = await createSessionTransport({
+      sdk: sdk({
+        globalEvent: () =>
+          globalSse(
+            (async function* (): GlobalEventStream {
+              await ready.promise
+              // Events for a session the transport does not track stay
+              // buffered; unbounded growth used to stall the process (#399).
+              // Flood past the capacity, then end the stream so close()
+              // cannot hang on a parked generator.
+              for (let n = 1; n <= 150; n++) {
+                yield globalEvent({
+                  id: `evt-untracked-${n}`,
+                  type: "session.status",
+                  properties: {
+                    sessionID: "session-untracked",
+                    status: { type: "busy" },
+                  },
+                })
+              }
+            })(),
+          ),
+        promptAsync: async () => {
+          ready.resolve()
+          return ok(undefined)
+        },
+        status: async () => ok({ "session-1": { type: "busy" } }),
+      }),
+      sessionID: "session-1",
+      thinking: true,
+      limits: () => ({}),
+      bufferCapacity: 50,
+      footer: ui.api,
+    })
+
+    try {
+      await expect(
+        transport.runPromptTurn({
+          agent: undefined,
+          model: undefined,
+          variant: undefined,
+          prompt: { text: "hello", parts: [] },
+          files: [],
+          includeFiles: false,
+        }),
+      ).rejects.toThrow("event buffer overflow")
+    } finally {
+      await transport.close()
+    }
+  })
+
   test("rejects the active turn when the backing instance is disposed", async () => {
     const ui = footer()
     const ready = defer()
@@ -2314,6 +2372,60 @@ describe("run stream transport", () => {
           includeFiles: false,
         }),
       ).rejects.toThrow("instance disposed")
+    } finally {
+      await transport.close()
+    }
+  })
+
+  test("ignores dispose events from another workspace on the same directory (#419)", async () => {
+    const ui = footer()
+    const ready = defer()
+
+    const transport = await createSessionTransport({
+      sdk: sdk({
+        globalEvent: () =>
+          globalSse(
+            (async function* (): AsyncGenerator<GlobalEvent> {
+              await ready.promise
+              // A dispose emitted by a different workspace on the same
+              // directory must not kill this transport; the turn still
+              // completes normally afterwards.
+              yield globalEvent(
+                {
+                  id: "evt-disposed-foreign",
+                  type: "server.instance.disposed",
+                  properties: {
+                    directory: "/tmp",
+                  },
+                },
+                "workspace-2",
+              )
+              yield globalEvent(assistant("msg-1"))
+              yield globalEvent(idle("session-1"))
+            })(),
+          ),
+        promptAsync: async () => {
+          ready.resolve()
+          return ok(undefined)
+        },
+        status: async () => ok({}),
+      }),
+      directory: "/tmp",
+      sessionID: "session-1",
+      thinking: true,
+      limits: () => ({}),
+      footer: ui.api,
+    })
+
+    try {
+      await transport.runPromptTurn({
+        agent: undefined,
+        model: undefined,
+        variant: undefined,
+        prompt: { text: "hello", parts: [] },
+        files: [],
+        includeFiles: false,
+      })
     } finally {
       await transport.close()
     }

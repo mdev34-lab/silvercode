@@ -27,6 +27,7 @@ import { LocationProvider } from "../../../src/context/location"
 import { OPENCODE_BASE_MODE, OpencodeKeymapProvider, registerOpencodeKeymap } from "../../../src/keymap"
 import { AssistantMessageRow, SessionContext } from "../../../src/routes/session"
 import { computeActivityGroups } from "../../../src/util/activity"
+import { captureFrame, waitUntil } from "../../fixture/frame"
 
 const SESSION = "ses_error_ui"
 const BASE = 1_700_000_000_000
@@ -51,14 +52,6 @@ function assistant(id: string, error?: unknown): AssistantMessage {
   }
 }
 
-async function waitUntil(fn: () => boolean, timeout = 5000) {
-  const start = Date.now()
-  while (!fn()) {
-    if (Date.now() - start > timeout) throw new Error("timed out waiting for condition")
-    await Bun.sleep(10)
-  }
-}
-
 let testSetup: { app: Awaited<ReturnType<typeof testRender>>; dispose: () => Promise<void> } | undefined
 type Sync = ReturnType<typeof useSync>
 
@@ -74,8 +67,8 @@ function seed(sync: Sync, rows: { message: Message; parts: Part[] }[]) {
   }
 }
 
-function frameOf(app: Awaited<ReturnType<typeof testRender>>) {
-  return app.captureCharFrame().split("\n").map((line) => line.trimEnd()).join("\n")
+async function frameOf(app: Awaited<ReturnType<typeof testRender>>) {
+  return (await captureFrame(app)).split("\n").map((line) => line.trimEnd()).join("\n")
 }
 
 function rowOf(frame: string, needle: string): number {
@@ -239,7 +232,7 @@ describe("AssistantMessageError rendering and truncation", () => {
       seed(sync, [{ message: msg, parts: [] }])
 
       await app.waitForFrame((frame: string) => frame.includes(errorMsg))
-      const frame = frameOf(app)
+      const frame = await frameOf(app)
       expect(frame).toContain(errorMsg)
       expect(frame).not.toContain("Click to expand")
       expect(frame).not.toContain("Click to collapse")
@@ -268,7 +261,7 @@ describe("AssistantMessageError rendering and truncation", () => {
       seed(sync, [{ message: msg, parts: [] }])
 
       await app.waitForFrame((frame: string) => frame.includes("Click to expand"))
-      const frame = frameOf(app)
+      const frame = await frameOf(app)
       // Preview should contain first 3 lines
       expect(frame).toContain("API error: Internal Server Error (500)")
       expect(frame).toContain("Error Code: WORKER_CRASHED")
@@ -293,7 +286,7 @@ describe("AssistantMessageError rendering and truncation", () => {
       seed(sync, [{ message: msg, parts: [] }])
 
       await app.waitForFrame((frame: string) => frame.includes("Click to expand"))
-      const frame = frameOf(app)
+      const frame = await frameOf(app)
       expect(frame).toContain("API error: request failed")
       expect(frame).toContain("…")
       expect(frame).toContain("Click to expand")
@@ -322,25 +315,27 @@ describe("AssistantMessageError rendering and truncation", () => {
       seed(sync, [{ message: msg, parts: [] }])
 
       await app.waitForFrame((frame: string) => frame.includes("Click to expand"))
-      expect(frameOf(app)).not.toContain("Detail row 4: extra diagnostics")
+      expect(await frameOf(app)).not.toContain("Detail row 4: extra diagnostics")
 
       // Click on the error block
-      const row = rowOf(frameOf(app), "Click to expand")
+      const row = rowOf(await frameOf(app), "Click to expand")
       await app.mockMouse.click(5, row)
 
       // Should expand to show all lines and "Click to collapse"
       await app.waitForFrame((frame: string) => frame.includes("Click to collapse"))
-      const expandedFrame = frameOf(app)
+      const expandedFrame = await frameOf(app)
       expect(expandedFrame).toContain("Detail row 4: extra diagnostics not visible in collapsed state")
       expect(expandedFrame).toContain("Click to collapse")
 
-      // Click again to collapse
-      const collapseRow = rowOf(frameOf(app), "Click to collapse")
+      // Click again to collapse. 0.6 counts a second click inside the double-click window as a
+      // text selection, and the block ignores clicks that end one, so give the toggle some space.
+      await Bun.sleep(600)
+      const collapseRow = rowOf(await frameOf(app), "Click to collapse")
       await app.mockMouse.click(5, collapseRow)
 
       // Should return to collapsed state
       await app.waitForFrame((frame: string) => frame.includes("Click to expand"))
-      const collapsedAgain = frameOf(app)
+      const collapsedAgain = await frameOf(app)
       expect(collapsedAgain).toContain("Click to expand")
       expect(collapsedAgain).not.toContain("Detail row 4: extra diagnostics")
     } finally {
@@ -360,16 +355,17 @@ describe("AssistantMessageError rendering and truncation", () => {
       seed(sync, [{ message: msg, parts: [] }])
 
       await app.waitForFrame((frame: string) => frame.includes("Click to expand"))
-      const frame = frameOf(app)
+      const frame = await frameOf(app)
       expect(frame).toContain("…")
       expect(frame).toContain("Click to expand")
 
       // Click to expand on narrow terminal
-      const row = rowOf(frameOf(app), "Click to expand")
+      const row = rowOf(await frameOf(app), "Click to expand")
       await app.mockMouse.click(2, row)
 
       await app.waitForFrame((frame: string) => frame.includes("Click to collapse"))
-      expect(frameOf(app)).toContain("upstream connection")
+      // Line breaks are decided by the native layout, so compare the reflowed text.
+      expect((await frameOf(app)).replace(/[\u2502\u2503]/g, " ").replace(/\s+/g, " ")).toContain("upstream connection refused")
     } finally {
       app.renderer.destroy()
     }

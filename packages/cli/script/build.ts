@@ -3,6 +3,7 @@
 import { $ } from "bun"
 import { rm } from "fs/promises"
 import path from "path"
+import { fileURLToPath } from "url"
 import { Script } from "@opencode-ai/script"
 import { createSolidTransformPlugin } from "@opentui/solid/bun-plugin"
 import pkg from "../package.json"
@@ -19,6 +20,8 @@ const baselineFlag = process.argv.includes("--baseline")
 const skipInstall = process.argv.includes("--skip-install")
 const sourcemapsFlag = process.argv.includes("--sourcemaps")
 const plugin = createSolidTransformPlugin()
+
+const treeSitterWorker = await Bun.file(fileURLToPath(import.meta.resolve("@opentui/core/parser.worker"))).text()
 
 const allTargets: {
   os: string
@@ -62,8 +65,15 @@ for (const item of targets) {
     .join("-")
   const name = target.replace(binary, "cli")
   console.log(`building ${name}`)
+  // The tree-sitter worker has to live inside the compiled binary, and the TUI
+  // finds it through OTUI_TREE_SITTER_WORKER_PATH.
+  const treeSitterWorkerPath = "opentui-tree-sitter-worker.js"
+  const bunfsRoot = item.os === "win32" ? "B:/~BUN/root/" : "/$bunfs/root/"
   const result = await Bun.build({
-    entrypoints: ["./src/index.ts"],
+    files: {
+      [treeSitterWorkerPath]: treeSitterWorker,
+    },
+    entrypoints: ["./src/index.ts", treeSitterWorkerPath],
     tsconfig: "./tsconfig.json",
     plugins: [plugin],
     external: ["node-gyp"],
@@ -89,6 +99,7 @@ for (const item of targets) {
       OPENCODE_VERSION: `'${Script.version}'`,
       OPENCODE_CLI_NAME: `'${binary}'`,
       OPENCODE_MODELS_DEV: modelsData,
+      OTUI_TREE_SITTER_WORKER_PATH: bunfsRoot + treeSitterWorkerPath,
       OPENCODE_CHANNEL: `'${Script.channel}'`,
       OPENCODE_LIBC: item.os === "linux" ? `'${item.abi ?? "glibc"}'` : "undefined",
       // FFF_LIBC selects the fff native lib variant: "musl" or "gnu".

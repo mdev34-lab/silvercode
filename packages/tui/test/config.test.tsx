@@ -1,5 +1,6 @@
 /** @jsxImportSource @opentui/solid */
 import { testRender } from "@opentui/solid"
+import { captureFrame } from "./fixture/frame"
 import { expect, test } from "bun:test"
 import { Schema } from "effect"
 import {
@@ -43,6 +44,11 @@ test("validates config constraints", () => {
   expect(() => decodeInfo({ leader_timeout: 0 })).toThrow()
   expect(() => decodeInfo({ attention: { volume: 1.1 } })).toThrow()
   expect(() => decodeInfo({ attention: { sound_when: "focused" } })).toThrow()
+  expect(() => decodeInfo({ attention: { notification_backend: "bogus" } })).toThrow()
+  expect(
+    resolve({ attention: { notification_backend: "native" } }, { terminalSuspend: true }).attention
+      .notification_backend,
+  ).toBe("native")
   expect(() => decodeInfo({ prompt: { max_width: 0 } })).toThrow()
   expect(() => decodeInfo({ scroll_speed: 0 })).toThrow()
   expect(() => decodeInfo({ cursor: { style: "beam" } })).toThrow()
@@ -55,6 +61,7 @@ test("resolves host-neutral defaults", () => {
   expect(config.attention).toEqual({
     enabled: false,
     notifications: true,
+    notification_backend: "auto",
     sound: true,
     sound_when: "blurred",
     volume: 0.4,
@@ -140,7 +147,7 @@ test("provides resolved config through Solid context", async () => {
   ))
   try {
     await app.renderOnce()
-    expect(app.captureCharFrame()).toContain(`custom true ${LeaderTimeoutDefault}`)
+    expect(await captureFrame(app)).toContain(`custom true ${LeaderTimeoutDefault}`)
   } finally {
     app.renderer.destroy()
   }

@@ -4,17 +4,19 @@ import { badge, go, logo } from "../src/logo"
 // "," is only expanded by tui/component/logo.tsx, so the shared art must not use it.
 const alphabet = new Set([" ", "▀", "▄", "█", "_", "^", "~"])
 
+// The wordmark templates carry a blank bottom row (room for descenders, which
+// silvercode does not use); the go mark has four rows.
 const templates = {
-  "logo.left": logo.left,
-  "logo.right": logo.right,
-  "go.left": go.left,
-  "go.right": go.right,
-  badge,
+  "logo.left": { rows: logo.left, count: 5 },
+  "logo.right": { rows: logo.right, count: 5 },
+  "go.left": { rows: go.left, count: 4 },
+  "go.right": { rows: go.right, count: 4 },
+  badge: { rows: badge, count: 5 },
 }
 
-for (const [name, rows] of Object.entries(templates)) {
-  test(`${name} is a rectangular four row template`, () => {
-    expect(rows).toHaveLength(4)
+for (const [name, { rows, count }] of Object.entries(templates)) {
+  test(`${name} is a rectangular ${count} row template`, () => {
+    expect(rows).toHaveLength(count)
     expect(new Set(rows.map((row) => row.length)).size).toBe(1)
   })
 
@@ -37,16 +39,42 @@ const pixels = logo.left
     return [top, bottom]
   })
 
-const columnTop = (column: number) => pixels.findIndex((row) => row[column])
+const inkRows = (start: number, width: number) =>
+  pixels.flatMap((row, index) => (row.slice(start, start + width).some(Boolean) ? [index] : []))
 
-test("every ascender rises exactly one half cell above x-height", () => {
-  // x-height starts at template row 1 (half-cell row 2); ascenders start at row 1.
-  const tops = new Set(pixels[0]!.map((_, column) => columnTop(column)).filter((top) => top >= 0 && top < 2))
-  expect([...tops]).toEqual([1])
-})
+// Left half is "silver" (muted); the right half starts one column after it.
+// Glyphs are {start, width}: "i" and "l" are a single column, the rest four.
+const LEFT_SPANS = [
+  [0, 4],
+  [5, 1],
+  [7, 1],
+  [9, 4],
+  [14, 4],
+  [19, 4],
+] as const
+const RIGHT_SPANS = [
+  [0, 4],
+  [5, 4],
+  [10, 4],
+  [15, 4],
+] as const
+const RIGHT_OFFSET = logo.left[0]!.length + 1
 
-test("no glyph rises above the ascender line", () => {
+test("every glyph spans the same half-cell rows 1-7 and nothing is drawn outside them", () => {
+  // Pixel row 0 and the descender rows (8-9) stay empty: this wordmark has no
+  // ascender above the body and no descenders. Row 1 is the top line (including
+  // the "i" dot), row 7 is the shared baseline.
+  const spans = [
+    ...LEFT_SPANS.map(([start, width]) => [start, width]),
+    ...RIGHT_SPANS.map(([start, width]) => [start + RIGHT_OFFSET, width]),
+  ]
+  for (const [start, width] of spans) {
+    const rows = inkRows(start!, width!)
+    expect(Math.min(...rows)).toBe(1)
+    expect(Math.max(...rows)).toBe(7)
+  }
   expect(pixels[0]!.some(Boolean)).toBe(false)
+  expect(pixels.slice(8).some((row) => row.some(Boolean))).toBe(false)
 })
 
 test("wordmark renders silvercode with an even baseline", () => {
@@ -55,23 +83,21 @@ test("wordmark renders silvercode with an even baseline", () => {
 
 // Independent expectation of the glyphs: the wordmark must actually spell
 // "silver" (muted half) + "code" (highlighted half). Each entry is the glyph on
-// the half-cell grid, pixel rows 1-6 (row 1 is the ascender line, row 6 the
-// baseline): "#" ink, "s" shadow counter, "." empty. If the art drifts back to
-// a different word these comparisons fail, unlike a snapshot taken from the art
-// itself.
-const GLYPH_WIDTH = 4
-const GLYPH_PITCH = GLYPH_WIDTH + 1
-
+// the half-cell grid, pixel rows 1-7 (row 1 the top line, row 7 the baseline):
+// "#" ink, "s" shadow counter, "." empty. These were checked against the
+// rendered pixels (see the snapshot). If the art drifts to a different word
+// these comparisons fail, unlike a snapshot taken from the art itself.
 const EXPECTED_GLYPHS: Record<string, string[]> = {
-  s: ["....", ".##.", "#...", ".##.", "...#", "###."],
-  i: [".#..", "....", ".#..", ".#..", ".#..", ".#.."],
-  l: [".#..", ".#..", ".#..", ".#..", ".#..", ".#.."],
-  v: ["....", "#..#", "#..#", "#..#", "#..#", ".##."],
-  e: ["....", ".##.", "#ss.", "####", "#ss.", ".##."],
-  r: ["....", "###.", "#..#", "#...", "#...", "#..."],
-  c: ["....", ".##.", "#ss.", "#ss.", "#ss.", ".##."],
-  o: ["....", ".##.", "#ss#", "#ss#", "#ss#", ".##."],
-  d: ["...#", ".###", "#ss#", "#ss#", "#ss#", ".###"],
+  s: [".###", "#...", "#...", ".##.", "...#", "...#", "###."],
+  i: ["#", ".", "#", "#", "#", "#", "#"],
+  l: ["#", "#", "#", "#", "#", "#", "#"],
+  v: ["#..#", "#..#", "#..#", "#..#", "#..#", ".#.#", "..#."],
+  e: [".##.", "#..#", "#..#", "####", "#...", "#...", ".###"],
+  r: ["###.", "#..#", "#...", "#...", "#...", "#...", "#..."],
+  c: [".###", "#sss", "#sss", "#...", "#...", "#...", ".###"],
+  o: [".##.", "#ss#", "#ss#", "#..#", "#..#", "#..#", ".##."],
+  d: ["...#", "...#", ".###", "#ss#", "#ss#", "#..#", ".###"],
+  E: [".##.", "#ss#", "#ss#", "####", "#...", "#...", ".###"],
 }
 
 const cellPixels = (char: string): [string, string] => {
@@ -102,8 +128,8 @@ const pixelRows = (part: string[]) =>
     return [top, bottom]
   })
 
-const glyphPixels = (part: string[], letter: number) =>
-  pixelRows(part).map((row) => row.slice(letter * GLYPH_PITCH, letter * GLYPH_PITCH + GLYPH_WIDTH).join(""))
+const glyphPixels = (part: string[], start: number, width: number) =>
+  pixelRows(part).map((row) => row.slice(start, start + width).join(""))
 
 test("wordmark spells silver plus code, glyph by glyph", () => {
   const word = "silvercode"
@@ -111,11 +137,15 @@ test("wordmark spells silver plus code, glyph by glyph", () => {
   const right = word.slice(6)
   expect(left).toBe("silver")
   expect(right).toBe("code")
-  for (const [letter, index] of Array.from(left).map((char, i) => [char, i] as const)) {
-    // Pixel rows 1-6 are the letter body; row 0 is never drawn.
-    expect(glyphPixels(logo.left, index).slice(1, 7)).toEqual(EXPECTED_GLYPHS[letter])
+  for (const [index, letter] of Array.from(left).entries()) {
+    const [start, width] = LEFT_SPANS[index]!
+    // Pixel rows 1-7 are the letter body; row 0 is never drawn.
+    expect(glyphPixels(logo.left, start, width).slice(1, 8)).toEqual(EXPECTED_GLYPHS[letter])
   }
-  for (const [letter, index] of Array.from(right).map((char, i) => [char, i] as const)) {
-    expect(glyphPixels(logo.right, index).slice(1, 7)).toEqual(EXPECTED_GLYPHS[letter])
+  for (const [index, letter] of Array.from(right).entries()) {
+    const [start, width] = RIGHT_SPANS[index]!
+    // The final "e" of the highlighted half is drawn with a shadow counter.
+    const expected = index === 3 ? EXPECTED_GLYPHS.E : EXPECTED_GLYPHS[letter]
+    expect(glyphPixels(logo.right, start, width).slice(1, 8)).toEqual(expected)
   }
 })

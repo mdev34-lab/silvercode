@@ -1,8 +1,9 @@
+import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { afterEach, describe, expect } from "bun:test"
 import path from "path"
 import fs from "fs/promises"
 import { fileURLToPath, pathToFileURL } from "url"
-import { Effect, Layer, Result, Schema } from "effect"
+import { Effect, Fiber, Layer, Result, Schema } from "effect"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { ToolRegistry } from "@/tool/registry"
 import { Tool } from "@/tool/tool"
@@ -12,6 +13,8 @@ import { TestConfig } from "../fixture/config"
 import { Config } from "@/config/config"
 import { Plugin } from "@/plugin"
 import { Agent } from "@/agent/agent"
+import { Session } from "@/session/session"
+import { PartID } from "@/session/schema"
 import { InstanceState } from "@/effect/instance-state"
 
 import { ToolJsonSchema } from "@/tool/json-schema"
@@ -20,6 +23,7 @@ import { RuntimeFlags } from "@/effect/runtime-flags"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { MCP } from "@/mcp"
+import { Question } from "@/question"
 import type { Tool as MCPToolDef } from "@modelcontextprotocol/sdk/types.js"
 
 const configLayer = TestConfig.layer({
@@ -50,7 +54,7 @@ const brokenPluginLayer = Layer.succeed(
   }),
 )
 
-const root = LayerNode.group([ToolRegistry.node, Agent.node])
+const root = LayerNode.group([ToolRegistry.node, Agent.node, Session.node, SessionProjector.node, Question.node])
 const replacements = [
   [Config.node, configLayer],
   [RuntimeFlags.node, RuntimeFlags.layer()],
@@ -94,6 +98,31 @@ const withEmptyCodeMode = testEffect(
   ]),
 )
 const withBrokenPlugin = testEffect(LayerNode.compile(root, [...replacements, [Plugin.node, brokenPluginLayer]]))
+
+// Fake Plugin.Service whose `tool.definition` hook replaces ONLY the task
+// tool's jsonSchema (parameters untouched). The registry must honor the
+// plugin's schema instead of injecting the generated subagent_type enum -
+// a plugin-replaced parameter shape (parameters or jsonSchema) wins.
+const schemaPluginLayer = Layer.succeed(
+  Plugin.Service,
+  Plugin.Service.of({
+    init: () => Effect.void,
+    trigger: ((name: unknown, input: unknown, output: unknown) => {
+      if (
+        name === "tool.definition" &&
+        (input as { toolID?: string }).toolID === "task"
+      ) {
+        ;(output as { jsonSchema?: unknown }).jsonSchema = {
+          type: "object",
+          properties: { plugin_custom: { type: "string" } },
+        }
+      }
+      return Effect.succeed(output)
+    }) as Plugin.Interface["trigger"],
+    list: () => Effect.succeed([]),
+  }),
+)
+const withSchemaPlugin = testEffect(LayerNode.compile(root, [...replacements, [Plugin.node, schemaPluginLayer]]))
 
 afterEach(async () => {
   await disposeAllInstances()
@@ -150,7 +179,28 @@ describe("tool.registry", () => {
     }),
   )
 
-  it.instance("hides task background parameter unless experimental background subagents are enabled", () =>
+  it.instance("a missing ancestor session fails closed instead of dying in tools()", () =>
+    Effect.gen(function* () {
+      const registry = yield* ToolRegistry.Service
+      const agent = yield* Agent.Service
+      const sessions = yield* Session.Service
+      const work = yield* agent.get("work")
+      if (!work) throw new Error("work agent not found")
+      const orphan = yield* sessions.create({ parentID: SessionID.make("ses_missing_ancestor") })
+      const tools = yield* registry.tools({
+        providerID: ProviderV2.ID.opencode,
+        modelID: ModelV2.ID.make("test"),
+        agent: work,
+        sessionID: orphan.id,
+      })
+      const ids = tools.map((tool) => tool.id)
+      // Unknown root is not a permission boundary: tools stay available.
+      expect(ids).toContain("read")
+      expect(ids).not.toContain("apply_patch")
+    }),
+  )
+
+  it.instance("exposes the task background parameter now that background subagents are stable", () =>
     Effect.gen(function* () {
       const registry = yield* ToolRegistry.Service
       const agent = yield* Agent.Service
@@ -162,8 +212,30 @@ describe("tool.registry", () => {
         agent: build,
       })).find((tool) => tool.id === "task")
 
-      expect(task?.jsonSchema).toBeDefined()
-      expect((task?.jsonSchema?.properties as Record<string, unknown> | undefined)?.background).toBeUndefined()
+      if (!task) throw new Error("task tool not found in registry")
+      // The registry defers JSON Schema materialization, so assert against the
+      // schema the model actually receives (fromTool falls back to parameters).
+      const schema = ToolJsonSchema.fromTool(task)
+      expect((schema.properties as Record<string, unknown> | undefined)?.background).toBeDefined()
+    }),
+  )
+
+  withSchemaPlugin.instance("honors a plugin jsonSchema-only override of the task tool over the generated enum", () =>
+    Effect.gen(function* () {
+      const registry = yield* ToolRegistry.Service
+      const agent = yield* Agent.Service
+      const build = yield* agent.get("work")
+      if (!build) throw new Error("build agent not found")
+      const task = (yield* registry.tools({
+        providerID: ProviderV2.ID.opencode,
+        modelID: ModelV2.ID.make("test"),
+        agent: build,
+      })).find((tool) => tool.id === "task")
+
+      if (!task) throw new Error("task tool not found in registry")
+      const schema = ToolJsonSchema.fromTool(task) as { properties?: Record<string, unknown> }
+      expect(schema.properties?.plugin_custom).toBeDefined()
+      expect(schema.properties?.subagent_type).toBeUndefined()
     }),
   )
 
@@ -623,3 +695,53 @@ describe("tool.registry", () => {
     }),
   )
 })
+
+it.instance("programming and non-programming Work keep the same tools (workflow is advisory)", () => Effect.gen(function* () {
+  const sessions=yield* Session.Service
+  const agents=yield* Agent.Service
+  const registry=yield* ToolRegistry.Service
+  for (const [text,restricted] of [["Fix Python software",false],["Research hotels",false]] as const) {
+    const chat=yield* sessions.create({title:"admission"})
+    const user=yield* sessions.updateMessage({id:MessageID.ascending(),role:"user",sessionID:chat.id,agent:"work",model:{providerID:ProviderV2.ID.make("test"),modelID:ModelV2.ID.make("test")},time:{created:Date.now()}})
+    yield* sessions.updatePart({id:PartID.ascending(),messageID:user.id,sessionID:chat.id,type:"text",text})
+    for (const role of ["work","think"]) {
+      const found=yield* registry.tools({sessionID:chat.id,agent:yield* agents.get(role),providerID:ProviderV2.ID.make("test"),modelID:ModelV2.ID.make("test")})
+      const ids=found.map(tool=>tool.id)
+      expect(ids.includes("read")).toBe(true)
+      expect(ids.includes("edit")).toBe(!restricted)
+      expect(ids.includes("bash")).toBe(!restricted)
+    }
+  }
+}))
+
+it.instance("a programming Work route keeps execution tools and the invalid-call reporter", () => Effect.gen(function* () {
+  const sessions=yield* Session.Service
+  const agents=yield* Agent.Service
+  const registry=yield* ToolRegistry.Service
+  const chat=yield* sessions.create({title:"admission"})
+  const user=yield* sessions.updateMessage({id:MessageID.ascending(),role:"user",sessionID:chat.id,agent:"work",model:{providerID:ProviderV2.ID.make("test"),modelID:ModelV2.ID.make("test")},time:{created:Date.now()}})
+  yield* sessions.updatePart({id:PartID.ascending(),messageID:user.id,sessionID:chat.id,type:"text",text:"Fix Python software"})
+  for (const role of ["work","think"]) {
+    const found=yield* registry.tools({sessionID:chat.id,agent:yield* agents.get(role),providerID:ProviderV2.ID.make("test"),modelID:ModelV2.ID.make("test")})
+    const ids=found.map(tool=>tool.id)
+    expect(ids.includes("invalid")).toBe(true)
+    expect(ids.includes("bash")).toBe(true)
+    const ctx={sessionID:chat.id,messageID:user.id,agent:role,abort:new AbortController().signal,messages:[],metadata:()=>Effect.void,ask:()=>Effect.void} as never
+    const out=yield* found.find(tool=>tool.id==="invalid")!.execute({tool:"bash",error:"Model tried to call unavailable tool 'bash'."},ctx)
+    expect(out.output).toContain("unavailable tool 'bash'")
+  }
+}))
+
+it.instance("a request the classifier is unsure about keeps Work's execution tools and Task; the model is advised, not blocked", () => Effect.gen(function* () {
+  const sessions=yield* Session.Service
+  const agents=yield* Agent.Service
+  const registry=yield* ToolRegistry.Service
+  for (const text of ["run echo hi","Fetch the pull request"]) {
+    const chat=yield* sessions.create({title:"admission"})
+    const user=yield* sessions.updateMessage({id:MessageID.ascending(),role:"user",sessionID:chat.id,agent:"work",model:{providerID:ProviderV2.ID.make("test"),modelID:ModelV2.ID.make("test")},time:{created:Date.now()}})
+    yield* sessions.updatePart({id:PartID.ascending(),messageID:user.id,sessionID:chat.id,type:"text",text})
+    const found=yield* registry.tools({sessionID:chat.id,agent:yield* agents.get("work"),providerID:ProviderV2.ID.make("test"),modelID:ModelV2.ID.make("test")})
+    const ids=found.map(tool=>tool.id)
+    for (const id of ["bash","edit","write","task","read"]) expect(ids.includes(id)).toBe(true)
+  }
+}))

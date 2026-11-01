@@ -87,6 +87,7 @@ function config(attention: Partial<AttentionConfig["attention"]> = {}): Attentio
     attention: {
       enabled: true,
       notifications: true,
+      notification_backend: "terminal",
       sound: true,
       sound_when: "blurred",
       volume: 0.4,
@@ -490,5 +491,151 @@ describe("createTuiAttention", () => {
       sound: false,
       skipped: "renderer_destroyed",
     })
+  })
+})
+
+describe("native attention delivery", () => {
+  test("auto tries native once and avoids duplicate terminal notification", async () => {
+    const renderer = new FakeRenderer()
+    const calls: string[][] = []
+    const attention = createTuiAttention({
+      renderer,
+      config: config({ notification_backend: "auto" }),
+      nativeNotification: async (title, message) => {
+        calls.push([title, message])
+        return true
+      },
+      audio: new FakeAudioEngine(),
+    })
+    renderer.emit("blur")
+    expect(await attention.notify({ title: "Work", message: "Done", sound: false })).toMatchObject({
+      notification: true,
+    })
+    expect(calls).toEqual([["Work", "Done"]])
+    expect(renderer.notifications).toHaveLength(0)
+    attention.dispose()
+  })
+
+  test("auto falls back on native failure, native-only does not", async () => {
+    for (const backend of ["auto", "native"] as const) {
+      const renderer = new FakeRenderer()
+      const attention = createTuiAttention({
+        renderer,
+        config: config({ notification_backend: backend }),
+        nativeNotification: async () => {
+          throw new Error("not installed")
+        },
+        audio: new FakeAudioEngine(),
+      })
+      renderer.emit("blur")
+      expect((await attention.notify({ message: "Done", sound: false })).notification).toBe(backend === "auto")
+      expect(renderer.notifications).toHaveLength(backend === "auto" ? 1 : 0)
+      attention.dispose()
+    }
+  })
+
+  test("native respects disabled, focused, unknown and terminal-only policies", async () => {
+    for (const overrides of [
+      {},
+      { enabled: false },
+      { notifications: false },
+      { notification_backend: "terminal" as const },
+    ]) {
+      const renderer = new FakeRenderer()
+      let calls = 0
+      const attention = createTuiAttention({
+        renderer,
+        config: config({ notification_backend: "auto", ...overrides }),
+        nativeNotification: async () => {
+          calls++
+          return true
+        },
+        audio: new FakeAudioEngine(),
+      })
+      await attention.notify({ message: "Unknown", sound: false })
+      renderer.emit("focus")
+      await attention.notify({ message: "Focused", sound: false })
+      expect(calls).toBe(0)
+      if (Object.keys(overrides).length) {
+        renderer.emit("blur")
+        await attention.notify({ message: "Blurred", sound: false })
+        expect(calls).toBe(0)
+      }
+      attention.dispose()
+    }
+  })
+
+  test("does not fall back or play sound after disposal while native is pending", async () => {
+    const renderer = new FakeRenderer()
+    const audio = new FakeAudioEngine()
+    let complete!: (ok: boolean) => void
+    const attention = createTuiAttention({
+      renderer,
+      audio,
+      config: config({ notification_backend: "auto" }),
+      nativeNotification: () =>
+        new Promise<boolean>((resolve) => {
+          complete = resolve
+        }),
+    })
+    renderer.emit("blur")
+    const result = attention.notify({ message: "Done", sound: false })
+    attention.dispose()
+    complete(false)
+    expect((await result).notification).toBe(false)
+    expect(renderer.notifications).toHaveLength(0)
+    expect(audio.playCalls).toBe(0)
+  })
+
+  test("disposal aborts all pending helpers and ignores late success", async () => {
+    const renderer = new FakeRenderer()
+    const audio = new FakeAudioEngine()
+    const signals: AbortSignal[] = []
+    const completions: ((ok: boolean) => void)[] = []
+    const attention = createTuiAttention({
+      renderer,
+      audio,
+      config: config({ notification_backend: "auto" }),
+      nativeNotification: (_title, _message, signal) => {
+        signals.push(signal!)
+        return new Promise<boolean>((resolve) => completions.push(resolve))
+      },
+    })
+    renderer.emit("blur")
+    const results = [
+      attention.notify({ message: "One", sound: false }),
+      attention.notify({ message: "Two", sound: false }),
+    ]
+    expect(signals).toHaveLength(2)
+    expect(signals.every((signal) => !signal.aborted)).toBe(true)
+    attention.dispose()
+    attention.dispose()
+    expect(signals.every((signal) => signal.aborted)).toBe(true)
+    completions.forEach((complete) => complete(true))
+    for (const result of await Promise.all(results)) {
+      expect(result).toEqual({ ok: false, notification: false, sound: false, skipped: "renderer_destroyed" })
+    }
+    expect(renderer.notifications).toHaveLength(0)
+    expect(audio.playCalls).toBe(0)
+  })
+
+  test("ignores late native success when the renderer was destroyed", async () => {
+    const renderer = new FakeRenderer()
+    let complete!: (ok: boolean) => void
+    const attention = createTuiAttention({
+      renderer,
+      config: config({ notification_backend: "auto" }),
+      nativeNotification: () =>
+        new Promise<boolean>((resolve) => {
+          complete = resolve
+        }),
+    })
+    renderer.emit("blur")
+    const result = attention.notify({ message: "Done", sound: false })
+    renderer.isDestroyed = true
+    complete(true)
+    expect(await result).toEqual({ ok: false, notification: false, sound: false, skipped: "renderer_destroyed" })
+    expect(renderer.notifications).toHaveLength(0)
+    attention.dispose()
   })
 })

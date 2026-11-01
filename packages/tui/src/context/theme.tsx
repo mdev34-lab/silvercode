@@ -1,4 +1,10 @@
-import { CliRenderEvents, SyntaxStyle, type TerminalColors } from "@opentui/core"
+import {
+  CliRenderEvents,
+  SyntaxStyle,
+  type CliRendererFrameEvent,
+  type NativeResourceOwner,
+  type TerminalColors,
+} from "@opentui/core"
 import { useRenderer } from "@opentui/solid"
 import {
   DEFAULT_THEMES,
@@ -72,10 +78,13 @@ export {
   resolveTheme,
   selectedForeground,
   terminalMode,
+  textAttributes,
   tint,
   upsertTheme,
+  type SyntaxTheme,
   type Theme,
   type ThemeJson,
+  type ThemeTextStyle,
   type SyntaxStyleOverrides,
 } from "../theme"
 
@@ -268,8 +277,8 @@ export const { use: useTheme, provider: ThemeProvider } = createSimpleContext({
 
     createEffect(() => renderer.setBackgroundColor(values().background))
 
-    const syntax = createSyntaxStyleMemo(() => generateSyntax(values()))
-    const subtleSyntax = createSyntaxStyleMemo(() => generateSubtleSyntax(values()))
+    const syntax = createSyntaxStyleMemo((owner) => generateSyntax(values(), owner))
+    const subtleSyntax = createSyntaxStyleMemo((owner) => generateSubtleSyntax(values(), owner))
 
     return {
       theme: new Proxy(values(), {
@@ -303,20 +312,36 @@ export const { use: useTheme, provider: ThemeProvider } = createSimpleContext({
   },
 })
 
-export function createSyntaxStyleMemo(factory: () => SyntaxStyle) {
+export function createSyntaxStyleMemo(factory: (owner: NativeResourceOwner) => SyntaxStyle) {
   const renderer = useRenderer()
   const retained = new Set<SyntaxStyle>()
   let current: SyntaxStyle | undefined
 
   const release = (style: SyntaxStyle) => {
     retained.add(style)
-    void renderer
-      .idle()
-      .catch(() => {})
-      .finally(() => {
-        if (!retained.delete(style)) return
-        style.destroy()
-      })
+    const destroy = () => {
+      if (!retained.delete(style)) return
+      style.destroy()
+    }
+    if (renderer.isDestroyed) {
+      destroy()
+      return
+    }
+    // Code, markdown and diff renderables keep reading the previous style until the next
+    // frame rebinds them (markdown rebinds its code blocks in that frame's lifecycle pass),
+    // so the native style has to outlive it. `renderer.idle()` can settle before that frame
+    // when nothing is scheduled, destroying a style the renderables still hold (#371).
+    // The FRAME event of a frame already in flight at release time carries the frameId the
+    // renderer had when the style was released, and that frame can still read the style -
+    // wait for a strictly later frame (#371 review).
+    const releasedAt = renderer.frameId
+    const frame = (event: CliRendererFrameEvent) => {
+      if (event.frameId <= releasedAt) return
+      renderer.off(CliRenderEvents.FRAME, frame)
+      destroy()
+    }
+    renderer.on(CliRenderEvents.FRAME, frame)
+    renderer.requestRender()
   }
 
   onCleanup(() => {
@@ -325,7 +350,7 @@ export function createSyntaxStyleMemo(factory: () => SyntaxStyle) {
 
   return createMemo(() => {
     const previous = current
-    current = factory()
+    current = factory(renderer.nativeScene)
     if (previous) release(previous)
     return current
   })

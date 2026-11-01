@@ -31,6 +31,7 @@ import { ToastProvider } from "../../src/ui/toast"
 import { DialogProvider } from "../../src/ui/dialog"
 import { OpencodeKeymapProvider, registerOpencodeKeymap } from "../../src/keymap"
 import { Prompt } from "../../src/component/prompt"
+import { captureFrame } from "../fixture/frame"
 
 /**
  * Regression test for the prompt status indicator.
@@ -66,7 +67,7 @@ async function observeBlink(app: Setup, timeout = 8_000) {
   let on: string | undefined
   let off: string | undefined
   while (Date.now() - start < timeout) {
-    const row = statusRow(app.captureCharFrame())
+    const row = statusRow(await captureFrame(app))
     if (row.includes("■") && on === undefined) on = row
     if (on !== undefined && !row.includes("■")) off = row
     if (on !== undefined && off !== undefined) return { on, off }
@@ -179,7 +180,7 @@ describe("prompt status indicator", () => {
       await ready
       await waitUntil(() => sync.status === "complete")
       await app.renderOnce()
-      expect(statusRow(app.captureCharFrame())).toBe("")
+      expect(statusRow(await captureFrame(app))).toBe("")
 
       const event: GlobalEvent = {
         directory,

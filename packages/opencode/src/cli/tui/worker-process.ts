@@ -1,4 +1,5 @@
 import path from "path"
+import { adoptWorkerProcess } from "@/cli/tui/win-job"
 
 export type WorkerExit = {
   code: number | null
@@ -12,6 +13,8 @@ type WorkerMessageTarget = {
 }
 
 type Subprocess = {
+  /** Spawned PID, used to hand the child to the owner's kill-on-close job. */
+  readonly pid?: number
   readonly exitCode: number | null
   readonly signalCode: string | number | null
   readonly exited: Promise<number>
@@ -26,6 +29,8 @@ type SpawnOptions = {
   stdin?: "ignore"
   stdout?: "ignore" | "inherit"
   stderr?: "ignore" | "inherit"
+  /** Run the worker in its own process group (POSIX only). */
+  detached?: boolean
   ipc: (message: string) => void
 }
 
@@ -56,10 +61,30 @@ export interface WorkerProcessOptions {
   cwd?: string
   env?: Record<string, string>
   maxRestarts?: number
+  /**
+   * Spawn the worker in its own process group (POSIX only, ignored on
+   * Windows). Terminal job-control signals — SIGTSTP from Ctrl+Z, SIGINT from
+   * Ctrl+C, SIGHUP when the terminal closes — are delivered to the foreground
+   * process group; a detached worker does not share it, so the UI can be
+   * suspended or signalled without pausing or killing in-flight work. The
+   * worker no longer dies from those signals either, so the owner must
+   * terminate it explicitly (see `terminate`) and the worker watches its
+   * parent's liveness to avoid outliving a dead owner.
+   */
+  detached?: boolean
   onRestart?: () => void | Promise<void>
   onExit?: (exit: WorkerExit) => void | Promise<void>
   log?: (message: string) => void
   spawn?: Spawn
+  /** Thread-mode worker factory (tests). Defaults to the global Worker. */
+  spawnWorker?: (target: string, init: { env?: Record<string, string> }) => ThreadWorkerLike
+  /** Thread-mode bootstrap watchdog timeout in ms (tests). Default 10_000. */
+  bootstrapTimeoutMs?: number
+  /**
+   * Parent-side owner-death hook for every spawned subprocess, restarts
+   * included (tests). Defaults to the win32 kill-on-close job object.
+   */
+  adoptWorker?: (pid: number | undefined, log: (message: string) => void) => void
 }
 
 /**
@@ -98,6 +123,7 @@ export function createWorkerProcess(target: string, options: WorkerProcessOption
   const spawn = options.spawn ?? ((command, spawnOptions) => Bun.spawn(command, spawnOptions))
   const maxRestarts = options.maxRestarts ?? MAX_RESTARTS
   const log = options.log ?? console.error
+  const adoptWorker = options.adoptWorker ?? adoptWorkerProcess
 
   let current: Subprocess | undefined
   let stopping = false
@@ -113,6 +139,10 @@ export function createWorkerProcess(target: string, options: WorkerProcessOption
   // crashes fan their waiters out to the matching cycles.
   let openCycles: RestartCycle[] = []
   let queuedWaiters: RestartWaiter[] = []
+  // Set once the worker exits with no restart following (clean exit, spent
+  // restart budget, or shutdown): later waitForRestart calls reject
+  // immediately instead of queueing for a cycle that can never start.
+  let terminalExit: WorkerExit | undefined
   let resolveClosed!: (exit: WorkerExit) => void
   const closed = new Promise<WorkerExit>((resolve) => {
     resolveClosed = resolve
@@ -129,6 +159,10 @@ export function createWorkerProcess(target: string, options: WorkerProcessOption
   transport.onclose = null
   transport.waitForRestart = () => {
     const waiter = new Promise<void>((resolve, reject) => {
+      if (terminalExit) {
+        reject(new Error(`Bun worker exited with ${describeExit(terminalExit)}; no restart will follow`))
+        return
+      }
       const open = openCycles[0]
       if (open) open.waiters.push({ resolve, reject })
       else queuedWaiters.push({ resolve, reject })
@@ -154,6 +188,16 @@ export function createWorkerProcess(target: string, options: WorkerProcessOption
   }
 
   const finish = (exit: WorkerExit) => {
+    terminalExit = exit
+    // No restart follows (clean exit, shutdown, or the restart budget is
+    // spent): settle every pending restart waiter instead of leaving it
+    // queued forever. A waiter that hangs past its caller's patience turns
+    // a diagnosable exhausted-budget exit into a silent deadlock (#468).
+    const stranded = [...openCycles, { waiters: queuedWaiters }]
+    openCycles = []
+    queuedWaiters = []
+    const error = new Error(`Bun worker exited with ${describeExit(exit)}; no restart will follow`)
+    for (const cycle of stranded) for (const waiter of cycle.waiters) waiter.reject(error)
     resolveClosed(exit)
     if (stopping) return
     void Promise.resolve()
@@ -170,10 +214,16 @@ export function createWorkerProcess(target: string, options: WorkerProcessOption
       stdin: "ignore",
       stdout: "ignore",
       stderr: "inherit",
+      detached: options.detached,
       ipc(message) {
         transport.onmessage?.({ data: message } as MessageEvent<string>)
       },
     })
+
+    // Parent-side owner-death guard. Windows cannot rely on the worker's own
+    // watchdog, so the owner puts the child in a job object the OS tears down
+    // with the owner (#442). No-op on every other platform.
+    adoptWorker(current.pid, log)
 
     const child = current
     void child.exited.then((code) => {
@@ -236,41 +286,93 @@ export function createWorkerProcess(target: string, options: WorkerProcessOption
  * on failure: report the exit and let the caller observe it like any other
  * dead backend.
  */
-function createThreadWorker(target: string, options: WorkerProcessOptions = {}): WorkerProcess {
-  const worker = new Worker(target, {
+type ThreadWorkerLike = {
+  postMessage(data: string): void
+  terminate(): void | Promise<void>
+  onmessage: ((event: MessageEvent<string>) => void) | null
+  onerror: ((event: unknown) => void) | null
+}
+
+export function createThreadWorker(target: string, options: WorkerProcessOptions = {}): WorkerProcess {
+  const spawnWorker =
+    options.spawnWorker ?? ((t: string, init: { env?: Record<string, string> }) => new Worker(t, init) as unknown as ThreadWorkerLike)
+  const worker = spawnWorker(target, {
     env: options.env,
   })
   const log = options.log ?? console.error
+
+  let resolveClosed!: (exit: WorkerExit) => void
+  const closed = new Promise<WorkerExit>((resolve) => {
+    resolveClosed = resolve
+  })
+  // terminate() settles closed itself: a clean thread shutdown never fires
+  // onerror, so resolving closed only there used to hang it forever and leak
+  // the onExit hook (#401). onerror now covers abnormal ends only, once.
+  let finished = false
+  const finish = (exit: WorkerExit) => {
+    if (finished) return
+    finished = true
+    resolveClosed(exit)
+    void Promise.resolve()
+      .then(() => options.onExit?.(exit))
+      .catch((error) => {
+        log(`[silvercode] worker exit hook failed: ${error instanceof Error ? error.message : String(error)}`)
+      })
+  }
 
   const transport = {} as WorkerProcess
   Object.defineProperties(transport, {
     closed: {
       enumerable: true,
-      value: new Promise<WorkerExit>((resolve) => {
-        worker.onerror = () => resolve({ code: 1, signal: null })
-      }),
+      value: closed,
     },
   })
   transport.postMessage = (data) => {
     worker.postMessage(data)
   }
+  // A thread shares the owner's process: there is no signal channel, only
+  // terminate(). Explicit no-op so the WorkerProcess contract holds.
   transport.signal = () => {}
   transport.terminate = async () => {
-    worker.terminate()
+    // Bun's Worker.terminate resolves after the thread finishes flushing;
+    // awaiting it keeps in-flight RPC emits from being cut off (#401).
+    clearTimeout(bootTimer)
+    await worker.terminate()
+    finish({ code: 0, signal: null })
   }
   transport.waitForRestart = () => Promise.resolve()
 
+  // Bootstrap watchdog (#398): the thread worker's identity depends on
+  // SILVERCODE_TUI_WORKER surviving into the thread's env, which Bun's
+  // Worker env option does not guarantee. If the thread never registers its
+  // RPC listener it also never emits a message, and the parent's first RPC
+  // call would hang forever. Any first message (the worker.ready beacon or
+  // a global event) proves bootstrap; otherwise fail fast with a clear
+  // error instead of a silent hang.
+  let booted = false
+  const bootTimer = setTimeout(() => {
+    if (booted) return
+    transport.onclose?.(
+      new Error(
+        "Bun worker bootstrap timed out: the thread never registered its RPC listener (worker identity env did not propagate)",
+      ),
+    )
+    void worker.terminate()
+    finish({ code: 1, signal: null })
+  }, options.bootstrapTimeoutMs ?? 10_000)
+
   worker.onmessage = (evt) => {
+    if (!booted) {
+      booted = true
+      clearTimeout(bootTimer)
+    }
     transport.onmessage?.({ data: evt.data as string } as MessageEvent<string>)
   }
   worker.onerror = (event) => {
+    clearTimeout(bootTimer)
     const message = event instanceof MessageEvent ? String(event.data ?? "unknown worker error") : "unknown worker error"
     transport.onclose?.(new Error(`Bun worker exited with error: ${message}`))
-    void Promise.resolve()
-      .then(() => options.onExit?.({ code: 1, signal: null }))
-      .catch((error) => {
-        log(`[silvercode] worker exit hook failed: ${error instanceof Error ? error.message : String(error)}`)
-      })
+    finish({ code: 1, signal: null })
   }
   return transport
 }
@@ -290,11 +392,21 @@ export function createTuiWorker(target: string, options: WorkerProcessOptions = 
     // (`Rpc.listenProcess`) — there is no `process.send` in a thread, so
     // worker.ts picks the thread transport from that absence.
     SILVERCODE_TUI_WORKER: "1",
+    // Owner PID for the worker's liveness watchdog: a detached child cannot
+    // trust `process.ppid` (Bun may parent it under an intermediate reaper),
+    // so the owner passes its identity down explicitly. See owner-watch.ts.
+    SILVERCODE_TUI_WORKER_OWNER_PID: String(process.pid),
   }
   if (compiled) {
     return createThreadWorker(target, { ...options, env })
   }
-  return createWorkerProcess(target, { ...options, env })
+  // A suspended UI must not pause in-flight work: keep the worker out of the
+  // terminal's foreground process group so job-control signals (Ctrl+Z's
+  // SIGTSTP, terminal close's SIGHUP, Ctrl+C's SIGINT) reach only the UI.
+  // Windows has no process-group job control — the console delivers Ctrl+C to
+  // every attached process and `terminal.suspend` is win32-disabled — so the
+  // existing console semantics stay untouched there.
+  return createWorkerProcess(target, { ...options, env, detached: process.platform !== "win32" })
 }
 
 export function isWorkerCrash(signal: string | number | null, code: number | null) {

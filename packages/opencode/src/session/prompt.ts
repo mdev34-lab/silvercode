@@ -15,6 +15,7 @@ import { type Tool as AITool, tool, jsonSchema } from "ai"
 import type { JSONSchema7 } from "@ai-sdk/provider"
 import { SessionCompaction } from "./compaction"
 import { SystemPrompt } from "./system"
+import { Workdir } from "./workdir"
 import { Instruction } from "./instruction"
 import { Plugin } from "../plugin"
 import { MAX_STEPS_PROMPT } from "@opencode-ai/core/session/runner/max-steps"
@@ -24,6 +25,13 @@ import { MCP } from "../mcp"
 import { LSP } from "@/lsp/lsp"
 import { ulid } from "ulid"
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process"
+
+// User `!` shell commands: live output is flushed as a bounded tail preview at
+// a bounded rate; after the process exits, streaming stops once the output has
+// been quiet for this window (a detached descendant can hold stdio open).
+const BANG_STREAM_PREVIEW_BYTES = 64 * 1024
+const BANG_STREAM_FLUSH_MS = 100
+const BANG_STREAM_QUIET = "500 millis"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import * as Stream from "effect/Stream"
 import { Command } from "../command"
@@ -37,6 +45,7 @@ import { PASTE_INLINE_MAX_BYTES, pastePreview, writePasteFile } from "./paste-fi
 import { Tool } from "@/tool/tool"
 import { Permission } from "@/permission"
 import { SessionStatus } from "./status"
+import { isRecord } from "@/util/record"
 import { LLM } from "./llm"
 import { Shell } from "@opencode-ai/core/shell"
 import { ShellID } from "@/tool/shell/id"
@@ -45,11 +54,20 @@ import { Truncate } from "@/tool/truncate"
 import { Image } from "@/image/image"
 import { decodeDataUrl } from "@/util/data-url"
 import { Process } from "@/util/process"
-import { Cause, Effect, Exit, Latch, Layer, Option, Scope, Context, Schema, Types } from "effect"
+import { Cause, DateTime, Effect, Exit, Fiber, Latch, Layer, Option, Scope, Context, Schema, Types } from "effect"
 import { InstanceState } from "@/effect/instance-state"
 import { TaskTool, type TaskPromptOps } from "@/tool/task"
 import { FinishTool, readTermination } from "@/tool/finish"
 import PROMPT_REVIEW_LOOP from "./prompt/review-loop.txt"
+import { declaresFileWrites } from "@opencode-ai/core/review-loop"
+
+// The todo scope contract is always sent. The Review Loop policy and the effort
+// block are a nudge that appears once the session has written files; before
+// that, `finish` (the enforcement checkpoint) carries the same requirement in
+// its description and decline feedback, so the gate is unchanged.
+const REVIEW_LOOP_SPLIT = PROMPT_REVIEW_LOOP.indexOf("## Review Loop")
+const PROMPT_SCOPE_CONTRACT = PROMPT_REVIEW_LOOP.slice(0, REVIEW_LOOP_SPLIT).trimEnd()
+const PROMPT_REVIEW_POLICY = PROMPT_REVIEW_LOOP.slice(REVIEW_LOOP_SPLIT)
 import FINISH_NUDGE from "./prompt/finish-nudge.txt"
 import { AgentEffort } from "@opencode-ai/schema/agent-effort"
 import REVIEW_STAGNATION_NUDGE from "./prompt/review-stagnation-nudge.txt"
@@ -57,6 +75,8 @@ import { ReviewStagnation } from "./review-stagnation"
 import { SessionRunState } from "./run-state"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { EventV2Bridge } from "@/event-v2-bridge"
+import { SessionEvent } from "@opencode-ai/schema/session-event"
+import { ContextReduction } from "./context-reduction"
 import { Database } from "@opencode-ai/core/database/database"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { ProviderV2 } from "@opencode-ai/core/provider"
@@ -98,17 +118,20 @@ const SUPPORTED_MCP_RESOURCE_ATTACHMENT_MIMES = new Set([
 const EFFORT_PROCESS: Record<AgentEffort.Level, string> = {
   fast: [
     "## Agent effort: fast (review passes: off, validation gate: minimal)",
-    "No independent review is required for this turn's work: self-check inline and finish when done. Declare minimal validation evidence (syntax/smoke where applicable) on finish. Deliver with an honest unreviewed status unless an independent review actually happened — finish never upgrades an unreviewed result to approved.",
+    "No independent review is required: self-check inline and finish. Declare minimal validation evidence on finish. The result is delivered as unreviewed unless a review actually happened; finish never upgrades it to approved.",
   ].join("\n\n"),
   medium: [
     "## Agent effort: medium (review passes: at most 2, validation gate: standard)",
-    'For work that changes files, finish requires at least one independent synchronous review (`subagent_type: "review"`, `background: false`) before delivery when a reviewer can run. Only blocking findings (Critical/Important, or a Needs-fixes report with no findings) or work landed after the last review require another pass, bounded by two completed passes; minor findings are logged, not re-litigated. After the budget, finish delivers with an honest exhausted/findings-open status rather than looping, and repeated finish calls never skip a required review. Declare standard validation evidence (relevant tests) on finish.',
+    'For work that changes files, an independent synchronous review is expected before finish (without one, finish delivers the result labelled UNREVIEWED, never approved) (`subagent_type: "review"`, `background: false`) when a reviewer can run. Only blocking findings (Critical/Important, or a Needs-fixes report with no findings) or work landed after the last review need another pass, bounded by two; minor findings are logged. After the budget, finish delivers with an honest exhausted/findings-open status. A Review with blocking findings holds finish back until fixed. Declare standard validation evidence (relevant tests) on finish.',
   ].join("\n\n"),
   thorough: [
     "## Agent effort: thorough (review passes: until clean, validation gate: full)",
-    "Finish keeps declining until a clean, current independent review exists: address blocking findings and re-review; any write after an approved review makes the tree stale and needs a fresh pass. There is no pass cap. If the reviewer genuinely cannot run, a successful finish remains blocked; only a declared failure can deliver as review-blocked, while a depth-limited child hands its unreviewed writes to its parent as review-pending. Neither outcome is approval. Declare full validation evidence (tests, typecheck, parity as applicable) on finish; incomplete or failed evidence is reported honestly.",
+    "Aim for a clean, current independent review: fix blocking findings and re-review; any write after an approval needs a fresh pass. No pass cap. Without one (or if the reviewer cannot run), finish delivers the result labelled UNREVIEWED, never approved; known blocking findings hold finish back until fixed. Declare full validation evidence (tests, typecheck, parity as applicable) on finish.",
   ].join("\n\n"),
 }
+
+/** Wall-clock bound for a custom command's `!` template block. */
+const SHELL_BLOCK_TIMEOUT_MS = 60_000
 
 const STRUCTURED_OUTPUT_DESCRIPTION = `Use this tool to return your final response in the requested structured format.
 
@@ -617,16 +640,45 @@ const layer = Layer.effect(
                 forceKillAfter: "3 seconds",
               })
               const handle = yield* spawner.spawn(cmd)
-              yield* Stream.runForEach(Stream.decodeText(handle.all), (chunk) =>
-                Effect.gen(function* () {
-                  output += chunk
-                  if (part.state.status === "running") {
-                    part.state.metadata = { output }
-                    yield* sessions.updatePart(part)
-                  }
-                }),
+              // Keep the UI responsive under heavy commands; see the shell tool.
+              try {
+                os.setPriority(handle.pid, os.constants.priority.PRIORITY_BELOW_NORMAL)
+              } catch {}
+              let bytes = 0
+              let preview = ""
+              let lastFlush = 0
+              const collect = yield* Effect.forkScoped(
+                Stream.runForEach(Stream.decodeText(handle.all), (chunk) =>
+                  Effect.gen(function* () {
+                    bytes += chunk.length
+                    output += chunk
+                    preview = (preview + chunk).slice(-BANG_STREAM_PREVIEW_BYTES)
+                    // Re-persisting and re-emitting the whole output per chunk is
+                    // O(n^2) on verbose commands; flush a bounded preview at a
+                    // bounded rate instead. The final update keeps everything.
+                    const now = Date.now()
+                    if (part.state.status === "running" && now - lastFlush >= BANG_STREAM_FLUSH_MS) {
+                      lastFlush = now
+                      part.state.metadata = { output: preview }
+                      yield* sessions.updatePart(part)
+                    }
+                  }),
+                ),
               )
-              yield* handle.exitCode
+              // Do not wait for stdio EOF: a detached descendant can hold the
+              // inherited pipes open forever. Wait for the process to exit,
+              // then stop once the output has been quiet for a short window.
+              // A signal death fails `exitCode` by design; the command still ran.
+              yield* handle.exitCode.pipe(Effect.catch(() => Effect.succeed(null)))
+              const settle = Effect.gen(function* () {
+                let seen = bytes
+                while (true) {
+                  yield* Effect.sleep(BANG_STREAM_QUIET)
+                  if (bytes === seen) return
+                  seen = bytes
+                }
+              })
+              yield* Effect.raceAll([Fiber.join(collect).pipe(Effect.ignore), settle])
             }).pipe(Effect.scoped, Effect.orDie),
           ).pipe(Effect.exit)
 
@@ -1175,9 +1227,17 @@ const layer = Layer.effect(
       return { info, parts }
     }, Effect.scoped)
 
-    const prompt: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error> = Effect.fn(
-      "SessionPrompt.prompt",
-    )(function* (input: PromptInput) {
+    const promptWithEpoch = Effect.fn("SessionPrompt.prompt")(function* (
+      input: PromptInput,
+      initialEpoch?: number,
+    ) {
+      // A prompt submitted right after ESC can race with the abort's epoch bump.
+      // If a cancel is still settling, wait for it before capturing the epoch so
+      // the new prompt is not poisoned by the previous run's cancellation and
+      // instead starts a clean run. Prompts already in-flight before the cancel
+      // keep their original epoch and are correctly treated as cancelled.
+      if (initialEpoch === undefined) yield* state.awaitCancel(input.sessionID)
+      const epoch = initialEpoch ?? (yield* state.cancelEpoch(input.sessionID))
       const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
       yield* revert.cleanup(session)
       const message = yield* createUserMessage(input)
@@ -1193,8 +1253,11 @@ const layer = Layer.effect(
       }
 
       if (input.noReply === true) return message
-      return yield* loop({ sessionID: input.sessionID })
+      return yield* loopWithEpoch({ sessionID: input.sessionID, messageID: message.info.id }, epoch)
     })
+
+    const prompt: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error> = (input) =>
+      promptWithEpoch(input)
 
     const lastAssistant = Effect.fnUntraced(function* (sessionID: SessionID) {
       const match = yield* sessions.findMessage(sessionID, (m) => m.info.role !== "user").pipe(Effect.orDie)
@@ -1202,6 +1265,38 @@ const layer = Layer.effect(
       const msgs = yield* sessions.messages({ sessionID, limit: 1 }).pipe(Effect.orDie)
       if (msgs.length > 0) return msgs[0]
       throw new Error("Impossible")
+    })
+
+    const abortedResult = Effect.fnUntraced(function* (input: LoopInput) {
+      const messageID = input.messageID
+      if (!messageID) return yield* lastAssistant(input.sessionID)
+      const existing = yield* sessions
+        .findMessage(input.sessionID, (m) => m.info.role === "assistant" && m.info.parentID === messageID)
+        .pipe(Effect.orDie)
+      if (Option.isSome(existing)) return existing.value
+      const user = yield* sessions.findMessage(input.sessionID, (m) => m.info.id === messageID).pipe(Effect.orDie)
+      if (Option.isNone(user) || user.value.info.role !== "user") return yield* lastAssistant(input.sessionID)
+
+      const ctx = yield* InstanceState.context
+      const now = Date.now()
+      const info: SessionV1.Assistant = {
+        id: MessageID.ascending(),
+        parentID: messageID,
+        role: "assistant",
+        mode: user.value.info.agent,
+        agent: user.value.info.agent,
+        variant: user.value.info.model.variant,
+        path: { cwd: ctx.directory, root: ctx.worktree },
+        cost: 0,
+        tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+        modelID: user.value.info.model.modelID,
+        providerID: user.value.info.model.providerID,
+        time: { created: now, completed: now },
+        sessionID: input.sessionID,
+        error: new SessionV1.AbortedError({ message: "Aborted" }).toObject(),
+      }
+      yield* sessions.updateMessage(info)
+      return { info, parts: [] }
     })
 
     // Hard backstop for a review that ignored the recovery nudge (issue #176).
@@ -1431,9 +1526,16 @@ const layer = Layer.effect(
                 })
                 break
               }
-              if (finishNudges >= MAX_FINISH_NUDGES) {
+              // A review agent in an active stagnation run gets one slot past the
+              // generic budget: the #171 protocol spends a generic nudge before the
+              // recovery nudge, and the #176 backstop needs one more generation to
+              // honor it. Capping at the generic count would kill the run one nudge
+              // before the backstop (or the model's own finish) can end it. The
+              // flow stays strictly bounded either way.
+              const maxNudges = MAX_FINISH_NUDGES + (stagnated ? 1 : 0)
+              if (finishNudges >= maxNudges) {
                 const error = new NamedError.Unknown({
-                  message: `The assistant did not complete the required finish tool after ${MAX_FINISH_NUDGES} nudges. The turn was stopped to prevent an unbounded continuation loop. Set agent.<name>.finishTool to false for agents that must end turns without finish.`,
+                  message: `The assistant did not complete the required finish tool after ${maxNudges} nudges. The turn was stopped to prevent an unbounded continuation loop. Set agent.<name>.finishTool to false for agents that must end turns without finish.`,
                 }).toObject()
                 yield* sessions.updateMessage({
                   ...lastAssistant,
@@ -1601,6 +1703,8 @@ const layer = Layer.effect(
               messages: msgs,
               promptOps,
             }).pipe(
+              Effect.provideService(Session.Service, sessions),
+              Effect.provideService(Agent.Service, agents),
               Effect.provideService(Plugin.Service, plugin),
               Effect.provideService(Permission.Service, permission),
               Effect.provideService(ToolRegistry.Service, registry),
@@ -1625,13 +1729,13 @@ const layer = Layer.effect(
 
             yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
 
-            const [skills, env, instructions, mcpInstructions, toolOverview, modelMsgs] = yield* Effect.all([
+            const [skills, env, instructions, mcpInstructions, toolOverview, delegation] = yield* Effect.all([
               sys.skills(agent),
-              sys.environment(model),
+              sys.environment(model, Workdir.of(session)),
               instruction.system().pipe(Effect.orDie),
               sys.mcp(agent, session.permission),
               catalog.overview(session.id),
-              MessageV2.toModelMessagesEffect(msgs, model),
+              sys.delegation(agent, session.permission),
             ])
             const isDefaultPrimary = yield* agents
               .defaultInfo()
@@ -1642,19 +1746,61 @@ const layer = Layer.effect(
             const effortConfig = yield* config.get()
             const configEffort = typeof effortConfig.agent?.effort === "string" ? effortConfig.agent.effort : undefined
             const effort = AgentEffort.resolve(readAgentEffort(session.metadata), AgentEffort.resolve(configEffort))
+            // Compaction can drop the write markers from the visible history, so a
+            // compacted session keeps the policy on: it was long enough to compact.
+            const sessionWroteFiles = msgs.some(
+              (msg) =>
+                (msg.info.role === "assistant" && msg.info.summary === true) ||
+                msg.parts.some(
+                  (part) =>
+                    part.type === "compaction" || declaresFileWrites(part as Parameters<typeof declaresFileWrites>[0]),
+                ),
+            )
             const system = [
               ...env,
               ...instructions,
               ...(mcpInstructions ? [mcpInstructions] : []),
               ...(toolOverview ? [toolOverview] : []),
               ...(skills ? [skills] : []),
-              ...(isDefaultPrimary ? [PROMPT_REVIEW_LOOP] : []),
+              ...(delegation ? [delegation] : []),
+              ...(isDefaultPrimary ? [PROMPT_SCOPE_CONTRACT] : []),
+              ...(isDefaultPrimary && sessionWroteFiles ? [PROMPT_REVIEW_POLICY] : []),
               // Reviewer sessions keep their own structured-report contract and
               // must not recursively review themselves.
-              ...(isReviewAgent(agent.name) ? [] : [EFFORT_PROCESS[effort]]),
+              ...(isReviewAgent(agent.name) || !sessionWroteFiles ? [] : [EFFORT_PROCESS[effort]]),
+              // Think scales research depth and candidate count by effort, but it does
+              // not write code, so the write-gated process line above rarely reaches
+              // it. Surface the bare level whenever the process line did not fire.
+              ...(agent.name === "think" && (isReviewAgent(agent.name) || !sessionWroteFiles)
+                ? [`## Agent effort: ${effort}`]
+                : []),
             ]
             const format = lastUser.format ?? { type: "text" as const }
             if (format.type === "json_schema") system.push(STRUCTURED_OUTPUT_SYSTEM_PROMPT)
+            // Dynamic context reduction: the model sees a projection of the history, sized against
+            // the real request (system prompt and tool definitions included). Canonical history is
+            // untouched; the report is published for clients to render.
+            const reduction = ContextReduction.reduce({
+              messages: msgs,
+              envelope: {
+                system,
+                tools: Object.entries(tools).map(([name, tool]) => ({
+                  name,
+                  description: (tool as { description?: string }).description,
+                })),
+                extra: isLastStep ? [MAX_STEPS_PROMPT] : [],
+              },
+              model,
+              config: effortConfig.context,
+            })
+            yield* events
+              .publish(SessionEvent.Context.Prepared, {
+                sessionID,
+                timestamp: yield* DateTime.now,
+                ...reduction.report,
+              })
+              .pipe(Effect.ignore)
+            const modelMsgs = yield* MessageV2.toModelMessagesEffect([...reduction.messages], model)
             const result = yield* handle.process({
               user: effectiveUser,
               agent,
@@ -1730,11 +1876,101 @@ const layer = Layer.effect(
       },
     )
 
-    const loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.loop")(function* (
-      input: LoopInput,
-    ) {
-      return yield* state.ensureRunning(input.sessionID, lastAssistant(input.sessionID), runLoop(input.sessionID))
+    // A crash mid-run leaves tool parts marked pending/running, text and
+    // reasoning parts without an end time, and assistant messages without a
+    // completion time, with no surviving fiber or background job to settle
+    // them (#411). Runners serialize per session, so when a run exits nothing
+    // in this process can still own those parts: settle them so replay,
+    // transport and status never rehydrate them as active forever.
+    const settleOrphanedParts = Effect.fn("SessionPrompt.settleOrphanedParts")(function* (sessionID: SessionID) {
+      const msgs = yield* sessions.messages({ sessionID }).pipe(Effect.catch(() => Effect.succeed(null)))
+      if (!msgs) return
+      const now = Date.now()
+      for (const msg of msgs) {
+        // Only assistant messages: user text parts never carry a time in
+        // normal flow, and touching them would re-publish them as updates.
+        if (msg.info.role !== "assistant") continue
+        for (const part of msg.parts) {
+          if (part.type === "tool" && (part.state.status === "pending" || part.state.status === "running")) {
+            const metadata = "metadata" in part.state && isRecord(part.state.metadata) ? part.state.metadata : {}
+            yield* sessions
+              .updatePart({
+                ...part,
+                state: {
+                  ...part.state,
+                  status: "error",
+                  error: "Tool execution aborted",
+                  metadata: { ...metadata, interrupted: true },
+                  time: { start: "time" in part.state ? part.state.time.start : now, end: now },
+                },
+              } as SessionV1.Part)
+              .pipe(Effect.catch((error) => Effect.logWarning("failed to settle orphaned tool part", { error })))
+            continue
+          }
+          if ((part.type === "text" || part.type === "reasoning") && part.time?.end === undefined) {
+            yield* sessions
+              .updatePart({
+                ...part,
+                recovery: "orphaned",
+                time: { start: part.time?.start ?? now, end: now },
+              } as SessionV1.Part)
+              .pipe(Effect.catch((error) => Effect.logWarning("failed to settle orphaned text part", { error })))
+          }
+        }
+        if (msg.info.role === "assistant" && msg.info.time.completed === undefined) {
+          yield* sessions
+            .updateMessage({ ...msg.info, time: { ...msg.info.time, completed: now } })
+            .pipe(Effect.catch((error) => Effect.logWarning("failed to settle orphaned message", { error })))
+        }
+      }
     })
+
+    const loopWithEpoch = Effect.fn("SessionPrompt.loop")(function* (input: LoopInput, initialEpoch?: number) {
+      // A loop call arriving while another run is active joins that run and
+      // its own runLoop work never executes (the runner keeps a single run),
+      // so the caller's freshly persisted user message could stay unanswered
+      // while the caller received the old run's result (#410). Re-enter until
+      // a run has actually answered this caller's message; if a newer user
+      // message overtook it and got answered instead, return the latest state
+      // rather than spinning on a superseded prompt.
+      // A cancel that happens while a prompt/command is preparing or while this
+      // caller is waiting to (re-)enter the loop must not be followed by a fresh
+      // run: cancel releases callers already submitted to the session.
+      const epoch = initialEpoch ?? (yield* state.cancelEpoch(input.sessionID))
+      let last: SessionV1.WithParts | undefined
+      while (true) {
+        if ((yield* state.cancelEpoch(input.sessionID)) !== epoch) {
+          yield* state.awaitCancel(input.sessionID)
+          return last ?? (yield* abortedResult(input))
+        }
+        const result = yield* state.ensureRunning(
+          input.sessionID,
+          lastAssistant(input.sessionID),
+          runLoop(input.sessionID).pipe(Effect.ensuring(settleOrphanedParts(input.sessionID))),
+        )
+        last = result
+        if (!input.messageID || (result.info.role === "assistant" && result.info.parentID === input.messageID))
+          return result
+        // Checked before every other re-entry path: once the run this caller joined was
+        // cancelled, no queued prompt (this one or a newer one) may start a fresh run.
+        if ((yield* state.cancelEpoch(input.sessionID)) !== epoch) {
+          yield* state.awaitCancel(input.sessionID)
+          return result
+        }
+
+        const msgs = yield* sessions
+          .messages({ sessionID: input.sessionID })
+          .pipe(Effect.catch(() => Effect.succeed(null)))
+        if (!msgs) return result
+        const ours = msgs.findIndex((msg) => msg.info.id === input.messageID)
+        const newerUser = msgs.slice(ours + 1).find((msg) => msg.info.role === "user")
+        if (!newerUser) continue
+        const superseded = msgs.some((msg) => msg.info.role === "assistant" && msg.info.parentID === newerUser.info.id)
+        if (superseded) return result
+      }
+    })
+
+    const loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts> = (input) => loopWithEpoch(input)
 
     const shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError> = Effect.fn(
       "SessionPrompt.shell",
@@ -1744,6 +1980,8 @@ const layer = Layer.effect(
     })
 
     const command = Effect.fn("SessionPrompt.command")(function* (input: CommandInput) {
+      yield* state.awaitCancel(input.sessionID)
+      const epoch = yield* state.cancelEpoch(input.sessionID)
       yield* Effect.logInfo("command", {
         "session.id": input.sessionID,
         command: input.command,
@@ -1790,7 +2028,18 @@ const layer = Layer.effect(
         const sh = Shell.preferred(cfg.shell)
         const results = yield* Effect.promise(() =>
           Promise.all(
-            shellMatches.map(async ([, cmd]) => (await Process.text([cmd], { shell: sh, nothrow: true })).text),
+            shellMatches.map(
+              async ([, cmd]) =>
+                // A `!` block that hangs would wedge command expansion forever;
+                // kill it instead and let nothrow surface the failure as text.
+                (
+                  await Process.text([cmd], {
+                    shell: sh,
+                    nothrow: true,
+                    abort: AbortSignal.timeout(SHELL_BLOCK_TIMEOUT_MS),
+                  })
+                ).text,
+            ),
           ),
         )
         let index = 0
@@ -1853,14 +2102,18 @@ const layer = Layer.effect(
         { parts },
       )
 
-      const result = yield* prompt({
-        sessionID: input.sessionID,
-        messageID: input.messageID,
-        model: userModel,
-        agent: userAgent,
-        parts,
-        variant: input.variant,
-      })
+      const result = yield* promptWithEpoch(
+        {
+          sessionID: input.sessionID,
+          messageID: input.messageID,
+          model: userModel,
+          agent: userAgent,
+          parts,
+          variant: input.variant,
+        },
+        epoch,
+      )
+      if ((yield* state.cancelEpoch(input.sessionID)) !== epoch) return result
       yield* events.publish(Command.Event.Executed, {
         name: input.command,
         sessionID: input.sessionID,
@@ -1914,6 +2167,9 @@ export type PromptInput = Schema.Schema.Type<typeof PromptInput>
 
 export class LoopInput extends Schema.Class<LoopInput>("SessionPrompt.LoopInput")({
   sessionID: SessionID,
+  // The user message this loop call must answer; used to detect a joined run
+  // that never processed it (#410).
+  messageID: Schema.optional(MessageID),
 }) {}
 
 export const ShellInput = Schema.Struct({

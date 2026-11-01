@@ -5,6 +5,7 @@ import { testRender, useRenderer } from "@opentui/solid"
 import { onCleanup } from "solid-js"
 import type { AssistantMessage, GlobalEvent, Message, Part, ReasoningPart, ToolPart } from "@opencode-ai/sdk/v2"
 import { tmpdir } from "../../fixture/fixture"
+import { captureFrame, captureSpans, waitFor } from "../../fixture/frame"
 import { createTuiResolvedConfig } from "../../fixture/tui-runtime"
 import { createEventSource, createFetch, directory, json } from "../../fixture/tui-sdk"
 import { TestTuiContexts } from "../../fixture/tui-environment"
@@ -54,7 +55,6 @@ const COT_BODY = "Step one: inspect the files carefully."
 const STREAMED_BODY = "Second pass: verify the diff end to end."
 
 type Setup = Awaited<ReturnType<typeof testRender>>
-
 
 const setups: { app: Setup; dispose: () => Promise<void> }[] = []
 
@@ -221,24 +221,26 @@ async function mountSession(seedParts: Part[]) {
   return { app, events, keymap: () => keymapRef! }
 }
 
-async function waitFor<T>(app: Setup, probe: () => T | undefined, passes = 400): Promise<T> {
-  for (let pass = 0; pass <= passes; pass++) {
-    await app.renderOnce()
-    const value = probe()
-    if (value !== undefined) return value
-    await Bun.sleep(5)
-  }
-  throw new Error(`condition never settled:\n${app.captureCharFrame()}`)
-}
-
-function frameOf(app: Setup) {
-  return app.captureCharFrame()
+async function frameOf(app: Setup) {
+  return captureFrame(app)
 }
 
 // The reasoning body renders through the streaming markdown/code block, which
 // settles a frame or two after the store change, so read spans for it.
-function spansOf(app: Setup) {
-  const spans = app.captureSpans()
+async function spansOf(app: Setup, visible?: string) {
+  if (visible !== undefined) {
+    return waitFor(
+      app,
+      () => {
+        const spans = app.captureSpans()
+        const text = spans.lines.map((line) => line.spans.map((span) => span.text).join("")).join("\n")
+        return text.includes(visible) ? text : undefined
+      },
+      400,
+      `reasoning body did not paint: ${visible}`,
+    )
+  }
+  const spans = await captureSpans(app)
   return spans.lines.map((line) => line.spans.map((span) => span.text).join("")).join("\n")
 }
 
@@ -270,7 +272,7 @@ function deltaEvent(partID: string, delta: string, id: number): GlobalEvent {
 // Two completed tool calls put the reasoning inside a Working block; expand it
 // through the real header click so nested rows are on screen.
 async function expandWorkingBlock(app: Setup, keymap: () => OpenTuiKeymap) {
-  await waitFor(app, () => (frameOf(app).includes("tool call") ? frameOf(app) : undefined))
+  await waitFor(app, () => (app.captureCharFrame().includes("Ran 2 commands") ? app.captureCharFrame() : undefined))
   keymap().dispatchCommand("session.toggle.activity")
   await settle(app)
 }
@@ -281,21 +283,21 @@ describe("thinking toggle on CoT nested inside a Working block", () => {
     await expandWorkingBlock(app, keymap)
 
     // Hide mode keeps the nested block collapsed to its header.
-    const collapsed = spansOf(app)
+    const collapsed = await spansOf(app)
     expect(collapsed).toContain("+ Thought")
     expect(collapsed).not.toContain(COT_BODY)
 
     // /thinking expand must reveal the CoT of the already-rendered block.
     keymap().dispatchCommand("session.toggle.thinking")
     await settle(app)
-    const expanded = spansOf(app)
+    const expanded = await spansOf(app, COT_BODY)
     expect(expanded).toContain(COT_BODY)
     expect(expanded).not.toContain("+ Thought")
 
     // And /thinking again restores the collapsed header.
     keymap().dispatchCommand("session.toggle.thinking")
     await settle(app)
-    const restored = spansOf(app)
+    const restored = await spansOf(app)
     expect(restored).toContain("+ Thought")
     expect(restored).not.toContain(COT_BODY)
   })
@@ -322,7 +324,7 @@ describe("thinking toggle on CoT nested inside a Working block", () => {
     events.emit(deltaEvent("prt_late", STREAMED_BODY, 1))
     await settle(app)
     // The stream is still open, so the body is readable regardless of mode.
-    expect(spansOf(app)).toContain(STREAMED_BODY)
+    expect(await spansOf(app, STREAMED_BODY)).toContain(STREAMED_BODY)
 
     // The reasoning stream ends; hide mode collapses the completed block.
     events.emit(
@@ -339,32 +341,36 @@ describe("thinking toggle on CoT nested inside a Working block", () => {
       ),
     )
     await settle(app)
-    expect(spansOf(app)).not.toContain(STREAMED_BODY)
+    expect(await spansOf(app)).not.toContain(STREAMED_BODY)
 
     // The command's expanded state reaches the subsequently-rendered block.
     keymap().dispatchCommand("session.toggle.thinking")
     await settle(app)
-    expect(spansOf(app)).toContain(STREAMED_BODY)
+    expect(await spansOf(app, STREAMED_BODY)).toContain(STREAMED_BODY)
   })
 
   test("a manually expanded nested thought stays open across streaming updates", async () => {
-    const { app, events, keymap } = await mountSession([reasoningPart(), toolPart("prt_tool_a"), toolPart("prt_tool_b")])
+    const { app, events, keymap } = await mountSession([
+      reasoningPart(),
+      toolPart("prt_tool_a"),
+      toolPart("prt_tool_b"),
+    ])
     await expandWorkingBlock(app, keymap)
 
     // Click-open the collapsed nested thought, like a user reading the CoT
     // while the rest of the run keeps streaming in.
-    const frame = frameOf(app)
+    const frame = await frameOf(app)
     const row = frame.split("\n").findIndex((line) => line.includes("+ Thought"))
     expect(row).toBeGreaterThan(-1)
     await app.mockMouse.click(8, row)
     await settle(app)
-    expect(spansOf(app)).toContain(COT_BODY)
+    expect(await spansOf(app, COT_BODY)).toContain(COT_BODY)
 
     // The next part of the run arrives: the activity groups recompute. The
     // expansion must survive it (top-level blocks already behave this way).
     events.emit(updatedEvent(toolPart("prt_tool_c", BASE + 300), 3))
     await settle(app)
-    expect(spansOf(app)).toContain(COT_BODY)
-    expect(frameOf(app)).toContain("- Thought")
+    expect(await spansOf(app, COT_BODY)).toContain(COT_BODY)
+    expect(await frameOf(app)).toContain("- Thought")
   })
 })

@@ -64,8 +64,9 @@ jobs:
             turbo-${{ runner.os }}-
 
       - name: Run unit tests
-        timeout-minutes: 20
-        run: GITHUB_ACTIONS=false bun turbo test
+        timeout-minutes: ${{ runner.os == 'Windows' && 40 || 20 }}
+        # Stream each package while it runs: grouped output is lost if the step times out.
+        run: GITHUB_ACTIONS=false bun turbo test --log-order=stream --output-logs=full --log-prefix=task
         env:
           OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER: ${{ runner.os == 'Windows' && 'true' || 'false' }}
 

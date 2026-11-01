@@ -1,6 +1,6 @@
 import { createStore } from "solid-js/store"
 import { createSimpleContext } from "./helper"
-import { batch, createEffect, createMemo, createSignal, on } from "solid-js"
+import { batch, createEffect, createMemo, createSignal, on, onCleanup } from "solid-js"
 import { useSync } from "./sync"
 import { useEvent } from "./event"
 import path from "path"
@@ -8,6 +8,7 @@ import { useTuiPaths } from "./runtime"
 import { useArgs } from "./args"
 import { useSDK } from "./sdk"
 import { effectiveVariant } from "../util/model"
+import * as ModelHealth from "../util/model-health"
 import { RGBA } from "@opentui/core"
 import { readJson, writeJsonAtomic } from "../util/persistence"
 import { errorMessage } from "../util/error"
@@ -18,6 +19,8 @@ import { usePermission } from "./permission"
 import { supportsVision } from "../util/model"
 import {
   coupledThinking,
+  defaultLevel,
+  effortRecord,
   isRecord,
   mergeEffortMetadata,
   metadataLevel,
@@ -235,6 +238,7 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
       const filePath = path.join(paths.state, "model.json")
       const state = {
         pending: false,
+        writes: Promise.resolve() as Promise<unknown>,
       }
 
       function save() {
@@ -243,12 +247,18 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
           return
         }
         state.pending = false
-        void writeJsonAtomic(filePath, {
-          recent: modelStore.recent,
-          favorite: modelStore.favorite,
-          variant: modelStore.variant,
-          coupled: modelStore.coupled,
-        })
+        // Serialize saves and absorb failures: a write that races process
+        // shutdown or a removed state directory must not surface as an
+        // unhandled rejection.
+        const write = state.writes.then(() =>
+          writeJsonAtomic(filePath, {
+            recent: modelStore.recent,
+            favorite: modelStore.favorite,
+            variant: modelStore.variant,
+            coupled: modelStore.coupled,
+          }),
+        )
+        state.writes = write.catch((error) => console.error("Failed to write model state", { error }))
       }
 
       readJson<unknown>(filePath)
@@ -318,8 +328,41 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
         )
       })
 
+      // Cached health of favorite models. Only favorites are ever probed, one at a time, in the
+      // background; the picker reads the cache and never waits on a probe.
+      const [health, setHealth] = createStore<Record<string, ModelHealth.HealthEntry | undefined>>({})
+      const healthKey = (model: { providerID: string; modelID: string }) => `${model.providerID}/${model.modelID}`
+      let probing = false
+      async function probeNext() {
+        if (probing || !modelStore.ready) return
+        const now = Date.now()
+        const target = modelStore.favorite
+          .filter((item) => isModelValid(item))
+          .map((item) => ({ item, due: ModelHealth.due(health[healthKey(item)]) }))
+          .filter((entry) => entry.due <= now)
+          .sort((a, b) => a.due - b.due)[0]?.item
+        if (!target) return
+        probing = true
+        const key = healthKey(target)
+        try {
+          const result = await sdk.client.provider
+            .probe({ providerID: target.providerID, modelID: target.modelID })
+            .then((response) => response.data?.outcome ?? ("transient" as const))
+            .catch(() => "transient" as const)
+          setHealth(key, ModelHealth.next(health[key], result, Date.now()))
+        } finally {
+          probing = false
+        }
+      }
+      const probeTimer = setInterval(() => void probeNext(), 15_000)
+      onCleanup(() => clearInterval(probeTimer))
+
       return {
         current: currentModel,
+        health(model: { providerID: string; modelID: string }) {
+          const entry = health[healthKey(model)]
+          return { status: ModelHealth.status(entry, Date.now()), checked: entry ? ModelHealth.age(entry, Date.now()) : undefined }
+        },
         get ready() {
           return modelStore.ready
         },
@@ -539,6 +582,7 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
       const filePath = path.join(paths.state, "session.json")
       const state = {
         pending: false,
+        writes: Promise.resolve() as Promise<unknown>,
       }
 
       function save() {
@@ -547,9 +591,12 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
           return
         }
         state.pending = false
-        void writeJsonAtomic(filePath, {
-          pinned: sessionStore.pinned,
-        })
+        const write = state.writes.then(() =>
+          writeJsonAtomic(filePath, {
+            pinned: sessionStore.pinned,
+          }),
+        )
+        state.writes = write.catch((error) => console.error("Failed to write session state", { error }))
       }
 
       readJson<unknown>(filePath)
@@ -587,9 +634,10 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
         })
       }
 
-      event.on("session.deleted", (evt) => {
+      const offDeleted = event.on("session.deleted", (evt) => {
         prune(evt.properties.info.id)
       })
+      onCleanup(offDeleted)
 
       return {
         get ready() {
@@ -633,6 +681,61 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
       const writes = new Map<string, Promise<void>>()
       const [pendingVersion, setPendingVersion] = createSignal(0)
 
+      // Home default for new sessions, persisted for the TUI in the state
+      // directory. `stored` is the optimistic display value while `persisted`
+      // tracks what the file actually holds, so a failed write can roll the
+      // display back to a value that was really saved instead of reporting a
+      // selection that never landed.
+      const defaultFile = path.join(paths.state, "effort.json")
+      const [stored, setStored] = createSignal<Level | undefined>()
+      let persisted: Level | undefined
+      let touched = false
+      let defaultSequence = 0
+
+      let defaultWrites = readJson<unknown>(defaultFile)
+        .then((value) => {
+          const level = metadataLevel(value)
+          if (!level) throw new Error("Invalid agent effort default")
+          persisted = level
+          // A selection made while the file was still loading wins over the
+          // file: the user's choice is newer than what was on disk.
+          if (!touched) setStored(level)
+        })
+        .catch((error) => {
+          if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") return
+          toast.show({
+            variant: "warning",
+            message: `Failed to load the agent effort default: ${errorMessage(error)}`,
+            duration: 3000,
+          })
+        })
+
+      function persistDefault(level: Level) {
+        touched = true
+        setStored(level)
+        const attempt = ++defaultSequence
+        // Wait for the initial read before writing so it cannot replace a
+        // newer rollback baseline. Then persist rapid selections in order.
+        const write = defaultWrites.then(() => writeJsonAtomic(defaultFile, effortRecord(level)))
+        defaultWrites = write.catch(() => {})
+        write.then(
+          () => {
+            persisted = level
+          },
+          (error) => {
+            // Only the newest selection owns the displayed default; an older
+            // failed write must not roll back a newer choice.
+            if (attempt !== defaultSequence) return
+            setStored(persisted)
+            toast.show({
+              variant: "warning",
+              message: `Failed to save the agent effort default: ${errorMessage(error)}`,
+              duration: 3000,
+            })
+          },
+        )
+      }
+
       function activeSessionID() {
         return route.data.type === "session" ? route.data.sessionID : undefined
       }
@@ -658,26 +761,45 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
           // write must be visible immediately, before the sync event that
           // confirms it lands on the session row.
           pendingVersion()
+          // Home has no session to override, so the persisted new-session
+          // default (then configuration) is what a new session would use.
+          if (!sessionID) return defaultLevel({ selected: stored(), config: sync.data.config })
           return effortSelection({
-            override: sessionID ? pending.get(sessionID) : undefined,
+            override: pending.get(sessionID),
             metadata: row?.metadata,
             config: sync.data.config,
           })
         },
         // Whether the selection is session-scoped right now. On the home
-        // route there is no session to persist into, so the configured
-        // default stays authoritative for new work.
+        // route the persisted default is authoritative for new work.
         scoped() {
           return activeSessionID() !== undefined
+        },
+        // Metadata a session created right now starts from, so the home
+        // default is stored on the session (and enforced by the server)
+        // rather than only being displayed. Undefined when the user never
+        // picked one, which leaves the configured default in charge.
+        newSessionMetadata() {
+          const level = stored()
+          return level ? effortRecord(level) : undefined
+        },
+        // Show a newly created session's inherited selection immediately:
+        // its row syncs a moment later, and reading through the same overlay
+        // as a session write keeps the label from flashing the old default.
+        seed(sessionID: string, metadata: Record<string, unknown> | undefined) {
+          if (!metadata) return
+          if (metadataLevel(sync.session.get(sessionID)?.metadata) === metadataLevel(metadata)) return
+          pending.set(sessionID, metadata)
+          setPendingVersion((version) => version + 1)
         },
         set(level: Level) {
           const sessionID = activeSessionID()
           if (!sessionID) {
-            toast.show({
-              variant: "info",
-              message: "Agent effort applies per session; open a session to change it.",
-              duration: 3000,
-            })
+            // Home selection: a failed default write rolls the value back and
+            // reports the failure, so the label never claims a level that is
+            // not actually persisted.
+            persistDefault(level)
+            model.variant.couple(level)
             return
           }
           const row = sync.session.get(sessionID)

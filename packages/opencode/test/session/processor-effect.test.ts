@@ -1,4 +1,7 @@
 import { SessionV1 } from "@opencode-ai/core/v1/session"
+import { applyPartDelta, applyPartUpdated } from "../../../tui/src/util/part"
+import type { Part } from "@opencode-ai/sdk/v2"
+import { pathToFileURL } from "url"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { Database } from "@opencode-ai/core/database/database"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
@@ -22,6 +25,7 @@ import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { provideTmpdirInstance, provideTmpdirServer } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
 import { raw, reply, TestLLMServer } from "../lib/llm-server"
+import { HeadlessRunRef } from "@/effect/instance-ref"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
@@ -1246,6 +1250,63 @@ const runProcessor = Effect.fn("test.runProcessor")(function* (dir: string, text
   return { value, handle, stored }
 })
 
+
+it.live("text-complete plugins can truncate or delete streamed text", () =>
+  provideTmpdirServer(
+    ({ dir, llm }) =>
+      Effect.gen(function* () {
+        const file = path.join(dir, "rewrite-plugin.ts")
+        yield* Effect.promise(() =>
+          Bun.write(
+            file,
+            `export default async () => ({
+          "experimental.text.complete": async (_input, output) => {
+            output.text = output.text.endsWith("prefix") ? "Hello" : ""
+          },
+        })`,
+          ),
+        )
+        yield* Effect.promise(() =>
+          Bun.write(
+            path.join(dir, "opencode.json"),
+            JSON.stringify({
+              ...providerCfg(llm.url),
+              plugin: [pathToFileURL(file).href],
+            }),
+          ),
+        )
+        const events = yield* EventV2Bridge.Service
+        const seen = new Map<string, Part[]>()
+        const off = yield* events.listen((event) => {
+          if (event.type === MessageV2.Event.PartUpdated.type) {
+            const data = event.data as typeof MessageV2.Event.PartUpdated.data.Type
+            seen.set(data.part.messageID, applyPartUpdated(seen.get(data.part.messageID), data.part as Part))
+          }
+          if (event.type === MessageV2.Event.PartDelta.type) {
+            const data = event.data as typeof MessageV2.Event.PartDelta.data.Type
+            const parts = applyPartDelta(seen.get(data.messageID), data.partID, data.field, data.delta)
+            if (parts) seen.set(data.messageID, parts)
+          }
+          return Effect.void
+        })
+        for (const [input, expected] of [
+          ["Hello secret prefix", "Hello"],
+          ["Hello secret deletion", ""],
+        ]) {
+          yield* llm.text(input)
+          const result = yield* runProcessor(dir, "hi")
+          const stored = result.stored.parts.find((part) => part.type === "text")
+          expect(stored).toMatchObject({ text: expected, time: { end: expect.any(Number) } })
+          expect(seen.get(result.stored.info.id)?.find((part) => part.type === "text")).toMatchObject({
+            text: expected,
+          })
+        }
+        yield* off
+      }),
+    { config: (url) => providerCfg(url) },
+  ),
+)
+
 const itStreamingMetrics = processorWithLLM(() =>
   delayedEvents([
     [0, LLMEvent.stepStart({ index: 0 })],
@@ -1489,3 +1550,208 @@ for (const scenario of [
     ),
   )
 }
+
+// A failed argument stream has not executed a tool, so retry is safe, but its
+// registered pending call must not remain a sibling finish waits on forever.
+let retryPendingCalls = 0
+let retryPendingHandle: SessionProcessor.Handle
+const itRetryPending = processorWithLLM(() => {
+  retryPendingCalls++
+  if (retryPendingCalls === 1) return Stream.make(
+    LLMEvent.stepStart({ index: 0 }),
+    LLMEvent.toolInputStart({ id: "abandoned-arguments", name: "bash" }),
+  ).pipe(Stream.concat(Stream.die(new SessionV1.APIError({ message: "temporary argument stream error", isRetryable: true }))))
+  return Stream.fromEffect(retryPendingHandle.waitForOtherTools("finish-retry")).pipe(
+    Stream.flatMap(() => Stream.make(
+      LLMEvent.stepStart({ index: 0 }),
+      LLMEvent.stepFinish({ index: 0, reason: "stop" }),
+      LLMEvent.finish({ reason: "stop" }),
+    )),
+  )
+})
+itRetryPending.live("clears abandoned argument calls before retry so finish can settle", () =>
+  provideTmpdirInstance((dir) => Effect.gen(function* () {
+    retryPendingCalls = 0
+    const { processors, session, provider } = yield* boot()
+    const chat = yield* session.create({})
+    const parent = yield* user(chat.id, "argument retry")
+    const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+    const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+    retryPendingHandle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
+    const result = yield* retryPendingHandle.process({ user: parent as SessionV1.User,
+      sessionID: chat.id, model: mdl, agent: agent(), system: [],
+      messages: [{ role: "user", content: "argument retry" }], tools: {},
+    }).pipe(Effect.timeout("8 seconds"), Effect.exit)
+    expect(retryPendingCalls).toBe(2)
+    expect(Exit.isSuccess(result)).toBe(true)
+    const parts = yield* MessageV2.parts(msg.id)
+    expect(parts.some((part) => part.type === "tool" && part.callID === "abandoned-arguments")).toBe(false)
+  }), { config: cfg }), { timeout: 15000 })
+
+let runningRetryCalls = 0
+let runningRetryHandle: SessionProcessor.Handle
+const itRetryRunning = processorWithLLM(() => {
+  runningRetryCalls++
+  if (runningRetryCalls === 1) return Stream.make(
+    LLMEvent.stepStart({ index: 0 }),
+    LLMEvent.toolInputStart({ id: "metadata-running", name: "bash" }),
+  ).pipe(Stream.concat(Stream.fromEffect(
+    runningRetryHandle.updateToolCall("metadata-running", (part) => ({ ...part,
+      state: { status: "running", input: { command: "already started" }, time: { start: Date.now() }, metadata: { evidence: "retained" } },
+    })).pipe(Effect.andThen(Effect.die(new SessionV1.APIError({ message: "temporary metadata stream error", isRetryable: true })))),
+  )))
+  return Stream.fromEffect(runningRetryHandle.completeToolCall("metadata-running", {
+    title: "started tool", output: "RUNNING_EVIDENCE", metadata: { evidence: "retained" },
+  })).pipe(Stream.flatMap(() => Stream.make(
+    LLMEvent.stepStart({ index: 0 }),
+    LLMEvent.stepFinish({ index: 0, reason: "stop" }),
+    LLMEvent.finish({ reason: "stop" }),
+  )))
+})
+itRetryRunning.live("preserves a metadata-promoted running call during retry cleanup", () =>
+  provideTmpdirInstance((dir) => Effect.gen(function* () {
+    runningRetryCalls = 0
+    const { processors, session, provider } = yield* boot()
+    const chat = yield* session.create({})
+    const parent = yield* user(chat.id, "running retry")
+    const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+    const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+    runningRetryHandle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
+    yield* runningRetryHandle.process({ user: parent as SessionV1.User, sessionID: chat.id, model: mdl,
+      agent: agent(), system: [], messages: [{ role: "user", content: "running retry" }], tools: {},
+    }).pipe(Effect.timeout("8 seconds"))
+    const parts = yield* MessageV2.parts(msg.id)
+    const call = parts.find((part): part is SessionV1.ToolPart => part.type === "tool" && part.callID === "metadata-running")
+    expect(runningRetryCalls).toBe(2)
+    expect(call?.state.status).toBe("completed")
+    if (call?.state.status === "completed") expect(call.state.output).toBe("RUNNING_EVIDENCE")
+  }), { config: cfg }), { timeout: 15000 })
+
+const headlessEnv = LayerNode.compile(
+  LayerNode.group([root, LayerNode.make({ service: TestLLMServer, layer: TestLLMServer.layer, deps: [] })]),
+  [
+    [SessionSummary.node, summary],
+    [RuntimeFlags.node, RuntimeFlags.layer({ experimentalEventSystem: true })],
+  ],
+)
+const itHeadless = testEffect(headlessEnv)
+
+itHeadless.live(
+  "halts immediately with APIError in headless mode when provider retry-after exceeds maxDelay",
+  () =>
+    provideTmpdirServer(
+      ({ dir, llm }) =>
+        Effect.gen(function* () {
+          yield* llm.error(
+            429,
+            {
+              type: "error",
+              error: {
+                type: "FreeUsageLimitError",
+                message: "Free usage limit reached. Subscribe to OpenCode Go for higher limits.",
+              },
+              metadata: {},
+            },
+            { "retry-after": "42504" },
+          )
+
+          const { processors, session, provider } = yield* boot()
+          const status = yield* SessionStatus.Service
+          const chat = yield* session.create({})
+          const parent = yield* user(chat.id, "Reply with exactly: OK")
+          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+          const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+          const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
+
+          const result = yield* handle
+            .process({
+              user: parent as SessionV1.User,
+              sessionID: chat.id,
+              model: mdl,
+              agent: agent(),
+              system: [],
+              messages: [{ role: "user", content: "Reply with exactly: OK" }],
+              tools: {},
+            })
+            .pipe(Effect.provideService(HeadlessRunRef, {}), Effect.timeout("5 seconds"))
+
+          expect(result).toBe("stop")
+          expect(yield* llm.calls).toBe(1)
+          expect(handle.message.error?.name).toBe("APIError")
+          if (handle.message.error?.name === "APIError") {
+            expect(handle.message.error.data.message).toContain("Free usage limit reached")
+          }
+          expect(yield* MessageV2.parts(msg.id)).toEqual([])
+          expect(yield* status.get(chat.id)).toEqual({ type: "idle" })
+        }),
+      { config: (url) => providerCfg(url) },
+    ),
+  { timeout: 15000 },
+)
+
+const nonHeadlessOverrideEnv = LayerNode.compile(
+  LayerNode.group([root, LayerNode.make({ service: TestLLMServer, layer: TestLLMServer.layer, deps: [] })]),
+  [
+    [SessionSummary.node, summary],
+    [RuntimeFlags.node, RuntimeFlags.layer({ experimentalEventSystem: true, retryMaxDelayMs: 50 })],
+  ],
+)
+const itNonHeadlessOverride = testEffect(nonHeadlessOverrideEnv)
+
+itNonHeadlessOverride.live(
+  "ignores retryMaxDelayMs outside headless runs so interactive sessions keep retry status",
+  () =>
+    provideTmpdirServer(
+      ({ dir, llm }) =>
+        Effect.gen(function* () {
+          yield* llm.error(
+            429,
+            {
+              type: "error",
+              error: {
+                type: "FreeUsageLimitError",
+                message: "Free usage limit reached. Subscribe to OpenCode Go for higher limits.",
+              },
+              metadata: {},
+            },
+            { "retry-after": "1" },
+          )
+          yield* llm.text("RECOVERED_INTERACTIVE")
+
+          const { processors, session, provider } = yield* boot()
+          const events = yield* EventV2Bridge.Service
+          const retryActions: Array<string | undefined> = []
+          yield* events.listen((event) => {
+            if (event.type !== SessionStatus.Event.Status.type) return Effect.void
+            const data = event.data as { status?: SessionStatus.Info }
+            if (data.status?.type === "retry") retryActions.push(data.status.action?.reason)
+            return Effect.void
+          })
+
+          const chat = yield* session.create({})
+          const parent = yield* user(chat.id, "Reply with exactly: OK")
+          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+          const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+          const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
+
+          const result = yield* handle
+            .process({
+              user: parent as SessionV1.User,
+              sessionID: chat.id,
+              model: mdl,
+              agent: agent(),
+              system: [],
+              messages: [{ role: "user", content: "Reply with exactly: OK" }],
+              tools: {},
+            })
+            .pipe(Effect.timeout("8 seconds"))
+
+          expect(result).toBe("continue")
+          expect(yield* llm.calls).toBe(2)
+          expect(handle.message.error).toBeUndefined()
+          expect(retryActions).toEqual(["free_tier_limit"])
+        }),
+      { config: (url) => providerCfg(url) },
+    ),
+  { timeout: 15000 },
+)

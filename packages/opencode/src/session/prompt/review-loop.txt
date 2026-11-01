@@ -1,64 +1,20 @@
 ## Todo as scope contract
 
-- At the start of ANY task — review, audit, question, debugging session, not
-  just implementation — write the task's scope as todo items BEFORE your
-  first tool call. Example for a review task:
-  1. Read PR diff and verify claims against the codebase
-  2. Run failing tests read-only to confirm defect
-  3. Deliver verdict
-- The todo list IS the task's scope. If you find yourself doing work not on
-  the list (e.g. "fixing" something while reviewing), you must either add a
-  todo item for it explicitly and update it when done, or stop. Doing
-  out-of-scope work silently and then reverting it is forbidden.
-- When scope changes, update the todo list to reflect the new scope before
-  continuing. Do not re-decide the plan from scratch in later turns.
+- At the start of any task, write its scope as todo items before your first tool call.
+- The todo list IS the task's scope. Doing out-of-scope work silently and then reverting it is forbidden. Add a todo for it or stop.
+- When scope changes, update the todo list to reflect the new scope before continuing.
 - Do not create backup files (`.bak`) — git already tracks your changes.
 
 ## Review Loop
 
-For a unit of work that changed files at medium or thorough effort, the required next step is review, not completion. At medium and thorough effort, Review is required before finishing file-writing work. Dispatch the `review` subagent instead of reviewing the code yourself, and call `finish` after it approves. Keep dispatching `subagent_type: "review"`: the runtime resolves it to the reviewer that matches your parent agent - `work-review` under Work, `code-review` under Code, and the generic `review` under any other parent - so you never need to name a specialized reviewer yourself. Run the review synchronously with `subagent_type: "review"` and `background: false`; a background task does not count as a review. Your own tests and diff review do not replace the independent review.
+For a unit of work that changed files at medium or thorough effort, the required next step is review, not completion. Review is required before finishing file-writing work. Dispatch the `review` subagent instead of reviewing the code yourself (`subagent_type: "review"`, `background: false`; the runtime picks the reviewer matching your agent). A background task does not count as a review, and your own tests and diff review do not replace it.
 
-If the user explicitly asks for a code review, dispatch the reviewer even when the request did not change files. The policy does not apply to turns with no file changes when the user is only asking a question or explanation.
+If the user explicitly asks for a code review, dispatch the reviewer even when no files changed. The policy does not apply to turns with no file changes when the user is only asking a question or explanation.
 
-Review requirements follow the effort policy (fast/medium/thorough) injected with your instructions, and `finish` is the only enforcement checkpoint. `finish` evaluates the persisted history for the current user turn and, when the effective level requires an independent review that has not happened, the call is declined with recoverable feedback. Repeated `finish` calls never waive a required review: the decision depends only on the review state, not on how often you call it. At `fast`, no review is required and delivery is labelled unreviewed unless an independent review actually happened. At `medium`, deliver after at least one clean synchronous review; only blocking findings (Critical/Important, or a Needs-fixes report with no findings) or work landed after the last review force another pass, bounded by two passes, after which `finish` delivers with an honest exhausted/open-findings status instead of looping. At `thorough`, `finish` keeps declining until a clean current review exists, or is blocked as `review-blocked` when the reviewer genuinely cannot run — never as approval. A background review, an incomplete task, a reviewer error, a missing assessment, or a review of a different turn does not count as approval.
-
-A declined `finish` is not a waiver: retrying it is declined again. A review requirement ends without approval only as `review-pending` (a child's unreviewed handoff), `review-blocked` (a declared dispatch failure), or the pass budget's honest status. None of these outcomes means the work was approved.
-
-When no review is required, say so plainly instead of implying approval. If a required review genuinely cannot run, a successful finish remains blocked; report failure honestly as `review-blocked`, or let a depth-limited child hand unreviewed writes to its parent as `review-pending`. An unreviewed, exhausted, blocked, or pending-review result is an honest status, not an approval.
+The effort policy owns the pass budget; `finish` is the only enforcement checkpoint. A missing or stale review is never reported as approved: `finish` delivers it labelled UNREVIEWED, while blocking findings from a Review that ran hold `finish` back. When a budget is exhausted the result is delivered as `budget-exhausted` or `findings-open` status — never as approved. A child's unreviewed handoff ends as `review-pending`; a reviewer that cannot run ends as `review-blocked`. None of these outcomes means the work was approved. When no review is required, say so plainly.
 
 ### Review and fix cycle
 
-1. Give the reviewer the requirements, changed-file summary, unit boundary, and the complete diff for this unit only.
-2. Read the final assessment. `Approved` permits completion; `Needs fixes` creates an outstanding obligation.
-3. For every Critical or Important finding, fix the code in the working tree and run a new synchronous review. The new review must cover the fixes; do not assume that a small fix is self-validating.
-4. After every Work pass made in response to findings, return to Review. Calling `finish` while findings or stale work remain is delivered only within the effort policy's pass budget, and then with an honest findings-open/exhausted status — it never converts open findings into approval.
-5. Prefer not to call `finish` until a later review explicitly approves the current work. Read-only inspection after approval is fine; any tool that may change files invalidates that approval.
+Give the reviewer the requirements, changed files, unit boundary (base/head SHAs or `uncommitted working tree`) and the full diff for this unit only; it ends with `Assessment: Approved` or `Assessment: Needs fixes` in a `<silvercode-review>` envelope. A review-delivery failure is not approval: re-dispatch the review. Fix every Critical or Important finding, then run a new synchronous review that covers the fixes. After every Work pass made in response to findings, return to Review. Prefer not to call `finish` until a later review explicitly approves the current work; any change to files invalidates that approval.
 
-The effort policy owns the pass budget: `fast` requires none, `medium` allows at most two completed review passes, and `thorough` is until-clean with no finite cap. The legacy configured `review_loop.max_iterations` value is not read by the effort policy: medium's budget is always two passes. When a level's budget is exhausted, the result is delivered with an honest `budget-exhausted` or `findings-open` status — never as approved.
-
-### Review result delivery
-
-The reviewer ends its report with a machine-readable `<silvercode-review>` envelope; the assessment inside that envelope is the review's canonical verdict, and the markdown around it is analysis. If the task returns a review-delivery failure instead of a report, the envelope was missing, malformed, or written in an unsupported schema version: re-dispatch the review, and do not treat that failure as approval, as findings, or as a review with no findings.
-
-### Required review prompt
-
-Include all of the following in the task prompt:
-
-- the request and acceptance checklist;
-- the files and behavior changed;
-- the unit boundary: base/head SHAs or `uncommitted working tree`;
-- the full diff for this unit, without unrelated branch changes.
-
-Ask the reviewer to end with one explicit assessment, for example:
-
-```text
-Assessment: Approved
-```
-
-or:
-
-```text
-Assessment: Needs fixes
-```
-
-A positive summary without that assessment is not approval. A review report is an instruction to act, not an acknowledgment: fix its Critical and Important findings in the same turn, re-review the resulting work, and correct the record if completion was already claimed. Minor findings can be addressed opportunistically unless the reviewer marks them as blocking.
+A review report is an instruction to act, not an acknowledgment: fix its Critical and Important findings in the same turn, re-review, and correct the record if completion was already claimed.

@@ -148,6 +148,10 @@ function isContextLostError(error: unknown): boolean {
 
 class Semaphore {
   private active = 0
+
+  get inUse(): number {
+    return this.active
+  }
   private readonly queue: Array<() => void> = []
 
   constructor(private readonly capacity: number) {}
@@ -190,6 +194,8 @@ export class QwenWebTransport {
   private readonly idleTimeoutMs: number
   private readonly reasoningIdleTimeoutMs: number
   private readonly slots: Semaphore
+  /** One-shot page requests currently running (they hold no stream slot). */
+  private jsonInflight = 0
   private readonly flushBytes: number
   private readonly flushMs: number
   private readonly states = new Map<string, StreamState>()
@@ -243,8 +249,14 @@ export class QwenWebTransport {
     const timeoutMs = options?.timeoutMs ?? this.metadataTimeoutMs
     const body = options?.body
     const referrer = options?.referrer
+    let counted = false
     try {
-      const page = await this.browser.ensureOnOrigin(signal, { steer: options?.allowNavigate ?? true })
+      const page = await this.browser.ensureForRequest(signal, {
+        steer: options?.allowNavigate ?? true,
+        canRestore: () => this.slots.inUse === 0 && this.jsonInflight === 0,
+      })
+      this.jsonInflight++
+      counted = true
       return await page.evaluate(
         async (arg: {
           url: string
@@ -280,6 +292,8 @@ export class QwenWebTransport {
       )
     } catch (error) {
       throw this.translatePageError(error, signal)
+    } finally {
+      if (counted) this.jsonInflight--
     }
   }
 
@@ -293,7 +307,10 @@ export class QwenWebTransport {
     if (signal?.aborted) throw abortedError()
     const releaseSlot = await this.slots.acquire(signal)
     try {
-      const page = await this.browser.ensureOnOrigin(signal, { steer: options?.allowNavigate ?? true })
+      const page = await this.browser.ensureForRequest(signal, {
+        steer: options?.allowNavigate ?? true,
+        canRestore: () => this.slots.inUse <= 1 && this.jsonInflight === 0,
+      })
       await this.ensureBinding(page)
       return await this.startStream(page, method, path, options, releaseSlot)
     } catch (error) {
@@ -338,7 +355,10 @@ export class QwenWebTransport {
     if (signal?.aborted) throw abortedError()
     const releaseSlot = await this.slots.acquire(signal)
     try {
-      const page = await this.browser.ensureOnOrigin(signal, { steer: options?.allowNavigate ?? true })
+      const page = await this.browser.ensureForRequest(signal, {
+        steer: options?.allowNavigate ?? true,
+        canRestore: () => this.slots.inUse <= 1 && this.jsonInflight === 0,
+      })
       const readyAt = Date.now()
       const [cookies, signals] = await Promise.all([this.browserCookies(page), this.collectWafSignals(page, stream)])
       debug("transport", "raw request prepared", {
@@ -377,12 +397,14 @@ export class QwenWebTransport {
           status: response.status,
           contentType,
           stream: pumpRawStream(response.body, controller, this.idleBudgetMs(options?.reasoning ?? false), signal, () =>
-            traceTransport("first stream chunk"),
+            traceTransport("first stream chunk"), onAbort,
           ),
           abort: () => controller.abort(),
         }
       } finally {
         clearTimeout(deadline)
+        // The pump takes ownership of the listener once constructed; this is
+        // the safety net for paths where the pump is never created.
         signal?.removeEventListener("abort", onAbort)
       }
     } catch (error) {
@@ -1028,6 +1050,7 @@ function pumpRawStream(
   idleMs: number,
   signal?: AbortSignal,
   onFirstChunk?: () => void,
+  onRawAbort?: () => void,
 ): ReadableStream<Uint8Array> {
   if (!upstream) {
     return new ReadableStream<Uint8Array>({
@@ -1039,6 +1062,18 @@ function pumpRawStream(
   let closed = false
   let firstChunkReported = false
   let timer: ReturnType<typeof setTimeout> | undefined
+  let signalListener: (() => void) | undefined
+  if (signal) {
+    if (signal.aborted) {
+      controller.abort()
+    } else {
+      if (onRawAbort) {
+        try { signal.removeEventListener("abort", onRawAbort) } catch {}
+      }
+      signalListener = () => controller.abort()
+      signal.addEventListener("abort", signalListener, { once: true })
+    }
+  }
   const kick = () => {
     if (timer) clearTimeout(timer)
     timer = setTimeout(() => {
@@ -1050,6 +1085,11 @@ function pumpRawStream(
     if (timer) clearTimeout(timer)
     if (closed) return
     closed = true
+    if (signalListener && signal) {
+      try {
+        signal.removeEventListener("abort", signalListener)
+      } catch {}
+    }
     if (controller.signal.aborted) return
     try {
       reader.releaseLock()

@@ -75,6 +75,29 @@ jobs:
       # Cleanup never deletes published releases; if a published release isn't latest, mark it latest manually.
       - run: gh release edit "${{ needs.version.outputs.tag }}" --draft=false --latest
 
+  npm:
+    env:
+      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+    # The launcher downloads the finished release, so it can only be published after finalize.
+    needs: [version, finalize]
+    if: ${{ !inputs.dry_run }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744 # v3.6.0
+        with:
+          ref: ${{ needs.version.outputs.tag }}
+          fetch-depth: 0
+      - uses: ./.github/actions/setup-bun
+      - name: Publish the launcher package to npm
+        if: ${{ env.NPM_TOKEN != '' }}
+        run: |
+          trap 'rm -f "$HOME/.npmrc"' EXIT
+          echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" > "$HOME/.npmrc"
+          ./packages/opencode/script/publish.ts
+        env:
+          SILVERCODE_VERSION: ${{ needs.version.outputs.version }}
+          SILVERCODE_RELEASE: "1"
+
   cleanup:
     # Wait for the entire publish path so cleanup sees build/finalize failures before evaluating the condition.
     needs: [version, build, finalize]

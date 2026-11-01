@@ -18,7 +18,7 @@ import { Global } from "@opencode-ai/core/global"
 import { QWEN_WEB_DEFAULTS, QWEN_WEB_ENV, QWEN_WEB_PROFILE_LOCKFILE, QWEN_WEB_PROFILE_SUBDIR } from "./constants"
 import { debug } from "./log"
 import { qwenWebOrigin, qwenWebUrl } from "./protocol"
-import { QwenWebError, isAbortLike } from "./errors"
+import { QwenWebError, isAbortLike, isChallengeMessage } from "./errors"
 
 // ---------------------------------------------------------------------------
 // Narrow structural interfaces (real Patchright objects satisfy these;
@@ -144,7 +144,8 @@ export function readProfileMetadata(profileDir?: string): QwenWebProfileMetadata
   }
 }
 
-function writeProfileMetadata(profileDir: string, patch: Partial<QwenWebProfileMetadata>): void {
+// Exported for tests.
+export function writeProfileMetadata(profileDir: string, patch: Partial<QwenWebProfileMetadata>): void {
   try {
     const current = readProfileMetadata(profileDir)
     const next: QwenWebProfileMetadata = {
@@ -154,7 +155,12 @@ function writeProfileMetadata(profileDir: string, patch: Partial<QwenWebProfileM
       lastSeenAt: patch.lastSeenAt ?? current?.lastSeenAt,
     }
     fs.mkdirSync(profileDir, { recursive: true })
-    fs.writeFileSync(metadataPath(profileDir), JSON.stringify(next, null, 2), "utf8")
+    // Temp file + atomic rename: an interruption mid-write must not leave
+    // truncated JSON that reads back as "unauthenticated" (#429).
+    const file = metadataPath(profileDir)
+    const tmp = `${file}.tmp`
+    fs.writeFileSync(tmp, JSON.stringify(next, null, 2), "utf8")
+    fs.renameSync(tmp, file)
   } catch (error) {
     debug("browser", "failed to persist profile metadata (non-fatal)", {
       error: error instanceof Error ? error.message : String(error),
@@ -201,18 +207,31 @@ function readLockPid(profileDir: string): number | undefined {
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 
-async function acquireProfileLock(profileDir: string, timeoutMs: number, signal?: AbortSignal): Promise<void> {
+// Exported for tests.
+export async function acquireProfileLock(profileDir: string, timeoutMs: number, signal?: AbortSignal): Promise<void> {
   fs.mkdirSync(profileDir, { recursive: true })
+  const file = lockfilePath(profileDir)
   const deadline = Date.now() + timeoutMs
   for (;;) {
     if (signal?.aborted) throw aborted()
+    // Atomic claim: the exclusive create is the only write, so two processes
+    // racing an absent lock cannot both proceed (#428).
+    try {
+      fs.writeFileSync(file, String(process.pid), { encoding: "utf8", flag: "wx" })
+      return
+    } catch {
+      // Claimed by someone else (or the file is stuck); inspect the owner.
+    }
     const owner = readLockPid(profileDir)
-    if (owner === undefined || owner === process.pid || !isPidAlive(owner)) {
+    if (owner === process.pid) return
+    if (owner === undefined || !isPidAlive(owner)) {
+      // Stale or unreadable lock: remove it, then race the exclusive create
+      // again. Losing that race just means the other process owns it now.
       try {
-        fs.writeFileSync(lockfilePath(profileDir), String(process.pid), "utf8")
-        return
+        fs.rmSync(file, { force: true })
+        continue
       } catch {
-        // Lost a race; fall through and retry.
+        // The stale file could not be removed; wait and retry until the deadline.
       }
     }
     if (Date.now() >= deadline) {
@@ -337,15 +356,6 @@ function explainLaunchFailure(error: unknown): QwenWebError {
 
 const LOGIN_URL_MARKERS = ["/login", "/auth", "login.", "account/login", "signin", "sign-in"]
 const CHALLENGE_URL_MARKERS = ["captcha", "challenge", "verify", "validation", "security-check"]
-const CHALLENGE_BODY_MARKERS = [
-  "aliyun_waf",
-  "_____tmd_____",
-  "fail_sys_user_validate",
-  "rgv587_error",
-  "denyfromx5",
-  "security verification",
-]
-
 function urlSuggestsLogin(url: string): boolean {
   const lowered = url.toLowerCase()
   return LOGIN_URL_MARKERS.some((marker) => lowered.includes(marker))
@@ -400,6 +410,10 @@ export class QwenWebBrowser {
   private page: QwenWebPage | undefined
   private launching: Promise<QwenWebContext> | undefined
   private challengeReveal: Promise<boolean> | undefined
+  private loginRelaunch: Promise<void> | undefined
+  private headlessRestore: Promise<void> | undefined
+  /** A headed window was opened only to show a challenge; later requests go back to headless. */
+  private challengeHeaded = false
   private contextDead = false
   private pageDead = false
   private lockHeldFor: string | undefined
@@ -445,7 +459,9 @@ export class QwenWebBrowser {
    */
   get loginHeaded(): boolean {
     if (!this.headless) return true
-    if (this.isRunning() || this.headlessExplicit) return false
+    // A running headless browser does not block a headed login: the login
+    // path relaunches it headed (see openLoginPage).
+    if (this.headlessExplicit) return false
     return hasDisplay()
   }
 
@@ -474,6 +490,7 @@ export class QwenWebBrowser {
     const operation = this.restartWithHeadless(signal, false)
       .then(() => {
         this.headless = false
+        this.challengeHeaded = true
         return true
       })
       .catch(async (error) => {
@@ -488,15 +505,89 @@ export class QwenWebBrowser {
   }
 
   /**
+   * Entry point for chat requests. A window revealed for a challenge is for the person to
+   * solve it once: the retry and every later request run headless again (the persistent
+   * profile keeps whatever the person solved). No solved-detection is involved.
+   */
+  async ensureForRequest(
+    signal?: AbortSignal,
+    opts?: { steer?: boolean; canRestore?: () => boolean },
+  ): Promise<QwenWebPage> {
+    // Closing the headed window drops every page on it: only start that while no other request
+    // is mid-flight (checked again right before the close). A restore already under way is
+    // joined by everyone, so nobody keeps using the page that is being closed.
+    await this.restoreHeadlessAfterChallenge(opts?.canRestore)
+    return this.ensureOnOrigin(signal, { steer: opts?.steer })
+  }
+
+  private async restoreHeadlessAfterChallenge(canRestore?: () => boolean): Promise<void> {
+    if (this.headlessRestore) return this.headlessRestore
+    if (!this.challengeHeaded || canRestore?.() === false) return
+    if (this.challengeReveal) await this.challengeReveal.catch(() => false)
+    if (this.headlessRestore) return this.headlessRestore
+    // The await above let other requests start: decide again, with no await before the close.
+    if (!this.challengeHeaded || canRestore?.() === false) return
+    this.headlessRestore = (async () => {
+      debug("browser", "returning to headless after a challenge window")
+      this.challengeHeaded = false
+      this.headless = true
+      await this.close()
+    })().finally(() => {
+      this.headlessRestore = undefined
+    })
+    return this.headlessRestore
+  }
+
+  /**
+   * Ensure the browser runs headed for an interactive login. Concurrent
+   * callers share exactly one relaunch. A launch that is still in flight is
+   * awaited first: `isRunning()` alone misses it and the login would attach
+   * to the in-flight headless context with no window (#483).
+   */
+  private relaunchHeadedForLogin(signal?: AbortSignal): Promise<void> {
+    if (this.loginRelaunch) return this.loginRelaunch
+    const operation = (async () => {
+      const inFlightLaunch = this.launching
+      if (inFlightLaunch) {
+        await inFlightLaunch.catch(() => {})
+        if (this.launching === inFlightLaunch) this.launching = undefined
+      }
+      if (!this.headless) return
+      if (this.isRunning()) {
+        // The shared browser was launched headless by an earlier probe (for
+        // example validating a saved or expired session). Relaunch it headed
+        // or the login would be trapped headless with no window (#483).
+        debug("browser", "relaunching headed for interactive login")
+        try {
+          // Holds the launch lock: other launch paths wait in ensureInternal
+          // while the old context closes and the headed one starts.
+          await this.close()
+          await this.ensureInternal(signal, false, true)
+        } catch (error) {
+          // Roll back the logical mode and clean up any partially-created headed context.
+          await this.close()
+          throw error
+        }
+      } else {
+        debug("browser", "switching to headed mode for interactive login")
+      }
+      this.headless = false
+    })()
+    this.loginRelaunch = operation.finally(() => {
+      this.loginRelaunch = undefined
+    })
+    return this.loginRelaunch
+  }
+
+  /**
    * Open the Qwen login page on the main page for an interactive login.
    * The user logs in normally; callers poll `detectAuthState` (or use
    * `waitForLogin`) to observe completion. Already-authenticated profiles
    * return immediately without navigating.
    */
   async openLoginPage(signal?: AbortSignal): Promise<QwenWebPage> {
-    if (!this.isRunning() && !this.headlessExplicit && hasDisplay() && this.headless) {
-      debug("browser", "switching to headed mode for interactive login")
-      this.headless = false
+    if (!this.headlessExplicit && hasDisplay() && this.headless) {
+      await this.relaunchHeadedForLogin(signal)
     }
     const page = await this.ensureOnOrigin(signal)
     try {
@@ -529,7 +620,15 @@ export class QwenWebBrowser {
   private async ensureInternal(
     signal?: AbortSignal,
     headlessOverride?: boolean,
+    skipTransitionGate = false,
   ): Promise<{ context: QwenWebContext; page: QwenWebPage }> {
+    // A login relaunch holds a launch lock: while the old context is closing,
+    // this.context is already cleared but this.headless still reads true, so
+    // an unblocked launch here would start headless and get reused by the
+    // relaunch as it flips to headed (#483). Wait the transition out.
+    if (this.loginRelaunch && !skipTransitionGate) {
+      await this.loginRelaunch.catch(() => {})
+    }
     if (this.context && !this.contextDead) {
       const page = await this.ensurePage()
       return { context: this.context, page }
@@ -679,8 +778,9 @@ export class QwenWebBrowser {
     const quick = await quickAuthState(page)
     if (quick === "challenge" || quick === "login") return quick
     if (steer || page.url().startsWith(qwenWebOrigin())) {
-      if (await this.sniffChallenge(page)) return "challenge"
       const probe = await this.probeSession(page).catch(() => "unknown" as const)
+      // An authenticated probe wins: page text may mention "captcha" in chat titles.
+      if (probe !== "authenticated" && (await this.sniffChallenge(page))) return "challenge"
       const state = probe !== "unknown" ? probe : quick
       if (state === "authenticated") markAuthenticated(this.profileDir)
       return state
@@ -697,7 +797,7 @@ export class QwenWebBrowser {
         const body = (document.body?.textContent ?? "").slice(0, 4000)
         return `${title}\n${body}`.toLowerCase()
       }, undefined)
-      return CHALLENGE_BODY_MARKERS.some((marker) => sample.includes(marker))
+      return isChallengeMessage(sample)
     } catch {
       return false
     }
@@ -723,10 +823,17 @@ export class QwenWebBrowser {
         clearTimeout(timer)
       }
     }, url)
+    const sample = `${result.contentType}\n${result.body}`
+    // Status is not enough: WAFs commonly return challenge pages with 200,
+    // 401, or 403. The body signal always wins over auth classification.
+    // Known trade-off (deferred, needs a product call): a 401/403 login page
+    // whose markup merely mentions "captcha" (e.g. an embedded widget script)
+    // also reports "challenge" here, pausing the run instead of prompting a
+    // re-login. Both directions need the user, so the body-wins rule this
+    // workstream ships stays as-is until that call is made.
+    if (isChallengeMessage(sample)) return "challenge"
     if (result.status >= 200 && result.status < 300) return "authenticated"
     if (result.status === 401 || result.status === 403) return "login"
-    const lowered = `${result.contentType}\n${result.body}`.toLowerCase()
-    if (CHALLENGE_BODY_MARKERS.some((marker) => lowered.includes(marker))) return "challenge"
     if (result.body && /<!doctype\s+html|<html\b/i.test(result.body)) return "login"
     return "unknown"
   }

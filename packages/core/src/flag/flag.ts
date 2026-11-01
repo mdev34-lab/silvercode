@@ -57,6 +57,14 @@ export const Flag = {
   get OPENCODE_DISABLE_CONFIG_DEP_INSTALL() {
     return truthy("OPENCODE_DISABLE_CONFIG_DEP_INSTALL")
   },
+  // Wall-clock bound for the background config dependency install (issue #271
+  // design proposal: 60 seconds). A stalled registry must not keep plugin
+  // loading or instance disposal waiting forever. Missing, invalid, or
+  // non-positive values fall back to the default instead of running unbounded.
+  get OPENCODE_CONFIG_DEP_INSTALL_TIMEOUT_MS() {
+    const parsed = Number(process.env["OPENCODE_CONFIG_DEP_INSTALL_TIMEOUT_MS"])
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : 60_000
+  },
   get OPENCODE_EXPERIMENTAL_REFERENCES() {
     return enabledByExperimental("OPENCODE_EXPERIMENTAL_REFERENCES")
   },

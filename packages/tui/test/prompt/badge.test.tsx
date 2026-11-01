@@ -4,6 +4,7 @@ import { testRender, useRenderer } from "@opentui/solid"
 import { describe, expect, test } from "bun:test"
 import { onCleanup, onMount } from "solid-js"
 import { tmpdir } from "../fixture/fixture"
+import { captureFrame } from "../fixture/frame"
 import { createFetch, directory, json } from "../fixture/tui-sdk"
 import { TestTuiContexts } from "../fixture/tui-environment"
 import { ArgsProvider } from "../../src/context/args"
@@ -131,7 +132,7 @@ describe("prompt badge", () => {
       await ready
       await wait(() => sync.status === "complete")
       await app.renderOnce()
-      const frame = app.captureCharFrame()
+      const frame = await captureFrame(app)
       expect(frame).toContain("YOLO")
     } finally {
       app.renderer.destroy()
@@ -236,7 +237,7 @@ describe("prompt badge", () => {
       await ready
       await wait(() => sync.status === "complete")
       await app.renderOnce()
-      const frame = app.captureCharFrame()
+      const frame = await captureFrame(app)
       expect(frame).not.toContain("YOLO")
     } finally {
       app.renderer.destroy()

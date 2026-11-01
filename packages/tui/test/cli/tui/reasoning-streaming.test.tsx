@@ -26,25 +26,18 @@ import { LocationProvider } from "../../../src/context/location"
 import { OpencodeKeymapProvider, registerOpencodeKeymap } from "../../../src/keymap"
 import { AssistantMessageRow, SessionContext } from "../../../src/routes/session"
 import { computeActivityGroups } from "../../../src/util/activity"
+import { captureSpans, waitUntil } from "../../fixture/frame"
 
 const SESSION = "ses_reason_stream"
 const BASE = 1_700_000_000_000
 const BODY = "Let me investigate the bug"
 
-async function waitUntil(fn: () => boolean, timeout = 5000) {
-  const start = Date.now()
-  while (!fn()) {
-    if (Date.now() - start > timeout) throw new Error("timed out waiting for condition")
-    await Bun.sleep(10)
-  }
-}
-
 // A frame with the reasoning body drawn. The reasoning body is rendered by a
 // streaming markdown/code block, which is not captured by `captureCharFrame()`
 // but IS captured by `captureSpans()` once the frame settles. We join every
 // span so partial word-aligned fragments are still detectable.
-function frameOfSpans(app: Awaited<ReturnType<typeof testRender>>) {
-  const spans = app.captureSpans()
+async function frameOfSpans(app: Awaited<ReturnType<typeof testRender>>) {
+  const spans = await captureSpans(app)
   return spans.lines.map((line) => line.spans.map((span) => span.text).join("")).join("\n")
 }
 
@@ -53,6 +46,18 @@ async function settle(app: Awaited<ReturnType<typeof testRender>>) {
   // body content, then flush a fresh frame.
   await Bun.sleep(150)
   await app.renderOnce()
+}
+
+// The markdown/code renderer draws the body asynchronously (tree-sitter load is
+// slow on cold CI runners), so poll until the text is drawn instead of trusting
+// one fixed delay. The assertions that follow still check the same content.
+async function settleUntilFrame(app: Awaited<ReturnType<typeof testRender>>, text: string, timeout = 8000) {
+  const start = Date.now()
+  await settle(app)
+  while (!(await frameOfSpans(app)).includes(text)) {
+    if (Date.now() - start > timeout) return
+    await settle(app)
+  }
 }
 
 type Setup = Awaited<ReturnType<typeof testRender>>
@@ -246,11 +251,11 @@ describe("reasoning streaming lifecycle", () => {
 
     const part = setup!.sync.data.part["m1"].find((item) => item.id === "prt_reason") as ReasoningPart
     await waitUntil(() => part.text === "Let me investigate")
-    await settle(app())
+    await settleUntilFrame(app(), "Let me investigate")
 
     // The streamed body is readable while reasoning is still active.
-    expect(frameOfSpans(app())).toContain("Let me investigate")
-    expect(frameOfSpans(app())).toContain("Thinking")
+    expect(await frameOfSpans(app())).toContain("Let me investigate")
+    expect(await frameOfSpans(app())).toContain("Thinking")
 
     // Now the reasoning stream actually ends (terminal snapshot with time.end).
     setup!.events.emit(updatedEvent(SESSION, "m1", reasoningPart("m1", "Let me investigate", BASE + 5000), 3))
@@ -258,16 +263,16 @@ describe("reasoning streaming lifecycle", () => {
     await settle(app())
 
     // Once done, hide mode collapses the body to a one-line summary.
-    const frame = frameOfSpans(app())
+    const frame = await frameOfSpans(app())
     expect(frame).toContain("Thought")
     expect(frame).toContain("5.0s")
   })
 
   test("show mode: the Thinking body stays open even after the reasoning stream ends", async () => {
     await mount({ thinkingMode: "show", parts: [reasoningPart("m1", BODY, BASE + 5000)] })
-    await settle(app())
+    await settleUntilFrame(app(), "Let me investigate")
 
-    const frame = frameOfSpans(app())
+    const frame = await frameOfSpans(app())
     expect(frame).toContain("Thought")
     expect(frame).toContain("Let me investigate")
   })

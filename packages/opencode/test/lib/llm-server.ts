@@ -36,6 +36,7 @@ type Sse = {
   type: "sse"
   head: unknown[]
   tail: unknown[]
+  onSend?: () => void
   wait?: PromiseLike<unknown>
   hang?: boolean
   error?: unknown
@@ -417,6 +418,7 @@ function modelFrom(body: unknown) {
 }
 
 function send(item: Sse) {
+  item.onSend?.()
   const head = bytes(item.head)
   const tail = bytes([...item.tail, ...(item.hang || item.error ? [] : [done])])
   const empty = Stream.fromIterable<Uint8Array>([])
@@ -456,6 +458,7 @@ export class Reply {
   #tail: unknown[] = []
   #usage: Usage | undefined
   #finish: string | undefined
+  #onSend: (() => void) | undefined
   #wait: PromiseLike<unknown> | undefined
   #hang = false
   #error: unknown
@@ -479,6 +482,11 @@ export class Reply {
 
   usage(value: Usage) {
     this.#usage = value
+    return this
+  }
+
+  onSend(fn: () => void) {
+    this.#onSend = fn
     return this
   }
 
@@ -542,6 +550,23 @@ export class Reply {
     return this
   }
 
+  /**
+   * In-band provider error frame: the shape a gateway emits when it reports a
+   * failure inside the SSE stream itself (as opposed to a transport drop).
+   * The Zen adapter converts transport cuts into this same frame.
+   */
+  cut(message: unknown = "boom") {
+    this.#finish = undefined
+    this.#hang = false
+    this.#error = undefined
+    this.#reset = false
+    this.#tail = [
+      ...this.#tail,
+      { error: { code: "server_error", message: typeof message === "string" ? message : "boom", type: "server_error" } },
+    ]
+    return this
+  }
+
   reset() {
     this.#finish = undefined
     this.#hang = false
@@ -554,7 +579,15 @@ export class Reply {
     return {
       type: "sse",
       head: this.#head,
-      tail: this.#finish ? [...this.#tail, finishLine(this.#finish, this.#usage)] : this.#tail,
+      // Without a finish reason the usage still rides its own final chunk:
+    // some providers complete a response, send the usage accounting, and
+    // omit finish metadata - a completed response, not a dropped stream.
+    tail: this.#finish
+      ? [...this.#tail, finishLine(this.#finish, this.#usage)]
+      : this.#usage
+        ? [...this.#tail, chunk({ usage: this.#usage })]
+        : this.#tail,
+      onSend: this.#onSend,
       wait: this.#wait,
       hang: this.#hang,
       error: this.#error,
@@ -584,6 +617,7 @@ export function raw(input: {
   chunks?: unknown[]
   head?: unknown[]
   tail?: unknown[]
+  onSend?: () => void
   wait?: PromiseLike<unknown>
   hang?: boolean
   error?: unknown
@@ -593,6 +627,7 @@ export function raw(input: {
     type: "sse",
     head: input.head ?? input.chunks ?? [],
     tail: input.tail ?? [],
+    onSend: input.onSend,
     wait: input.wait,
     hang: input.hang,
     error: input.error,
@@ -609,6 +644,27 @@ function hit(url: string, body: unknown) {
     url: new URL(url, "http://localhost"),
     body: body && typeof body === "object" ? (body as Record<string, unknown>) : {},
   } satisfies Hit
+}
+
+const MAX_MISSES = 20
+
+interface Miss {
+  url: URL
+  body: string
+}
+
+function miss(hit: Hit): Miss {
+  // The decisive part of an unmatched request is its final messages, not the
+  // JSON tail: chat bodies end with the tools array, so a raw slice shows
+  // tool schemas instead of the message that failed to match. Excerpt the
+  // last two messages (chat mode) or input items (responses mode) instead.
+  const body = hit.body as { messages?: unknown; input?: unknown }
+  const items = Array.isArray(body.messages) ? body.messages : Array.isArray(body.input) ? body.input : []
+  const excerpt = items
+    .slice(-2)
+    .map((entry) => JSON.stringify(entry).slice(-500))
+    .join("\n---\n")
+  return { url: hit.url, body: excerpt || JSON.stringify(hit.body).slice(-800) }
 }
 
 function isTitleRequest(body: unknown): boolean {
@@ -628,6 +684,7 @@ namespace TestLLMServer {
     readonly toolHang: (name: string, input: unknown) => Effect.Effect<void>
     readonly reason: (value: string, opts?: { text?: string; usage?: Usage }) => Effect.Effect<void>
     readonly fail: (message?: unknown) => Effect.Effect<void>
+    readonly cut: (message?: unknown) => Effect.Effect<void>
     readonly error: (status: number, body: unknown, headers?: Record<string, string>) => Effect.Effect<void>
     readonly hang: Effect.Effect<void>
     readonly hold: (value: string, wait: PromiseLike<unknown>) => Effect.Effect<void>
@@ -637,7 +694,7 @@ namespace TestLLMServer {
     readonly wait: (count: number) => Effect.Effect<void>
     readonly inputs: Effect.Effect<Record<string, unknown>[]>
     readonly pending: Effect.Effect<number>
-    readonly misses: Effect.Effect<Hit[]>
+    readonly misses: Effect.Effect<Miss[]>
   }
 }
 
@@ -651,7 +708,7 @@ export class TestLLMServer extends Context.Service<TestLLMServer, TestLLMServer.
       let hits: Hit[] = []
       let list: Queue[] = []
       let waits: Wait[] = []
-      let misses: Hit[] = []
+      let misses: Miss[] = []
 
       const queue = (...input: (Item | Reply)[]) => {
         list = [...list, ...input.map((value) => ({ item: item(value) }))]
@@ -690,6 +747,11 @@ export class TestLLMServer extends Context.Service<TestLLMServer, TestLLMServer.
         const next = pull(current)
         if (!next) {
           hits = [...hits, current]
+          // Record the unmatched request: on a miss the auto-reply below has
+          // no finish tool, which surfaces far away as a 3-nudge turn stop.
+          // Keep only a truncated copy of the body and cap the array so a
+          // runaway request loop cannot grow memory without bound.
+          misses = [...misses, miss(current)].slice(-MAX_MISSES)
           yield* notify()
           const auto: Sse = { type: "sse", head: [role()], tail: [textLine("ok"), finishLine("stop")] }
           if (mode === "responses") return send(responses(auto, modelFrom(body)))
@@ -753,6 +815,9 @@ export class TestLLMServer extends Context.Service<TestLLMServer, TestLLMServer.
         }),
         fail: Effect.fn("TestLLMServer.fail")(function* (message: unknown = "boom") {
           queue(reply().streamError(message).item())
+        }),
+        cut: Effect.fn("TestLLMServer.cut")(function* (message: unknown = "Zen stream ended before the completion finished") {
+          queue(reply().cut(message).item())
         }),
         error: Effect.fn("TestLLMServer.error")(function* (
           status: number,

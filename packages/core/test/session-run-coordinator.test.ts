@@ -206,6 +206,77 @@ describe("SessionRunCoordinator", () => {
     ),
   )
 
+  it.effect("claims an idle stop and then refuses every new run", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        let runs = 0
+        const gate = yield* Deferred.make<void>()
+        const coordinator = yield* SessionRunCoordinator.make<string, never>({
+          drain: () => Effect.sync(() => runs++).pipe(Effect.andThen(Deferred.await(gate))),
+        })
+
+        expect(yield* coordinator.stopIfIdle).toEqual({ status: "stopping" })
+
+        yield* coordinator.wake("session")
+        yield* coordinator.run("session")
+        yield* Effect.yieldNow
+
+        expect(runs).toBe(0)
+        expect(Array.from(yield* coordinator.active)).toEqual([])
+        // A claimed stop stays claimed: no run may start behind the caller's
+        // shutdown, and a second claim is still granted rather than retried.
+        expect(yield* coordinator.stopIfIdle).toEqual({ status: "stopping" })
+      }),
+    ),
+  )
+
+  it.effect("refuses the claim while a run is active", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const started = yield* Deferred.make<void>()
+        const gate = yield* Deferred.make<void>()
+        const coordinator = yield* SessionRunCoordinator.make<string, never>({
+          drain: () => Deferred.succeed(started, undefined).pipe(Effect.andThen(Deferred.await(gate))),
+        })
+
+        const running = yield* coordinator.run("session").pipe(Effect.forkChild)
+        yield* Deferred.await(started)
+
+        expect(yield* coordinator.stopIfIdle).toEqual({ status: "busy", activeRuns: 1 })
+        expect(Array.from(yield* coordinator.active)).toEqual(["session"])
+
+        yield* Deferred.succeed(gate, undefined)
+        yield* Fiber.join(running)
+
+        expect(yield* coordinator.stopIfIdle).toEqual({ status: "stopping" })
+      }),
+    ),
+  )
+
+  it.effect("counts every active run in a refused claim", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const started = yield* Deferred.make<void>()
+        const gate = yield* Deferred.make<void>()
+        let active = 0
+        const coordinator = yield* SessionRunCoordinator.make<string, never>({
+          drain: () =>
+            Effect.sync(() => ++active).pipe(
+              Effect.andThen(Deferred.succeed(started, undefined)),
+              Effect.andThen(Deferred.await(gate)),
+            ),
+        })
+
+        yield* coordinator.wake("first")
+        yield* Deferred.await(started)
+        yield* coordinator.wake("second")
+        yield* Effect.yieldNow
+
+        expect(yield* coordinator.stopIfIdle).toEqual({ status: "busy", activeRuns: 2 })
+      }),
+    ),
+  )
+
   it.effect("does nothing when interrupted while idle", () =>
     Effect.scoped(
       Effect.gen(function* () {

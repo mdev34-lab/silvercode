@@ -35,6 +35,25 @@ import { RepetitionGuard } from "./llm/repetition-guard"
 import { SystemPrompt } from "./system"
 import { ToolCatalog } from "@/tool/catalog"
 
+// A tool call whose arguments never parsed as JSON is almost always a response
+// cut off at the output-token limit mid-payload (or genuinely malformed JSON).
+// Name the likely cause and the recovery instead of relaying the bare parser
+// error, so the model retries with smaller arguments instead of improvising
+// chunking schemes. A nudge only: the model remains free to retry the same call.
+export function repairToolCallMessage(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error)
+  const cause = error instanceof Error && error.cause instanceof Error ? error.cause.message : ""
+  const combined = `${message} ${cause}`
+  if (!/json parse|unterminated|unexpected end of json|unexpected end of input|syntaxerror/i.test(combined)) {
+    return message
+  }
+  return [
+    `The tool-call arguments were not valid JSON (${message}).`,
+    "This usually means the response was cut off at the output-token limit while the arguments were being generated.",
+    "Retry with smaller arguments. When writing a large file, split the content across several smaller tool calls or append it in chunks instead of sending one large payload, and keep each individual tool call well within the output budget.",
+  ].join(" ")
+}
+
 export const OUTPUT_TOKEN_MAX = ProviderTransform.OUTPUT_TOKEN_MAX
 
 export type StreamInput = {
@@ -280,6 +299,11 @@ const live: Layer.Layer<
           return {
             type: "native" as const,
             stream: native.stream,
+            executableTools: new Set(
+              Object.entries(prepared.tools)
+                .filter(([, tool]) => tool.execute)
+                .map(([name]) => name),
+            ),
             summarizedReasoning,
             maxGenerationChars,
             repetitionThresholds,
@@ -311,6 +335,11 @@ const live: Layer.Layer<
       // LLMAISDK.toLLMEvents below normalizes fullStream parts for the processor.
       return {
         type: "ai-sdk" as const,
+        executableTools: new Set(
+          Object.entries(prepared.tools)
+            .filter(([, tool]) => tool.execute)
+            .map(([name]) => name),
+        ),
         summarizedReasoning,
         maxGenerationChars,
         repetitionThresholds,
@@ -361,7 +390,7 @@ const live: Layer.Layer<
               ...failed.toolCall,
               input: JSON.stringify({
                 tool: failed.toolCall.toolName,
-                error: failed.error.message,
+                error: repairToolCallMessage(failed.error),
               }),
               toolName: "invalid",
             }
@@ -445,7 +474,10 @@ const live: Layer.Layer<
                   )
             return GenerationLimit.guard(
               RepetitionGuard.guard(
-                ReasoningWatchdog.guard(inner, { summarized: result.summarizedReasoning }),
+                ReasoningWatchdog.guard(inner, {
+                  summarized: result.summarizedReasoning,
+                  executableTools: result.executableTools,
+                }),
                 { thresholds: result.repetitionThresholds },
               ),
               { maxChars: result.maxGenerationChars },

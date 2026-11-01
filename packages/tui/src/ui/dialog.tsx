@@ -1,4 +1,5 @@
-import { useRenderer, useTerminalDimensions } from "@opentui/solid"
+import { useRenderer } from "@opentui/solid"
+import { useTerminalDimensions } from "../util/terminal-dimensions"
 import { batch, createContext, createEffect, onCleanup, Show, useContext, type JSX, type ParentProps } from "solid-js"
 import { useTheme } from "../context/theme"
 import { MouseButton, Renderable, RGBA } from "@opentui/core"
@@ -85,10 +86,17 @@ function init() {
   })
 
   let focus: Renderable | null
+  // One pending refocus at a time: rapid open/close used to stack untracked
+  // timers that could focus a destroyed renderable or walk a destroyed
+  // renderer (#420).
+  let refocusTimer: ReturnType<typeof setTimeout> | undefined
   function refocus() {
-    setTimeout(() => {
+    if (refocusTimer !== undefined) clearTimeout(refocusTimer)
+    refocusTimer = setTimeout(() => {
+      refocusTimer = undefined
       if (!focus) return
       if (focus.isDestroyed) return
+      if (renderer.isDestroyed) return
       function find(item: Renderable) {
         for (const child of item.getChildren()) {
           if (child === focus) return true
@@ -101,6 +109,9 @@ function init() {
       focus.focus()
     }, 1)
   }
+  onCleanup(() => {
+    if (refocusTimer !== undefined) clearTimeout(refocusTimer)
+  })
 
   useBindings(() => ({
     enabled: store.stack.length > 0 && !renderer.getSelection()?.getSelectedText(),

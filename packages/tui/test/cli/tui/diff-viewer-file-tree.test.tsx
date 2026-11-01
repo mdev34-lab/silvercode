@@ -3,6 +3,7 @@ import { describe, expect, test } from "bun:test"
 import { RGBA } from "@opentui/core"
 import { testRender } from "@opentui/solid"
 import type { JSX } from "solid-js"
+import { captureFrame } from "../../fixture/frame"
 import { createTuiResolvedConfig } from "../../fixture/tui-runtime"
 import { KVProvider } from "../../../src/context/kv"
 import { ThemeProvider } from "../../../src/context/theme"
@@ -51,7 +52,7 @@ describe("DiffViewerFileTree", () => {
 
     try {
       await renderOnceSettled(app)
-      const lines = visibleLines(app.captureCharFrame())
+      const lines = visibleLines(await captureFrame(app))
 
       expect(lines).toEqual([
         "▾ a",
@@ -169,13 +170,13 @@ async function renderOnceSettled(app: Awaited<ReturnType<typeof testRender>>) {
 }
 
 async function captureSettledFrame(app: Awaited<ReturnType<typeof testRender>>) {
-  for (let attempt = 0; attempt < 5; attempt++) {
-    const frame = app.captureCharFrame()
+  for (let attempt = 0; attempt < 40; attempt++) {
+    const frame = await captureFrame(app)
     if (frame.trim().length > 0) return frame
     await new Promise((resolve) => setTimeout(resolve, 25))
     await app.renderOnce()
   }
-  return app.captureCharFrame()
+  return await captureFrame(app)
 }
 
 function withTheme(component: () => JSX.Element) {
@@ -183,7 +184,9 @@ function withTheme(component: () => JSX.Element) {
     <TestTuiContexts>
       <TuiConfigProvider config={createTuiResolvedConfig()}>
         <KVProvider>
-          <ThemeProvider mode="dark">{component()}</ThemeProvider>
+          <ThemeProvider mode="dark" source={{ discover: async () => ({}) }}>
+            {component()}
+          </ThemeProvider>
         </KVProvider>
       </TuiConfigProvider>
     </TestTuiContexts>

@@ -17,7 +17,7 @@ export const HELP_SECTIONS: HelpSection[] = [
       { command: "/help", desc: "Open this help dialog" },
       { command: "/connect", desc: "Connect an AI provider to start coding" },
       { command: "/models", desc: "Switch the active AI model" },
-      { command: "/agents", desc: "Switch agent (Work, Plan, or subagents)" },
+      { command: "/agents", desc: "Switch agent (Work, Think, or subagents)" },
       { command: "/skills", desc: "Browse and load an available skill" },
     ],
   },
@@ -50,6 +50,7 @@ export const HELP_SECTIONS: HelpSection[] = [
     title: "System",
     commands: [
       { command: "/variants", desc: "Switch model variants, when supported" },
+      { command: "/effort", desc: "Agent effort: review rigor (fast, medium, thorough)" },
       { command: "/mcps", desc: "Toggle MCP servers" },
       { command: "/themes", desc: "Switch the terminal theme" },
       { command: "/status", desc: "View system status info" },

@@ -1,7 +1,7 @@
-import type { AssistantMessage, Model } from "@opencode-ai/sdk/v2"
 import type { TuiPlugin, TuiPluginApi } from "@opencode-ai/plugin/tui"
 import type { BuiltinTuiPlugin } from "../builtins"
 import { createMemo } from "solid-js"
+import { contextUsage } from "../../util/context-usage"
 
 const id = "internal:sidebar-context"
 
@@ -15,23 +15,20 @@ const money = new Intl.NumberFormat("en-US", {
 // accessibility-friendly detail underneath instead of the sole readout.
 //
 // Owner correction (post-review): there is no "confidently empty" status.
-// Before any assistant message with real usage exists, the true state is
-// UNKNOWN — we have not measured anything yet, so reporting "0 tokens /
-// 0% used" would assert a fact we don't have. The same "unknown" status
-// also covers the pre-existing case of usage existing but the model's
-// context limit not being resolvable. Both render identically: a plain
-// empty bar (no fill, no hatch/texture glyph) paired with the "usage
-// unknown" text. A prior hatch-glyph ("▨") rendering for unknown was
-// removed because that glyph's cell height renders differently from the
-// fill/empty glyphs in terminal fonts, visually breaking the single-bar
-// presentation the issue calls for.
+// When no measured usage exists — either no report and no assistant message
+// yet, or usage exists but the model's context limit is not resolvable — the
+// true state is UNKNOWN; reporting "0 tokens / 0% used" would assert a fact
+// we don't have. It renders as a plain empty bar (no fill, no hatch/texture
+// glyph) paired with the "usage unknown" text. A prior hatch-glyph ("▨")
+// rendering for unknown was removed because that glyph's cell height renders
+// differently from the fill/empty glyphs in terminal fonts, visually breaking
+// the single-bar presentation the issue calls for.
 //
-// The percent formula here is intentionally the simplest possible one
-// (last assistant message's own token total over its own model's context
-// limit). Any notion of summing/aggregating usage across providers or
-// models is explicitly out of scope and held pending the #243 spec, which
-// owns context measurement/budget semantics; #241 must not invent that
-// formula ahead of #243.
+// Measurement itself is not derived here: the runtime publishes one report per
+// provider request (see `util/context-usage`), and this view renders it. Only a
+// session that has not reached its first provider request falls back to the
+// provider's token accounting for its last assistant turn, which is where the
+// UNKNOWN cases above come from.
 export const CONTEXT_BAR_WIDTH = 20
 
 export type ContextUsage = { status: "known"; tokens: number; percent: number } | { status: "unknown"; tokens: number }
@@ -43,38 +40,37 @@ export function contextBarGlyphs(usage: ContextUsage): string {
   return "█".repeat(filled) + "░".repeat(CONTEXT_BAR_WIDTH - filled)
 }
 
-export function contextUsageFrom(messages: readonly AssistantMessage[], findModel: (providerID: string, modelID: string) => { limit: Pick<Model["limit"], "context"> } | undefined): ContextUsage {
-  // Input, reasoning and cache usage are measured even when output is zero.
-  // Do not treat an all-zero placeholder as a measured empty context.
-  const last = messages.findLast((item): item is AssistantMessage => item.role === "assistant" &&
-    [item.tokens.input, item.tokens.output, item.tokens.reasoning, item.tokens.cache.read, item.tokens.cache.write]
-      .some((tokens) => tokens > 0))
-  if (!last) return { status: "unknown", tokens: 0 }
-
-  const tokens =
-    last.tokens.input + last.tokens.output + last.tokens.reasoning + last.tokens.cache.read + last.tokens.cache.write
-  const model = findModel(last.providerID, last.modelID)
-  if (!model?.limit.context) return { status: "unknown", tokens }
-  return { status: "known", tokens, percent: Math.round((tokens / model.limit.context) * 100) }
-}
-
 function View(props: { api: TuiPluginApi; session_id: string }) {
   const theme = () => props.api.theme.current
   const msg = createMemo(() => props.api.state.session.messages(props.session_id))
   const session = createMemo(() => props.api.state.session.get(props.session_id))
   const cost = createMemo(() => session()?.cost ?? 0)
+  const report = createMemo(() => props.api.state.session.context(props.session_id))
 
-  const state = createMemo(() =>
-    contextUsageFrom(
-      msg().filter((item): item is AssistantMessage => item.role === "assistant"),
-      (providerID, modelID) => props.api.state.provider.find((item) => item.id === providerID)?.models[modelID],
-    ),
+  const usage = createMemo(() =>
+    contextUsage({
+      report: report(),
+      messages: msg(),
+      contextLimit: (providerID, modelID) =>
+        props.api.state.provider.find((item) => item.id === providerID)?.models[modelID]?.limit.context,
+    }),
   )
 
+  const state = createMemo((): ContextUsage => {
+    const measured = usage()
+    if (!measured) return { status: "unknown", tokens: 0 }
+    if (measured.percent === undefined) return { status: "unknown", tokens: measured.tokens }
+    return { status: "known", tokens: measured.tokens, percent: measured.percent }
+  })
+
   const detail = createMemo(() => {
-    const usage = state()
-    if (usage.status === "unknown") return "usage unknown"
-    return `${usage.tokens.toLocaleString()} tokens · ${usage.percent}% used`
+    const measured = usage()
+    if (!measured) return "usage unknown"
+    if (measured.exhausted) return `${measured.tokens.toLocaleString()} tokens · context exhausted`
+    if (measured.urgent)
+      return `${measured.tokens.toLocaleString()} tokens · ${measured.reclaimed.toLocaleString()} reclaimed`
+    if (state().status === "unknown") return "usage unknown"
+    return `${measured.tokens.toLocaleString()} tokens · ${measured.percent}% used`
   })
 
   return (

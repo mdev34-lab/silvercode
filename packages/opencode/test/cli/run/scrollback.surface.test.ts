@@ -47,7 +47,9 @@ function render(commits: ClaimedCommit[]) {
 }
 
 function renderRows(commit: ClaimedCommit, width = 80) {
-  const raw = decoder.decode(commit.snapshot.getRealCharBytes(true))
+  // Rows are sliced straight off the grid, so the line breaks are left out and every row
+  // occupies exactly `width` cells.
+  const raw = decoder.decode(commit.snapshot.getRealCharBytes(false))
   return Array.from({ length: commit.snapshot.height }, (_, index) =>
     raw.slice(index * width, (index + 1) * width).trimEnd(),
   )
@@ -63,7 +65,7 @@ async function setup(
   input: {
     width?: number
     wrote?: boolean
-    theme?: RunTheme
+    theme?: RunTheme | ((renderer: TestRenderer) => RunTheme)
     onThemeRelease?: (theme: RunTheme) => void
   } = {},
 ) {
@@ -76,12 +78,18 @@ async function setup(
   })
   active.push(out.renderer)
 
+  // Syntax styles belong to a native context, so a theme that carries one is
+  // built from the renderer it will be drawn with.
+  const theme = (typeof input.theme === "function" ? input.theme(out.renderer) : input.theme) ?? RUN_THEME_FALLBACK
+
   const treeSitterClient = new MockTreeSitterClient({ autoResolveTimeout: 0 })
   treeSitterClient.setMockResult({ highlights: [] })
 
   return {
     renderer: out.renderer,
-    scrollback: new RunScrollbackStream(out.renderer, input.theme ?? RUN_THEME_FALLBACK, {
+    externalOutput: out.externalOutput,
+    theme,
+    scrollback: new RunScrollbackStream(out.renderer, theme, {
       treeSitterClient,
       wrote: input.wrote ?? false,
       onThemeRelease: input.onThemeRelease,
@@ -129,16 +137,20 @@ test("turn summary starts at the left edge", async () => {
 })
 
 test("theme swaps restyle active reasoning without resetting the stream", async () => {
-  const previousSyntax = SyntaxStyle.fromStyles({ default: { fg: "#123456" } })
-  const nextSyntax = SyntaxStyle.fromStyles({ default: { fg: "#abcdef" } })
   const released: RunTheme[] = []
-  const previous = {
-    ...RUN_THEME_FALLBACK,
-    block: {
-      ...RUN_THEME_FALLBACK.block,
-      subtleSyntax: previousSyntax,
-    },
-  }
+  const out = await setup({
+    theme: (renderer) => ({
+      ...RUN_THEME_FALLBACK,
+      block: {
+        ...RUN_THEME_FALLBACK.block,
+        subtleSyntax: SyntaxStyle.fromStyles({ default: { fg: "#123456" } }, renderer.nativeScene),
+      },
+    }),
+    onThemeRelease: (theme) => released.push(theme),
+  })
+  const previous = out.theme
+  const previousSyntax = previous.block.subtleSyntax!
+  const nextSyntax = SyntaxStyle.fromStyles({ default: { fg: "#abcdef" } }, out.renderer.nativeScene)
   const next = {
     ...RUN_THEME_FALLBACK,
     block: {
@@ -146,7 +158,6 @@ test("theme swaps restyle active reasoning without resetting the stream", async 
       subtleSyntax: nextSyntax,
     },
   }
-  const out = await setup({ theme: previous, onThemeRelease: (theme) => released.push(theme) })
 
   try {
     await out.scrollback.append(reasoning("before"))
@@ -497,77 +508,29 @@ test("inserts spacers for new visible groups", async () => {
   }
 })
 
-// TODO(windows): Re-enable on Windows once the streaming CodeRenderable
-// flush race is fixed. The reasoning commit is delivered as a `<code>`
-// renderable with `filetype="markdown"`, `streaming=true`, and
-// `drawUnstyledText=false`. On Windows the first paragraph of the reasoning
-// body (here `_Thinking:_ **Plan**`) is dropped from the committed rows —
-// the failing assertion shows only `Say hello.` survives, while Linux
-// (where `useThread` is forced off in `@opentui/core/testing`) and macOS
-// both pass.
-//
-// Investigation summary (see PR description for the link to this work):
-//   1. `reasoning("Thinking: ...", "progress")` enters `entry.body.ts`
-//      `reasoningBody`, which becomes a `code` body with filetype="markdown".
-//   2. `RunScrollbackStream.writeStreaming` sets `renderable.content = ...`
-//      while `streaming=true`. `CodeRenderable.set content` short-circuits
-//      (does NOT call `textBuffer.setText`) when streaming, drawUnstyledText
-//      is false, and a filetype is set — it relies on the next
-//      `startHighlight()` cycle to populate the buffer.
-//   3. `ScrollbackSurface.settle()` renders the surface, kicks the
-//      highlight via `renderSelf` → `startHighlight`, waits on
-//      `highlightingDone`, and re-renders. With `MockTreeSitterClient`
-//      returning `{highlights: []}`, the final branch (`else
-//      this.textBuffer.setText(content)`) populates the buffer and
-//      `_shouldRenderTextBuffer = true`.
-//   4. `flushActive` then commits rows `[0, surface.height - 1)` during
-//      streaming. On Windows the committed rows are blank for the first
-//      paragraph — suggesting the height/text-buffer state is observed
-//      before/after the highlight resolution in a way that drops rows on
-//      that platform.
-//
-// Linux CI can also drop the first paragraph of the replayed reasoning block,
-// so this test asserts the stable second paragraph instead of the first-line
-// `Thinking:` label. A real fix probably belongs in opentui (either force
-// deterministic rendering for tests, or eagerly call `textBuffer.setText` in
-// `CodeRenderable.set content` when streaming updates a non-empty body).
-//
-// Skipping on win32 unblocks unrelated PRs; the assertion is still
-// exercised on Linux and macOS in CI.
-test.skipIf(process.platform === "win32")(
-  "renders replayed user, reasoning, and assistant output after completion",
-  async () => {
-    const out = await setup()
+test("renders replayed user, reasoning, and assistant output after completion", async () => {
+  const out = await setup()
 
-    try {
-      const lines: string[] = []
-      const take = () => {
-        const commits = claim(out.renderer)
-        try {
-          lines.push(...commits.flatMap((commit) => renderRows(commit).flatMap((row) => row.split("\n"))))
-        } finally {
-          destroy(commits)
-        }
-      }
+  try {
+    await out.scrollback.append(user("Hello you"))
+    await out.scrollback.append(reasoning("Thinking: **Plan**\n\nSay hello.", "progress"))
+    await out.scrollback.complete()
+    await out.scrollback.append(assistant("Hello.", "progress"))
+    await out.scrollback.complete()
 
-      await out.scrollback.append(user("Hello you"))
-      take()
-      await out.scrollback.append(reasoning("Thinking: **Plan**\n\nSay hello.", "progress"))
-      await out.scrollback.complete()
-      take()
-      await out.scrollback.append(assistant("Hello.", "progress"))
-      await out.scrollback.complete()
-      take()
-
-      const output = lines.join("\n")
-      expect(output).toContain("› Hello you")
-      expect(output).toContain("Say hello.")
-      expect(output).toContain("Hello.")
-    } finally {
-      out.scrollback.destroy()
-    }
-  },
-)
+    // externalOutput.takeText() reads the committed scrollback text through
+    // the 0.6.6 testing API. Asserting the FIRST reasoning paragraph (the
+    // "Thinking:" label) is the #440 check: it was the paragraph the Windows
+    // render thread dropped from committed rows before the upgrade.
+    const output = out.externalOutput.takeText()
+    expect(output).toContain("› Hello you")
+    expect(output).toContain("Thinking:")
+    expect(output).toContain("Say hello.")
+    expect(output).toContain("Hello.")
+  } finally {
+    out.scrollback.destroy()
+  }
+})
 
 test("coalesces same-line tool progress into one snapshot", async () => {
   const out = await setup()

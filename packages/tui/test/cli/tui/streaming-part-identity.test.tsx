@@ -18,6 +18,7 @@ import { SDKProvider } from "../../../src/context/sdk"
 import { SyncProvider, useSync } from "../../../src/context/sync"
 import { RouteProvider } from "../../../src/context/route"
 import { TuiConfigProvider } from "../../../src/config"
+import { captureFrame, waitUntil } from "../../fixture/frame"
 
 let mountCount = 0
 
@@ -65,14 +66,6 @@ function updatedEvent(sessionID: string, messageID: string, part: Part, id: numb
     type: "message.part.updated",
     properties: { sessionID, time: id, part },
   })
-}
-
-async function waitUntil(fn: () => boolean, timeout = 5000) {
-  const start = Date.now()
-  while (!fn()) {
-    if (Date.now() - start > timeout) throw new Error("timed out waiting for condition")
-    await Bun.sleep(10)
-  }
 }
 
 type Sync = ReturnType<typeof useSync>
@@ -185,7 +178,7 @@ describe("streaming part identity", () => {
       await app.renderOnce()
 
       expect(mountCount).toBe(1)
-      expect(app.captureCharFrame().split("\n").join("")).toContain("Hello streaming world!")
+      expect((await captureFrame(app)).split("\n").join("")).toContain("Hello streaming world!")
     } finally {
       app.renderer.destroy()
     }
@@ -228,7 +221,7 @@ describe("streaming part identity", () => {
       await app.renderOnce()
 
       expect(mountCount).toBe(1)
-      expect(app.captureCharFrame().split("\n").join("")).toContain("Hello world")
+      expect((await captureFrame(app)).split("\n").join("")).toContain("Hello world")
     } finally {
       app.renderer.destroy()
     }
@@ -251,7 +244,7 @@ describe("streaming part identity", () => {
       await app.renderOnce()
 
       expect(mountCount).toBe(1)
-      expect(app.captureCharFrame().split("\n").join("")).toContain("Hello world!")
+      expect((await captureFrame(app)).split("\n").join("")).toContain("Hello world!")
     } finally {
       app.renderer.destroy()
     }
@@ -284,7 +277,7 @@ describe("streaming part identity", () => {
 
       expect(mountCount).toBe(1)
       expect(textOf(sync, messageID, partID)).toBe("final answer")
-      expect(app.captureCharFrame().split("\n").join("")).toContain("final answer")
+      expect((await captureFrame(app)).split("\n").join("")).toContain("final answer")
     } finally {
       app.renderer.destroy()
     }

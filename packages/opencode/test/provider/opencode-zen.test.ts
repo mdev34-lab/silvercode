@@ -38,6 +38,11 @@ const ZEN_UUID = "11111111-1111-4111-8111-111111111111"
 // A session id as `Identifier.create` generates it: 12 hex timestamp chars
 // followed by 14 base 62 chars. These are not UUIDs.
 const SESSION_ID = "ses_1134d213e0014q5ohvhfGiiuCj"
+// Request ids share that shape under the `msg_` prefix.
+const REQUEST_ID_PATTERN = /^msg_[0-9a-f]{12}[0-9A-Za-z]{14}$/
+// The web tools the free-tier gate requires in every tool catalog; the adapter
+// appends upstream's definitions when the caller's catalog carries neither.
+const ZEN_WEB_TOOLS = ["webfetch", "websearch"]
 
 const encoder = new TextEncoder()
 
@@ -473,11 +478,14 @@ describe("OpenCodeZen", () => {
       })
     })
 
-    test("regenerates request ids", () => {
-      expect(requestID(() => ZEN_UUID)).toBe(`msg_${ZEN_UUID}`)
-      expect(requestID()).toMatch(/^msg_[0-9a-f-]{36}$/)
-      const requests = uuids("first", "second")
-      expect(requestID(requests)).not.toBe(requestID(requests))
+    test("regenerates request ids in the workspace message-id shape", () => {
+      // The gateway rejects uuid-style request ids; ids follow `Identifier`
+      // (`msg_` + 12 hex timestamp chars + 14 base 62 chars) even when a uuid
+      // source is supplied.
+      expect(requestID()).toMatch(REQUEST_ID_PATTERN)
+      expect(requestID(() => ZEN_UUID)).toMatch(REQUEST_ID_PATTERN)
+      expect(requestID(() => ZEN_UUID)).not.toBe(`msg_${ZEN_UUID}`)
+      expect(requestID()).not.toBe(requestID())
     })
   })
 
@@ -493,7 +501,40 @@ describe("OpenCodeZen", () => {
       expect(calls[0].headers.get("x-opencode-client")).toBe("cli")
       expect(calls[0].headers.get("x-opencode-project")).toBe("global")
       expect(calls[0].headers.get("x-opencode-session")).toBe(`ses_${ZEN_UUID}`)
-      expect(calls[0].headers.get("x-opencode-request")).toBe(`msg_${ZEN_UUID}`)
+      // The gate requires the session id under `x-opencode-session-id` too.
+      expect(calls[0].headers.get("x-opencode-session-id")).toBe(`ses_${ZEN_UUID}`)
+      expect(calls[0].headers.get("x-opencode-request")).toMatch(REQUEST_ID_PATTERN)
+    })
+
+    test("mirrors the resolved session into x-opencode-session-id", async () => {
+      const { calls, upstream } = recorder(() => Response.json({ ok: true }))
+      const zen = createFetch({ upstream })
+      const body = JSON.stringify({ model: "big-pickle", messages: [], stream: true })
+
+      await zen(zenURL, { method: "POST", headers: { "x-opencode-session": SESSION_ID }, body })
+      await zen(zenURL, { method: "POST", headers: { "x-opencode-session": "garbage" }, body })
+
+      expect(calls[0].headers.get("x-opencode-session-id")).toBe(SESSION_ID)
+      // A replaced session id is mirrored, so both headers always agree.
+      const replaced = calls[1].headers.get("x-opencode-session")
+      expect(replaced).toMatch(/^ses_/)
+      expect(replaced).not.toBe("garbage")
+      expect(calls[1].headers.get("x-opencode-session-id")).toBe(replaced)
+    })
+
+    test("keeps a caller request id and regenerates one per request otherwise", async () => {
+      const { calls, upstream } = recorder(() => Response.json({ ok: true }))
+      const zen = createFetch({ upstream })
+      const body = JSON.stringify({ model: "big-pickle", messages: [] })
+
+      await zen(zenURL, { method: "POST", headers: { "x-opencode-request": "msg_turn" }, body })
+      await zen(zenURL, { method: "POST", body })
+      await zen(zenURL, { method: "POST", body })
+
+      expect(calls[0].headers.get("x-opencode-request")).toBe("msg_turn")
+      expect(calls[1].headers.get("x-opencode-request")).toMatch(REQUEST_ID_PATTERN)
+      expect(calls[2].headers.get("x-opencode-request")).toMatch(REQUEST_ID_PATTERN)
+      expect(calls[2].headers.get("x-opencode-request")).not.toBe(calls[1].headers.get("x-opencode-request"))
     })
 
     test("keeps a caller session and gives each caller without one its own session", async () => {
@@ -558,47 +599,61 @@ describe("OpenCodeZen", () => {
       expect(calls[1].headers.get("authorization")).toBe("Bearer sk")
     })
 
-    test("enforces streaming and satisfies the bash/glob/grep/read tool quartet wiregate", async () => {
+    test("enforces streaming and sends a tool-less request without a synthetic catalog", async () => {
       const { calls, upstream } = recorder(() => sse())
       const zen = createFetch({ upstream })
 
+      // The gate now rejects the synthetic bash/glob/grep/read quartet and
+      // accepts genuine tool-less requests (e.g. title or compaction turns), so
+      // nothing is injected and tool_choice is left untouched.
       await zen(zenURL, { method: "POST", body: JSON.stringify({ model: "big-pickle", messages: [] }) })
 
       expect(calls[0].body?.stream).toBe(true)
-      expect(calls[0].body?.tools).toHaveLength(4)
-      expect(calls[0].body?.tools.map((t: any) => t.function?.name)).toEqual(["bash", "glob", "grep", "read"])
-      expect(calls[0].body?.tool_choice).toBe("none")
+      expect(calls[0].body).not.toHaveProperty("tools")
+      expect(calls[0].body).not.toHaveProperty("tool_choice")
 
-      // Explicit caller tool_choice is preserved verbatim and not silently weakened to auto
+      // An empty catalog is dropped as well; an explicit caller tool_choice is
+      // preserved verbatim and not silently weakened.
       await zen(zenURL, {
         method: "POST",
         body: JSON.stringify({ model: "big-pickle", messages: [], tools: [], tool_choice: "required" }),
       })
 
-      expect(calls[1].body?.tools).toHaveLength(4)
-      expect(calls[1].body?.tools.map((t: any) => t.function?.name)).toEqual(["bash", "glob", "grep", "read"])
+      expect(calls[1].body).not.toHaveProperty("tools")
       expect(calls[1].body?.tool_choice).toBe("required")
+    })
 
-      // Caller tools are preserved verbatim at index 0 and missing quartet tools are appended
+    test("appends the upstream web tools the wiregate requires when a caller catalog lacks both", async () => {
+      const { calls, upstream } = recorder(() => sse())
+      const zen = createFetch({ upstream })
+      const custom = { type: "function", function: { name: "my_custom_tool", description: "custom", parameters: {} } }
+
+      // Caller tools are preserved verbatim at the front; upstream's webfetch and
+      // websearch definitions are appended, and the quartet is never injected.
       await zen(zenURL, {
         method: "POST",
         body: JSON.stringify({
           model: "big-pickle",
           messages: [],
-          tools: [{ type: "function", function: { name: "my_custom_tool", description: "custom", parameters: {} } }],
+          tools: [custom],
           tool_choice: { type: "function", function: { name: "my_custom_tool" } },
         }),
       })
 
-      expect(calls[2].body?.tools).toHaveLength(5)
-      expect(calls[2].body?.tools[0]).toEqual({
-        type: "function",
-        function: { name: "my_custom_tool", description: "custom", parameters: {} },
-      })
-      expect(calls[2].body?.tools.slice(1).map((t: any) => t.function?.name)).toEqual(["bash", "glob", "grep", "read"])
-      expect(calls[2].body?.tool_choice).toEqual({ type: "function", function: { name: "my_custom_tool" } })
+      expect(calls[0].body?.tools).toHaveLength(3)
+      expect(calls[0].body?.tools[0]).toEqual(custom)
+      expect(calls[0].body?.tools.slice(1).map((t: any) => t.function?.name)).toEqual(ZEN_WEB_TOOLS)
+      expect(calls[0].body?.tool_choice).toEqual({ type: "function", function: { name: "my_custom_tool" } })
 
-      // If caller already provides bash, it is not duplicated
+      // The appended definitions are real upstream tool schemas, not empty stubs.
+      const [webfetch, websearch] = calls[0].body?.tools.slice(1)
+      expect(webfetch.function.parameters.required).toEqual(["url"])
+      expect(Object.keys(webfetch.function.parameters.properties)).toEqual(["url", "format", "timeout"])
+      expect(websearch.function.parameters.required).toEqual(["query"])
+      expect(websearch.function.parameters.properties.query.type).toBe("string")
+
+      // Caller tools that share a quartet name are passed through untouched and
+      // the remaining quartet members are not filled in.
       await zen(zenURL, {
         method: "POST",
         body: JSON.stringify({
@@ -608,9 +663,29 @@ describe("OpenCodeZen", () => {
         }),
       })
 
-      expect(calls[3].body?.tools).toHaveLength(4)
-      expect(calls[3].body?.tools.map((t: any) => t.function?.name)).toEqual(["bash", "glob", "grep", "read"])
-      expect(calls[3].body?.tools[0].function.description).toBe("caller bash")
+      expect(calls[1].body?.tools.map((t: any) => t.function?.name)).toEqual(["bash", ...ZEN_WEB_TOOLS])
+      expect(calls[1].body?.tools[0].function.description).toBe("caller bash")
+    })
+
+    test("leaves a caller catalog alone when it already carries webfetch or websearch", async () => {
+      const { calls, upstream } = recorder(() => sse())
+      const zen = createFetch({ upstream })
+      const webfetch = { type: "function", function: { name: "webfetch", description: "caller webfetch" } }
+      const websearch = { type: "function", function: { name: "websearch", description: "caller websearch" } }
+
+      await zen(zenURL, {
+        method: "POST",
+        body: JSON.stringify({ model: "big-pickle", messages: [], tools: [webfetch] }),
+      })
+      await zen(zenURL, {
+        method: "POST",
+        body: JSON.stringify({ model: "big-pickle", messages: [], tools: [websearch] }),
+      })
+
+      // Either web tool satisfies the gate, so the caller's definition is the
+      // only one on the wire and nothing is duplicated.
+      expect(calls[0].body?.tools).toEqual([webfetch])
+      expect(calls[1].body?.tools).toEqual([websearch])
     })
 
     test("leaves non-completion requests alone", async () => {
@@ -666,6 +741,126 @@ describe("OpenCodeZen", () => {
       expect(await response.text()).toBe(ssePayload)
     })
 
+    test("converts a stream cut before completion into an in-band provider error frame", async () => {
+      // No finish-reason chunk and no [DONE]: the upstream connection ended
+      // mid-completion. Ending the guarded stream cleanly here would let the
+      // SDK synthesize a reason-less "unknown" finish and hide the cut.
+      const { upstream } = recorder(() =>
+        stream('data: {"choices":[{"index":0,"delta":{"content":"partial"},"finish_reason":null}]}', ""),
+      )
+      const zen = createFetch({ upstream })
+      const body = JSON.stringify({ model: "big-pickle", messages: [], stream: true })
+
+      const response = await zen(zenURL, { method: "POST", body })
+      const text = await response.text()
+      expect(text).toContain('"content":"partial"')
+      expect(text).not.toContain("[DONE]")
+      expect(text).toContain('"error"')
+      expect(text).toContain("Zen stream ended before the completion finished")
+    })
+
+    test("passes a [DONE]-terminated stream through without a truncation frame", async () => {
+      const { upstream } = recorder(() => sse())
+      const zen = createFetch({ upstream })
+      const body = JSON.stringify({ model: "big-pickle", messages: [], stream: true })
+
+      const response = await zen(zenURL, { method: "POST", body })
+      const text = await response.text()
+      expect(text).toContain("[DONE]")
+      expect(text).not.toContain('"error"')
+    })
+
+    test("tolerates a finish-reason completion that omits the [DONE] frame", async () => {
+      const { upstream } = recorder(() =>
+        stream('data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}', ""),
+      )
+      const zen = createFetch({ upstream })
+      const body = JSON.stringify({ model: "big-pickle", messages: [], stream: true })
+
+      const response = await zen(zenURL, { method: "POST", body })
+      const text = await response.text()
+      expect(text).not.toContain('"error"')
+    })
+
+    test("converts a mid-stream transport failure into an in-band provider error frame", async () => {
+      const failing = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(
+            encoder.encode('data: {"choices":[{"index":0,"delta":{"content":"partial"},"finish_reason":null}]}\n\n'),
+          )
+          controller.error(new Error("connection reset"))
+        },
+      })
+      const { upstream } = recorder(() => new Response(failing, { headers: { "content-type": "text/event-stream" } }))
+      const zen = createFetch({ upstream })
+      const body = JSON.stringify({ model: "big-pickle", messages: [], stream: true })
+
+      const response = await zen(zenURL, { method: "POST", body })
+      const text = await response.text()
+            // Bytes buffered behind the failed read may or may not survive the
+      // transport error; the truncation frame is the contract.
+      expect(text).toContain("Zen stream ended before the completion finished")
+    })
+
+    test("applies the truncation contract when the caller catalog already carries the fingerprint tools", async () => {
+      // injectedOnly is empty here (caller already lists bash/glob/grep/read,
+      // the production shape): the guard must still wrap the stream, or a cut
+      // like this one would sail through as a clean end.
+      const { upstream } = recorder(() =>
+        stream('data: {"choices":[{"index":0,"delta":{"content":"partial"},"finish_reason":null}]}', ""),
+      )
+      const zen = createFetch({ upstream })
+      const body = JSON.stringify({
+        model: "big-pickle",
+        messages: [],
+        stream: true,
+        tools: ["bash", "glob", "grep", "read"].map((name) => ({
+          type: "function",
+          function: { name, parameters: { type: "object", properties: {} } },
+        })),
+      })
+
+      const response = await zen(zenURL, { method: "POST", body })
+      const text = await response.text()
+      expect(text).toContain("Zen stream ended before the completion finished")
+    })
+
+    test("treats a frame cut off inside the finish_reason value as truncation", async () => {
+      // The tail dies after the full `"finish_reason":"sto` prefix: a
+      // substring search would count this as a completed response even though
+      // the frame is not valid JSON and no finish was ever transmitted.
+      const { upstream } = recorder(() =>
+        stream(
+          'data: {"choices":[{"index":0,"delta":{"content":"partial"},"finish_reason":null}]}',
+          "",
+          'data: {"choices":[{"index":0,"delta":{},"finish_reason":"sto',
+        ),
+      )
+      const zen = createFetch({ upstream })
+      const body = JSON.stringify({ model: "big-pickle", messages: [], stream: true })
+
+      const response = await zen(zenURL, { method: "POST", body })
+      const text = await response.text()
+      expect(text).toContain("Zen stream ended before the completion finished")
+    })
+
+    test("does not mistake content quoting a finish_reason literal for completion", async () => {
+      // The model's own text can contain the substring `"finish_reason":"stop"`;
+      // only a parsed finish field proves completion.
+      const { upstream } = recorder(() =>
+        stream(
+          'data: {"choices":[{"index":0,"delta":{"content":"see {\\"finish_reason\\":\\"stop\\"} here"}}]}',
+          "",
+        ),
+      )
+      const zen = createFetch({ upstream })
+      const body = JSON.stringify({ model: "big-pickle", messages: [], stream: true })
+
+      const response = await zen(zenURL, { method: "POST", body })
+      const text = await response.text()
+      expect(text).toContain("Zen stream ended before the completion finished")
+    })
+
     test("forwards a non-JSON body untouched", async () => {
       const { calls, upstream } = recorder(() => Response.json({ ok: true }))
       const zen = createFetch({ upstream })
@@ -686,12 +881,13 @@ describe("OpenCodeZen", () => {
 
       await zen(zenURL, {
         method: "POST",
-        body: encoder.encode(JSON.stringify({ model: "big-pickle", messages: [] })),
+        body: encoder.encode(JSON.stringify({ model: "big-pickle", messages: [], tools: [], tool_choice: "auto" })),
       })
 
       expect(calls[0].body?.stream).toBe(true)
-      expect(calls[0].body?.tools).toHaveLength(4)
-      expect(calls[0].body?.tools.map((t: any) => t.function?.name)).toEqual(["bash", "glob", "grep", "read"])
+      expect(calls[0].body?.model).toBe("big-pickle")
+      expect(calls[0].body).not.toHaveProperty("tools")
+      expect(calls[0].body?.tool_choice).toBe("auto")
     })
 
     test("honors an init body override over a Request body", async () => {
@@ -1624,11 +1820,14 @@ it.live("runs a non-streaming free-tier request through the opencode provider", 
           expect(request.headers.get("x-opencode-client")).toBe("cli")
           expect(request.headers.get("x-opencode-project")).toBe("global")
           expect(request.headers.get("x-opencode-session")).toBe(SESSION_ID)
+          expect(request.headers.get("x-opencode-session-id")).toBe(SESSION_ID)
           expect(request.headers.get("x-opencode-request")).toBe("msg_turn")
           expect(request.headers.get("authorization")).toBe(ZEN_PUBLIC_AUTHENTICATION)
           expect(request.body?.stream).toBe(true)
-          expect(request.body?.tools).toHaveLength(4)
-          expect(request.body?.tools?.map((t: any) => t.function?.name)).toEqual(["bash", "glob", "grep", "read"])
+          // A plain chat turn carries no tools, and the adapter no longer
+          // fabricates a catalog for it.
+          expect(request.body).not.toHaveProperty("tools")
+          expect(request.body).not.toHaveProperty("tool_choice")
           expect(request.body?.model).toBe("deepseek-v4-flash-free")
         }),
       { config: zenProviderConfig(server.url) },
@@ -2243,6 +2442,14 @@ it.live(
             expect(genResult.toolResults).toHaveLength(1)
             expect(genResult.toolResults[0].output).toBe("found-test-val")
             expect(executedQuery).toBe("test-val")
+
+            // On the wire the caller catalog is kept in front, upstream's web
+            // tools are appended for the gate, and the quartet is not injected.
+            expect(server.requests).toHaveLength(1)
+            expect(server.requests[0].body?.tools?.map((t: any) => t.function?.name)).toEqual([
+              "custom_lookup",
+              ...ZEN_WEB_TOOLS,
+            ])
 
             // 2. streamText with partial caller tools
             executedQuery = ""

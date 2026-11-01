@@ -33,6 +33,13 @@ import { RuntimeFlags } from "@/effect/runtime-flags"
 import { ProviderError } from "./error"
 import { OpenCodeZen } from "./opencode-zen"
 import {
+  discoverModels as discoverTokenHarborModels,
+  providerInfo as tokenHarborProviderInfo,
+  TOKENHARBOR_BASE_URL,
+  TOKENHARBOR_ENV,
+  TOKENHARBOR_PROVIDER_ID,
+} from "./tokenharbor"
+import {
   createQwenWebModel,
   providerInfo as qwenWebProviderInfo,
   QWEN_WEB_PROVIDER_ID,
@@ -994,6 +1001,16 @@ function custom(dep: CustomDep): Record<string, CustomLoader> {
         options,
       }
     }),
+    tokenharbor: Effect.fnUntraced(function* (input: Info) {
+      const auth = yield* dep.auth(input.id)
+      const apiKey = auth?.type === "api" ? auth.key : yield* dep.get(TOKENHARBOR_ENV)
+      const baseURL = ((yield* dep.config()).provider?.[TOKENHARBOR_PROVIDER_ID]?.options?.baseURL as string | undefined) ?? TOKENHARBOR_BASE_URL
+      return {
+        autoload: false,
+        options: { baseURL },
+        discoverModels: () => discoverTokenHarborModels(apiKey, baseURL),
+      }
+    }),
     "qwen-web": Effect.fnUntraced(function* (input: Info) {
       const stored = yield* dep.auth(input.id)
       const hasConfig = Boolean((yield* dep.config()).provider?.[QWEN_WEB_PROVIDER_ID])
@@ -1416,7 +1433,12 @@ export function toPublicInfo(provider: Info): Info {
 }
 
 export function defaultModelIDs<T extends { models: Record<string, { id: string }> }>(providers: Record<string, T>) {
-  return mapValues(providers, (item) => sort(Object.values(item.models))[0].id)
+  // Providers whose models are discovered after auth (e.g. Token Harbor) can
+  // be listed with no models yet; they have no default to offer.
+  const withModels = Object.fromEntries(
+    Object.entries(providers).filter(([, provider]) => Object.keys(provider.models).length > 0),
+  )
+  return mapValues(withModels, (item) => sort(Object.values(item.models))[0].id)
 }
 
 export class ModelNotFoundError extends Schema.TaggedErrorClass<ModelNotFoundError>()("ProviderModelNotFoundError", {
@@ -1689,6 +1711,7 @@ const layer = Layer.effect(
         // *loaded* when its custom loader's autoload gate passes (stored
         // login, authenticated browser profile, or explicit user config).
         catalog[ProviderV2.ID.make(QWEN_WEB_PROVIDER_ID)] = qwenWebProviderInfo()
+        catalog[ProviderV2.ID.make(TOKENHARBOR_PROVIDER_ID)] = tokenHarborProviderInfo()
         const database = mapValues(catalog, toPublicInfo)
 
         const providers: Record<ProviderV2.ID, Info> = {} as Record<ProviderV2.ID, Info>
@@ -1934,14 +1957,15 @@ const layer = Layer.effect(
           mergeProvider(providerID, partial)
         }
 
-        const gitlab = ProviderV2.ID.make("gitlab")
-        if (discoveryLoaders[gitlab] && providers[gitlab] && isProviderAllowed(gitlab)) {
+        for (const [id, discover] of Object.entries(discoveryLoaders)) {
+          const providerID = ProviderV2.ID.make(id)
+          if (!providers[providerID] || !isProviderAllowed(providerID)) continue
           yield* Effect.promise(async () => {
             try {
-              const discovered = await discoveryLoaders[gitlab]()
+              const discovered = await discover()
               for (const [modelID, model] of Object.entries(discovered)) {
-                if (!providers[gitlab].models[modelID]) {
-                  providers[gitlab].models[modelID] = model
+                if (!providers[providerID].models[modelID]) {
+                  providers[providerID].models[modelID] = model
                 }
               }
             } catch (e) {}

@@ -3,7 +3,7 @@ export * as PluginInternal from "./internal"
 import { makeLocationNode } from "../effect/app-node"
 import { httpClient } from "../effect/app-node-platform"
 import type { PluginContext } from "@opencode-ai/plugin/v2/effect"
-import { Effect, Layer, Scope } from "effect"
+import { Context, Deferred, Effect, Layer, Scope } from "effect"
 import { AgentV2 } from "../agent"
 import { Catalog } from "../catalog"
 import { CommandV2 } from "../command"
@@ -35,6 +35,13 @@ import { ProviderPlugins } from "./provider"
 import { SkillPlugin } from "./skill"
 import { VariantPlugin } from "./variant"
 
+export interface Interface {
+  /** Completes only after the internal plugin batch has reloaded agent/config state. */
+  readonly ready: Effect.Effect<void>
+}
+
+export class Service extends Context.Service<Service, Interface>()("@opencode/v2/PluginInternal") {}
+
 export type Requirements =
   | AgentV2.Service
   | Catalog.Service
@@ -62,8 +69,10 @@ export function define<R>(plugin: Plugin<R>) {
   return plugin
 }
 
-const layer = Layer.effectDiscard(
+const layer = Layer.effect(
+  Service,
   Effect.gen(function* () {
+    const ready = yield* Deferred.make<void>()
     const catalog = yield* Catalog.Service
     const commands = yield* CommandV2.Service
     const plugin = yield* PluginV2.Service
@@ -113,7 +122,7 @@ const layer = Layer.effectDiscard(
         for (const item of ProviderPlugins) yield* add(item)
 
         const flags = yield* RuntimeFlags.Service
-        if (!(flags.factoryDefault)) {
+        if (!flags.factoryDefault) {
           yield* add(ConfigReferencePlugin.Plugin)
           yield* add(AgentPlugin.Plugin)
           yield* add(CommandPlugin.Plugin)
@@ -126,7 +135,13 @@ const layer = Layer.effectDiscard(
           yield* add(VariantPlugin.Plugin)
         }
       }),
-    ).pipe(Effect.withSpan("PluginInternal.boot"), Effect.forkScoped({ startImmediately: true }))
+    ).pipe(
+      Effect.onExit((exit) => Deferred.done(ready, exit)),
+      Effect.withSpan("PluginInternal.boot"),
+      Effect.forkScoped({ startImmediately: true }),
+    )
+
+    return Service.of({ ready: Deferred.await(ready) })
   }),
 )
 
@@ -136,7 +151,7 @@ export const locationLayer = layer.pipe(
 )
 
 export const node = makeLocationNode({
-  name: "plugin-internal",
+  service: Service,
   layer,
   deps: [
     Catalog.node,

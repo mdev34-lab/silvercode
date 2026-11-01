@@ -123,6 +123,9 @@ function stateApi(sync: ReturnType<typeof useSync>): TuiPluginApi["state"] {
       get(sessionID) {
         return sync.session.get(sessionID)
       },
+      context(sessionID) {
+        return sync.data.session_context[sessionID]
+      },
       diff(sessionID) {
         return (sync.data.session_diff[sessionID] ?? []).flatMap((item) =>
           item.file === undefined ? [] : [{ ...item, file: item.file }],
@@ -232,6 +235,7 @@ export function createTuiApiAdapters(input: Input): Omit<TuiPluginApi, "lifecycl
             onFilter={props.onFilter}
             onSelect={mapOptionCb(props.onSelect)}
             skipFilter={props.skipFilter}
+            renderFilter={props.renderFilter}
             current={props.current}
           />
         )

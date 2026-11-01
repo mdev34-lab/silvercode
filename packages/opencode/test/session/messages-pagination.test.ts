@@ -195,6 +195,29 @@ describe("MessageV2.page", () => {
     }),
   )
 
+  it.instance("fails with InvalidCursorError for a malformed cursor", () =>
+    withSession(({ sessionID }) =>
+      Effect.gen(function* () {
+        yield* fill(sessionID, 2)
+        // Effect.flip only catches typed errors - a raw JSON.parse/schema
+        // throw would surface as a defect and fail this test instead.
+        const error = yield* Effect.flip(MessageV2.page({ sessionID, limit: 10, before: "%%%not-a-cursor%%%" }))
+        expect(error).toBeInstanceOf(MessageV2.InvalidCursorError)
+      }),
+    ),
+  )
+
+  it.instance("fails with InvalidCursorError for valid base64url missing cursor fields", () =>
+    withSession(({ sessionID }) =>
+      Effect.gen(function* () {
+        yield* fill(sessionID, 2)
+        const bogus = Buffer.from(JSON.stringify({ id: "msg_nope" })).toString("base64url")
+        const error = yield* Effect.flip(MessageV2.page({ sessionID, limit: 10, before: bogus }))
+        expect(error).toBeInstanceOf(MessageV2.InvalidCursorError)
+      }),
+    ),
+  )
+
   it.instance("handles exact limit boundary", () =>
     withSession(({ sessionID }) =>
       Effect.gen(function* () {

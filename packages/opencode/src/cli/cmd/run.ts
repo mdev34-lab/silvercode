@@ -18,13 +18,16 @@ import path from "path"
 import { pathToFileURL } from "url"
 import { open } from "node:fs/promises"
 import { Effect } from "effect"
+import { BackgroundTasks } from "./run/background-tasks"
+import { RetryNotice } from "./run/retry-notice"
 import { UI } from "../ui"
 import { effectCmd } from "../effect-cmd"
 import { EOL } from "os"
 import { Filesystem } from "@/util/filesystem"
-import { createOpencodeClient, type OpencodeClient, type ToolPart } from "@opencode-ai/sdk/v2"
+import { createOpencodeClient, type OpencodeClient, type Part, type ToolPart } from "@opencode-ai/sdk/v2"
 import { FormatError, FormatUnknownError } from "../error"
 import { INTERACTIVE_INPUT_ERROR, resolveInteractiveStdin } from "./run/runtime.stdin"
+import { win32InstallCtrlCGuard } from "@opencode-ai/tui/terminal-win32"
 
 type ModelInput = Parameters<OpencodeClient["session"]["prompt"]>[0]["model"]
 
@@ -87,10 +90,21 @@ function formatRunError(error: unknown) {
   return FormatError(error) ?? FormatUnknownError(error)
 }
 
-async function tool(part: ToolPart) {
+// `printed` is the last text the run already showed. A finish result that only
+// repeats it is left out, so the answer is not printed twice.
+async function tool(part: ToolPart, printed?: string) {
   try {
-    const { toolInlineInfo } = await import("./run/tool")
+    const { toolInlineInfo, withoutRepeatedResult } = await import("./run/tool")
     const next = toolInlineInfo(part)
+    if (next.mode === "block" && part.tool === "finish" && printed && next.body) {
+      const rest = withoutRepeatedResult(next.dedupeBody ?? next.body, printed)
+      if (rest !== undefined) {
+        const info: Inline = { icon: next.icon, title: next.title, description: next.description }
+        if (rest) block(info, rest)
+        else inline(info)
+        return
+      }
+    }
     if (next.mode === "block") {
       block(next, next.body)
       return
@@ -121,6 +135,29 @@ async function toolError(part: ToolPart) {
       title: `${part.tool} failed`,
     })
   }
+}
+
+/** Retry delays longer than this are announced by a non-interactive run; shorter ones stay silent. */
+const RUN_RETRY_NOTICE_MS = 10_000
+
+type AssistantHeaderInfo = {
+  role?: unknown
+  agent?: unknown
+  modelID?: unknown
+  error?: unknown
+}
+
+type AssistantResponsePayload = {
+  info?: AssistantHeaderInfo
+  parts?: Part[]
+}
+
+function extractAssistantError(data: unknown): unknown {
+  if (!data || typeof data !== "object" || !("info" in data)) return undefined
+  const info = (data as { info?: unknown }).info
+  if (!info || typeof info !== "object") return undefined
+  const record = info as { role?: unknown; error?: unknown }
+  return record.role === "assistant" && record.error ? record.error : undefined
 }
 
 export const RunCommand = effectCmd({
@@ -263,12 +300,14 @@ export const RunCommand = effectCmd({
   handler: Effect.fn("Cli.run")(function* (args) {
     const { Agent } = yield* Effect.promise(() => import("@/agent/agent"))
     const { RuntimeFlags } = yield* Effect.promise(() => import("@/effect/runtime-flags"))
-    const { InstanceRef } = yield* Effect.promise(() => import("@/effect/instance-ref"))
+    const { HEADLESS_RETRY_MAX_DELAY_HEADER, HEADLESS_RUN_HEADER, InstanceRef } = yield* Effect.promise(
+      () => import("@/effect/instance-ref"),
+    )
     const { ServerAuth } = yield* Effect.promise(() => import("@/server/auth"))
     const agentSvc = yield* Agent.Service
     const flags = yield* RuntimeFlags.Service
     const localInstance = yield* InstanceRef
-    yield* Effect.promise(async () => {
+    yield* Effect.promise(async (fiberSignal) => {
       const rawMessage = [...args.message, ...(args["--"] || [])].join(" ")
       const interactive = args.mini
       const auto = args.auto || args.yolo || args["dangerously-skip-permissions"]
@@ -343,8 +382,22 @@ export const RunCommand = effectCmd({
           process.exit(1)
         }
       })()
+      const headlessHeaders: Record<string, string> = !interactive
+        ? {
+            [HEADLESS_RUN_HEADER]: "1",
+            ...(flags.retryMaxDelayMs !== undefined
+              ? { [HEADLESS_RETRY_MAX_DELAY_HEADER]: String(flags.retryMaxDelayMs) }
+              : {}),
+          }
+        : {}
       const attachHeaders = args.attach
-        ? ServerAuth.headers({ password: args.password, username: args.username })
+        ? (() => {
+            const merged = {
+              ...ServerAuth.headers({ password: args.password, username: args.username }),
+              ...headlessHeaders,
+            }
+            return Object.keys(merged).length > 0 ? merged : undefined
+          })()
         : undefined
       const attachSDK = (dir?: string) => {
         return createOpencodeClient({
@@ -690,40 +743,198 @@ export const RunCommand = effectCmd({
           return false
         }
 
+        const toggles = new Map<string, boolean>()
+        const renderedParts = new Set<string>()
+        let lastText = ""
+        let turnSettled = false
+        let onTurnSettled: (() => void) | undefined
+
+        const renderAssistantHeader = (info: AssistantHeaderInfo | undefined) => {
+          if (!info || info.role !== "assistant") return
+          if (args.format === "json" || toggles.get("start") === true) return
+          if (typeof info.agent !== "string" || typeof info.modelID !== "string") return
+          UI.empty()
+          UI.println(`> ${info.agent} · ${info.modelID}`)
+          UI.empty()
+          toggles.set("start", true)
+        }
+
+        const markPartRendered = (part: Part) => {
+          const key = `${part.type}:${part.id}`
+          if (renderedParts.has(key)) return false
+          renderedParts.add(key)
+          return true
+        }
+
+        const renderSessionPart = async (part: Part, opts?: { fromFinalResponse?: boolean }) => {
+          if (part.sessionID !== sessionID) return
+
+          if (part.type === "tool" && (part.state.status === "completed" || part.state.status === "error")) {
+            if (!markPartRendered(part)) return
+            if (emit("tool_use", { part })) return
+            if (part.state.status === "completed") {
+              await tool(part, lastText)
+              return
+            }
+            await toolError(part)
+            UI.error(part.state.error)
+            return
+          }
+
+          if (
+            !opts?.fromFinalResponse &&
+            part.type === "tool" &&
+            part.tool === "task" &&
+            part.state.status === "running" &&
+            args.format !== "json"
+          ) {
+            if (toggles.get(part.id) === true) return
+            await tool(part)
+            toggles.set(part.id, true)
+            return
+          }
+
+          if (part.type === "step-start") {
+            if (!markPartRendered(part)) return
+            emit("step_start", { part })
+            return
+          }
+
+          if (part.type === "step-finish") {
+            if (!markPartRendered(part)) return
+            emit("step_finish", { part })
+            return
+          }
+
+          if (part.type === "text" && (opts?.fromFinalResponse || Boolean(part.time?.end))) {
+            if (args.format === "json") {
+              if (!markPartRendered(part)) return
+              emit("text", { part })
+              return
+            }
+            const text = part.text.trim()
+            if (!text) return
+            if (!markPartRendered(part)) {
+              // `replayResponse` walks `parts` in causal message order: if an
+              // earlier unstreamed text part just replayed and overwrote
+              // `lastText`, advance `lastText` past already-streamed text parts
+              // too so a subsequent late `finish` tool part compares its full
+              // `dedupeBody` against the text part that immediately preceded it.
+              if (opts?.fromFinalResponse) lastText = text
+              return
+            }
+            lastText = text
+            if (!process.stdout.isTTY) {
+              process.stdout.write(text + EOL)
+              return
+            }
+            UI.empty()
+            UI.println(text)
+            UI.empty()
+            return
+          }
+
+          if (part.type === "reasoning" && (opts?.fromFinalResponse || Boolean(part.time?.end)) && thinking) {
+            if (args.format === "json") {
+              if (!markPartRendered(part)) return
+              emit("reasoning", { part })
+              return
+            }
+            const text = part.text.trim()
+            if (!text) return
+            if (!markPartRendered(part)) return
+            const line = `Thinking: ${text}`
+            if (process.stdout.isTTY) {
+              UI.empty()
+              UI.println(`${UI.Style.TEXT_DIM}\u001b[3m${line}\u001b[0m${UI.Style.TEXT_NORMAL}`)
+              UI.empty()
+              return
+            }
+            process.stdout.write(line + EOL)
+          }
+        }
+
+        const replayResponse = async (data: unknown) => {
+          if (!data || typeof data !== "object") return
+          const payload = data as AssistantResponsePayload
+          if (payload.info && payload.info.role !== "assistant") return
+          const parts = Array.isArray(payload.parts) ? payload.parts : []
+          if (parts.length > 0) {
+            renderAssistantHeader(payload.info)
+          }
+          for (const part of parts) {
+            await renderSessionPart(part, { fromFinalResponse: true })
+          }
+        }
+
         // Consume one subscribed event stream for the active session and mirror it
         // to stdout/UI. `client` is passed explicitly because attach mode may
         // rebind the SDK to the session's directory after the subscription is
         // created, and replies issued from inside the loop must use that client.
-        async function loop(client: OpencodeClient, events: Awaited<ReturnType<typeof sdk.event.subscribe>>) {
-          const toggles = new Map<string, boolean>()
+        async function loop(
+          client: OpencodeClient,
+          events: Awaited<ReturnType<typeof sdk.event.subscribe>>,
+          abortEvents: () => void,
+          eventSignal: AbortSignal,
+        ) {
           // Background subagents are the default task mode: the parent turn may
-          // finish while child jobs still run. Track child sessions launched in
-          // the background so the loop does not exit (killing the in-process
-          // server and its jobs) before every result is surfaced. `Resolved`
-          // keeps fast completions (which can arrive before the tool part) from
-          // re-marking a task as pending.
-          const backgroundPending = new Set<string>()
-          const backgroundResolved = new Set<string>()
+          // finish while child jobs still run. Track the sessions this run
+          // launched - and the sessions they launched - so the loop does not
+          // exit, killing the in-process server and every job with it, before
+          // all of their results are surfaced.
+          const background = BackgroundTasks.make(sessionID)
+          // Sessions already known to descend from this run's root, so a request is checked once.
+          const ownedSessions = new Set<string>([sessionID])
+          const ownsPermissionSession = async (id: string) => {
+            if (ownedSessions.has(id)) return true
+            if (background.owns(id)) return true
+            const chain: string[] = []
+            let current: string | undefined = id
+            for (let depth = 0; current && depth < 16; depth++) {
+              if (eventSignal.aborted) return false
+              if (ownedSessions.has(current)) {
+                for (const item of chain) ownedSessions.add(item)
+                return true
+              }
+              chain.push(current)
+              const next: string | undefined = await client.session
+                .get({ sessionID: current }, { signal: eventSignal })
+                .then((info) => info.data?.parentID)
+                .catch(() => undefined)
+              if (eventSignal.aborted) return false
+              current = next
+            }
+            return false
+          }
+          let rootIdle = false
           let error: string | undefined
+          const rootTerminal = () => rootIdle || (turnSettled && error !== undefined)
+          onTurnSettled = () => {
+            if (args.attach && error !== undefined) {
+              abortEvents()
+              return
+            }
+            if (rootTerminal() && background.settled()) abortEvents()
+          }
+          // Announces long retry waits of the root and of owned background children (#555).
+          const retryNotice = RetryNotice.make({
+            rootSessionID: sessionID,
+            owns: background.owns,
+            print: (line) => UI.println(line),
+            threshold: RUN_RETRY_NOTICE_MS,
+            json: args.format === "json",
+          })
 
           for await (const event of events.stream) {
-            if (
-              event.type === "message.updated" &&
-              event.properties.sessionID === sessionID &&
-              event.properties.info.role === "assistant" &&
-              args.format !== "json" &&
-              toggles.get("start") !== true
-            ) {
-              UI.empty()
-              UI.println(`> ${event.properties.info.agent} · ${event.properties.info.modelID}`)
-              UI.empty()
-              toggles.set("start", true)
+            if (event.type === "message.updated" && event.properties.sessionID === sessionID) {
+              renderAssistantHeader(event.properties.info)
             }
 
             if (event.type === "message.part.updated") {
               const part = event.properties.part
-              if (part.sessionID !== sessionID) continue
-
+              // Launches are observed wherever they happen: a subagent's own
+              // subagents have to settle before this run may exit, and the
+              // envelope that reports them lands in the subagent's session.
               if (part.type === "tool" && part.tool === "task" && part.state.status === "completed") {
                 const taskID =
                   ("metadata" in part.state && typeof part.state.metadata?.sessionId === "string"
@@ -736,75 +947,30 @@ export const RunCommand = effectCmd({
                 if (
                   launched &&
                   typeof part.state.output === "string" &&
-                  part.state.output.includes(`state="running"`) &&
-                  !backgroundResolved.has(taskID!)
+                  part.state.output.includes(`state="running"`)
                 ) {
-                  backgroundPending.add(taskID!)
+                  const run =
+                    "metadata" in part.state && typeof part.state.metadata?.runId === "string"
+                      ? part.state.metadata.runId
+                      : undefined
+                  background.launch({ sessionID: taskID!, parentSessionID: part.sessionID, run, launchID: part.id })
+                  retryNotice.launched()
                 }
               }
               if (part.type === "text") {
-                const match = part.text.match(/<task id="([^"]+)" state="(?:completed|error|cancelled)">/)
-                if (match?.[1]) {
-                  backgroundResolved.add(match[1])
-                  backgroundPending.delete(match[1])
+                const match = part.text.match(/<task id="([^"]+)"(?: run="([^"]+)")? state="(?:completed|error|cancelled)">/)
+                if (match?.[1] && !/<termination reason="waiting_for_subagent">/.test(part.text)) {
+                  background.resolve(match[2] ?? match[1])
+                  // A normal notification is about to wake the root. Do not
+                  // exit in the gap between its user part and busy status.
+                  if (part.sessionID === sessionID && part.synthetic && part.metadata?.backgroundNoReply !== true)
+                    rootIdle = false
+                  if (rootTerminal() && background.settled()) break
                 }
               }
 
-              if (part.type === "tool" && (part.state.status === "completed" || part.state.status === "error")) {
-                if (emit("tool_use", { part })) continue
-                if (part.state.status === "completed") {
-                  await tool(part)
-                  continue
-                }
-                await toolError(part)
-                UI.error(part.state.error)
-              }
-
-              if (
-                part.type === "tool" &&
-                part.tool === "task" &&
-                part.state.status === "running" &&
-                args.format !== "json"
-              ) {
-                if (toggles.get(part.id) === true) continue
-                await tool(part)
-                toggles.set(part.id, true)
-              }
-
-              if (part.type === "step-start") {
-                if (emit("step_start", { part })) continue
-              }
-
-              if (part.type === "step-finish") {
-                if (emit("step_finish", { part })) continue
-              }
-
-              if (part.type === "text" && part.time?.end) {
-                if (emit("text", { part })) continue
-                const text = part.text.trim()
-                if (!text) continue
-                if (!process.stdout.isTTY) {
-                  process.stdout.write(text + EOL)
-                  continue
-                }
-                UI.empty()
-                UI.println(text)
-                UI.empty()
-              }
-
-              if (part.type === "reasoning" && part.time?.end && thinking) {
-                if (emit("reasoning", { part })) continue
-                const text = part.text.trim()
-                if (!text) continue
-                const line = `Thinking: ${text}`
-                if (process.stdout.isTTY) {
-                  UI.empty()
-                  UI.println(`${UI.Style.TEXT_DIM}\u001b[3m${line}\u001b[0m${UI.Style.TEXT_NORMAL}`)
-                  UI.empty()
-                  continue
-                }
-                process.stdout.write(line + EOL)
-              }
+              // Everything below mirrors and prints the run's own session.
+              await renderSessionPart(part)
             }
 
             if (event.type === "session.error") {
@@ -815,52 +981,61 @@ export const RunCommand = effectCmd({
                 err = String(props.error.data.message)
               }
               error = error ? error + EOL + err : err
-              if (emit("error", { error: props.error })) continue
-              UI.error(err)
+              if (!emit("error", { error: props.error })) {
+                UI.error(err)
+              }
+              if (args.attach && turnSettled) break
+              if (rootTerminal() && background.settled()) break
+              continue
             }
 
-            // A background subagent session settling (completed, failed, or
-            // cancelled) emits its own idle status and resolves the task.
-            if (
-              event.type === "session.status" &&
-              event.properties.sessionID !== sessionID &&
-              event.properties.status.type === "idle"
-            ) {
-              backgroundResolved.add(event.properties.sessionID)
-              backgroundPending.delete(event.properties.sessionID)
+            if (event.type === "session.status") {
+              const statusSession = event.properties.sessionID
+              if (statusSession === sessionID) rootIdle = event.properties.status.type === "idle"
+              retryNotice.status(statusSession, event.properties.status)
             }
-
-            if (
-              event.type === "session.status" &&
-              event.properties.sessionID === sessionID &&
-              event.properties.status.type === "idle"
-            ) {
-              // Keep the loop alive until every launched background task has
-              // been resolved, so non-interactive runs surface child results.
-              if (backgroundPending.size > 0) continue
-              break
-            }
+            // A deferred/silent descendant delivery can arrive after the root's
+            // last idle event. Recheck on every event, not only another root
+            // turn: teardown deliberately does not wake the stopped session.
+            if (rootTerminal() && background.settled()) break
 
             if (event.type === "permission.asked") {
               const permission = event.properties
-              if (permission.sessionID !== sessionID) continue
+              // A delegated child (foreground or background) waits for the same answer the root would
+              // get; nobody else answers a headless run's requests, so ignoring it hangs the child.
+              if (!(await ownsPermissionSession(permission.sessionID))) {
+                if (eventSignal.aborted) break
+                continue
+              }
+              if (eventSignal.aborted) break
 
               if (auto) {
-                await client.permission.reply({
-                  requestID: permission.id,
-                  reply: "once",
-                })
+                await client.permission
+                  .reply(
+                    {
+                      requestID: permission.id,
+                      reply: "once",
+                    },
+                    { signal: eventSignal },
+                  )
+                  .catch(() => undefined)
               } else {
                 UI.println(
                   UI.Style.TEXT_WARNING_BOLD + "!",
                   UI.Style.TEXT_NORMAL +
                     `permission requested: ${permission.permission} (${permission.patterns.join(", ")}); auto-rejecting`,
                 )
-                await client.permission.reply({
-                  requestID: permission.id,
-                  reply: "reject",
-                })
+                await client.permission
+                  .reply(
+                    {
+                      requestID: permission.id,
+                      reply: "reject",
+                    },
+                    { signal: eventSignal },
+                  )
+                  .catch(() => undefined)
               }
+              if (eventSignal.aborted) break
             }
           }
           return error
@@ -874,50 +1049,106 @@ export const RunCommand = effectCmd({
         await share(client, sessionID)
 
         if (!interactive) {
-          const events = await client.event.subscribe()
-          const completed = loop(client, events).catch((e) => {
+          const eventAbort = new AbortController()
+          const abortEvents = () => {
+            if (!eventAbort.signal.aborted) eventAbort.abort()
+          }
+          const onFiberAbort = () => abortEvents()
+          if (fiberSignal.aborted) abortEvents()
+          else fiberSignal.addEventListener("abort", onFiberAbort, { once: true })
+
+          const events = await client.event.subscribe(undefined, {
+            signal: eventAbort.signal,
+          })
+          const completed = loop(client, events, abortEvents, eventAbort.signal).catch((e) => {
+            if (eventAbort.signal.aborted) return undefined
             console.error(e)
             process.exitCode = 1
+            return undefined
           })
-          async function finish() {
-            if (args.attach) return
-            const error = await completed
-            if (error) process.exitCode = 1
+          const stopEvents = async () => {
+            abortEvents()
+            await events.stream.return(undefined).catch(() => undefined)
+            return await completed
+          }
+          // Terminal contract for headless `run`:
+          // - Local (`!args.attach`): the CLI owns the in-process server and any
+          //   background subagents it spawned, so `completed` waits until SSE
+          //   reports `rootTerminal() && background.settled()`.
+          // - Attached (`args.attach`): the server outlives the CLI, background
+          //   subagents belong to the remote server, and foreign/older servers
+          //   may omit `session.status: idle`. The synchronous `prompt`/`command`
+          //   HTTP response (`{ info, parts }`) is therefore the authoritative
+          //   foreground turn-completion signal: `stopEvents()` immediately
+          //   cancels the `/event` stream and any in-flight permission RPC via
+          //   `eventAbort.signal`, and `replayResponse(responseData)` reconciles
+          //   the final `parts` and `info.error` against `renderedParts`/`loopError`
+          //   so late or omitted SSE frames are never lost or duplicated.
+          async function finish(responseData?: unknown) {
+            turnSettled = true
+            onTurnSettled?.()
+            if (!args.attach) {
+              await completed
+            }
+            const loopError = await stopEvents()
+            if (args.attach) {
+              await replayResponse(responseData)
+            }
+            if (loopError) {
+              process.exitCode = 1
+              return
+            }
+            const assistantError = extractAssistantError(responseData)
+            if (assistantError) {
+              if (!emit("error", { error: assistantError })) UI.error(formatRunError(assistantError))
+              process.exitCode = 1
+            }
           }
 
-          if (args.command) {
-            const result = await client.session.command({
-              sessionID,
-              agent,
-              model: args.model,
-              command: args.command,
-              arguments: message,
-              variant: args.variant,
-            })
+          try {
+            if (args.command) {
+              const result = await client.session.command(
+                {
+                  sessionID,
+                  agent,
+                  model: args.model,
+                  command: args.command,
+                  arguments: message,
+                  variant: args.variant,
+                },
+                { signal: fiberSignal },
+              )
+              if (result.error) {
+                if (!emit("error", { error: result.error })) UI.error(formatRunError(result.error))
+                process.exitCode = 1
+                return
+              }
+              await finish(result.data)
+              return
+            }
+
+            const model = pick(args.model)
+            const result = await client.session.prompt(
+              {
+                sessionID,
+                agent,
+                model,
+                variant: args.variant,
+                parts: [...files, { type: "text", text: message }],
+              },
+              { signal: fiberSignal },
+            )
             if (result.error) {
               if (!emit("error", { error: result.error })) UI.error(formatRunError(result.error))
               process.exitCode = 1
               return
             }
-            await finish()
+            await finish(result.data)
             return
+          } finally {
+            fiberSignal.removeEventListener("abort", onFiberAbort)
+            await stopEvents()
           }
-
-          const model = pick(args.model)
-          const result = await client.session.prompt({
-            sessionID,
-            agent,
-            model,
-            variant: args.variant,
-            parts: [...files, { type: "text", text: message }],
-          })
-          if (result.error) {
-            if (!emit("error", { error: result.error })) UI.error(formatRunError(result.error))
-            process.exitCode = 1
-            return
-          }
-          await finish()
-          return
         }
 
         const model = pick(args.model)
@@ -992,6 +1223,9 @@ export const RunCommand = effectCmd({
         const headers = new Headers(request.headers)
         const auth = ServerAuth.header()
         if (auth) headers.set("Authorization", auth)
+        for (const [key, value] of Object.entries(headlessHeaders)) {
+          headers.set(key, value)
+        }
         return Server.Default().app.fetch(new Request(request, { headers }))
       }) as typeof globalThis.fetch
       const sdk = createOpencodeClient({
@@ -1022,36 +1256,48 @@ type MiniCommandInput = {
 
 export async function runMini(input: MiniCommandInput) {
   if (!RunCommand.handler) throw new Error("Mini command handler is unavailable")
-  await RunCommand.handler({
-    $0: "silvercode",
-    _: ["mini"],
-    message: input.prompt ? [input.prompt] : [],
-    command: undefined,
-    continue: input.continue,
-    session: input.session,
-    fork: input.fork,
-    share: undefined,
-    model: input.model,
-    agent: input.agent,
-    format: "default",
-    file: undefined,
-    title: undefined,
-    attach: input.attach,
-    password: input.password,
-    username: input.username,
-    dir: input.directory,
-    port: undefined,
-    variant: undefined,
-    thinking: undefined,
-    mini: true,
-    interactive: false,
-    replay: input.replay ?? true,
-    "replay-limit": input.replayLimit,
-    replayLimit: input.replayLimit,
-    auto: false,
-    yolo: false,
-    "dangerously-skip-permissions": false,
-    dangerouslySkipPermissions: false,
-    demo: input.demo ?? false,
-  })
+  // Mini owns the console exactly like the full TUI: the split-footer renderer
+  // toggles raw mode, including across external-editor suspends. Keep the
+  // Windows Ctrl+C guard installed for the whole runtime so those toggles
+  // cannot turn Ctrl+C into a console event that kills the launcher's child
+  // abruptly (#441).
+  const unguard = win32InstallCtrlCGuard()
+  try {
+    await RunCommand.handler({
+      $0: "silvercode",
+      _: ["mini"],
+      message: input.prompt ? [input.prompt] : [],
+      command: undefined,
+      continue: input.continue,
+      session: input.session,
+      fork: input.fork,
+      share: undefined,
+      model: input.model,
+      agent: input.agent,
+      format: "default",
+      file: undefined,
+      title: undefined,
+      attach: input.attach,
+      password: input.password,
+      username: input.username,
+      dir: input.directory,
+      port: undefined,
+      variant: undefined,
+      thinking: undefined,
+      mini: true,
+      interactive: false,
+      replay: input.replay ?? true,
+      "replay-limit": input.replayLimit,
+      replayLimit: input.replayLimit,
+      auto: false,
+      yolo: false,
+      "dangerously-skip-permissions": false,
+      dangerouslySkipPermissions: false,
+      demo: input.demo ?? false,
+    })
+  } finally {
+    try {
+      unguard?.()
+    } catch {}
+  }
 }

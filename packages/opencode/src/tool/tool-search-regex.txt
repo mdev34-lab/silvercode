@@ -1,11 +1,1 @@
-Search for available tools with a regular expression. The pattern is matched case-insensitively against tool names and descriptions.
-
-Prefer `tool_search` for capability-style queries; use this one when you know part of a tool name or need a precise match.
-
-Examples:
-
-- tool_search_regex("github.*issue") -> tools with "github" followed by "issue"
-- tool_search_regex("^get") -> tools whose name or description starts with "get"
-- tool_search_regex("file|directory") -> tools mentioning "file" or "directory"
-
-Tools returned by a search stay available for the rest of the session, so you can call them directly on your next step.
+Search hidden tools with a case-insensitive regex over names and descriptions, e.g. "github.*issue" or "^get". Prefer `tool_search` for capability queries. Tools returned stay available for the rest of the session.

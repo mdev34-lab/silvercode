@@ -1,4 +1,5 @@
-import { render, TimeToFirstDraw, useRenderer, useTerminalDimensions } from "@opentui/solid"
+import { render, TimeToFirstDraw, useRenderer } from "@opentui/solid"
+import { useTerminalDimensions } from "./util/terminal-dimensions"
 import { registerOpencodeSpinner } from "./component/register-spinner"
 import { createDefaultOpenTuiKeymap } from "@opentui/keymap/opentui"
 import { Deferred, Effect } from "effect"
@@ -56,6 +57,8 @@ import { Session } from "./routes/session"
 import { PromptHistoryProvider } from "./component/prompt/history"
 import { FrecencyProvider } from "./component/prompt/frecency"
 import { PromptStashProvider } from "./component/prompt/stash"
+import { SessionTabsProvider, useSessionTabs } from "./context/session-tabs"
+import { SessionTabsBar } from "./component/session-tabs-bar"
 import { DialogAlert } from "./ui/dialog-alert"
 import { DialogConfirm } from "./ui/dialog-confirm"
 import { ToastProvider, useToast } from "./ui/toast"
@@ -86,6 +89,7 @@ import { createTuiAttention } from "./attention"
 import * as TuiAudio from "./audio"
 import { win32DisableProcessedInput, win32FlushInputBuffer } from "./terminal-win32"
 import { destroyRenderer } from "./util/renderer"
+import { createSigcontResume } from "./util/sigcont-resume"
 import { cliErrorMessage, errorFormat } from "./util/error"
 
 registerOpencodeSpinner()
@@ -93,6 +97,9 @@ registerOpencodeSpinner()
 const appGlobalBindingCommands = [
   "session.list",
   "session.new",
+  "session.tab.next",
+  "session.tab.prev",
+  "session.tab.close",
   "session.quick_switch.1",
   "session.quick_switch.2",
   "session.quick_switch.3",
@@ -187,7 +194,7 @@ function isVersionGreater(left: string, right: string) {
 
 export const run = Effect.fn("Tui.run")(function* (input: TuiInput) {
   const global = yield* Global.Service
-  const exit = { epilogue: undefined as string | undefined, reason: undefined as unknown }
+  const exit = { epilogue: undefined as string | undefined, reason: undefined as unknown, consoleLogs: "" }
   const result = yield* Effect.scoped(
     Effect.gen(function* () {
       const renderer = yield* Effect.acquireRelease(
@@ -208,10 +215,10 @@ export const run = Effect.fn("Tui.run")(function* (input: TuiInput) {
             }),
           catch: (error) => (error instanceof Error ? error : new Error(String(error))),
         }),
-        (renderer) =>
-          Effect.sync(() => {
-            destroyRenderer(renderer)
-          }),
+        // Scoped cleanup must await the async destroy: returning from the
+        // acquireRelease finalizer before `closed` settles lets the process
+        // exit with the terminal unrestored (Arena review on #451).
+        (renderer) => Effect.promise(() => destroyRenderer(renderer)),
       )
       win32DisableProcessedInput()
       const keymap = createDefaultOpenTuiKeymap(renderer)
@@ -230,6 +237,38 @@ export const run = Effect.fn("Tui.run")(function* (input: TuiInput) {
       )
       yield* Effect.addFinalizer(() => Effect.sync(TuiAudio.dispose))
       const shutdown = yield* Deferred.make<unknown>()
+      // opentui 0.6.6 catches renderer/process errors, but with its console overlay disabled
+      // those errors and cached console output are not visible. Restore the terminal before reporting.
+      let stoppingOnError = false
+      const stopOnError = (error: unknown) => {
+        if (stoppingOnError) return
+        stoppingOnError = true
+        exit.reason = error
+        try {
+          exit.consoleLogs = renderer.console.getCachedLogs()
+        } catch {}
+        void destroyRenderer(renderer)
+      }
+      const onRenderError = (event: { error: Error }) => stopOnError(event.error)
+      const onHandlerError = (event: { error: unknown }) => stopOnError(event.error)
+      const onUncaughtException = (error: Error) => stopOnError(error)
+      const onUnhandledRejection = (reason: unknown) =>
+        stopOnError(reason instanceof Error ? reason : new Error(String(reason)))
+      yield* Effect.acquireRelease(
+        Effect.sync(() => {
+          renderer.on("render:error", onRenderError)
+          renderer.on("handler:error", onHandlerError)
+          process.on("uncaughtException", onUncaughtException)
+          process.on("unhandledRejection", onUnhandledRejection)
+        }),
+        () =>
+          Effect.sync(() => {
+            renderer.off("render:error", onRenderError)
+            renderer.off("handler:error", onHandlerError)
+            process.off("uncaughtException", onUncaughtException)
+            process.off("unhandledRejection", onUnhandledRejection)
+          }),
+      )
       const onSighup = () => destroyRenderer(renderer)
       yield* Effect.acquireRelease(
         Effect.sync(() => process.on("SIGHUP", onSighup)),
@@ -310,24 +349,26 @@ export const run = Effect.fn("Tui.run")(function* (input: TuiInput) {
                                                 <DataProvider>
                                                   <ThemeProvider mode={mode}>
                                                     <LocalProvider>
-                                                      <PromptStashProvider>
-                                                        <DialogProvider>
-                                                          <FrecencyProvider>
-                                                            <PromptHistoryProvider>
-                                                              <PromptRefProvider>
-                                                                <EditorContextProvider>
-                                                                  <LocationProvider>
-                                                                    <App
-                                                                      onSnapshot={input.onSnapshot}
-                                                                      pluginHost={input.pluginHost}
-                                                                    />
-                                                                  </LocationProvider>
-                                                                </EditorContextProvider>
-                                                              </PromptRefProvider>
-                                                            </PromptHistoryProvider>
-                                                          </FrecencyProvider>
-                                                        </DialogProvider>
-                                                      </PromptStashProvider>
+                                                      <SessionTabsProvider>
+                                                        <PromptStashProvider>
+                                                          <DialogProvider>
+                                                            <FrecencyProvider>
+                                                              <PromptHistoryProvider>
+                                                                <PromptRefProvider>
+                                                                  <EditorContextProvider>
+                                                                    <LocationProvider>
+                                                                      <App
+                                                                        onSnapshot={input.onSnapshot}
+                                                                        pluginHost={input.pluginHost}
+                                                                      />
+                                                                    </LocationProvider>
+                                                                  </EditorContextProvider>
+                                                                </PromptRefProvider>
+                                                              </PromptHistoryProvider>
+                                                            </FrecencyProvider>
+                                                          </DialogProvider>
+                                                        </PromptStashProvider>
+                                                      </SessionTabsProvider>
                                                     </LocalProvider>
                                                   </ThemeProvider>
                                                 </DataProvider>
@@ -353,13 +394,14 @@ export const run = Effect.fn("Tui.run")(function* (input: TuiInput) {
         }, renderer)
       })
       yield* Deferred.await(shutdown)
-      return { epilogue: exit.epilogue, reason: exit.reason }
+      return { epilogue: exit.epilogue, reason: exit.reason, consoleLogs: exit.consoleLogs }
     }),
   )
   yield* Effect.sync(() => {
     win32FlushInputBuffer()
     if (result.reason !== undefined)
       process.stderr.write((cliErrorMessage(result.reason) ?? errorFormat(result.reason)) + "\n")
+    if (result.consoleLogs) process.stderr.write("Renderer console cache:\n" + result.consoleLogs + "\n")
     if (result.epilogue) process.stdout.write(result.epilogue + "\n")
   })
 })
@@ -368,8 +410,17 @@ function App(props: { onSnapshot?: () => Promise<string[]>; pluginHost: TuiPlugi
   const startup = useTuiStartup()
   const tuiConfig = useTuiConfig()
   const route = useRoute()
+  const tabs = useSessionTabs()
   const dimensions = useTerminalDimensions()
   const renderer = useRenderer()
+  // Every component that reads the terminal size adds its own resize listener, and a busy
+  // session has well over Node's default of 10. The warning would print into the screen.
+  renderer.setMaxListeners(0)
+  // Keyboard and paste hooks share a single emitter (renderer.keyInput) for the whole tree, so
+  // every component and plugin calling useKeyboard/usePaste adds a listener there. Past Node's
+  // default of 10 per event that trips MaxListenersExceededWarning, which opentui routes into its
+  // console cache instead of the terminal, so the cap has to be lifted on this emitter too.
+  renderer.keyInput.setMaxListeners(0)
   const dialog = useDialog()
   const local = useLocal()
   const kv = useKV()
@@ -430,9 +481,11 @@ function App(props: { onSnapshot?: () => Promise<string[]>; pluginHost: TuiPlugi
     },
     { priority: 1 },
   )
+  const sigcont = createSigcontResume(renderer)
   onCleanup(() => {
     offSelectionKeys()
     attention.dispose()
+    sigcont.dispose()
   })
 
   // Wire up console copy-to-clipboard via opentui's onCopySelection callback
@@ -454,26 +507,34 @@ function App(props: { onSnapshot?: () => Promise<string[]>; pluginHost: TuiPlugi
   // Update terminal window title based on current route and session
   createEffect(() => {
     if (!terminalTitleEnabled() || Flag.OPENCODE_DISABLE_TERMINAL_TITLE) return
+    // Since 0.6 the renderer rejects terminal control writes while its session is closing, and
+    // destroy() finishes asynchronously; a lost title is not worth crashing the UI over.
+    if (renderer.isDestroyed) return
+    const write = (title: string) => {
+      try {
+        renderer.setTerminalTitle(title)
+      } catch {}
+    }
 
     if (route.data.type === "home") {
-      renderer.setTerminalTitle("silvercode")
+      write("silvercode")
       return
     }
 
     if (route.data.type === "session") {
       const session = sync.session.get(route.data.sessionID)
       if (!session || isDefaultTitle(session.title)) {
-        renderer.setTerminalTitle("silvercode")
+        write("silvercode")
         return
       }
 
       const title = session.title.length > 40 ? session.title.slice(0, 37) + "..." : session.title
-      renderer.setTerminalTitle(`α | ${title}`)
+      write(`α | ${title}`)
       return
     }
 
     if (route.data.type === "plugin") {
-      renderer.setTerminalTitle(`α | ${route.data.id}`)
+      write(`α | ${route.data.id}`)
     }
   })
 
@@ -591,6 +652,35 @@ function App(props: { onSnapshot?: () => Promise<string[]>; pluginHost: TuiPlugi
           route.navigate({
             type: "home",
           })
+          dialog.clear()
+        },
+      },
+      {
+        name: "session.tab.next",
+        title: "Next session tab",
+        category: "Session",
+        run: () => {
+          tabs.step(1)
+          dialog.clear()
+        },
+      },
+      {
+        name: "session.tab.prev",
+        title: "Previous session tab",
+        category: "Session",
+        run: () => {
+          tabs.step(-1)
+          dialog.clear()
+        },
+      },
+      {
+        // Closing a tab never deletes the session or stops its run. Reopen it
+        // from the session list.
+        name: "session.tab.close",
+        title: "Close session tab",
+        category: "Session",
+        run: () => {
+          if (tabs.active) tabs.close(tabs.active)
           dialog.clear()
         },
       },
@@ -740,7 +830,10 @@ function App(props: { onSnapshot?: () => Promise<string[]>; pluginHost: TuiPlugi
         name: "effort.list",
         title: "Switch agent effort",
         category: "Agent",
-        slashName: "agent-effort",
+        // Agent effort is a review-rigor dial, so it keeps its own `/effort`
+        // name: `/variants` (plural) stays the model thinking selector.
+        slashName: "effort",
+        slashAliases: ["agent-effort"],
         run: () => {
           dialog.replace(() => <DialogAgentEffort />)
         },
@@ -885,13 +978,21 @@ function App(props: { onSnapshot?: () => Promise<string[]>; pluginHost: TuiPlugi
       },
       {
         name: "terminal.suspend",
-        title: "Suspend terminal",
+        title: "Suspend terminal (work continues)",
         category: "System",
         hidden: true,
         enabled: process.platform !== "win32",
-        run: () => {
-          renderer.suspend()
-          process.once("SIGCONT", () => renderer.resume())
+        run: async () => {
+          // SIGTSTP goes to this process group only. The server worker runs
+          // detached (worker-process.ts), so the session keeps executing while
+          // the UI is stopped; queued events are delivered on SIGCONT and any
+          // attention signals fire then. See docs/tui/background.md.
+          // The terminal is only handed over once suspend() has restored it.
+          await renderer.suspend()
+          // A second suspend before SIGCONT would stack another once-listener
+          // and resume twice; arm() drops the pending one first. The renderer
+          // can also be destroyed while stopped, so the resume is guarded (#426).
+          sigcont.arm()
           process.kill(0, "SIGTSTP")
         },
       },
@@ -1027,8 +1128,12 @@ function App(props: { onSnapshot?: () => Promise<string[]>; pluginHost: TuiPlugi
   })
 
   event.on("session.deleted", (evt) => {
-    if (route.data.type === "session" && route.data.sessionID === evt.properties.info.id) {
-      route.navigate({ type: "home" })
+    const deleted = evt.properties.info.id
+    const wasCurrent = route.data.type === "session" && route.data.sessionID === deleted
+    // Drops the tab first: if it was active, the close moves to a neighbouring
+    // tab, or home when none is left.
+    tabs.close(deleted)
+    if (wasCurrent) {
       toast.show({
         variant: "info",
         message: "The current session was deleted",
@@ -1130,6 +1235,7 @@ function App(props: { onSnapshot?: () => Promise<string[]>; pluginHost: TuiPlugi
       </Show>
       <Show when={ready()}>
         <box flexGrow={1} minHeight={0} flexDirection="column">
+          <SessionTabsBar />
           <Switch>
             <Match when={route.data.type === "home"}>
               <Home />

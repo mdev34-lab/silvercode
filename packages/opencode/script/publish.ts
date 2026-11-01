@@ -39,60 +39,39 @@ async function publish(dir: string, name: string, version: string) {
   }
 }
 
-const binaries: Record<string, string> = {}
-for (const filepath of new Bun.Glob("*/package.json").scanSync({ cwd: "./dist" })) {
-  const pkg = await Bun.file(`./dist/${filepath}`).json()
-  binaries[pkg.name] = pkg.version
-}
-console.log("binaries", binaries)
-const version = Object.values(binaries)[0]
-
-await $`mkdir -p ./dist/${pkg.name}`
-await $`mkdir -p ./dist/${pkg.name}/bin`
-await $`cp ./script/postinstall.mjs ./dist/${pkg.name}/postinstall.mjs`
-await Bun.file(`./dist/${pkg.name}/LICENSE`).write(await Bun.file("../../LICENSE").text())
-await Bun.file(`./dist/${pkg.name}/bin/${binName}.exe`).write(
-  [
-    `echo "Error: ${pkg.name}'s postinstall script was not run." >&2`,
-    'echo "" >&2',
-    'echo "This occurs when using --ignore-scripts during installation, or when using a" >&2',
-    'echo "package manager like pnpm that does not run postinstall scripts by default." >&2',
-    'echo "" >&2',
-    'echo "To fix this, run the postinstall script manually:" >&2',
-    `echo "  cd node_modules/${pkg.name} && node postinstall.mjs" >&2`,
-    'echo "" >&2',
-    `echo "Or reinstall ${pkg.name} without the --ignore-scripts flag." >&2`,
-    "exit 1",
-    "",
-  ].join("\n"),
-)
-
-await Bun.file(`./dist/${pkg.name}/package.json`).write(
+// One package: a launcher that downloads the matching binary from the GitHub
+// release of the same version. The binaries themselves are not published to npm.
+const version = Script.version
+const out = `./dist/${pkg.name}`
+await $`rm -rf ${out}`
+await $`mkdir -p ${out}/bin`
+await Bun.file(`${out}/bin/${binName}.cjs`).write('#!/usr/bin/env node\nrequire("../launcher.cjs").main()\n')
+await $`cp ./script/launcher.cjs ${out}/launcher.cjs`
+await Bun.file(`${out}/LICENSE`).write(await Bun.file("../../LICENSE").text())
+await Bun.file(`${out}/package.json`).write(
   JSON.stringify(
     {
       name: pkg.name,
-      bin: {
-        [binName]: `./bin/${binName}.exe`,
-      },
-      scripts: {
-        postinstall: "node ./postinstall.mjs",
-      },
-      version: version,
+      version,
+      description: "SilverCode, an AI coding agent for the terminal",
       license: pkg.license,
+      repository: { type: "git", url: "git+https://github.com/mdev34-lab/silvercode.git" },
+      bin: { [binName]: `./bin/${binName}.cjs` },
+      scripts: { postinstall: "node ./launcher.cjs --install" },
+      files: ["bin", "launcher.cjs", "LICENSE"],
       os: ["darwin", "linux", "win32"],
       cpu: ["arm64", "x64"],
-      optionalDependencies: binaries,
+      engines: { node: ">=18" },
     },
     null,
     2,
   ),
 )
 
-await publish(`./dist/${pkg.name}`, pkg.name, version)
-
-for (const [name] of Object.entries(binaries)) {
-  await publish(`./dist/${name}`, name, binaries[name])
-  await Bun.sleep(300000)
+if (process.env.PACK_ONLY === "1") {
+  await $`npm pack --pack-destination ..`.cwd(out)
+} else {
+  await publish(out, pkg.name, version)
 }
 
 const image = "ghcr.io/mdev34-lab/silvercode"
@@ -113,8 +92,7 @@ if (!Script.preview && process.env.OPENCODE_PUBLISH_EXTRAS === "1") {
 
   // arch
   const binaryPkgbuild = [
-    "# Maintainer: dax",
-    "# Maintainer: adam",
+    "# Maintainer: mdev34-lab",
     "",
     "pkgname='silvercode-bin'",
     `pkgver=${pkgver}`,

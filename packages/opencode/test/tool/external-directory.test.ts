@@ -110,24 +110,30 @@ describe("tool.assertExternalDirectory", () => {
       "normalizes Windows path variants to one glob",
       () =>
         Effect.gen(function* () {
-          const { requests, ctx } = makeCtx()
-
           const outerTmp = yield* tmpdirScoped()
           yield* Effect.promise(() => Bun.write(path.join(outerTmp, "outside.txt"), "x"))
 
           const target = path.join(outerTmp, "outside.txt")
-          const alt = target
-            .replace(/^[A-Za-z]:/, "")
-            .replaceAll("\\", "/")
-            .toLowerCase()
-
-          yield* assertExternalDirectoryEffect(ctx, alt)
-
-          const req = requests.find((r) => r.permission === "external_directory")
           const expected = glob(path.join(outerTmp, "*"))
-          expect(req).toBeDefined()
-          expect(req!.patterns).toEqual([expected])
-          expect(req!.always).toEqual([expected])
+
+          // Case and separator variants always name the same file. A
+          // drive-relative variant only does when the process cwd sits on the
+          // same drive as the temp dir - on the GitHub windows runner the
+          // repo lives on D: while TEMP is on C: (#505).
+          const variants = [target.replaceAll("\\", "/").toLowerCase()]
+          const sameDrive =
+            path.parse(process.cwd()).root.slice(0, 1).toLowerCase() ===
+            path.parse(target).root.slice(0, 1).toLowerCase()
+          if (sameDrive) variants.push(target.replace(/^[A-Za-z]:/, "").replaceAll("\\", "/").toLowerCase())
+
+          for (const variant of variants) {
+            const { requests, ctx } = makeCtx()
+            yield* assertExternalDirectoryEffect(ctx, variant)
+            const req = requests.find((r) => r.permission === "external_directory")
+            expect(req).toBeDefined()
+            expect(req!.patterns).toEqual([expected])
+            expect(req!.always).toEqual([expected])
+          }
         }),
       { git: true },
     )

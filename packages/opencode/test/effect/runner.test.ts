@@ -1,6 +1,7 @@
 import { describe, expect } from "bun:test"
 import { Cause, Deferred, Effect, Exit, Fiber, Latch, Ref, Scope } from "effect"
 import { Runner } from "@/effect/runner"
+import { TestClock } from "effect/testing"
 import { it } from "../lib/effect"
 
 const waitForState = <A, E>(runner: Runner.Runner<A, E>, tag: Runner.State<A, E>["_tag"]) =>
@@ -331,8 +332,9 @@ describe("Runner", () => {
     }),
   )
 
-  it.live(
-    "cancel does not mask shell defects",
+  // Advance the readiness deadline so a missing ready signal fails without a live-clock race.
+  it.effect(
+    "cancel preserves a shell finalizer defect",
     Effect.gen(function* () {
       const s = yield* Scope.Scope
       const runner = Runner.make<string>(s, { onInterrupt: Effect.succeed("interrupted") })
@@ -347,10 +349,61 @@ describe("Runner", () => {
           ready,
         )
         .pipe(Effect.forkChild)
-      yield* ready.await.pipe(Effect.timeout("250 millis"))
+      const readiness = yield* ready.await.pipe(Effect.timeout("250 millis"), Effect.forkChild)
+      yield* Effect.yieldNow
+      yield* TestClock.adjust("250 millis")
+      yield* Fiber.join(readiness)
 
       yield* runner.cancel
-      expect(Exit.isFailure(yield* Fiber.await(sh))).toBe(true)
+      const exit = yield* Fiber.await(sh)
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isFailure(exit)) expect(Cause.squash(exit.cause)).toBe("boom")
+    }),
+  )
+
+  it.effect(
+    "cancel preserves a mixed interrupt and shell defect cause",
+    Effect.gen(function* () {
+      const s = yield* Scope.Scope
+      const runner = Runner.make<string>(s, { onInterrupt: Effect.succeed("interrupted") })
+      const ready = yield* Latch.make()
+      const cause = Cause.combine(Cause.interrupt(), Cause.die("mixed boom"))
+      const sh = yield* runner
+        .startShell(ready.open.pipe(Effect.andThen(Effect.never), Effect.onExit(() => Effect.failCause(cause))), ready)
+        .pipe(Effect.forkChild)
+      const readiness = yield* ready.await.pipe(Effect.timeout("250 millis"), Effect.forkChild)
+      yield* Effect.yieldNow
+      yield* TestClock.adjust("250 millis")
+      yield* Fiber.join(readiness)
+      yield* runner.cancel
+      const exit = yield* Fiber.await(sh)
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isFailure(exit)) {
+        expect(Cause.hasInterrupts(exit.cause)).toBe(true)
+        expect(Cause.hasDies(exit.cause)).toBe(true)
+        expect(Cause.squash(exit.cause)).toBe("mixed boom")
+      }
+    }),
+  )
+
+  it.effect(
+    "cancel maps a mixed interrupt and typed shell failure to the fallback",
+    Effect.gen(function* () {
+      const s = yield* Scope.Scope
+      const runner = Runner.make<string, string>(s, { onInterrupt: Effect.succeed("interrupted") })
+      const ready = yield* Latch.make()
+      const cause = Cause.combine(Cause.interrupt(), Cause.fail("shell failure"))
+      const sh = yield* runner
+        .startShell(ready.open.pipe(Effect.andThen(Effect.never), Effect.onExit(() => Effect.failCause(cause))), ready)
+        .pipe(Effect.forkChild)
+      const readiness = yield* ready.await.pipe(Effect.timeout("250 millis"), Effect.forkChild)
+      yield* Effect.yieldNow
+      yield* TestClock.adjust("250 millis")
+      yield* Fiber.join(readiness)
+      yield* runner.cancel
+      const exit = yield* Fiber.await(sh)
+      expect(Exit.isSuccess(exit)).toBe(true)
+      if (Exit.isSuccess(exit)) expect(exit.value).toBe("interrupted")
     }),
   )
 

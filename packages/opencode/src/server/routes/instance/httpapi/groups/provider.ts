@@ -31,6 +31,15 @@ export class ProviderAuthApiError extends Schema.ErrorClass<ProviderAuthApiError
   { httpApiStatus: 400 },
 ) {}
 
+export const ProviderProbeInput = Schema.Struct({
+  providerID: ProviderV2.ID,
+  modelID: Schema.String,
+})
+export const ProviderProbeResult = Schema.Struct({
+  outcome: Schema.Literals(["ok", "transient", "error"]),
+  latencyMs: Schema.Number,
+})
+
 export const ProviderApi = HttpApi.make("provider")
   .add(
     HttpApiGroup.make("provider")
@@ -53,6 +62,18 @@ export const ProviderApi = HttpApi.make("provider")
             identifier: "provider.auth",
             summary: "Get provider auth methods",
             description: "Retrieve available authentication methods for all AI providers.",
+          }),
+        ),
+        HttpApiEndpoint.post("probe", `${root}/probe`, {
+          query: WorkspaceRoutingQuery,
+          payload: ProviderProbeInput,
+          success: described(ProviderProbeResult, "Probe outcome"),
+        }).annotateMerge(
+          OpenApi.annotations({
+            identifier: "provider.probe",
+            summary: "Probe a model",
+            description:
+              "Send one tiny request to a model and report whether it answered. Failures that are likely to pass on their own, such as rate limits and network errors, are reported as transient.",
           }),
         ),
         HttpApiEndpoint.post("authorize", `${root}/:providerID/oauth/authorize`, {

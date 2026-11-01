@@ -18,6 +18,7 @@ import type {
   ProviderAuthMethod,
   VcsInfo,
   SnapshotFileDiff,
+  SessionNextContextPrepared,
   ConsoleState,
 } from "@opencode-ai/sdk/v2"
 import { createStore, produce, reconcile } from "solid-js/store"
@@ -32,7 +33,7 @@ import { batch, onMount } from "solid-js"
 import path from "path"
 import { useKV } from "./kv"
 import { usePermission } from "./permission"
-import { applyPartDelta, applyPartUpdated } from "../util/part"
+import { applyPartDelta, applyPartUpdated, mergePartInPlace, mergePartText } from "../util/part"
 
 const emptyConsoleState: ConsoleState = {
   consoleManagedProviders: [],
@@ -94,6 +95,9 @@ export const {
       session_diff: {
         [sessionID: string]: SnapshotFileDiff[]
       }
+      session_context: {
+        [sessionID: string]: SessionNextContextPrepared["data"]
+      }
       todo: {
         [sessionID: string]: Todo[]
       }
@@ -134,6 +138,7 @@ export const {
       session: [],
       session_status: {},
       session_diff: {},
+      session_context: {},
       todo: {},
       message: {},
       part: {},
@@ -311,6 +316,13 @@ export const {
               session.time.updated = event.properties.timestamp
             }),
           )
+          break
+        }
+
+        case "session.next.context.prepared": {
+          // The runtime's own measurement of the request it sends. Consumers render this report
+          // rather than deriving a second context state of their own.
+          setStore("session_context", event.properties.sessionID, event.properties)
           break
         }
 
@@ -633,14 +645,8 @@ export const {
                   const parts = message.parts.flatMap((part) => {
                     const current = currentParts.find((item) => item.id === part.id)
                     if (tracker.parts.has(part.id)) return current ? [current] : []
-                    if (
-                      current &&
-                      (part.type === "text" || part.type === "reasoning") &&
-                      (current.type === "text" || current.type === "reasoning") &&
-                      part.text.length === 0 &&
-                      current.text.length > 0
-                    ) {
-                      return [current]
+                    if (current && part.type === current.type && (part.type === "text" || part.type === "reasoning")) {
+                      return [mergePartInPlace(current, mergePartText(current, part))]
                     }
                     return [part]
                   })

@@ -65,7 +65,13 @@ export class CorrectedError extends Schema.TaggedErrorClass<CorrectedError>()("P
 
 export class BlockedError extends Schema.TaggedErrorClass<BlockedError>()("PermissionV2.BlockedError", {
   rules: Permission.Ruleset,
-}) {}
+}) {
+  override get message(): string {
+    const rule = this.rules.find((rule) => rule.effect === "deny") ?? this.rules.at(-1)
+    if (!rule) return "Permission blocked by configured rules"
+    return `Permission blocked by rule: ${JSON.stringify(rule)}`
+  }
+}
 
 export class NotFoundError extends Schema.TaggedErrorClass<NotFoundError>()("PermissionV2.NotFoundError", {
   requestID: ID,
@@ -148,10 +154,6 @@ const layer = Layer.effect(
       return input.resources.some((resource) => evaluate(input.action, resource, rules).effect === "deny")
     }
 
-    function relevant(input: AssertInput, rules: Permission.Ruleset) {
-      return rules.filter((rule) => Wildcard.match(input.action, rule.action))
-    }
-
     const evaluateInput = EffectRuntime.fnUntraced(function* (input: AssertInput) {
       const rules = yield* configured(input.sessionID, input.agent)
       if (denied(input, rules)) return { effect: "deny" as const, rules }
@@ -200,16 +202,28 @@ const layer = Layer.effect(
           const result = yield* evaluateInput(input)
           if (result.effect === "deny") {
             return yield* new BlockedError({
-              rules: relevant(input, result.rules),
+              rules: input.resources.map((resource) => evaluate(input.action, resource, result.rules)),
             })
           }
           if (result.effect === "allow") return
           const item = yield* create(request(input), input.agent)
           return yield* restore(Deferred.await(item.deferred)).pipe(
             EffectRuntime.catchTag("PermissionV2.DeclinedError", (error) => EffectRuntime.die(error)),
+            // Still pending here means the assertion was aborted unanswered. Clients only drop a
+            // prompt on a replied event, so announce it, detached because this runs while it ends.
             EffectRuntime.ensuring(
-              EffectRuntime.sync(() => {
-                pending.delete(item.request.id)
+              EffectRuntime.suspend(() => {
+                if (!pending.delete(item.request.id)) return EffectRuntime.void
+                return events
+                  .publish(Event.Replied, {
+                    sessionID: item.request.sessionID,
+                    requestID: item.request.id,
+                    reply: "reject",
+                  })
+                  .pipe(
+                    EffectRuntime.ignoreCause({ log: true, message: "failed to announce the abandoned permission" }),
+                    EffectRuntime.forkDetach,
+                  )
               }),
             ),
           )

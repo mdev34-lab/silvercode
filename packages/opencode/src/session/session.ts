@@ -664,11 +664,29 @@ const layer: Layer.Layer<
         return msg
       }).pipe(Effect.withSpan("Session.updateMessage"))
 
+    // Plugin-supplied parts and session metadata are user-extensible records
+    // and can carry values structuredClone rejects (functions, class instances
+    // with methods, AbortSignals). A DataCloneError here used to escape as a
+    // fiber defect that killed the session service mid-turn (#395); fall back
+    // to a JSON clone, then to a shallow copy if even JSON fails (circular
+    // refs, BigInt), so persistence degrades instead of freezing the turn.
+    function clonePersistable<T>(value: T): T {
+      try {
+        return structuredClone(value)
+      } catch {
+        try {
+          return JSON.parse(JSON.stringify(value)) as T
+        } catch {
+          return Array.isArray(value) ? ([...value] as T) : ({ ...(value as object) } as T)
+        }
+      }
+    }
+
     const persistPart = <T extends SessionV1.Part>(part: T): Effect.Effect<T> =>
       Effect.gen(function* () {
         yield* events.publish(SessionV1.Event.PartUpdated, {
           sessionID: part.sessionID,
-          part: structuredClone(part),
+          part: clonePersistable(part),
           time: Date.now(),
         })
         return part
@@ -748,7 +766,12 @@ const layer: Layer.Layer<
         path: sessionPath(ctx.worktree, ctx.directory),
         workspaceID: original.workspaceID,
         title,
-        metadata: structuredClone(original.metadata),
+        // A fork continues the same conversation, so it keeps the rules the user or a parent set on it
+        // (denies, asks) and the agent pinned to it. Dropping them would let the fork do what the
+        // original was forbidden to do.
+        agent: original.agent,
+        permission: original.permission,
+        metadata: original.metadata === undefined ? undefined : clonePersistable(original.metadata),
       })
       const msgs = yield* messages({ sessionID: input.sessionID })
       const idMap = new Map<string, MessageID>()
@@ -879,6 +902,9 @@ const layer: Layer.Layer<
     const messages: Interface["messages"] = Effect.fn("Session.messages")(function* (input) {
       if (input.limit) {
         return (yield* MessageV2.page({ sessionID: input.sessionID, limit: input.limit }).pipe(
+          // No cursor is passed here, so a decode failure is impossible input;
+          // keep it out of the typed channel.
+          Effect.catchIf(MessageV2.InvalidCursorError.isInstance, (error) => Effect.die(error)),
           Effect.provideService(Database.Service, database),
         )).items
       }
@@ -888,6 +914,9 @@ const layer: Layer.Layer<
       let before: string | undefined
       while (true) {
         const page = yield* MessageV2.page({ sessionID: input.sessionID, limit: size, before }).pipe(
+          // messages pages with cursors it generated itself, so a decode
+          // failure is an internal invariant breach, not user input.
+          Effect.catchIf(MessageV2.InvalidCursorError.isInstance, (error) => Effect.die(error)),
           Effect.provideService(Database.Service, database),
         )
         if (page.items.length === 0) break
@@ -941,6 +970,9 @@ const layer: Layer.Layer<
       let before: string | undefined
       while (true) {
         const page = yield* MessageV2.page({ sessionID, limit: size, before }).pipe(
+          // findMessage pages with cursors it generated itself, so a decode
+          // failure is an internal invariant breach, not user input.
+          Effect.catchIf(MessageV2.InvalidCursorError.isInstance, (error) => Effect.die(error)),
           Effect.provideService(Database.Service, database),
         )
         if (page.items.length === 0) break
@@ -994,7 +1026,10 @@ const cancelBackgroundJobs = Effect.fn("Session.cancelBackgroundJobs")(function*
   const jobs = yield* background.list()
   yield* Effect.forEach(
     jobs.filter((job) => job.status === "running" && BackgroundJob.belongsToSession(job, sessionID)),
-    (job) => background.cancel(job.id),
+    // Removal is always a teardown: the session is going away, so a delivery
+    // from any job it owned would prompt a deleted session (#413). The marker
+    // keeps TaskTool's watcher from injecting a spurious notification.
+    (job) => background.cancel(job.id, { teardown: true }),
     { concurrency: "unbounded", discard: true },
   )
 })

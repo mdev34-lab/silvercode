@@ -1,3 +1,5 @@
+import { Locale } from "./locale"
+
 function readFinite(input: object, key: string) {
   const value = Reflect.get(input, key)
   if (typeof value !== "number" || !Number.isFinite(value)) return undefined
@@ -12,7 +14,7 @@ export function formatGenerationMetrics(input: object) {
     parts.push(`${tokensPerSecond.toFixed(1)} tok/s`)
   }
   if (ttft !== undefined && ttft >= 0) {
-    parts.push(`TTFT ${Math.round(ttft)} ms`)
+    parts.push(`TTFT ${Locale.duration(Math.round(ttft))}`)
   }
   return parts.join(" · ")
 }

@@ -1,4 +1,4 @@
-import { describe, expect } from "bun:test"
+import { describe, expect, onTestFinished } from "bun:test"
 import fs from "fs/promises"
 import { realpathSync } from "node:fs"
 import { tmpdir } from "node:os"
@@ -258,11 +258,27 @@ describe("AppProcess", () => {
             const settled = path.join(directory, "settled")
             const script = `const fs=require('fs');fs.writeFileSync(${JSON.stringify(ready)},String(process.pid));process.on('SIGTERM',()=>{fs.writeFileSync(${JSON.stringify(settled)},'settled');process.exit(0)});setInterval(()=>{},60000)`
             return Effect.gen(function* () {
+              // Both waits below are unbounded, so a host timeout looks the same whichever one stalls.
+              // Record the stage and print it only when the test did not finish, so a pass stays silent.
+              const started = Date.now()
+              let stage = "starting the child"
+              let pid = "unknown"
+              onTestFinished(() => {
+                if (stage === "done") return
+                console.error(
+                  `[process-interrupt] stopped while ${stage} (child pid ${pid}, ${Date.now() - started}ms after start)`,
+                )
+              })
               const svc = yield* AppProcess.Service
               const fiber = yield* svc.run(cmd("-e", script)).pipe(Effect.forkChild)
-              expect(yield* waitForFile(ready)).toMatch(/^\d+$/)
+              stage = "waiting for the ready file"
+              pid = yield* waitForFile(ready)
+              expect(pid).toMatch(/^\d+$/)
+              stage = "interrupting and joining the run fiber"
               yield* Fiber.interrupt(fiber)
+              stage = "waiting for the settled file"
               expect(yield* waitForFile(settled)).toBe("settled")
+              stage = "done"
             })
           },
           (directory) => Effect.promise(() => fs.rm(directory, { recursive: true, force: true })),

@@ -1,8 +1,18 @@
-import { mkdtemp, rm, mkdir, readFile, writeFile } from "node:fs/promises"
+import { mkdtemp, mkdir, readFile, writeFile, rm, stat } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
-import { describe, expect, test } from "bun:test"
+import { afterEach, describe, expect, test } from "bun:test"
 import { archiveName, archivePath } from "../src/artifacts"
+import {
+  describeSubprocess,
+  expectSubprocessOk,
+  git,
+  assertNoCleanupFailures,
+  removeFixture,
+  runAsync,
+  runSync,
+  type SubprocessRecord,
+} from "./helpers/subprocess"
 
 const repoRoot = path.resolve(import.meta.dir, "../../..")
 const stubGh = path.join(import.meta.dir, "helpers", "gh-stub.bash")
@@ -10,15 +20,12 @@ const stubGh = path.join(import.meta.dir, "helpers", "gh-stub.bash")
 const isWindows = process.platform === "win32"
 
 /**
- * Fails with the subprocess output attached, so a red CI run shows the real
- * error instead of a bare exit-code diff.
+ * Fails with the subprocess exit code, signal, spawn error and stdout/stderr
+ * attached, so a red CI run names the real cause instead of showing a bare
+ * exit-code diff (#286). The condition is unchanged: the child must exit cleanly.
  */
-function expectOk(run: { exitCode: number; stdout: string; stderr: string }) {
-  if (run.exitCode !== 0) {
-    throw new Error(
-      `expected exit code 0, got ${run.exitCode}\n--- stdout ---\n${run.stdout}\n--- stderr ---\n${run.stderr}`,
-    )
-  }
+function expectOk(run: SubprocessRecord) {
+  expectSubprocessOk(run, "expected exit code 0")
 }
 
 /** Git Bash, resolved once per call so the shim never depends on the ambient PATH. */
@@ -45,7 +52,9 @@ async function installGhStub(bin: string) {
   } else {
     const target = path.join(bin, "gh")
     await Bun.write(target, script)
-    Bun.spawnSync(["chmod", "+x", target])
+    // A silent chmod failure would surface later as a confusing "permission
+    // denied" from the stub; record it at the source instead (#286).
+    expectSubprocessOk(runSync(["chmod", "+x", target]), `chmod +x ${target} failed`)
   }
 }
 
@@ -65,14 +74,6 @@ function withPathPrefix(env: Record<string, string>, dir: string) {
   return { ...env, [key]: `${dir}${path.delimiter}${env[key] ?? ""}` }
 }
 
-function git(cwd: string, ...args: string[]) {
-  const result = Bun.spawnSync(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe" })
-  if (result.exitCode !== 0) {
-    throw new Error(`git ${args.join(" ")} failed: ${result.stderr.toString()}`)
-  }
-  return result.stdout.toString().trim()
-}
-
 interface Sandbox {
   dir: string
   origin: string
@@ -83,35 +84,144 @@ interface Sandbox {
   cleanup: () => Promise<void>
 }
 
-async function makeSandbox(): Promise<Sandbox> {
-  const dir = await mkdtemp(path.join(tmpdir(), "silvercode-release-flow-"))
-  const origin = path.join(dir, "origin.git")
-  const work = path.join(dir, "work")
-  const state = path.join(dir, "ghstate")
-  const bin = path.join(dir, "bin")
-  const out = path.join(dir, "github-output.txt")
-  await mkdir(state, { recursive: true })
-  await mkdir(bin, { recursive: true })
-  await installGhStub(bin)
+// Per-call dependencies keep failure injection local to the real factories.
+type Setup = {
+  mkdtemp: (prefix: string) => Promise<string>
+  mkdir: (dir: string, options: { recursive: true }) => Promise<string | undefined>
+  git: typeof git
+  write: (file: string, data: string) => Promise<number>
+  cleanup: (dir: string) => Promise<void>
+}
+const setupDefaults: Setup = { mkdtemp, mkdir, git, write: Bun.write, cleanup: removeFixture }
 
-  git(dir, "init", "--quiet", "--bare", origin)
-  git(dir, "clone", "--quiet", origin, work)
-  git(work, "config", "user.name", "SilverCode Test")
-  git(work, "config", "user.email", "silvercode-test@example.com")
-  git(work, "checkout", "--quiet", "-b", "dev")
-  await writeFile(path.join(work, "seed.txt"), "seed\n")
-  git(work, "add", "--all")
-  git(work, "commit", "--quiet", "-m", "chore: seed")
-  git(work, "push", "--quiet", "-u", "origin", "dev")
+async function makeSandbox(overrides: Partial<Setup> = {}): Promise<Sandbox> {
+  const setup = { ...setupDefaults, ...overrides }
+  const dir = await setup.mkdtemp(path.join(tmpdir(), "silvercode-release-flow-"))
+  try {
+    const origin = path.join(dir, "origin.git")
+    const work = path.join(dir, "work")
+    const state = path.join(dir, "ghstate")
+    const bin = path.join(dir, "bin")
+    const out = path.join(dir, "github-output.txt")
+    await setup.mkdir(state, { recursive: true })
+    await setup.mkdir(bin, { recursive: true })
+    await installGhStub(bin)
 
-  return {
-    dir,
-    origin,
-    work,
-    state,
-    bin,
-    out,
-    cleanup: () => rm(dir, { recursive: true, force: true }),
+    setup.git(dir, "init", "--quiet", "--bare", origin)
+    setup.git(dir, "clone", "--quiet", origin, work)
+    setup.git(work, "config", "user.name", "SilverCode Test")
+    setup.git(work, "config", "user.email", "silvercode-test@example.com")
+    setup.git(work, "checkout", "--quiet", "-b", "dev")
+    await writeFile(path.join(work, "seed.txt"), "seed\n")
+    setup.git(work, "add", "--all")
+    setup.git(work, "commit", "--quiet", "-m", "chore: seed")
+    setup.git(work, "push", "--quiet", "-u", "origin", "dev")
+
+    return {
+      dir,
+      origin,
+      work,
+      state,
+      bin,
+      out,
+      cleanup: () => removeFixture(dir),
+    }
+  } catch (error) {
+    // removeFixture reports cleanup failures separately; never replace setup failure.
+    await setup.cleanup(dir)
+    throw error
+  }
+}
+
+function setupFailureTests(
+  factory: (setup: Partial<Setup>) => Promise<{ dir: string; cleanup: () => Promise<void> }>,
+  late: "git" | "write",
+) {
+  for (const stage of ["early", "late"] as const) {
+    for (const cleanupFails of [false, true]) {
+      test(`partial setup ${stage}: original error survives; cleanup ${cleanupFails ? "failure is reported separately" : "removes owned directory"}`, async () => {
+        const original = new Error(`injected ${stage} setup failure`)
+        const cleanupError = new Error("injected cleanup failure")
+        let owned: string | undefined
+        let cleanupCalls = 0
+        let reached = false
+        const setup: Partial<Setup> = {
+          mkdtemp: async (...args) => {
+            owned = await mkdtemp(...args)
+            return owned
+          },
+          mkdir: async (...args) => {
+            if (stage === "early") {
+              reached = true
+              throw original
+            }
+            return mkdir(...args)
+          },
+          cleanup: async (dir) => {
+            expect(dir).toBe(owned)
+            cleanupCalls++
+            await removeFixture(
+              dir,
+              cleanupFails
+                ? async () => {
+                    throw cleanupError
+                  }
+                : rm,
+            )
+          },
+        }
+        if (stage === "late" && late === "git")
+          setup.git = (cwd, ...args) => {
+            if (args[0] === "push") {
+              reached = true
+              throw original
+            }
+            return git(cwd, ...args)
+          }
+        if (stage === "late" && late === "write")
+          setup.write = async () => {
+            reached = true
+            throw original
+          }
+        try {
+          let caught: unknown
+          try {
+            await factory(setup)
+          } catch (error) {
+            caught = error
+          }
+          expect(reached).toBe(true)
+          expect(caught).toBe(original)
+          expect(owned).toBeDefined()
+          const remains = await stat(owned!).then(
+            () => true,
+            (error) => {
+              if (error.code === "ENOENT") return false
+              throw error
+            },
+          )
+          console.log(
+            `[partial-setup] ${late}/${stage}: sameError=${caught === original} cleanupCalls=${cleanupCalls} remains=${remains} cleanupFails=${cleanupFails}`,
+          )
+          expect(cleanupCalls).toBe(1)
+          if (cleanupFails) {
+            expect(await stat(owned!)).toBeDefined()
+            expect(() => assertNoCleanupFailures()).toThrow("injected cleanup failure")
+            expect(() => assertNoCleanupFailures()).not.toThrow()
+          } else {
+            await expect(stat(owned!)).rejects.toMatchObject({ code: "ENOENT" })
+            expect(() => assertNoCleanupFailures()).not.toThrow()
+          }
+        } finally {
+          // Test-owned fallback also removes leaked fixtures on the unpatched base.
+          if (owned) await rm(owned, { recursive: true, force: true })
+          // Consume diagnostics even when an earlier regression assertion failed.
+          try {
+            assertNoCleanupFailures()
+          } catch {}
+        }
+      })
+    }
   }
 }
 
@@ -134,28 +244,26 @@ function flowEnv(sandbox: Sandbox, extra: Record<string, string> = {}) {
 }
 
 async function runScript(sandbox: Sandbox, script: string, args: string[] = [], extra: Record<string, string> = {}) {
-  const proc = Bun.spawn(["bun", "run", path.join(repoRoot, "script", script), ...args], {
+  return runAsync(["bun", "run", path.join(repoRoot, "script", script), ...args], {
     cwd: sandbox.work,
-    stdout: "pipe",
-    stderr: "pipe",
     env: flowEnv(sandbox, extra),
   })
-  const [stdout, stderr, exitCode] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-    proc.exited,
-  ])
-  return { exitCode, stdout, stderr }
 }
 
 const runVersion = (sandbox: Sandbox, extra: Record<string, string> = {}) => runScript(sandbox, "version.ts", [], extra)
 const runCleanup = (sandbox: Sandbox, tag: string) => runScript(sandbox, "release-cleanup.ts", [tag])
 
-const remoteTagSha = (sandbox: Sandbox, tag: string) =>
-  Bun.spawnSync(["git", `--git-dir=${sandbox.origin}`, "rev-parse", "-q", "--verify", `refs/tags/${tag}`], {
-    stdout: "pipe",
-    stderr: "pipe",
-  }).stdout.toString().trim()
+const remoteTagSha = (sandbox: Sandbox, tag: string) => {
+  const record = runSync(["git", `--git-dir=${sandbox.origin}`, "rev-parse", "-q", "--verify", `refs/tags/${tag}`])
+  // A missing ref is the expected, non-fatal result: `rev-parse --verify` exits 1
+  // and prints nothing, which reads as an empty sha. A signal, a spawn error or a
+  // host process fault is NOT "the tag is absent" and must be surfaced with its
+  // cause instead of being silently read as empty (#286).
+  if (record.spawnError === null && record.signalCode === null && (record.exitCode === 0 || record.exitCode === 1)) {
+    return record.stdout.trim()
+  }
+  throw new Error(`git rev-parse for refs/tags/${tag} failed unexpectedly\n${describeSubprocess(record)}`)
+}
 
 async function stubRelease(sandbox: Sandbox, tag: string) {
   const file = Bun.file(path.join(sandbox.state, "releases", `${tag}.json`))
@@ -169,21 +277,13 @@ const stubLog = async (sandbox: Sandbox) => {
 }
 
 async function gh(sandbox: Sandbox, ...args: string[]) {
-  const proc = Bun.spawn(ghCommand(sandbox.bin, args), {
-    cwd: sandbox.work,
-    stdout: "pipe",
-    stderr: "pipe",
-    env: flowEnv(sandbox),
-  })
-  const [stdout, stderr, exitCode] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-    proc.exited,
-  ])
-  return { exitCode, stdout, stderr }
+  return runAsync(ghCommand(sandbox.bin, args), { cwd: sandbox.work, env: flowEnv(sandbox) })
 }
 
+afterEach(() => assertNoCleanupFailures())
+
 describe("release lifecycle with stubbed gh and a real git remote", () => {
+  setupFailureTests(makeSandbox, "git")
   test(
     "pushes the tag before the draft exists, so the build job can check the tag out",
     async () => {
@@ -206,12 +306,21 @@ describe("release lifecycle with stubbed gh and a real git remote", () => {
         expect(output).toContain("tag=v0.1.0")
         expect(output).toContain("repo=stub/silvercode")
 
-        // The build job's checkout of the tag succeeds against the remote.
-        const checkout = Bun.spawnSync(
-          ["git", "clone", "--quiet", "--branch", "v0.1.0", sandbox.origin, path.join(sandbox.dir, "bld")],
-          { stdout: "pipe", stderr: "pipe" },
-        )
-        expect(checkout.exitCode).toBe(0)
+        // The build job's checkout of the tag succeeds against the remote. The
+        // clone is recorded with its exit code, signal, spawn error and
+        // stdout/stderr so a non-zero exit names its cause instead of showing a
+        // bare `128` with the captured stderr left unprinted (#286). The
+        // assertion is unchanged: the clone must exit cleanly.
+        const checkout = runSync([
+          "git",
+          "clone",
+          "--quiet",
+          "--branch",
+          "v0.1.0",
+          sandbox.origin,
+          path.join(sandbox.dir, "bld"),
+        ])
+        expectSubprocessOk(checkout, "the build job's tag checkout must clone cleanly")
         expect(git(path.join(sandbox.dir, "bld"), "tag", "--points-at", "HEAD")).toContain("v0.1.0")
       } finally {
         await sandbox.cleanup()
@@ -382,21 +491,33 @@ describe("release archive upload", () => {
     { name: "silvercode-ai-windows-x64-baseline", os: "win32" },
   ]
 
-  async function makeUploadSandbox() {
-    const dir = await mkdtemp(path.join(tmpdir(), "silvercode-upload-"))
-    const state = path.join(dir, "ghstate")
-    const bin = path.join(dir, "bin")
-    await mkdir(path.join(state, "releases"), { recursive: true })
-    await mkdir(path.join(dir, "dist"), { recursive: true })
-    await mkdir(bin, { recursive: true })
-    await installGhStub(bin)
-    await Bun.write(path.join(state, "releases", "v0.1.0.json"), '{"tagName":"v0.1.0","databaseId":1001,"isDraft":true}\n')
-    return {
-      dir,
-      state,
-      cleanup: () => rm(dir, { recursive: true, force: true }),
+  async function makeUploadSandbox(overrides: Partial<Setup> = {}) {
+    const setup = { ...setupDefaults, ...overrides }
+    const dir = await setup.mkdtemp(path.join(tmpdir(), "silvercode-upload-"))
+    try {
+      const state = path.join(dir, "ghstate")
+      const bin = path.join(dir, "bin")
+      await setup.mkdir(path.join(state, "releases"), { recursive: true })
+      await setup.mkdir(path.join(dir, "dist"), { recursive: true })
+      await setup.mkdir(bin, { recursive: true })
+      await installGhStub(bin)
+      await setup.write(
+        path.join(state, "releases", "v0.1.0.json"),
+        '{"tagName":"v0.1.0","databaseId":1001,"isDraft":true}\n',
+      )
+      return {
+        dir,
+        state,
+        cleanup: () => removeFixture(dir),
+      }
+    } catch (error) {
+      // removeFixture reports cleanup failures separately; never replace setup failure.
+      await setup.cleanup(dir)
+      throw error
     }
   }
+
+  setupFailureTests(makeUploadSandbox, "write")
 
   // Runs the upload through a subprocess so `gh` resolves from the stubbed PATH
   // (the sandbox never touches the real gh).
@@ -406,18 +527,10 @@ describe("release archive upload", () => {
       `await uploadReleaseArchives(${JSON.stringify(tag)}, ${JSON.stringify(archives)}, "stub/silvercode")`,
     ].join("\n")
     const env: Record<string, string> = { ...process.env } as Record<string, string>
-    const proc = Bun.spawn(["bun", "-e", runner], {
+    return runAsync(["bun", "-e", runner], {
       cwd: sandbox.dir,
-      stdout: "pipe",
-      stderr: "pipe",
       env: { ...withPathPrefix(env, path.join(sandbox.dir, "bin")), GH_STUB_STATE: sandbox.state.replace(/\\/g, "/") },
     })
-    const [stdout, stderr, exitCode] = await Promise.all([
-      new Response(proc.stdout).text(),
-      new Response(proc.stderr).text(),
-      proc.exited,
-    ])
-    return { exitCode, stdout, stderr }
   }
 
   test("linux targets are tarballs, every other target is a zip", () => {

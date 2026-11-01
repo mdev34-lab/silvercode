@@ -238,6 +238,92 @@ describe("Session", () => {
     }),
   )
 
+  it.instance("a fork keeps the permission rules and the pinned agent of the original session", () =>
+    Effect.gen(function* () {
+      const session = yield* SessionNs.Service
+      const permission = [
+        { permission: "question", pattern: "*", action: "deny" as const },
+        { permission: "edit", pattern: "secrets/*", action: "deny" as const },
+      ]
+      const created = yield* Effect.acquireRelease(
+        session.create({ title: "restricted", agent: "work", permission }),
+        (info) => session.remove(info.id).pipe(Effect.ignore),
+      )
+      const fork = yield* Effect.acquireRelease(session.fork({ sessionID: created.id }), (info) =>
+        session.remove(info.id).pipe(Effect.ignore),
+      )
+      const stored = yield* session.get(fork.id)
+      expect(stored.permission).toEqual(permission)
+      expect(stored.agent).toBe("work")
+      // Independent copy: editing the fork's rules must not touch the original.
+      expect(stored.permission).not.toBe(created.permission)
+    }),
+  )
+
+  it.instance("fork tolerates non-cloneable values in session metadata", () =>
+    Effect.gen(function* () {
+      const session = yield* SessionNs.Service
+      const meta = { source: "sdk", callback: () => "dropped" } as unknown as Record<string, unknown>
+      const created = yield* Effect.acquireRelease(session.create({ title: "with-fn-meta", metadata: meta }), (info) =>
+        session.remove(info.id).pipe(Effect.ignore),
+      )
+      const fork = yield* Effect.acquireRelease(session.fork({ sessionID: created.id }), (info) =>
+        session.remove(info.id).pipe(Effect.ignore),
+      )
+
+      expect(fork.metadata).toEqual({ source: "sdk" })
+    }),
+  )
+
+  it.instance("updatePart tolerates non-cloneable values in part state", () =>
+    Effect.gen(function* () {
+      const session = yield* SessionNs.Service
+      const info = yield* Effect.acquireRelease(session.create({}), (info) =>
+        session.remove(info.id).pipe(Effect.ignore),
+      )
+      const messageID = MessageID.ascending()
+      yield* session.updateMessage({
+        id: messageID,
+        sessionID: info.id,
+        role: "user",
+        time: { created: Date.now() },
+        agent: "user",
+        model: { providerID: "test", modelID: "test" },
+        tools: {},
+        mode: "",
+      } as unknown as SessionV1.Info)
+
+      const events = yield* EventV2Bridge.Service
+      const received = yield* Deferred.make<SessionV1.Part>()
+      const unsub = yield* events.listen((event) => {
+        if (event.type === MessageV2.Event.PartUpdated.type)
+          Deferred.doneUnsafe(
+            received,
+            Effect.succeed((event.data as typeof MessageV2.Event.PartUpdated.data.Type).part as SessionV1.Part),
+          )
+        return Effect.void
+      })
+      yield* Effect.addFinalizer(() => unsub)
+
+      const part = {
+        id: PartID.ascending(),
+        messageID,
+        sessionID: info.id,
+        type: "step-finish" as const,
+        reason: "stop",
+        cost: 0,
+        tokens: { total: 1, input: 1, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+        metadata: { note: "kept", callback: () => "dropped" },
+      }
+      yield* session.updatePart(part as unknown as SessionV1.StepFinishPart)
+
+      const stored = yield* awaitDeferred(received, "timed out waiting for message.part.updated")
+      expect(stored.type).toBe("step-finish")
+      expect(stored).not.toBe(part)
+      expect((stored as unknown as { metadata: Record<string, unknown> }).metadata).toEqual({ note: "kept" })
+    }),
+  )
+
   it.instance("forks the chronological prefix across mixed message ID ordering", () =>
     Effect.gen(function* () {
       const session = yield* SessionNs.Service

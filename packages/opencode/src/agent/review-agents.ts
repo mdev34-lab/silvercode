@@ -1,5 +1,7 @@
+import { Agent as AgentSchema } from "@opencode-ai/schema/agent"
+
 /**
- * Every agent that reviews completed work and therefore must deliver its result
+ * The agent that reviews completed work and therefore must deliver its result
  * through a `<silvercode-review>` report envelope.
  *
  * The set is the single source of truth for the report gate, which is applied in
@@ -11,51 +13,48 @@
  * site and a guard test - it does not remove the failure mode. A new reviewer
  * must be added here rather than compared inline at each gate.
  *
- * `ReviewAgent` is the element type, not `string`, so the routing table below
- * can name the invariant this module documents - every routed target is itself
- * a reviewer - and have the compiler enforce it. The set stays a runtime value
- * because the gate is applied to an agent name read from a session row, which
- * the type system never sees; the pair is pinned together by the guard test
- * rather than by inference from the `Set`.
+ * `ReviewAgent` is the element type, not `string`, so the compiler can enforce
+ * that every name this module calls a reviewer is one the registry defines; the
+ * set stays a runtime value because the gate is applied to an agent name read
+ * from a session row, which the type system never sees. The pair is pinned
+ * together by the guard test rather than by inference from the `Set`.
  */
-export const REVIEW_AGENTS: ReadonlySet<ReviewAgent> = new Set<ReviewAgent>(["review", "work-review", "code-review"])
+export const REVIEW_AGENTS: ReadonlySet<ReviewAgent> = new Set<ReviewAgent>(["review"])
 
-export type ReviewAgent = "review" | "work-review" | "code-review"
+export type ReviewAgent = "review"
 
 /**
- * Answers "is this dispatched name a reviewer", for the report gate. It is not a
- * routing table: nothing here maps one name to another.
+ * Reviewer names retired by the single-reviewer consolidation, derived from the
+ * schema's legacy-id table so this gate and `Agent.get` can never disagree
+ * about them. They stay resolvable so stored sessions that recorded a
+ * specialist reviewer still pass the report gate, and so delegations and config
+ * written against them keep working: `Agent.get` answers them through the
+ * legacy-id table, and `resolveReviewer` rewrites them to the single reviewer.
+ */
+export const LEGACY_REVIEW_AGENTS: ReadonlySet<string> = new Set(
+  Object.entries(AgentSchema.LEGACY_IDS)
+    .filter((entry): entry is [string, string] => entry[1] === "review")
+    .map(([id]) => id),
+)
+
+/**
+ * Answers "is this dispatched or recorded name a reviewer", for the report
+ * gate. Legacy specialist names count: a session row written before the
+ * consolidation still names them, and the gate must not silently drop its
+ * verdict requirement for it.
  */
 export function isReviewAgent(name: string | undefined) {
-  return name !== undefined && REVIEW_AGENTS.has(name as ReviewAgent)
+  return (
+    name !== undefined &&
+    (REVIEW_AGENTS.has(name as ReviewAgent) || LEGACY_REVIEW_AGENTS.has(name))
+  )
 }
 
 /**
- * Which reviewer runs a generic `review` request, keyed by the agent that made
- * the request. This is the routing table, and it is deliberately separate from
- * `REVIEW_AGENTS`: a parent with no entry keeps the generic reviewer.
- *
- * The key type is deliberately `string`, not a discriminated union of the two
- * parents that have a specialization. The key domain is the set of agents a user
- * can define in config, which is open-ended, so a union key would make every
- * future configured agent a compile error at this table and force a widening
- * cast at the one call site that indexes it with a resolved parent name. There is
- * no closed parent union to check exhaustiveness against, so `Record<...>` would
- * buy nothing; the guard test in `review-specialization.test.ts` pins the other
- * direction instead, and the `ReviewAgent` value type pins this one at compile
- * time.
+ * Resolves the agent actually dispatched. A legacy specialist name is rewritten
+ * to the single reviewer; every other requested name passes through untouched,
+ * so resolution can never turn an explicit delegation into a different one.
  */
-export const REVIEW_ROUTING: Readonly<Record<string, ReviewAgent>> = {
-  work: "work-review",
-  code: "code-review",
-}
-
-/**
- * Resolves the agent actually dispatched. Only a generic `review` request is
- * rewritten; every other requested name passes through untouched, so routing can
- * never turn an explicit delegation into a different one.
- */
-export function resolveReviewer(requested: string, parentAgent: string | undefined) {
-  if (requested !== "review") return requested
-  return (parentAgent === undefined ? undefined : REVIEW_ROUTING[parentAgent]) ?? requested
+export function resolveReviewer(requested: string) {
+  return LEGACY_REVIEW_AGENTS.has(requested) ? "review" : requested
 }

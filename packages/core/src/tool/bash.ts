@@ -5,6 +5,7 @@ import { ToolFailure } from "@opencode-ai/llm"
 import { Duration, Effect, Layer, Schema } from "effect"
 import { ChildProcess } from "effect/unstable/process"
 import { Config } from "../config"
+import { shellOutputDecoder, windowsPowerShellCommand } from "../shell-encoding"
 import { makeLocationNode } from "../effect/app-node"
 import { FSUtil } from "../fs-util"
 import { LocationMutation } from "../location-mutation"
@@ -164,7 +165,12 @@ const layer = Layer.effectDiscard(
               const shell =
                 Object.assign({}, ...entries.flatMap((entry) => (entry.type === "document" ? [entry.info] : [])))
                   .shell ?? defaultShell()
-              const command = ChildProcess.make(input.command, [], {
+              const decoder = shellOutputDecoder(shell, { ignoreBOM: true })
+              if (decoder.warning) {
+                warnings.push(decoder.warning)
+                yield* Effect.logWarning(decoder.warning)
+              }
+              const command = ChildProcess.make(windowsPowerShellCommand(shell, input.command), [], {
                 cwd: target.canonical,
                 shell,
                 stdin: "ignore",
@@ -192,7 +198,7 @@ const layer = Layer.effectDiscard(
                 }
               }
 
-              const output = result.output?.toString("utf8") || "(no output)"
+              const output = (result.output ? decoder.decode(result.output) + decoder.end() : "") || "(no output)"
               const notice = result.outputTruncated
                 ? "[output capture truncated at the in-memory safety limit]"
                 : undefined

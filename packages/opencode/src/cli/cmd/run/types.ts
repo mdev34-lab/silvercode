@@ -57,6 +57,10 @@ export type RunResource = RunResourceMap[string]
 export type RunInput = {
   sdk: OpencodeClient
   directory: string
+  // Control-plane workspace the session lives in; undefined is the default
+  // workspace. Forwarded to the stream transport so dispose events from
+  // other workspaces on the same directory are ignored (#419).
+  workspace?: string
   sessionID: string
   sessionTitle?: string
   resume?: boolean

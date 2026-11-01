@@ -4,7 +4,7 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { filesystem } from "@opencode-ai/core/effect/app-node-platform"
 import { createOpencodeClient } from "@opencode-ai/sdk/v2/client"
 import { ServerAuth } from "@opencode-ai/server/auth"
-import { Context, Effect, FileSystem, Layer, Option, Schedule, Schema, Scope } from "effect"
+import { Cause, Context, Effect, Exit, FileSystem, Layer, Option, Schedule, Schema, Scope } from "effect"
 import { HttpServer } from "effect/unstable/http"
 import { randomBytes, randomUUID } from "crypto"
 import { spawn } from "node:child_process"
@@ -43,34 +43,87 @@ export function decideStart(input: {
   return "replace"
 }
 
-// Restart is stop-then-start, so it is refused unless the registered service is
-// verified idle. This client-side probe is not atomic with the later signal: a
-// run may begin between them. A server-side stop-if-idle/drain contract is needed
-// to close that gap. If spawning fails after stopping, the service stays stopped.
-// Explicit `service stop` remains the way to end a service on purpose.
+// Result of the server-side stop-if-idle contract. `busy` is a refusal, not a
+// failure to stop: the service answered and stays up. `stopping` is only
+// returned for a 200 whose body confirms `{ data: { status: "stopping" } }`;
+// any other 200 is unconfirmed. Any transport-level surprise (non-2xx other
+// than 409, timeout, network error, unconfirmed 200) is `unknown`. An
+// unconfirmed stop is not proof the service stayed up: a granted stop ends the
+// service even if the answer is lost, so `restart` re-verifies liveness before
+// refusing (see recheckAfterUnknown) and never treats unknown as idle.
+export type StopIdleResult =
+  | { readonly status: "stopping" }
+  | { readonly status: "busy"; readonly activeRuns: number | undefined }
+  | { readonly status: "unknown" }
+  // The listener is confirmed gone but the registered process is still alive:
+  // the service is wedged, not stopped. Spawning a replacement would orphan it.
+  | { readonly status: "orphaned" }
+
+// Restart is stop-then-start, so it is refused unless the registered service
+// itself accepted a stop-if-idle request. The server performs the idle check and
+// closes its run gate in one atomic step, so unlike a client-side probe there is
+// no window where a run can begin after the service was verified idle. If
+// spawning fails after the stop, the service stays stopped. Explicit
+// `service stop` remains the way to end a service on purpose.
 export function decideRestart(input: {
   registered: boolean
-  activeRuns: number | undefined
-}): "proceed" | "refuse-active" | "refuse-unknown" {
+  stop: StopIdleResult
+}): "proceed" | "refuse-active" | "refuse-unknown" | "refuse-orphaned" {
   if (!input.registered) return "proceed"
-  if (input.activeRuns === undefined) return "refuse-unknown"
-  if (input.activeRuns > 0) return "refuse-active"
+  if (input.stop.status === "busy") return "refuse-active"
+  if (input.stop.status === "unknown") return "refuse-unknown"
+  if (input.stop.status === "orphaned") return "refuse-orphaned"
   return "proceed"
 }
 
-const ACTIVE_PROBE_TIMEOUT = "2 seconds"
-const ActiveBody = Schema.Struct({ data: Schema.Record(Schema.String, Schema.Unknown) })
+// True only when no process owns the PID (ESRCH). EPERM and any other probe
+// error read as alive: they refuse, which is the safe side. A PID recycled by
+// an unrelated process also reads as alive, so reuse can cause a false
+// refusal but never a false "exited".
+export function kill0MeansExited(cause: unknown): boolean {
+  return cause !== null && typeof cause === "object" && (cause as { code?: unknown }).code === "ESRCH"
+}
 
+const ACTIVE_PROBE_TIMEOUT = "2 seconds"
+const ACTIVE_PROBE_TIMEOUT_MS = 2_000
+const STOP_IDLE_PATH = "/api/daemon/stop-if-idle"
+const STOP_IDLE_TIMEOUT = 2_000
+const ActiveBody = Schema.Struct({ data: Schema.Record(Schema.String, Schema.Unknown) })
+const ActiveRunsBody = Schema.Struct({ activeRuns: Schema.Number })
+const StoppingBody = Schema.Struct({ data: Schema.Struct({ status: Schema.Literal("stopping") }) })
+
+// The PID <-> listener association is by construction, not inferred: the
+// serving process writes this file itself in `register` with its own
+// `process.pid` and the address it actually bound. A registration can still
+// go STALE (the process dies and the OS recycles its PID), so a PID read from
+// this file is an identity hint that must be re-checked, never proof.
 const Registration = Schema.Struct({
   id: Schema.optional(Schema.String),
+  coordination: Schema.optional(Schema.String),
   version: Schema.optional(Schema.String),
   url: Schema.String,
   pid: Schema.Int.check(Schema.isGreaterThan(0)),
+  // Wall-clock at register time computed by the serving process itself
+  // (Date.now minus uptime), NOT an OS-reported process start time. An
+  // operator can correlate it with `ps -o lstart` on Unix as a hint; it does
+  // not prove process identity and has no direct Windows equivalent.
+  // Optional so older registrations still decode.
+  startedAt: Schema.optional(Schema.String),
 })
 type Registration = typeof Registration.Type
 
+// Compares registration FILE contents, not OS process identity. It catches
+// the file being rewritten by another server instance between probe and
+// signal; it does NOT detect the OS recycling the PID while the file stays
+// unchanged. Treat it as a guard, never as proof of identity.
 function sameRegistration(left: Registration, right: Registration) {
-  return left.id === right.id && left.version === right.version && left.url === right.url && left.pid === right.pid
+  return (
+    left.id === right.id &&
+    left.coordination === right.coordination &&
+    left.version === right.version &&
+    left.url === right.url &&
+    left.pid === right.pid
+  )
 }
 
 export const layer = Layer.effect(
@@ -96,8 +149,42 @@ export const layer = Layer.effect(
       return generated
     })
 
+    const requireCoordinated = (info: Registration) =>
+      info.coordination === "registration-lock-v1"
+        ? Effect.void
+        : Effect.fail(
+            new Error(
+              "Legacy or unknown service registration protocol cannot be changed safely by this client. Stop all older service and client processes using this state directory, verify they have exited, then remove the legacy registration and start again. Nothing was signaled or removed by this operation.",
+            ),
+          )
+
     const registration = Effect.fnUntraced(function* () {
       return yield* fs.readFileString(file).pipe(Effect.flatMap(decodeRegistration))
+    })
+
+    // Only ENOENT is absence. Decode, permission, and I/O failures preserve
+    // the entry and refuse instead of silently opening the spawn path.
+    const optionalRegistration = Effect.fnUntraced(function* () {
+      const text = yield* fs.readFileString(file).pipe(
+        Effect.map((value) => Option.some(value)),
+        Effect.catchReason("PlatformError", "NotFound", () => Effect.succeed(Option.none<string>())),
+        Effect.mapError(
+          () =>
+            new Error(
+              "Service registration is unreadable. Stop all service and client processes using this state directory and inspect the registration before retrying. Nothing was removed or spawned.",
+            ),
+        ),
+      )
+      if (Option.isNone(text)) return Option.none<Registration>()
+      const info = yield* decodeRegistration(text.value).pipe(
+        Effect.mapError(
+          () =>
+            new Error(
+              "Service registration is invalid. Stop all service and client processes using this state directory and inspect the registration before retrying. Nothing was removed or spawned.",
+            ),
+        ),
+      )
+      return Option.some(info)
     })
 
     const createClient = Effect.fnUntraced(function* (url: string) {
@@ -121,30 +208,153 @@ export const layer = Layer.effect(
     const signal = (pid: number, signal: NodeJS.Signals) =>
       Effect.try({ try: () => process.kill(pid, signal), catch: (cause) => cause }).pipe(Effect.ignore)
 
-    const awaitStopped = Effect.fnUntraced(function* (pid: number) {
-      const running = yield* Effect.try({ try: () => process.kill(pid, 0), catch: () => false }).pipe(
-        Effect.orElseSucceed(() => false),
-      )
-      if (!running) return true
-      return yield* Effect.fail(new Error(`Server process ${pid} is still running`))
+    // True only when no process owns the PID (ESRCH via kill0MeansExited).
+    // EPERM and every other probe error read as alive, which is the safe
+    // side: they refuse instead of claiming an exit.
+    const processExited = Effect.fnUntraced(function* (pid: number) {
+      return yield* Effect.try({
+        try: () => {
+          process.kill(pid, 0)
+          return false
+        },
+        catch: (cause) => cause,
+      }).pipe(Effect.catch((cause) => Effect.succeed(kill0MeansExited(cause))))
     })
 
-    const stopProcess = Effect.fnUntraced(function* (info: Registration) {
-      const current = yield* healthy().pipe(Effect.option)
-      if (Option.isNone(current) || !sameRegistration(current.value, info)) return
+    // Same ESRCH-only rule on the wait path: an EPERM (or any other) kill(0)
+    // failure keeps the process "not proven stopped", never "stopped".
+    const awaitStopped = Effect.fnUntraced(function* (pid: number) {
+      if (yield* processExited(pid)) return true
+      return yield* Effect.fail(new Error(`Server process ${pid} still holds its PID`))
+    })
 
-      yield* signal(info.pid, "SIGTERM")
+    // "delivered": the signal reached a process. "exited": ESRCH, nobody owns
+    // the PID anymore. "error": EPERM or anything else - delivery is not
+    // confirmed and teardown must not proceed as if it were.
+    const signalChecked = Effect.fnUntraced(function* (pid: number, sig: NodeJS.Signals) {
+      return yield* Effect.try({
+        try: () => {
+          process.kill(pid, sig)
+          return "delivered" as const
+        },
+        catch: (cause) => cause,
+      }).pipe(
+        Effect.catch((cause) => Effect.succeed(kill0MeansExited(cause) ? ("exited" as const) : ("error" as const))),
+      )
+    })
+
+    // Teardown ends in exactly one of two outcomes. "stopped" means the
+    // original PID was VERIFIED gone (ESRCH) - only then may a caller remove
+    // the registration or spawn a replacement. "unverified" means the exit of
+    // the original process was not proven: the health re-check failed, the
+    // registration changed, a signal could not be delivered, or the PID was
+    // still held after SIGKILL. Callers must refuse, keep the registration,
+    // and spawn nothing on "unverified".
+    //
+    // Signals are sent only after authenticating the server (healthy() +
+    // sameRegistration): the PID alone is never enough. The healthy()
+    // re-check narrows the check-to-signal race but cannot close it: the PID
+    // can exit and be recycled between probe and signal, and sameRegistration
+    // compares the registration file, not OS identity, so a recycled PID with
+    // an unchanged file is not detected. No stronger userspace guarantee
+    // exists without platform-specific PID handles.
+    const stopProcess = Effect.fnUntraced(function* (info: Registration) {
+      yield* requireCoordinated(info)
+      // Nothing to signal when nobody owns the PID: ESRCH is a verified exit.
+      // This says only that the ORIGINAL process is gone; it says nothing
+      // about who owns the registration file now. Callers must condition any
+      // removal on ownership (removeIfSame) - a different service may have
+      // registered while this teardown ran.
+      if (yield* processExited(info.pid)) return { status: "stopped" }
+
+      const current = yield* healthy().pipe(Effect.option)
+      if (Option.isNone(current) || !sameRegistration(current.value, info))
+        return {
+          status: "unverified",
+          reason:
+            "the health re-check before signaling failed or the registration changed, so the registered server could not be authenticated and its exit is not proven",
+        }
+
+      const term = yield* signalChecked(info.pid, "SIGTERM")
+      if (term === "exited") return { status: "stopped" }
+      if (term === "error") return { status: "unverified", reason: `SIGTERM could not be delivered to PID ${info.pid}` }
       const stopped = yield* awaitStopped(info.pid).pipe(
         Effect.retry(Schedule.spaced("50 millis").pipe(Schedule.both(Schedule.recurs(100)))),
         Effect.option,
       )
-      if (Option.isSome(stopped)) return
+      if (Option.isSome(stopped)) return { status: "stopped" }
 
       const latest = yield* healthy().pipe(Effect.option)
-      if (Option.isNone(latest) || !sameRegistration(latest.value, info)) return
-      yield* signal(info.pid, "SIGKILL")
-      yield* awaitStopped(info.pid).pipe(
+      if (Option.isNone(latest) || !sameRegistration(latest.value, info))
+        return {
+          status: "unverified",
+          reason:
+            "the health re-check before SIGKILL failed or the registration changed, so the registered server could not be re-authenticated and its exit is not proven",
+        }
+      const kill = yield* signalChecked(info.pid, "SIGKILL")
+      if (kill === "exited") return { status: "stopped" }
+      if (kill === "error") return { status: "unverified", reason: `SIGKILL could not be delivered to PID ${info.pid}` }
+      const final = yield* awaitStopped(info.pid).pipe(
         Effect.retry(Schedule.spaced("50 millis").pipe(Schedule.both(Schedule.recurs(100)))),
+        Effect.option,
+      )
+      if (Option.isSome(final)) return { status: "stopped" }
+      return { status: "unverified", reason: `a process still holds PID ${info.pid} after SIGKILL` }
+    })
+
+    // Ownership coordination is a lock directory, not a field guard: mkdir is
+    // atomic, so while a remover holds the lock no publisher running THIS
+    // build can rewrite the registration between the compare and the remove.
+    // (Servers on older builds do not take the lock; against those the
+    // compare still narrows the window but cannot close it - no claim
+    // otherwise.) A lock is never stolen based on age: a paused live
+    // holder is indistinguishable from a crashed one. Contention refuses
+    // safely; abandoned locks require operator recovery after all service
+    // and client processes using this state directory have been stopped.
+    const lockDir = file + ".lock"
+    const acquireLock = Effect.gen(function* () {
+      yield* fs
+        .makeDirectory(directory, { recursive: true })
+        .pipe(Effect.mapError(() => new Error("Could not create the service state directory; nothing was removed.")))
+      const deadline = Date.now() + 2_000
+      for (;;) {
+        const acquired = yield* fs.makeDirectory(lockDir).pipe(
+          Effect.as(true),
+          Effect.orElseSucceed(() => false),
+        )
+        if (acquired) return
+        if (Date.now() > deadline) {
+          return yield* Effect.fail(
+            new Error(
+              "The service registration is being updated concurrently; nothing was removed. Retry. If the lock is abandoned, stop all service and client processes using this state directory before removing server.json.lock.",
+            ),
+          )
+        }
+        yield* Effect.sleep("50 millis")
+      }
+    })
+    const withRegistrationLock = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+      Effect.acquireUseRelease(
+        acquireLock,
+        () => effect,
+        () => fs.remove(lockDir, { recursive: true }).pipe(Effect.ignore),
+      )
+
+    // Ownership-conditioned removal under the lock: the registration is
+    // deleted only when the file still describes the exact record this caller
+    // tore down. If a different service registered meanwhile ("changed"), its
+    // file is preserved and the caller must rediscover or refuse - never
+    // delete or replace a registration it does not own.
+    const removeIfSame = Effect.fnUntraced(function* (expected: Registration) {
+      yield* requireCoordinated(expected)
+      return yield* withRegistrationLock(
+        Effect.gen(function* () {
+          const current = yield* optionalRegistration()
+          if (Option.isNone(current)) return "absent" as const
+          if (!sameRegistration(current.value, expected)) return "changed" as const
+          yield* fs.remove(file).pipe(Effect.ignore)
+          return "removed" as const
+        }),
       )
     })
 
@@ -166,40 +376,225 @@ export const layer = Layer.effect(
             return Object.keys(body.data).length
           }).pipe(Effect.catch(() => Effect.succeed(undefined)))
 
+    // Asks the registered service to stop itself, atomically, only while idle.
+    // The status code is the contract: 200 granted (the service is terminating),
+    // 409 refused with runs active, 503 refused because its active-run state is
+    // unknown. Anything else — network error, timeout, other status — is unknown.
+    const stopIfIdle = Effect.fn("cli.daemon.stopIfIdle")(function* (info: Registration) {
+      yield* requireCoordinated(info)
+      const headers = ServerAuth.headers({ password: yield* password() })
+      const response = yield* Effect.tryPromise({
+        try: () =>
+          fetch(new URL(STOP_IDLE_PATH, info.url), {
+            method: "POST",
+            headers,
+            signal: AbortSignal.timeout(STOP_IDLE_TIMEOUT),
+          }),
+        catch: (cause) => cause,
+      }).pipe(Effect.catch(() => Effect.succeed(undefined)))
+      if (response === undefined) return { status: "unknown" as const }
+      if (response.status === 200) {
+        // The status code alone is not the grant: an unrelated 200 (a server
+        // that does not mount the daemon route behind a fallback, a proxy, an
+        // older build) must not be read as acceptance. Only the contract body
+        // confirms the service is terminating.
+        return yield* Effect.tryPromise(() => response.json()).pipe(
+          Effect.flatMap(Schema.decodeUnknownEffect(StoppingBody)),
+          Effect.map(() => ({ status: "stopping" }) as const),
+          Effect.catch(() => Effect.succeed({ status: "unknown" } as const)),
+        )
+      }
+      if (response.status === 503) return { status: "unknown" as const }
+      if (response.status !== 409) return { status: "unknown" as const }
+      // A busy refusal is already safe to act on; the count only improves the
+      // message, so an unreadable body still refuses.
+      const activeRuns = yield* Effect.tryPromise(() => response.json()).pipe(
+        Effect.flatMap(Schema.decodeUnknownEffect(ActiveRunsBody)),
+        Effect.map((body) => body.activeRuns),
+        Effect.catch(() => Effect.succeed(undefined)),
+      )
+      return { status: "busy" as const, activeRuns }
+    })
+
+    // Re-verifies liveness after an unconfirmed stop request. A granted stop
+    // terminates the service ~250ms after the response is written, whether or
+    // not the answer arrived, so a lost answer must not be reported as "left
+    // running". The recheck waits out the self-terminate delay with margin,
+    // then classifies the probe precisely:
+    //
+    // - any HTTP response at all (200, 401, 404, 500, ...) proves a process is
+    //   listening and answering: the service is ALIVE. A 401/404 is an auth or
+    //   version mismatch, not a dead process.
+    // - a refused connection proves ONLY that nothing is listening on the
+    //   registered address: the LISTENER is gone. It says nothing about the
+    //   process - a wedged service can outlive its own listener, and treating
+    //   a closed port as a dead process would let a replacement orphan it.
+    //   Process exit is verified separately, by PID (see recheckAfterUnknown).
+    // - anything else (timeout, reset, DNS, TLS) proves nothing and stays
+    //   unknown, which refuses.
+    type Liveness = "alive" | "listener-gone" | "unknown"
+
+    // Structured codes only, walking the cause chain. A message-substring
+    // match is not accepted: an interposed proxy or tunnel can produce errors
+    // whose text mentions a refused connection for an address that is not the
+    // registered one, and only the kernel-generated refusal code on the actual
+    // dial proves nothing is listening there. A proxy that answers HTTP at all
+    // already reads as `alive` upstream, so it never reaches this check.
+    const isConnectionRefused = (error: unknown): boolean => {
+      let current: unknown = error
+      while (current !== null && typeof current === "object") {
+        const code = (current as { code?: unknown }).code
+        if (code === "ECONNREFUSED" || code === "ConnectionRefused") return true
+        current = (current as { cause?: unknown }).cause
+      }
+      return false
+    }
+
+    const probeLiveness = Effect.fn("cli.daemon.probeLiveness")(function* (info: Registration) {
+      const headers = ServerAuth.headers({ password: yield* password() })
+      const response = yield* Effect.tryPromise({
+        try: () =>
+          fetch(new URL("/api/health", info.url), {
+            headers,
+            signal: AbortSignal.timeout(ACTIVE_PROBE_TIMEOUT_MS),
+          }),
+        catch: (cause) => cause,
+      }).pipe(Effect.exit)
+      if (Exit.isSuccess(response)) return "alive" as const
+      // Unwrap the Effect Cause to the original fetch error before inspecting
+      // codes; the Cause wrapper itself carries no connection information.
+      return isConnectionRefused(Cause.squash(response.cause)) ? ("listener-gone" as const) : ("unknown" as const)
+    })
+
+    const recheckAfterUnknown = Effect.fn("cli.daemon.recheckAfterUnknown")(function* (info: Registration) {
+      yield* Effect.sleep("500 millis")
+      const first = yield* probeLiveness(info)
+      if (first !== "listener-gone") return { status: "unknown" } as const
+      // Two consecutive refusals prove the listener is gone for good, not that
+      // the process exited. A granted stop ends both together, but only the
+      // PID check separates "service stopped" from "service wedged without a
+      // listener"; a transient refusal while the socket tears down also cannot
+      // reopen the stop.
+      yield* Effect.sleep("250 millis")
+      const second = yield* probeLiveness(info)
+      if (second !== "listener-gone") return { status: "unknown" } as const
+      return (yield* processExited(info.pid)) ? ({ status: "stopping" } as const) : ({ status: "orphaned" } as const)
+    })
+
+    // Classifies a registration whose health check failed at ENTRY (no stop
+    // was requested). Anything that still answers HTTP is alive-but-unhealthy
+    // for this client, which is unknown and refuses. Two consecutive refusals
+    // prove only the listener is gone; the PID then separates a stale
+    // registration (ESRCH) from a wedged-or-recycled process that still holds
+    // the PID, which refuses as orphaned. Nothing here spawns or removes.
+    const classifyUnhealthyEntry = Effect.fn("cli.daemon.classifyUnhealthyEntry")(function* (info: Registration) {
+      const first = yield* probeLiveness(info)
+      if (first !== "listener-gone") return { status: "unknown" } as const
+      yield* Effect.sleep("250 millis")
+      const second = yield* probeLiveness(info)
+      if (second !== "listener-gone") return { status: "unknown" } as const
+      return (yield* processExited(info.pid)) ? ({ status: "stopping" } as const) : ({ status: "orphaned" } as const)
+    })
+
     const start = Effect.fn("cli.daemon.start")(function* () {
       const existing = yield* healthy().pipe(Effect.option)
-      const found = Option.getOrUndefined(existing)
+      let found = Option.getOrUndefined(existing)
+      if (found === undefined) {
+        // Same entry rule as restart: a failed health check is not absence.
+        // Classify the registration before spawning anything; a wedged or
+        // unconfirmable registered process refuses instead of being orphaned.
+        const raw = yield* optionalRegistration()
+        if (Option.isSome(raw)) {
+          yield* requireCoordinated(raw.value)
+          const entry = yield* classifyUnhealthyEntry(raw.value)
+          if (entry.status === "orphaned") {
+            return yield* Effect.fail(
+              new Error(
+                `Start refused: the registered service (PID ${raw.value.pid}) no longer answers its listener, but a process still holds that PID. A live PID is not proof of identity - it may be a wedged server or an unrelated process that reused the PID. Nothing was signaled, spawned, or removed; the registration stays at ${file}. Verify the process identity independently (compare ps -p ${raw.value.pid} -o lstart,args against the registration) and end it manually only if it is the silvercode server.`,
+              ),
+            )
+          }
+          if (entry.status === "unknown") {
+            return yield* Effect.fail(
+              new Error(
+                "Start refused: the registered service failed its health check and its state could not be confirmed (the probe may have timed out, been reset, or the service answered unhealthy - a failed check does not say which). Nothing was signaled or spawned. Retry when the service is healthy, or verify and end it manually.",
+              ),
+            )
+          }
+          // The registered process is gone (ESRCH): the registration is stale
+          // and removed so the spawn below starts clean. Ownership-checked:
+          // if a different service registered meanwhile, its file stays and
+          // start refuses instead of deleting it.
+          const removal = yield* removeIfSame(raw.value)
+          if (removal === "changed") {
+            return yield* Effect.fail(
+              new Error(
+                `Start refused: the stale registration was replaced by a different service while it was being cleared. Nothing was removed or spawned; the registration stays at ${file}. Retry to act on the current registration.`,
+              ),
+            )
+          }
+        }
+      }
       const compiled = path.basename(process.execPath).replace(/\.exe$/, "") !== "bun"
       const factoryDefault =
         process.env.OPENCODE_FACTORY_DEFAULT === "1" || process.env.OPENCODE_FACTORY_DEFAULT === "true"
-      // Keep probing even for compatible servers: verified idle retains the
-      // development/factory replacement behavior. Unknown permits only reuse,
-      // not replacement, and is never converted to a zero active-run count.
-      const activeCount = yield* probeActiveRuns(found)
+      // Replacement races a fresh registration: A exits, B registers, A's
+      // teardown verifies A's exit and must NOT delete B's file. Removal is
+      // ownership-checked; a changed registration is rediscovered and the
+      // decision re-runs against it. Bounded: a second change refuses.
+      for (let pass = 0; ; pass++) {
+        // Keep probing even for compatible servers: verified idle retains the
+        // development/factory replacement behavior. Unknown permits only reuse,
+        // not replacement, and is never converted to a zero active-run count.
+        if (found) yield* requireCoordinated(found)
+        const activeCount = yield* probeActiveRuns(found)
 
-      const decision = decideStart({
-        registered: found !== undefined,
-        sameVersion: found?.version === InstallationVersion,
-        compiled,
-        factoryDefault,
-        activeRuns: activeCount,
-      })
-      if (decision === "reuse" && found) return found.url
-      if (decision === "refuse-active" && found) {
-        return yield* Effect.fail(
-          new Error(
-            `Background service ${found.version ?? "unknown"} does not match this client and has ${activeCount} active run(s). Wait for them to finish, or run "service stop" to end them explicitly, then start again.`,
-          ),
-        )
+        const decision = decideStart({
+          registered: found !== undefined,
+          sameVersion: found?.version === InstallationVersion,
+          compiled,
+          factoryDefault,
+          activeRuns: activeCount,
+        })
+        if (decision === "reuse" && found) return found.url
+        if (decision === "refuse-active" && found) {
+          return yield* Effect.fail(
+            new Error(
+              `Background service ${found.version ?? "unknown"} does not match this client and has ${activeCount} active run(s). Wait for them to finish, or run "service stop" to end them explicitly, then start again.`,
+            ),
+          )
+        }
+        if (decision === "refuse-unknown" && found) {
+          return yield* Effect.fail(
+            new Error(
+              "Start refused: the background service state could not be confirmed (active-run probe failed). Nothing was signaled or spawned. Retry when the service answers its probes again.",
+            ),
+          )
+        }
+        if (found) {
+          const teardown = yield* stopProcess(found)
+          if (teardown.status !== "stopped") {
+            return yield* Effect.fail(
+              new Error(
+                `Start refused: teardown of the registered service (PID ${found.pid}) could not be verified (${teardown.reason}). Nothing was spawned or removed; the registration stays at ${file}. Verify the process state before retrying.`,
+              ),
+            )
+          }
+          const removal = yield* removeIfSame(found)
+          if (removal === "changed") {
+            if (pass >= 1) {
+              return yield* Effect.fail(
+                new Error(
+                  "Start refused: the service registration changed repeatedly during teardown. Nothing was spawned or removed. Retry once the registration is stable.",
+                ),
+              )
+            }
+            found = Option.getOrUndefined(yield* optionalRegistration())
+            continue
+          }
+        }
+        break
       }
-      if (decision === "refuse-unknown" && found) {
-        return yield* Effect.fail(
-          new Error(
-            'Could not confirm whether the background service has active runs (active-run probe failed). The service was left running. Retry, or run "service stop" to end it explicitly.',
-          ),
-        )
-      }
-      if (found) yield* stopProcess(found).pipe(Effect.ignore)
 
       const entrypoint = compiled ? undefined : process.argv[1]
       if (!compiled && entrypoint === undefined)
@@ -223,24 +618,72 @@ export const layer = Layer.effect(
 
     const restart = Effect.fn("cli.daemon.restart")(function* () {
       const existing = yield* healthy().pipe(Effect.option)
-      const found = Option.getOrUndefined(existing)
-      const activeCount = yield* probeActiveRuns(found)
-      const restartDecision = decideRestart({ registered: found !== undefined, activeRuns: activeCount })
+      let found = Option.getOrUndefined(existing)
+      let stopIdle: StopIdleResult
+      if (found !== undefined) {
+        stopIdle = yield* stopIfIdle(found)
+        if (stopIdle.status === "unknown") stopIdle = yield* recheckAfterUnknown(found)
+      } else {
+        // A failed health check does not prove nothing is registered: re-read
+        // the registration and classify it before the service is treated as
+        // absent. Spawning here with a live registered PID would orphan it.
+        const raw = yield* optionalRegistration()
+        if (Option.isNone(raw)) {
+          stopIdle = { status: "stopping" }
+        } else {
+          found = raw.value
+          yield* requireCoordinated(found)
+          stopIdle = yield* classifyUnhealthyEntry(found)
+        }
+      }
+      const restartDecision = decideRestart({ registered: found !== undefined, stop: stopIdle })
       if (restartDecision === "refuse-active") {
+        const runs = stopIdle.status === "busy" ? stopIdle.activeRuns : undefined
+        const active = runs === undefined ? "has active runs" : `has ${runs} active run(s)`
         return yield* Effect.fail(
           new Error(
-            `Background service has ${activeCount} active run(s); restart refused so they are not interrupted. Wait for them to finish, or run "service stop" to end them explicitly.`,
+            `Background service ${active}; restart refused so they are not interrupted. Wait for them to finish, or run "service stop" to end them explicitly.`,
           ),
         )
       }
       if (restartDecision === "refuse-unknown") {
         return yield* Effect.fail(
           new Error(
-            'Could not confirm the background service is idle (active-run probe failed); restart refused and the service was left running. Retry, or run "service stop" to end it explicitly.',
+            "Restart refused: the background service state could not be confirmed (health, stop-if-idle, or liveness probes were inconclusive - timeout, reset, or unreachable; a failed probe does not say which). Nothing was signaled or spawned. Retry when the service answers its probes again.",
           ),
         )
       }
-      yield* stop()
+      if (restartDecision === "refuse-orphaned") {
+        return yield* Effect.fail(
+          new Error(
+            `Restart refused: the registered service (PID ${found?.pid}) no longer answers its listener, but a process still holds that PID. A live PID is not proof of identity - it may be a wedged server or an unrelated process that reused the PID, and a command-line match alone does not settle that. Nothing was signaled, spawned, or removed; the registration stays at ${file}. Verify the process identity independently (compare ps -p ${found?.pid} -o lstart,args against the registration) and end it manually only if it is the silvercode server.`,
+          ),
+        )
+      }
+      // The service closed its run gate when it granted the stop, so the usual
+      // teardown (SIGTERM, escalating to SIGKILL) cannot interrupt a run.
+      // Waiting for it to go away also keeps the replacement from racing the
+      // registration of the service that is still shutting down.
+      if (found) {
+        const teardown = yield* stopProcess(found)
+        if (teardown.status !== "stopped") {
+          return yield* Effect.fail(
+            new Error(
+              `Restart refused: teardown of the current service (PID ${found.pid}) could not be verified (${teardown.reason}). Nothing was spawned or removed; the registration stays at ${file}. Verify the process state before retrying.`,
+            ),
+          )
+        }
+        // A different service may have registered during the teardown; its
+        // registration is not ours to delete or replace.
+        const removal = yield* removeIfSame(found)
+        if (removal === "changed") {
+          return yield* Effect.fail(
+            new Error(
+              `Restart refused: the original service (PID ${found.pid}) was stopped, but a different service registered at ${file} meanwhile. That registration was kept and nothing was spawned. Retry to act on the current registration.`,
+            ),
+          )
+        }
+      }
       return yield* start()
     })
 
@@ -256,9 +699,35 @@ export const layer = Layer.effect(
     const status = Effect.fn("cli.daemon.status")(function* () {
       const existing = yield* healthy().pipe(Effect.option)
       const found = Option.getOrUndefined(existing)
+      if (found) {
+        const coordinated = yield* requireCoordinated(found).pipe(
+          Effect.as(true),
+          Effect.catch((error) => Effect.logWarning(error.message).pipe(Effect.as(false))),
+        )
+        if (!coordinated) return undefined
+      }
       if (found?.version === InstallationVersion) return found.url
       if (found) return undefined
-      yield* fs.remove(file).pipe(Effect.ignore)
+      // A failed health check is not absence: only a verified dead PID
+      // (ESRCH) makes the registration stale enough to remove. While any
+      // process holds the PID the registration is the operator's only record.
+      const raw = yield* optionalRegistration().pipe(
+        Effect.catch((error) => Effect.logWarning(error.message).pipe(Effect.as(Option.none<Registration>()))),
+      )
+      if (Option.isSome(raw)) {
+        const valid = yield* requireCoordinated(raw.value).pipe(
+          Effect.as(true),
+          Effect.catch((error) => Effect.logWarning(error.message).pipe(Effect.as(false))),
+        )
+        if (!valid) return undefined
+      }
+      if (Option.isSome(raw) && (yield* processExited(raw.value.pid))) {
+        // Same ownership rule as the other callers: remove only if the file
+        // still describes the record we just proved stale. Best-effort: a
+        // contested lock leaves the stale entry for the next caller rather
+        // than failing a read-only status query.
+        yield* removeIfSame(raw.value).pipe(Effect.catch((error) => Effect.logWarning(error.message)))
+      }
       return undefined
     })
 
@@ -266,21 +735,71 @@ export const layer = Layer.effect(
       const existing = yield* healthy().pipe(Effect.option)
       // A stale registration may point at a PID that has since been reused by
       // another process. Only signal the PID after authenticating the server.
-      if (Option.isNone(existing)) return yield* fs.remove(file).pipe(Effect.ignore)
-      yield* stopProcess(existing.value)
-      yield* fs.remove(file).pipe(Effect.ignore)
+      if (Option.isSome(existing)) {
+        const teardown = yield* stopProcess(existing.value)
+        if (teardown.status !== "stopped") {
+          return yield* Effect.fail(
+            new Error(
+              `Stop incomplete: teardown of the service (PID ${existing.value.pid}) could not be verified (${teardown.reason}). The registration stays at ${file}; a process may still hold that PID. Verify the process state and retry.`,
+            ),
+          )
+        }
+        // The requested service is verified gone. The registration is removed
+        // only if it still belongs to that service: a different service may
+        // have registered during the teardown, and its file is kept.
+        const removal = yield* removeIfSame(existing.value)
+        if (removal === "changed") {
+          yield* Effect.logWarning(
+            `The requested service (PID ${existing.value.pid}) is stopped, but the registration at ${file} now describes a different service and was kept.`,
+          )
+        }
+        return
+      }
+      // The registered server did not authenticate (wedged, hung, or stale).
+      // Its PID is NOT safe to signal unauthenticated. A dead PID makes the
+      // registration stale, so it is removed; a live PID keeps it, because
+      // the registration is the only record the operator has for the manual
+      // route, and removing it before a verified kill would lose that.
+      const raw = yield* optionalRegistration()
+      if (Option.isNone(raw)) return
+      yield* requireCoordinated(raw.value)
+      const pid = raw.value.pid
+      const gone = yield* processExited(pid)
+      if (gone) {
+        yield* removeIfSame(raw.value)
+        return
+      }
+      yield* Effect.logWarning(
+        `The registered service (PID ${pid}) did not answer its health endpoint and was not signaled. A process still holds that PID, but a live PID is not proof of identity (wedged server or recycled PID), and a command-line match alone does not settle that. The registration was kept at ${file}. Verify the process identity independently (compare ps -p ${pid} -o lstart,args against the registration) and end it manually only if it is the silvercode server, then remove the registration.`,
+      )
     })
 
     const register = Effect.fn("cli.daemon.register")(function* (address: HttpServer.Address) {
       const id = randomUUID()
       const temp = file + "." + id + ".tmp"
-      yield* fs.makeDirectory(directory, { recursive: true })
-      yield* fs.writeFileString(
-        temp,
-        JSON.stringify({ id, version: InstallationVersion, url: HttpServer.formatAddress(address), pid: process.pid }),
-        { mode: 0o600 },
+      // Published under the same lock the removers take, so a teardown can
+      // never delete a registration that appeared between its compare and
+      // its remove (same build on both sides).
+      yield* withRegistrationLock(
+        Effect.gen(function* () {
+          const current = yield* optionalRegistration()
+          if (Option.isSome(current)) yield* requireCoordinated(current.value)
+          yield* fs.makeDirectory(directory, { recursive: true })
+          yield* fs.writeFileString(
+            temp,
+            JSON.stringify({
+              id,
+              coordination: "registration-lock-v1",
+              version: InstallationVersion,
+              url: HttpServer.formatAddress(address),
+              pid: process.pid,
+              startedAt: new Date(Date.now() - process.uptime() * 1000).toISOString(),
+            }),
+            { mode: 0o600 },
+          )
+          yield* fs.rename(temp, file)
+        }),
       )
-      yield* fs.rename(temp, file)
       yield* registration().pipe(
         Effect.flatMap((info) => (info.id === id ? Effect.void : signal(process.pid, "SIGTERM"))),
         Effect.catch(() => signal(process.pid, "SIGTERM")),
@@ -288,10 +807,13 @@ export const layer = Layer.effect(
         Effect.forkScoped,
       )
       yield* Effect.addFinalizer(() =>
-        registration().pipe(
-          Effect.flatMap((info) => (info.id === id ? fs.remove(file) : Effect.void)),
-          Effect.ignore,
-        ),
+        withRegistrationLock(
+          registration().pipe(
+            Effect.flatMap((info) =>
+              info.id === id ? requireCoordinated(info).pipe(Effect.andThen(fs.remove(file))) : Effect.void,
+            ),
+          ),
+        ).pipe(Effect.ignore),
       )
     })
 

@@ -13,7 +13,9 @@ import { fileURLToPath } from "url"
 import { Config } from "@/config/config"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Shell } from "@opencode-ai/core/shell"
+import { shellOutputDecoder, windowsPowerShellCommand } from "@opencode-ai/core/shell-encoding"
 import { ShellID } from "./shell/id"
+import { ToolFailure } from "@opencode-ai/llm"
 
 import * as Truncate from "./truncate"
 import { Plugin } from "@/plugin"
@@ -293,12 +295,19 @@ const ask = Effect.fn("ShellTool.ask")(function* (ctx: Tool.Context, scan: Scan,
 
 function cmd(shell: string, command: string, cwd: string, env: NodeJS.ProcessEnv) {
   if (process.platform === "win32" && Shell.ps(shell)) {
-    return ChildProcess.make(shell, ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command], {
-      cwd,
-      env,
-      stdin: "ignore",
-      detached: false,
-    })
+    return ChildProcess.make(
+      shell,
+      ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", windowsPowerShellCommand(shell, command)],
+      {
+        cwd,
+        env,
+        stdin: "ignore",
+        detached: false,
+        // Bound scope-teardown kills: without this, a child that ignores SIGTERM
+        // hangs the finalizer forever and the session never leaves "running".
+        forceKillAfter: "3 seconds",
+      },
+    )
   }
 
   return ChildProcess.make(command, [], {
@@ -307,6 +316,7 @@ function cmd(shell: string, command: string, cwd: string, env: NodeJS.ProcessEnv
     env,
     stdin: "ignore",
     detached: process.platform !== "win32",
+    forceKillAfter: "3 seconds",
   })
 }
 const parser = lazy(async () => {
@@ -446,9 +456,12 @@ export const ShellTool = Tool.define(
       let processing = false
       let file = ""
       let sink: ReturnType<typeof createWriteStream> | undefined
+      let spillError: Error | undefined
       let cut = false
       let expired = false
       let aborted = false
+      let signaled: string | undefined
+      const meta: string[] = []
 
       const markOutputProcessed = Effect.sync(() => {
         processing = false
@@ -489,57 +502,83 @@ export const ShellTool = Tool.define(
       const code: number | null = yield* Effect.scoped(
         Effect.gen(function* () {
           yield* Effect.addFinalizer(closeSink)
+          const decoder = shellOutputDecoder(input.shell)
+          if (decoder.warning) {
+            meta.push(decoder.warning)
+            yield* Effect.logWarning(decoder.warning)
+          }
           const handle = yield* spawner.spawn(cmd(input.shell, input.command, input.cwd, input.env))
+          // A heavy command (build, headless browser, busy loop) at normal
+          // priority can starve the TUI of CPU time until the screen stops
+          // rendering. Run tool commands below normal priority; children
+          // inherit it, and on an idle machine it costs nothing. Best effort.
+          try {
+            os.setPriority(handle.pid, os.constants.priority.PRIORITY_BELOW_NORMAL)
+          } catch {}
 
-          const output = yield* Effect.forkScoped(
-            Stream.runForEach(Stream.decodeText(handle.all), (chunk) => {
-              processing = true
-              const size = Buffer.byteLength(chunk, "utf-8")
-              list.push({ text: chunk, size })
-              used += size
-              while (used > keep && list.length > 1) {
-                const item = list.shift()
-                if (!item) break
-                used -= item.size
-                cut = true
+          const append = (chunk: string) => {
+            processing = true
+            const size = Buffer.byteLength(chunk, "utf-8")
+            list.push({ text: chunk, size })
+            used += size
+            while (used > keep && list.length > 1) {
+              const item = list.shift()
+              if (!item) break
+              used -= item.size
+              cut = true
+            }
+
+            last = preview(last + chunk)
+
+            if (file) {
+              sink?.write(chunk)
+            } else {
+              full += chunk
+              if (Buffer.byteLength(full, "utf-8") > limits.maxBytes) {
+                return trunc.write(full).pipe(
+                  Effect.andThen((next) =>
+                    Effect.sync(() => {
+                      file = next
+                      cut = true
+                      sink = createWriteStream(next, { flags: "a" })
+                      // Listen right away: a mid-command failure (ENOSPC, EACCES,
+                      // EMFILE) with no listener is an uncaughtException that kills
+                      // a bare server process. On failure, stop spilling and keep the
+                      // truncated in-memory output instead of taking down the runtime.
+                      const stream = sink
+                      stream.on("error", (error) => {
+                        spillError = error instanceof Error ? error : new Error(String(error))
+                        if (sink === stream) sink = undefined
+                        stream.destroy()
+                      })
+                      full = ""
+                    }),
+                  ),
+                  Effect.andThen(
+                    ctx.metadata({
+                      metadata: {
+                        output: last,
+                      },
+                    }),
+                  ),
+                  Effect.ensuring(markOutputProcessed),
+                )
               }
+            }
 
-              last = preview(last + chunk)
-
-              if (file) {
-                sink?.write(chunk)
-              } else {
-                full += chunk
-                if (Buffer.byteLength(full, "utf-8") > limits.maxBytes) {
-                  return trunc.write(full).pipe(
-                    Effect.andThen((next) =>
-                      Effect.sync(() => {
-                        file = next
-                        cut = true
-                        sink = createWriteStream(next, { flags: "a" })
-                        full = ""
-                      }),
-                    ),
-                    Effect.andThen(
-                      ctx.metadata({
-                        metadata: {
-                          output: last,
-                        },
-                      }),
-                    ),
-                    Effect.ensuring(markOutputProcessed),
-                  )
-                }
-              }
-
-              return ctx
-                .metadata({
-                  metadata: {
-                    output: last,
-                  },
-                })
-                .pipe(Effect.ensuring(markOutputProcessed))
-            }),
+            return ctx
+              .metadata({
+                metadata: {
+                  output: last,
+                },
+              })
+              .pipe(Effect.ensuring(markOutputProcessed))
+          }
+          const output = yield* Stream.runForEach(Stream.map(handle.all, decoder.decode), append).pipe(
+            // Abort, timeout, and idle cutoff can close the scope before the input
+            // reaches EOF, so flush the decoder when this fiber ends for any reason.
+            Effect.ensuring(Effect.suspend(() => append(decoder.end()))),
+            Effect.forkScoped,
           )
 
           const abort = Effect.callback<void>((resume) => {
@@ -551,19 +590,43 @@ export const ShellTool = Tool.define(
 
           const timeout = Effect.sleep(`${input.timeout + 100} millis`)
 
+          // A child killed by an external signal fails `exitCode` by design
+          // ("Process interrupted due to receipt of signal"). That is a normal
+          // way for a command to end, so recover it here: the run completes
+          // with the output collected so far and a note about the signal
+          // instead of dying as a defect.
+          const exited = handle.exitCode.pipe(
+            Effect.map((code) => ({ kind: "exit" as const, code: code as number | null, signal: undefined })),
+            Effect.catch((error) => {
+              const message = error instanceof Error ? error.message : String(error)
+              const cause = error instanceof Error && error.cause instanceof Error ? error.cause.message : ""
+              return Effect.succeed({
+                kind: "exit" as const,
+                code: null,
+                signal: /signal: '([^']+)'/.exec(message)?.[1] ?? /signal: '([^']+)'/.exec(cause)?.[1],
+              })
+            }),
+          )
           const exit = yield* Effect.raceAll([
-            handle.exitCode.pipe(Effect.map((code) => ({ kind: "exit" as const, code }))),
-            abort.pipe(Effect.map(() => ({ kind: "abort" as const, code: null }))),
-            timeout.pipe(Effect.map(() => ({ kind: "timeout" as const, code: null }))),
+            exited,
+            abort.pipe(Effect.map(() => ({ kind: "abort" as const, code: null, signal: undefined }))),
+            timeout.pipe(Effect.map(() => ({ kind: "timeout" as const, code: null, signal: undefined }))),
           ])
 
+          // The kill can lose the race against the child exiting on its own
+          // (ESRCH on POSIX, "not found" from taskkill on Windows): the wanted
+          // end state already holds, so tolerate the failure.
+          const kill = handle.kill({ forceKillAfter: "3 seconds" }).pipe(Effect.ignore)
           if (exit.kind === "abort") {
             aborted = true
-            yield* handle.kill({ forceKillAfter: "3 seconds" }).pipe(Effect.orDie)
+            yield* kill
           }
           if (exit.kind === "timeout") {
             expired = true
-            yield* handle.kill({ forceKillAfter: "3 seconds" }).pipe(Effect.orDie)
+            yield* kill
+          }
+          if (exit.kind === "exit" && exit.signal) {
+            signaled = exit.signal
           }
 
           if (exit.kind === "exit") {
@@ -583,19 +646,29 @@ export const ShellTool = Tool.define(
 
           return exit.kind === "exit" ? exit.code : null
         }),
-      ).pipe(Effect.orDie)
+      ).pipe(
+        Effect.mapError(
+          (error) => new ToolFailure({ message: error instanceof Error ? error.message : String(error) }),
+        ),
+      )
 
-      const meta: string[] = []
       if (expired) {
         meta.push(
           `shell tool terminated command after exceeding timeout ${input.timeout} ms. If this command is expected to take longer and is not waiting for interactive input, retry with a larger timeout value in milliseconds.`,
         )
       }
       if (aborted) meta.push("User aborted the command")
+      if (spillError) {
+        meta.push(
+          `Could not save the full output to a file (${spillError.message}). The output below may be incomplete.`,
+        )
+        file = ""
+      }
+      if (signaled) meta.push(`Command was terminated by signal ${signaled}`)
       const raw = list.map((item) => item.text).join("")
       const end = tail(raw, limits.maxLines, limits.maxBytes)
       if (end.cut) cut = true
-      if (!file && end.cut) {
+      if (!file && end.cut && !spillError) {
         file = yield* trunc.write(raw)
       }
 

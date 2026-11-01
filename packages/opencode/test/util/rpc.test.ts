@@ -16,6 +16,28 @@ describe("Rpc client", () => {
     await expect(pending).rejects.toThrow("worker crashed")
   })
 
+  test("rejects the call when postMessage throws, without leaking it", async () => {
+    let down = true
+    const target = {
+      postMessage(message: string) {
+        if (down) throw new Error("Bun worker is not running")
+        queueMicrotask(() =>
+          target.onmessage?.({
+            data: JSON.stringify({ type: "rpc.result", id: JSON.parse(message).id, result: "recovered" }),
+          } as MessageEvent<string>),
+        )
+      },
+      onmessage: null as ((event: MessageEvent<string>) => void) | null,
+      onclose: null as ((error: Error) => void) | null,
+    }
+
+    const client = Rpc.client<{ work: (input: string) => Promise<string> }>(target)
+    await expect(client.call("work", "input")).rejects.toThrow("Bun worker is not running")
+
+    down = false
+    await expect(client.call("work", "again")).resolves.toBe("recovered")
+  })
+
   test("rejects pending calls on rpc.error replies", async () => {
     const target = {
       postMessage() {},

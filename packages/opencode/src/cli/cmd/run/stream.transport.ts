@@ -69,10 +69,18 @@ const StreamClosed = undefined as never
 type StreamInput = {
   sdk: OpencodeClient
   directory?: string
+  // Control-plane workspace the session lives in; undefined is the default
+  // workspace. Dispose events from other workspaces must not kill this
+  // transport (#419).
+  workspace?: string
   sessionID: string
   thinking: boolean
   replay?: boolean
   replayLimit?: number
+  // Cap on buffered events held while booting/replaying or waiting for an
+  // untracked session; overflow faults the transport instead of growing
+  // without bound (#399). Injectable for tests.
+  bufferCapacity?: number
   limits: () => Record<string, number>
   providers?: () => RunProvider[]
   footer: FooterApi
@@ -196,12 +204,26 @@ function globalPayloadEvent(value: unknown): Event | undefined {
   return isEvent(payload) ? payload : undefined
 }
 
-function isMatchingDisposeEvent(value: unknown, directory: string | undefined): boolean {
+function isMatchingDisposeEvent(
+  value: unknown,
+  directory: string | undefined,
+  workspace: string | undefined,
+): boolean {
   if (!directory || !isGlobalEvent(value)) {
     return false
   }
 
   if (value.directory !== directory) {
+    return false
+  }
+
+  // Multi-workspace instances share a directory and a global bus, so a
+  // dispose emitted by one workspace reaches every transport subscribed to
+  // that directory. The envelope carries the emitting workspace; both sides
+  // are undefined for the default workspace, so exact equality is the match
+  // (#419).
+  const eventWorkspace = Reflect.get(value, "workspace")
+  if (eventWorkspace !== workspace) {
     return false
   }
 
@@ -458,6 +480,7 @@ function createLayer(input: StreamInput) {
         let replayDisabled = false
         let replayPending: SessionResizeReplayInput | undefined
         const buffered: Event[] = []
+        const bufferCapacity = input.bufferCapacity ?? 10_000
         const replayedParts = new Set<string>()
         const recovering = new Set<string>()
         const tracked = (sessionID: string | undefined) =>
@@ -826,6 +849,23 @@ function createLayer(input: StreamInput) {
           yield* Deferred.fail(next.done, error).pipe(Effect.ignore)
         })
 
+        // Like EventV2.allBounded: past the cap the buffer faults the
+        // transport with an overflow error instead of growing until the
+        // process stalls (#399). The buffer is cleared so a faulted
+        // transport stops accumulating.
+        const bufferEvent = Effect.fn("RunStreamTransport.bufferEvent")(function* (event: Event) {
+          if (buffered.length >= bufferCapacity) {
+            buffered.length = 0
+            yield* fail(
+              new Error(
+                `event buffer overflow: more than ${bufferCapacity} events buffered while booting, replaying, or waiting for a session to be tracked`,
+              ),
+            )
+            return
+          }
+          buffered.push(event)
+        })
+
         const touch = (event: Event) => {
           const next = state.wait
           if (!next || !active(event, input.sessionID)) {
@@ -883,6 +923,23 @@ function createLayer(input: StreamInput) {
         }
 
         const applyEvent = Effect.fn("RunStreamTransport.applyEvent")(function* (event: Event) {
+          // The server's replay log could not prove completeness for our
+          // resume cursor (events evicted during a long disconnect), so the
+          // gap is real: surface it rather than running on silently stale
+          // state.
+          if (event.type === "server.resync") {
+            input.trace?.write("recv.resync", {
+              sessionID: input.sessionID,
+              reason: event.properties.reason,
+            })
+            input.footer.append({
+              kind: "error",
+              text: "event stream resumed with gaps after a disconnect; displayed state may be stale",
+              phase: "start",
+              source: "system",
+            })
+            return
+          }
           if (event.type === "message.part.delta" && event.properties.sessionID === input.sessionID) {
             if (replayedParts.has(event.properties.partID)) {
               const seen = state.data.text.get(event.properties.partID) ?? ""
@@ -1138,7 +1195,7 @@ function createLayer(input: StreamInput) {
                   return
                 }
 
-                if (isMatchingDisposeEvent(item, input.directory)) {
+                if (isMatchingDisposeEvent(item, input.directory, input.workspace)) {
                   yield* fail(new Error("instance disposed"))
                   yield* closeScope()
                   return
@@ -1153,7 +1210,7 @@ function createLayer(input: StreamInput) {
                 if (booting || replaying) {
                   if (sessionID) {
                     input.trace?.write("recv.event", event)
-                    buffered.push(event)
+                    yield* bufferEvent(event)
                   }
                   return
                 }
@@ -1161,7 +1218,7 @@ function createLayer(input: StreamInput) {
                 if (!tracked(sessionID)) {
                   if (sessionID) {
                     input.trace?.write("recv.event", event)
-                    buffered.push(event)
+                    yield* bufferEvent(event)
                   }
                   return
                 }

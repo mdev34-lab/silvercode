@@ -68,12 +68,27 @@ type Cursor = typeof Cursor.Type
 
 const decodeCursor = Schema.decodeUnknownSync(Cursor)
 
+export class InvalidCursorError extends Schema.TaggedErrorClass<InvalidCursorError>()(
+  "MessageV2.InvalidCursorError",
+  { message: Schema.String },
+) {
+  static isInstance(input: unknown): input is InvalidCursorError {
+    return input instanceof InvalidCursorError
+  }
+}
+
 export const cursor = {
   encode(input: Cursor) {
     return Buffer.from(JSON.stringify(input)).toString("base64url")
   },
   decode(input: string) {
     return decodeCursor(JSON.parse(Buffer.from(input, "base64url").toString("utf8")))
+  },
+  decodeEffect(input: string) {
+    return Effect.try({
+      try: () => cursor.decode(input),
+      catch: () => new InvalidCursorError({ message: "Invalid cursor" }),
+    })
   },
 }
 
@@ -428,7 +443,7 @@ export const page = Effect.fn("MessageV2.page")(function* (input: {
   before?: string
 }) {
   const { db } = yield* Database.Service
-  const before = input.before ? cursor.decode(input.before) : undefined
+  const before = input.before ? yield* cursor.decodeEffect(input.before) : undefined
   const where = before
     ? and(eq(MessageTable.session_id, input.sessionID), older(before))
     : eq(MessageTable.session_id, input.sessionID)
@@ -476,6 +491,9 @@ export function stream(sessionID: SessionID) {
         Effect.catchIf(NotFoundError.isInstance, () =>
           Effect.succeed({ items: [] as WithParts[], more: false, cursor: undefined }),
         ),
+        // stream pages with cursors it generated itself, so a decode failure
+        // is an internal invariant breach, not user input: keep it a defect.
+        Effect.catchIf(InvalidCursorError.isInstance, (error) => Effect.die(error)),
       )
       if (next.items.length === 0) break
       for (let i = next.items.length - 1; i >= 0; i--) {
@@ -665,6 +683,18 @@ export function fromError(
         },
         { cause: e },
       ).toObject()
+    case e instanceof ProviderError.StreamInterruptedAfterToolCallError:
+      return new APIError(
+        {
+          message: e.message,
+          isRetryable: false,
+          metadata: {
+            code: e.name,
+            ...ProviderError.interruptedStreamCause(e.cause),
+          },
+        },
+        { cause: e },
+      ).toObject()
     case e instanceof ProviderError.ResponseStreamError:
       return new APIError(
         {
@@ -702,6 +732,11 @@ export function fromError(
         },
         { cause: e },
       ).toObject()
+    // Named session errors thrown upstream (e.g. from a provider-error stream
+    // event, #409) keep their classification instead of degrading to Unknown.
+    case ContextOverflowError.isInstance(e):
+    case APIError.isInstance(e):
+      return e
     case e instanceof Error:
       return new NamedError.Unknown({ message: errorMessage(e) }, { cause: e }).toObject()
     default:

@@ -5,6 +5,7 @@ import path from "node:path"
 import { createSignal, onMount } from "solid-js"
 import { testRender } from "@opentui/solid"
 import { tmpdir } from "../../fixture/fixture"
+import { captureFrame } from "../../fixture/frame"
 import { createTuiResolvedConfig } from "../../fixture/tui-runtime"
 import { TestTuiContexts } from "../../fixture/tui-environment"
 import { TuiConfigProvider } from "../../../src/config"
@@ -12,9 +13,9 @@ import { KVProvider } from "../../../src/context/kv"
 import { ThemeProvider } from "../../../src/context/theme"
 import { Countdown } from "../../../src/routes/session/permission"
 
-async function wait(condition: () => boolean, message: string, timeout = 2000) {
+async function wait(condition: () => boolean | Promise<boolean>, message: string, timeout = 2000) {
   const start = Date.now()
-  while (!condition()) {
+  while (!(await condition())) {
     if (Date.now() - start > timeout) throw new Error(message)
     await Bun.sleep(10)
   }
@@ -57,7 +58,9 @@ async function mountCountdown(root: string) {
   // in the tree until the harness reports it mounted.
   await wait(() => mounted, "the countdown never mounted")
   await app.renderOnce()
-  return { app, frame: () => app.captureCharFrame(), setExpiresAt }
+  // captureFrame retries while the output buffer is leased mid-flush (OutputBusy),
+  // which a raw captureCharFrame turns into a spurious failure on a busy runner.
+  return { app, frame: () => captureFrame(app), setExpiresAt }
 }
 
 test("permission countdown renders the time left before the prompt is auto-denied", async () => {
@@ -68,8 +71,8 @@ test("permission countdown renders the time left before the prompt is auto-denie
     // The label updates through the reactive graph, which the renderer commits on a later
     // frame, so this polls instead of rendering once. Rendering that first frame can take
     // long enough for the countdown to tick, so either of the first two seconds counts.
-    await wait(() => /auto-deny in 4[12]s/.test(frame()), "the countdown never rendered the time left")
-    expect(frame()).toMatch(/auto-deny in 4[12]s/)
+    await wait(async () => /auto-deny in 4[12]s/.test(await frame()), "the countdown never rendered the time left")
+    expect(await frame()).toMatch(/auto-deny in 4[12]s/)
   } finally {
     app.renderer.destroy()
   }
@@ -81,8 +84,8 @@ test("permission countdown stops at zero once the deadline has passed", async ()
   // client the prompt is still on screen, so the label clamps instead of counting negative.
   const { app, frame } = await mountCountdown(tmp.path)
   try {
-    await wait(() => frame().includes("auto-deny in 0s"), "the countdown never rendered the clamped label")
-    expect(frame()).toContain("auto-deny in 0s")
+    await wait(async () => (await frame()).includes("auto-deny in 0s"), "the countdown never rendered the clamped label")
+    expect(await frame()).toContain("auto-deny in 0s")
   } finally {
     app.renderer.destroy()
   }

@@ -1,5 +1,5 @@
 import { $ } from "bun"
-import { describe, expect } from "bun:test"
+import { describe, expect, setDefaultTimeout } from "bun:test"
 import fs from "fs/promises"
 import path from "path"
 import { Effect, Layer } from "effect"
@@ -11,6 +11,9 @@ import { Snapshot } from "@opencode-ai/core/snapshot"
 import { Hash } from "@opencode-ai/core/util/hash"
 import { tmpdir } from "./fixture/tmpdir"
 import { testEffect } from "./lib/effect"
+
+// Real Git setup per test; Windows runners intermittently exceed the 5s default (#303).
+setDefaultTimeout(30_000)
 
 describe("Snapshot", () => {
   testEffect(Layer.empty).live("captures and restores Location-scoped changes", () => {
@@ -98,34 +101,66 @@ describe("Snapshot", () => {
     ),
   )
 
-  testEffect(Layer.empty).live("isolates snapshot indexes by canonical Git worktree", () =>
-    Effect.acquireUseRelease(
-      Effect.promise(() => tmpdir()),
+  testEffect(Layer.empty).live("isolates snapshot indexes by canonical Git worktree", () => {
+    // Keep the default budget: the last start/done pair identifies the Windows
+    // timeout boundary, including native Git setup and scoped layer disposal.
+    const startedAt = Date.now()
+    const phase = (name: string) =>
+      console.error(`[snapshot-worktree-test] phase=${name} elapsedMs=${Date.now() - startedAt}`)
+    return Effect.acquireUseRelease(
+      Effect.promise(async () => {
+        phase("tmpdir:start")
+        const tmp = await tmpdir()
+        phase("tmpdir:done")
+        return tmp
+      }),
       (tmp) =>
         Effect.gen(function* () {
           const project = path.join(tmp.path, "project")
           const linked = path.join(tmp.path, "linked")
           yield* Effect.promise(async () => {
+            phase("files:start")
             await fs.mkdir(project)
             await fs.writeFile(path.join(project, "tracked.txt"), "main\n")
+            phase("files:done")
+            phase("git-init:start")
             await $`git init`.cwd(project).quiet()
+            phase("git-init:done")
+            phase("git-config:start")
             await $`git config core.fsmonitor false`.cwd(project).quiet()
             await $`git config commit.gpgsign false`.cwd(project).quiet()
             await $`git config user.email test@opencode.test`.cwd(project).quiet()
             await $`git config user.name Test`.cwd(project).quiet()
+            phase("git-config:done")
+            phase("git-add:start")
             await $`git add .`.cwd(project).quiet()
+            phase("git-add:done")
+            phase("git-commit:start")
             await $`git commit -m initial`.cwd(project).quiet()
+            phase("git-commit:done")
+            phase("git-worktree:start")
             await $`git worktree add --detach ${linked} HEAD`.cwd(project).quiet()
+            phase("git-worktree:done")
           })
 
-          const capture = (directory: string) =>
+          const capture = (directory: string, name: string) =>
             Effect.gen(function* () {
-              const snapshot = yield* Snapshot.Service
-              return yield* snapshot.capture()
-            }).pipe(Effect.provide(snapshotLayer(tmp.path, directory)))
-          expect(yield* capture(project)).toBeDefined()
-          expect(yield* capture(linked)).toBeDefined()
+              yield* Effect.sync(() => phase(`${name}-layer:start`))
+              const result = yield* Effect.gen(function* () {
+                const snapshot = yield* Snapshot.Service
+                yield* Effect.sync(() => phase(`${name}-capture:start`))
+                const captured = yield* snapshot.capture()
+                yield* Effect.sync(() => phase(`${name}-capture:done`))
+                return captured
+              }).pipe(Effect.provide(snapshotLayer(tmp.path, directory)))
+              // Effect.provide has closed the layer scope before this marker.
+              yield* Effect.sync(() => phase(`${name}-layer:done`))
+              return result
+            })
+          expect(yield* capture(project, "project")).toBeDefined()
+          expect(yield* capture(linked, "linked")).toBeDefined()
 
+          yield* Effect.sync(() => phase("project-id:start"))
           const projectID = yield* Effect.gen(function* () {
             return (yield* Location.Service).project.id
           }).pipe(
@@ -133,16 +168,24 @@ describe("Snapshot", () => {
               AppNodeBuilder.build(Location.boundNode(Location.Ref.make({ directory: AbsolutePath.make(project) }))),
             ),
           )
+          yield* Effect.sync(() => phase("project-id:done"))
+          yield* Effect.sync(() => phase("indexes:start"))
           expect(
             yield* Effect.promise(() => fs.stat(path.join(tmp.path, "snapshot", projectID, Hash.fast(project)))),
           ).toBeDefined()
           expect(
             yield* Effect.promise(() => fs.stat(path.join(tmp.path, "snapshot", projectID, Hash.fast(linked)))),
           ).toBeDefined()
+          yield* Effect.sync(() => phase("indexes:done"))
         }),
-      (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
-    ),
-  )
+      (tmp) =>
+        Effect.promise(async () => {
+          phase("cleanup:start")
+          await tmp[Symbol.asyncDispose]()
+          phase("cleanup:done")
+        }),
+    )
+  })
 
   testEffect(Layer.empty).live("checks out a legacy revert snapshot without removing unrelated files", () =>
     Effect.acquireUseRelease(

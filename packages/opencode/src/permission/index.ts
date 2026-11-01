@@ -187,8 +187,17 @@ const layer = Layer.effect(
           yield* events.publish(Event.Asked, info)
           return yield* Deferred.await(deferred)
         }),
-        Effect.sync(() => {
-          pending.delete(id)
+        // Still pending here means nobody answered: the ask was aborted or the instance is
+        // going away. Clients only drop a prompt on `permission.replied`, so announce it
+        // the way a countdown does, detached because this runs while the ask is ending.
+        Effect.suspend(() => {
+          if (!pending.delete(id)) return Effect.void
+          return events
+            .publish(Event.Replied, { sessionID: info.sessionID, requestID: id, reply: "reject" })
+            .pipe(
+              Effect.ignoreCause({ log: true, message: "failed to announce the abandoned permission request" }),
+              Effect.forkDetach,
+            )
         }),
       )
     })

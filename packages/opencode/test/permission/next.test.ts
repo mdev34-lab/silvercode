@@ -1,9 +1,10 @@
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
-import { test, expect } from "bun:test"
+import { test, expect, beforeEach, afterEach } from "bun:test"
 import os from "os"
 import { Cause, Deferred, Effect, Exit, Fiber, Layer } from "effect"
 import { EventV2Bridge } from "../../src/event-v2-bridge"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
+import { Npm } from "@opencode-ai/core/npm"
 import { Permission } from "../../src/permission"
 import { InstanceBootstrap } from "../../src/project/bootstrap"
 import { InstanceStore } from "../../src/project/instance-store"
@@ -14,11 +15,43 @@ import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 
 const noopBootstrap = Layer.succeed(InstanceBootstrap.Service, InstanceBootstrap.Service.of({ run: Effect.void }))
+
+// Every ask that needs a prompt loads config, and that load forks the background dependency
+// preseed (`npm install @opencode-ai/plugin`) into the process-wide global config dir. The
+// install is detached, so it outlives the test that started it and can run while a later
+// test's readiness window is open. These fixtures configure no plugins, so the flag keeps them
+// out of the preseed (the same isolation as timeout.test.ts, #675). The stub records any
+// attempt so the guard test below can prove none happened.
+const depInstalls: string[] = []
+const stubNpm = Layer.succeed(
+  Npm.Service,
+  Npm.Service.of({
+    add: () => Effect.die(new Error("permission fixtures must not install packages")),
+    install: (dir) => Effect.sync(() => void depInstalls.push(dir)),
+    which: () => Effect.die(new Error("permission fixtures must not install packages")),
+  }),
+)
+
 const env = AppNodeBuilder.build(
   LayerNode.group([Permission.node, EventV2Bridge.node, CrossSpawnSpawner.node, InstanceStore.node]),
-  [[InstanceStore.bootstrapNode, noopBootstrap]],
+  [
+    [InstanceStore.bootstrapNode, noopBootstrap],
+    [Npm.node, stubNpm],
+  ],
 )
 const it = testEffect(env)
+
+let priorDepInstallFlag: string | undefined
+beforeEach(() => {
+  priorDepInstallFlag = process.env.OPENCODE_DISABLE_CONFIG_DEP_INSTALL
+  // Evaluated at access time during instance config load, so setting it per test is enough.
+  process.env.OPENCODE_DISABLE_CONFIG_DEP_INSTALL = "1"
+  depInstalls.length = 0
+})
+afterEach(() => {
+  if (priorDepInstallFlag === undefined) delete process.env.OPENCODE_DISABLE_CONFIG_DEP_INSTALL
+  else process.env.OPENCODE_DISABLE_CONFIG_DEP_INSTALL = priorDepInstallFlag
+})
 
 const rejectAll = (message?: string) =>
   Effect.gen(function* () {
@@ -1169,6 +1202,35 @@ it.instance(
       const exit = yield* Fiber.await(fiber)
       expect(Exit.isFailure(exit)).toBe(true)
       if (Exit.isFailure(exit)) expect(Cause.squash(exit.cause)).toBeInstanceOf(PermissionV1.RejectedError)
+    }),
+  { git: true },
+)
+
+// Guards the isolation above. The ask needs a prompt (the ruleset says "ask"), so it goes
+// through config load before it is published. If the flag stops being honored, or the beforeEach
+// stops setting it, the stubbed Npm.install records the attempt and this test fails.
+it.instance(
+  "config load never forks a background dependency install",
+  () =>
+    Effect.gen(function* () {
+      const fiber = yield* ask({
+        id: PermissionV1.ID.make("per_no_dep_install"),
+        sessionID: SessionID.make("session_no_dep_install"),
+        permission: "bash",
+        patterns: ["ls"],
+        metadata: {},
+        always: [],
+        ruleset: [{ permission: "bash", pattern: "*", action: "ask" }],
+      }).pipe(Effect.forkScoped)
+
+      // Pending membership means the ask already went through config load, so a fork that
+      // happened there has been started by now. The short pause lets its detached fiber run.
+      expect(yield* waitForPending(1)).toHaveLength(1)
+      yield* Effect.sleep("100 millis")
+      expect(depInstalls).toEqual([])
+
+      yield* rejectAll()
+      yield* Fiber.await(fiber)
     }),
   { git: true },
 )

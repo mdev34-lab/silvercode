@@ -154,7 +154,24 @@ describe("PermissionV2", () => {
       yield* setRules([{ action: "read", resource: "*", effect: "deny" }])
       const blocked = yield* service.assert(assertion()).pipe(Effect.flip)
       expect(blocked).toBeInstanceOf(PermissionV2.BlockedError)
+      expect(blocked.message).toContain("Permission blocked by rule:")
+      expect(blocked.message).toContain('"action":"read"')
       expect(yield* service.list()).toEqual([])
+    }),
+  )
+
+  it.effect("blocked message names the effective deny rule, not an unrelated later rule", () =>
+    Effect.gen(function* () {
+      yield* setup([
+        { action: "read", resource: "/secret", effect: "deny" },
+        { action: "read", resource: "/public", effect: "allow" },
+      ])
+      const service = yield* PermissionV2.Service
+      const blocked = yield* service.assert(assertion({ resources: ["/secret"] })).pipe(Effect.flip)
+      expect(blocked).toBeInstanceOf(PermissionV2.BlockedError)
+      expect(blocked.message).toContain('"resource":"/secret"')
+      expect(blocked.message).toContain('"effect":"deny"')
+      expect(blocked.message).not.toContain("/public")
     }),
   )
 
@@ -251,6 +268,28 @@ describe("PermissionV2", () => {
       expect(yield* service.ask(assertion({ action: "bash", resources: ["pwd"] }))).toEqual({
         id: PermissionV2.ID.create("per_test"),
         effect: "deny",
+      })
+    }),
+  )
+
+  it.effect("announces a rejection when an unanswered assertion is aborted", () =>
+    Effect.gen(function* () {
+      yield* setup()
+      const events = yield* EventV2.Service
+      const replied = yield* Deferred.make<unknown>()
+      const unsubscribe = yield* events.listen((event) =>
+        event.type === PermissionV2.Event.Replied.type
+          ? Deferred.succeed(replied, event.data).pipe(Effect.asVoid)
+          : Effect.void,
+      )
+      yield* Effect.addFinalizer(() => unsubscribe)
+      const { service, fiber, request } = yield* waitForRequest()
+      yield* Fiber.interrupt(fiber)
+      expect(yield* service.list()).toEqual([])
+      expect(yield* Deferred.await(replied)).toEqual({
+        sessionID: request.sessionID,
+        requestID: request.id,
+        reply: "reject",
       })
     }),
   )

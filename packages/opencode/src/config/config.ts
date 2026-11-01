@@ -11,14 +11,13 @@ import { Flag } from "@opencode-ai/core/flag/flag"
 import { Auth } from "../auth"
 import { Env } from "../env"
 import { applyEdits, modify } from "jsonc-parser"
-import { InstallationLocal, InstallationVersion } from "@opencode-ai/core/installation/version"
 import { existsSync } from "fs"
 import { Account } from "@/account/account"
 import { isRecord } from "@/util/record"
 import type { ConsoleState } from "@opencode-ai/core/v1/config/console-state"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { InstanceState } from "@/effect/instance-state"
-import { Context, Duration, Effect, Exit, Fiber, Layer, Option, Schema } from "effect"
+import { Cause, Context, Duration, Effect, Exit, Fiber, Layer, Option, Schema } from "effect"
 import { FetchHttpClient, HttpClient, HttpClientRequest } from "effect/unstable/http"
 import { EffectFlock } from "@opencode-ai/core/util/effect-flock"
 import { containsPath, type InstanceContext } from "../project/instance-context"
@@ -261,18 +260,42 @@ const layer = Layer.effect(
 
       const legacy = path.join(Global.Path.config, "config")
       if (existsSync(legacy)) {
-        yield* Effect.promise(() =>
-          import(pathToFileURL(legacy).href, { with: { type: "toml" } })
-            .then(async (mod) => {
-              const { provider, model, ...rest } = mod.default
-              if (provider && model) result.model = `${provider}/${model}`
-              result["$schema"] = "https://opencode.ai/config.json"
-              result = mergeConfig(result, rest)
-              await fsNode.writeFile(path.join(Global.Path.config, "config.json"), JSON.stringify(result, null, 2))
-              await fsNode.unlink(legacy)
+        // Migrate step by step so a failure is reported and never silently
+        // loses data (#436): write the converted JSON before touching
+        // in-memory state, and only unlink the legacy file after the write
+        // landed. A failed write keeps the legacy file and leaves the
+        // running process on un-migrated config, so the two never diverge.
+        const migration = yield* Effect.promise(async () => {
+          try {
+            const mod = await import(pathToFileURL(legacy).href, { with: { type: "toml" } })
+            const { provider, model, ...rest } = mod.default
+            const converted = { ...rest, $schema: "https://opencode.ai/config.json" } as Info
+            if (provider && model) converted.model = `${provider}/${model}`
+            const merged = mergeConfig(result, converted)
+            await fsNode.writeFile(
+              path.join(Global.Path.config, "config.json"),
+              JSON.stringify(merged, null, 2),
+            )
+            return { ok: true as const, converted }
+          } catch (error) {
+            return { ok: false as const, error }
+          }
+        })
+        if (migration.ok) {
+          result = mergeConfig(result, migration.converted)
+          const unlinkError = yield* Effect.promise(() => fsNode.unlink(legacy).then(() => undefined, (error) => error))
+          if (unlinkError !== undefined) {
+            yield* Effect.logWarning("legacy config migrated but the legacy file could not be removed", {
+              path: legacy,
+              error: String(unlinkError),
             })
-            .catch(() => {}),
-        )
+          }
+        } else {
+          yield* Effect.logWarning("legacy config migration failed, keeping the legacy file", {
+            path: legacy,
+            error: String(migration.error),
+          })
+        }
       }
 
       return result
@@ -399,8 +422,20 @@ const layer = Layer.effect(
         yield* merge(Global.Path.config, global, "global")
 
         if (Flag.OPENCODE_CONFIG) {
-          yield* merge(Flag.OPENCODE_CONFIG, yield* loadFile(Flag.OPENCODE_CONFIG, authEnv))
-          yield* Effect.logDebug("loaded custom config", { path: Flag.OPENCODE_CONFIG })
+          // An invalid custom config file (JSONC syntax error or schema
+          // mismatch) must not abort config loading: warn and fall back to
+          // defaults (#434). Parse/schema failures escape loadFile as
+          // defects, so recover from the full cause rather than typed errors.
+          const custom = yield* loadFile(Flag.OPENCODE_CONFIG, authEnv).pipe(
+            Effect.tap(() => Effect.logDebug("loaded custom config", { path: Flag.OPENCODE_CONFIG })),
+            Effect.catchCause((cause) =>
+              Effect.logWarning("failed to load custom config, using defaults", {
+                path: Flag.OPENCODE_CONFIG,
+                cause: Cause.pretty(cause),
+              }).pipe(Effect.as({} as Info)),
+            ),
+          )
+          yield* merge(Flag.OPENCODE_CONFIG, custom)
         }
 
         if (!Flag.OPENCODE_DISABLE_PROJECT_CONFIG) {
@@ -436,16 +471,35 @@ const layer = Layer.effect(
           yield* ensureGitignore(dir).pipe(Effect.orDie)
 
           if (!Flag.OPENCODE_DISABLE_CONFIG_DEP_INSTALL) {
+            // Bound the background install (design proposal: 60s, override with
+            // OPENCODE_CONFIG_DEP_INSTALL_TIMEOUT_MS). A stalled registry install must
+            // not keep waitForDependencies — and therefore plugin loading and instance
+            // disposal — waiting indefinitely. Effect.timeout interrupts the install
+            // fiber on expiry; Npm.reify aborts its Arborist signal on interruption and
+            // releases the install lock, so the bounded fiber leaves no orphan work
+            // behind. Warn-and-continue is safe here: this install only pre-seeds
+            // @opencode-ai/plugin for config dirs; plugin resolution still installs and
+            // reports per-plugin requirements (PluginLoader) when plugins actually load.
+            const timeoutMs = Flag.OPENCODE_CONFIG_DEP_INSTALL_TIMEOUT_MS
             const dep = yield* npmSvc
               .install(dir, {
                 add: [
                   {
                     name: "@opencode-ai/plugin",
-                    version: InstallationLocal ? undefined : InstallationVersion,
+                    // SilverCode versions are never published as @opencode-ai/plugin (a dev or dirty build
+                    // version 404s and fails every start), so resolve the registry dist-tag instead.
+                    version: undefined,
                   },
                 ],
               })
               .pipe(
+                Effect.timeout(Duration.millis(timeoutMs)),
+                Effect.catchTag("TimeoutError", () =>
+                  Effect.logWarning("background dependency install timed out, continuing without it", {
+                    dir,
+                    timeoutMs,
+                  }),
+                ),
                 Effect.exit,
                 Effect.tap((exit) =>
                   Exit.isFailure(exit)

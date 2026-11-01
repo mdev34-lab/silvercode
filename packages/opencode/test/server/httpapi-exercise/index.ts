@@ -33,6 +33,7 @@ import {
 import { color, printHeader, printResults } from "./report"
 import { coverageResult, parseOptions, routeKey, routeKeys, selectedScenarios } from "./routing"
 import { runScenario } from "./runner"
+import { boundedCleanup } from "./cleanup"
 import { disposeApps } from "./backend"
 import { runtime } from "./runtime"
 import { type Scenario } from "./types"
@@ -263,6 +264,14 @@ const scenarios: Scenario[] = [
     .status(204, undefined, "status"),
   http.protected.get("/provider", "provider.list").json(),
   http.protected.get("/provider/auth", "provider.auth").json(),
+  http.protected
+    .post("/provider/probe", "provider.probe")
+    .at((ctx) => ({
+      path: "/provider/probe",
+      headers: ctx.headers(),
+      body: { providerID: "httpapi", modelID: "missing" },
+    }))
+    .json(),
   http.protected
     .post("/provider/{providerID}/oauth/authorize", "provider.oauth.authorize")
     .at((ctx) => ({
@@ -1856,7 +1865,9 @@ const llmScenarios = new Set([
 ])
 
 const main = Effect.gen(function* () {
-  yield* Effect.addFinalizer(() => Effect.promise(() => disposeApps()).pipe(Effect.andThen(cleanupExercisePaths)))
+  yield* Effect.addFinalizer(() =>
+    Effect.promise(() => boundedCleanup("final disposeApps", disposeApps())).pipe(Effect.andThen(cleanupExercisePaths)),
+  )
   const options = parseOptions(Bun.argv.slice(2))
   const modules = yield* Effect.promise(() => runtime())
   const effectRoutes = routeKeys(OpenApi.fromApi(modules.PublicApi))

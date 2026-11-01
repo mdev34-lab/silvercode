@@ -145,6 +145,8 @@ import type {
   PromptInput,
   ProviderAuthErrors,
   ProviderAuthResponses,
+  ProviderProbeErrors,
+  ProviderProbeResponses,
   ProviderListErrors,
   ProviderListResponses,
   ProviderOauthAuthorizeErrors,
@@ -1321,6 +1323,26 @@ export class Config extends HeyApiClient {
   }
 }
 
+
+// HAND-EDIT (#435, reapplied by script/build.ts): runtime envelope check
+// for SSE events. The generated SSE parser casts parsed JSON to the event
+// type unchecked, so both event subscriptions reject frames that are not a
+// shaped event (instance events carry a top-level type, global events wrap
+// it in payload; a bad frame is reported through onSseError and skipped,
+// the stream continues).
+const validateSseEvent = async (data: unknown) => {
+  if (typeof data !== "object" || data === null) {
+    const preview = JSON.stringify(data)?.slice(0, 200)
+    throw new Error(`Malformed SSE event frame: ${preview}`)
+  }
+  // Instance events carry a top-level type; global events wrap it in payload.
+  const envelope = data as { type?: unknown; payload?: { type?: unknown } }
+  if (typeof envelope.type !== "string" && typeof envelope.payload?.type !== "string") {
+    const preview = JSON.stringify(data)?.slice(0, 200)
+    throw new Error(`Malformed SSE event frame: ${preview}`)
+  }
+}
+
 export class Global extends HeyApiClient {
   /**
    * Get health
@@ -1342,6 +1364,7 @@ export class Global extends HeyApiClient {
   public event<ThrowOnError extends boolean = false>(options?: Options<never, ThrowOnError>) {
     return (options?.client ?? this.client).sse.get<GlobalEventResponses, GlobalEventErrors, ThrowOnError>({
       url: "/global/event",
+      responseValidator: validateSseEvent,
       ...options,
     })
   }
@@ -1414,6 +1437,7 @@ export class Event extends HeyApiClient {
     )
     return (options?.client ?? this.client).sse.get<EventSubscribeResponses, unknown, ThrowOnError>({
       url: "/event",
+      responseValidator: validateSseEvent,
       ...options,
       ...params,
     })
@@ -3326,6 +3350,45 @@ export class Provider extends HeyApiClient {
       url: "/provider",
       ...options,
       ...params,
+    })
+  }
+
+  /**
+   * Probe a model
+   *
+   * Send one tiny request to a model and report whether it answered. Failures that are likely to pass on their own, such as rate limits and network errors, are reported as transient.
+   */
+  public probe<ThrowOnError extends boolean = false>(
+    parameters: {
+      directory?: string
+      workspace?: string
+      providerID: string
+      modelID: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { in: "body", key: "providerID" },
+            { in: "body", key: "modelID" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<ProviderProbeResponses, ProviderProbeErrors, ThrowOnError>({
+      url: "/provider/probe",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
     })
   }
 

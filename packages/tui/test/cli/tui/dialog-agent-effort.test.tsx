@@ -1,9 +1,13 @@
 /** @jsxImportSource @opentui/solid */
-import { describe, expect, test } from "bun:test"
+import { describe, expect, spyOn, test } from "bun:test"
+import { TextareaRenderable } from "@opentui/core"
 import { createDefaultOpenTuiKeymap } from "@opentui/keymap/opentui"
 import { testRender, useRenderer } from "@opentui/solid"
 import { onCleanup, onMount, type JSX } from "solid-js"
+import { chmod, mkdir } from "node:fs/promises"
+import path from "node:path"
 import { tmpdir } from "../../fixture/fixture"
+import { captureFrame, captureSpans, waitFor, waitUntil } from "../../fixture/frame"
 import { createTuiResolvedConfig } from "../../fixture/tui-runtime"
 import { createEventSource, createFetch, directory, json } from "../../fixture/tui-sdk"
 import { TestTuiContexts } from "../../fixture/tui-environment"
@@ -31,9 +35,9 @@ import { createPluginRuntime, PluginRuntimeProvider } from "../../../src/plugin/
 import { FrecencyProvider } from "../../../src/prompt/frecency"
 import { PromptHistoryProvider } from "../../../src/prompt/history"
 import { PromptStashProvider } from "../../../src/prompt/stash"
-import { DialogProvider } from "../../../src/ui/dialog"
+import { DialogProvider, useDialog } from "../../../src/ui/dialog"
 import { Toast, ToastProvider } from "../../../src/ui/toast"
-import { wait } from "../cmd/tui/sync-fixture"
+import { effortBadge, effortColor, METADATA_KEY } from "../../../src/util/agent-effort"
 
 type Setup = Awaited<ReturnType<typeof testRender>>
 
@@ -122,7 +126,11 @@ type Harness = {
   local: ReturnType<typeof useLocal>
   route: ReturnType<typeof useRoute>
   sync: ReturnType<typeof useSync>
+  dialog: ReturnType<typeof useDialog>
   updates: { sessionID: string; body: Record<string, unknown> }[]
+  // Bodies of the session.create calls a home submit issued.
+  creates: Record<string, unknown>[]
+  sessions: ReturnType<typeof sessionRow>[]
   // Gated mode only: answer PATCH number `index` (and emit its session.updated event), or fail it.
   release: (index: number, outcome?: "ok" | "fail") => void
   dispose: () => Promise<void>
@@ -133,11 +141,18 @@ async function mountEffort(input: {
   model: string
   children: () => JSX.Element
   agentVariant?: string
+  configEffort?: "fast" | null
   // Hold every session.update PATCH until the test releases it.
   gated?: boolean
+  // Reuse a state directory (restart coverage); a fresh tmpdir is created otherwise.
+  state?: string
+  width?: number
+  height?: number
 }): Promise<Harness> {
+
   const tmp = await tmpdir()
-  await Bun.write(`${tmp.path}/kv.json`, "{}")
+  const state = input.state ?? tmp.path
+  await Bun.write(`${state}/kv.json`, "{}")
 
   const events = createEventSource()
   const agentModel = parseModel(input.model)
@@ -147,10 +162,11 @@ async function mountEffort(input: {
     sessionRow(SESSION_PLAIN),
   ]
   const updates: { sessionID: string; body: Record<string, unknown> }[] = []
+  const creates: Record<string, unknown>[] = []
   const gates: Array<(outcome: "ok" | "fail") => void> = []
 
   const calls = createFetch((url) => {
-    if (url.pathname === "/config") return json({ agent: { effort: "fast" } })
+    if (url.pathname === "/config") return json(input.configEffort === null ? {} : { agent: { effort: "fast" } })
     if (url.pathname === "/config/providers") return json(providersPayload())
     if (url.pathname === "/agent") return json(agentsPayload(input.agentVariant, agentModel))
     if (url.pathname === "/api/agent") {
@@ -177,6 +193,13 @@ async function mountEffort(input: {
   const fetch = (async (raw: RequestInfo | URL, init?: RequestInit) => {
     const request = raw instanceof Request ? raw : new Request(raw, init)
     const url = new URL(request.url)
+    if (request.method === "POST" && url.pathname === "/session") {
+      const body = (await request.clone().json()) as Record<string, unknown>
+      creates.push(body)
+      const row = sessionRow(`ses_created_${creates.length}`, body.metadata as Record<string, unknown> | undefined)
+      sessions.push(row)
+      return json(row)
+    }
     if (request.method === "PATCH" && url.pathname.startsWith("/session/")) {
       const sessionID = url.pathname.slice("/session/".length)
       const body = (await request.clone().json()) as Record<string, unknown>
@@ -196,7 +219,7 @@ async function mountEffort(input: {
   }) as typeof globalThis.fetch
 
   const config = createTuiResolvedConfig({})
-  let captured: Pick<Harness, "local" | "route" | "sync"> | undefined
+  let captured: Pick<Harness, "local" | "route" | "sync" | "dialog"> | undefined
   let done!: () => void
   const ready = new Promise<void>((resolve) => {
     done = resolve
@@ -206,8 +229,9 @@ async function mountEffort(input: {
     const local = useLocal()
     const route = useRoute()
     const sync = useSync()
+    const dialog = useDialog()
     onMount(() => {
-      captured = { local, route, sync }
+      captured = { local, route, sync, dialog }
       done()
     })
     return null
@@ -237,9 +261,9 @@ async function mountEffort(input: {
                                   <DataProvider>
                                     <ThemeProvider mode="dark">
                                       <LocalProvider>
-                                        <Capture />
                                         <PromptStashProvider>
                                           <DialogProvider>
+                                            <Capture />
                                             <FrecencyProvider>
                                               <PromptHistoryProvider>
                                                 <PromptRefProvider>{props.children()}</PromptRefProvider>
@@ -274,7 +298,7 @@ async function mountEffort(input: {
 
   const app = await testRender(
     () => (
-      <TestTuiContexts directory={directory} paths={{ home: "/tmp", state: tmp.path, worktree: directory }}>
+      <TestTuiContexts directory={directory} paths={{ home: "/tmp", state, worktree: directory }}>
         <ArgsProvider model={input.model}>
           <KVProvider>
             <Harness>{input.children}</Harness>
@@ -282,18 +306,21 @@ async function mountEffort(input: {
         </ArgsProvider>
       </TestTuiContexts>
     ),
-    { width: 120, height: 40 },
+    { width: input.width ?? 120, height: input.height ?? 40, kittyKeyboard: true },
   )
 
   await ready
-  await wait(() => captured!.sync.status === "complete")
+  await waitUntil(() => captured!.sync.status === "complete")
 
   return {
     app,
     local: captured!.local,
     route: captured!.route,
     sync: captured!.sync,
+    dialog: captured!.dialog,
     updates,
+    creates,
+    sessions,
     release(index, outcome = "ok") {
       gates[index](outcome)
     },
@@ -305,13 +332,18 @@ async function mountEffort(input: {
 }
 
 async function frameWhere(app: Setup, predicate: (frame: string) => boolean, label: string) {
-  for (let pass = 0; pass < 200; pass++) {
-    await app.renderOnce()
-    const frame = app.captureCharFrame()
-    if (predicate(frame)) return frame
-    await Bun.sleep(10)
-  }
-  throw new Error(`timed out waiting for frame: ${label}`)
+  return waitFor(
+    app,
+    () => {
+      const frame = app.captureCharFrame()
+      return predicate(frame) ? frame : undefined
+    },
+    // 200 passes ran dry in ~3.5s on the loaded windows runner before the
+    // failure toast painted; 600 keeps the same pump shape with headroom
+    // (#485).
+    600,
+    `timed out waiting for frame: ${label}`,
+  )
 }
 
 function lineOf(frame: string, needle: string) {
@@ -320,6 +352,33 @@ function lineOf(frame: string, needle: string) {
 
 function markerLine(frame: string) {
   return frame.split("\n").find((line) => line.includes("●")) ?? ""
+}
+
+function hexOf(color: { r: number; g: number; b: number }) {
+  const part = (value: number) => Math.round(value * 255).toString(16).padStart(2, "0")
+  return `#${part(color.r)}${part(color.g)}${part(color.b)}`
+}
+
+/** The filled ` Level ` chip a selector row paints, with its ink. */
+async function chipHex(app: Setup, level: string) {
+  const spans = await captureSpans(app)
+  for (const line of spans.lines) {
+    const chip = line.spans.find((span) => span.text === ` ${level} `)
+    if (chip) return { fg: hexOf(chip.fg), bg: hexOf(chip.bg) }
+  }
+  throw new Error(`no ${level} chip in the captured frame`)
+}
+
+/** Waits for a persisted JSON file to appear, then returns it. */
+async function fileJson(file: string, level?: string): Promise<unknown> {
+  for (let pass = 0; pass < 1500; pass++) {
+    const value = await Bun.file(file)
+      .json()
+      .catch(() => undefined)
+    if (value !== undefined && (!level || (value as { agentEffort?: string } | null)?.agentEffort === level)) return value
+    await Bun.sleep(10)
+  }
+  throw new Error(`timed out waiting for ${file}`)
 }
 
 describe("agent effort selector", () => {
@@ -356,7 +415,7 @@ describe("agent effort selector", () => {
       expect(harness.local.effort.current()).toBe("fast")
       harness.app.mockInput.pressArrow("down")
       harness.app.mockInput.pressEnter()
-      await wait(() => harness.updates.length >= 1, 3000)
+      await waitUntil(() => harness.updates.length >= 1)
       const [update] = harness.updates
       expect(update.sessionID).toBe(SESSION_FAST)
       expect(update.body.metadata).toEqual({ agentEffort: "medium", task: "keep-me" })
@@ -367,7 +426,7 @@ describe("agent effort selector", () => {
     }
   })
 
-  test("keeps selections isolated across session switches and no-ops on home", async () => {
+  test("keeps selections isolated across session switches and off the home default", async () => {
     const harness = await mountEffort({
       route: { type: "session", sessionID: SESSION_THOROUGH },
       model: "test-provider/variant-model",
@@ -383,13 +442,331 @@ describe("agent effort selector", () => {
       expect(switched).toContain("Stored on this session")
 
       harness.route.navigate({ type: "home" })
-      await frameWhere(harness.app, (f) => f.includes("Config default"), "home footer")
+      const home = await frameWhere(harness.app, (f) => f.includes("Default for new sessions"), "home footer")
+      // Home offers the new-session default instead of a session override, and
+      // switching back never rewrote the sessions that have their own level.
       expect(harness.local.effort.current()).toBe("fast")
-      harness.app.mockInput.pressEnter()
-      await frameWhere(harness.app, (f) => f.includes("Agent effort applies per session"), "home toast")
+      expect(harness.local.effort.scoped()).toBe(false)
+      expect(home).not.toContain("applies per session")
       expect(harness.updates.length).toBe(0)
     } finally {
       await harness.dispose()
+    }
+  })
+
+  test("paints each level's hue as a filled chip with its name in the dialog", async () => {
+    const harness = await mountEffort({
+      route: { type: "home" },
+      model: "test-provider/variant-model",
+      children: () => <DialogAgentEffort />,
+    })
+    try {
+      await frameWhere(harness.app, (f) => f.includes("Agent effort"), "dialog title")
+      // Fast green, medium orange, thorough red; the names stay visible so the
+      // levels never depend on color alone.
+      expect((await chipHex(harness.app, "Fast")).bg).toBe("#3fb950")
+      expect((await chipHex(harness.app, "Medium")).bg).toBe("#f0883e")
+      expect((await chipHex(harness.app, "Thorough")).bg).toBe("#f85149")
+      for (const label of ["Fast", "Medium", "Thorough"]) expect((await chipHex(harness.app, label)).fg).toBe("#000000")
+
+      const frame = await frameWhere(harness.app, () => true, "settled dialog")
+      expect(frame).toContain("Fast")
+      expect(frame).toContain("Medium")
+      expect(frame).toContain("Thorough")
+      expect(markerLine(frame)).toContain("Fast")
+    } finally {
+      await harness.dispose()
+    }
+  })
+
+  test("home selection persists as the default for new sessions and survives a restart", async () => {
+    const shared = await tmpdir()
+    try {
+      const harness = await mountEffort({
+        route: { type: "home" },
+        model: "test-provider/variant-model",
+        children: () => <Prompt />,
+        state: shared.path,
+      })
+      try {
+        // Configured default until the user picks one.
+        expect(harness.local.effort.current()).toBe("fast")
+        expect(harness.local.effort.scoped()).toBe(false)
+        expect(harness.local.effort.newSessionMetadata()).toBeUndefined()
+
+        harness.dialog.replace(() => <DialogAgentEffort />)
+        await frameWhere(harness.app, (f) => f.includes("Agent effort"), "dialog title")
+        harness.app.mockInput.pressArrow("down")
+        harness.app.mockInput.pressArrow("down")
+        harness.app.mockInput.pressEnter()
+
+        await waitUntil(() => harness.local.effort.current() === "thorough")
+        // Visible immediately: the composer label follows the new default
+        // before the write settles, and the selector marks it when reopened.
+        await frameWhere(harness.app, (f) => f.includes("thorough"), "composer label")
+        harness.dialog.replace(() => <DialogAgentEffort />)
+        await frameWhere(harness.app, (f) => f.includes("Agent effort"), "dialog reopened")
+        await frameWhere(harness.app, (f) => markerLine(f).includes("Thorough"), "home marker")
+        harness.dialog.clear()
+        expect(await fileJson(`${shared.path}/effort.json`)).toEqual({ agentEffort: "thorough" })
+        expect(harness.local.effort.newSessionMetadata()).toEqual({ agentEffort: "thorough" })
+        // A home default never writes to a session.
+        expect(harness.updates.length).toBe(0)
+      } finally {
+        await harness.dispose()
+      }
+
+      // Restart: a fresh app reading the same state directory starts from the
+      // persisted default, with no user action.
+      const restarted = await mountEffort({
+        route: { type: "home" },
+        model: "test-provider/variant-model",
+        children: () => <Prompt />,
+        state: shared.path,
+      })
+      try {
+        await waitUntil(() => restarted.local.effort.current() === "thorough")
+        await frameWhere(restarted.app, (f) => f.includes("thorough"), "restart composer label")
+        expect(restarted.local.effort.scoped()).toBe(false)
+        expect(restarted.local.effort.newSessionMetadata()).toEqual({ agentEffort: "thorough" })
+      } finally {
+        await restarted.dispose()
+      }
+    } finally {
+      await shared[Symbol.asyncDispose]()
+    }
+  })
+
+  test("home submit inherits the chosen effort and seeds it before the new session syncs", async () => {
+    const harness = await mountEffort({
+      route: { type: "home" },
+      model: "test-provider/variant-model",
+      children: () => <Prompt />,
+    })
+    try {
+      harness.dialog.replace(() => <DialogAgentEffort />)
+      await frameWhere(harness.app, (f) => f.includes("Agent effort"), "effort selector")
+      harness.app.mockInput.pressArrow("down")
+      harness.app.mockInput.pressArrow("down")
+      harness.app.mockInput.pressEnter()
+      await waitUntil(() => harness.local.effort.current() === "thorough")
+      await harness.app.renderOnce()
+      harness.app.mockInput.typeText("Check the project")
+      await frameWhere(harness.app, (f) => f.includes("Check the project"), "home prompt")
+      harness.app.mockInput.pressEnter()
+      await waitUntil(() => harness.creates.length === 1)
+      expect(harness.creates[0].metadata).toEqual({ agentEffort: "thorough" })
+      await waitUntil(() => harness.route.data.type === "session")
+      const sessionID = harness.route.data.type === "session" ? harness.route.data.sessionID : ""
+      expect(sessionID).toBe("ses_created_1")
+      // The create response has not been emitted as a session.updated event.
+      // Only the seeded overlay can show the inherited level on this route.
+      expect(harness.sync.session.get(sessionID)).toBeUndefined()
+      expect(harness.local.effort.scoped()).toBe(true)
+      expect(harness.local.effort.current()).toBe("thorough")
+      expect(harness.updates).toEqual([])
+    } finally {
+      await harness.dispose()
+    }
+  })
+
+  test("a failed home default write is visible and keeps the selection consistent", async () => {
+    const shared = await tmpdir()
+    // A directory where the default file belongs makes every write fail.
+    await mkdir(`${shared.path}/effort.json`, { recursive: true })
+    const harness = await mountEffort({
+      route: { type: "home" },
+      model: "test-provider/variant-model",
+      children: () => <Prompt />,
+      state: shared.path,
+    })
+    try {
+      expect(harness.local.effort.current()).toBe("fast")
+      harness.local.effort.set("thorough")
+      await frameWhere(harness.app, (f) => f.includes("Failed to save the agent effort default"), "failure toast")
+      // The selection rolls back to what is really stored instead of claiming
+      // a level that never landed.
+      await waitUntil(() => harness.local.effort.current() === "fast")
+      expect(harness.local.effort.newSessionMetadata()).toBeUndefined()
+      expect(harness.local.effort.scoped()).toBe(false)
+    } finally {
+      await harness.dispose()
+      await shared[Symbol.asyncDispose]()
+    }
+  })
+
+  test.each(["{", '{"agentEffort":"invalid"}', "{}", "null", "[]"])(
+    "warns about corrupt or invalid stored defaults (%s) and keeps the config fallback",
+    async (content) => {
+      await using shared = await tmpdir()
+      await Bun.write(`${shared.path}/effort.json`, content)
+      const harness = await mountEffort({
+        route: { type: "home" },
+        model: "test-provider/variant-model",
+        children: () => <Prompt />,
+        state: shared.path,
+      })
+      try {
+        await frameWhere(harness.app, (f) => f.includes("Failed to load the agent effort default"), "load warning")
+        expect(harness.local.effort.current()).toBe("fast")
+        expect(harness.local.effort.newSessionMetadata()).toBeUndefined()
+        harness.local.effort.set("thorough")
+        expect(await fileJson(`${shared.path}/effort.json`, "thorough")).toEqual({ agentEffort: "thorough" })
+      } finally {
+        await harness.dispose()
+      }
+    },
+  )
+
+  test.skipIf(process.platform === "win32")("warns about an unreadable stored default and keeps the medium fallback", async () => {
+    await using shared = await tmpdir()
+    const file = `${shared.path}/effort.json`
+    await Bun.write(file, '{"agentEffort":"thorough"}')
+    await chmod(file, 0)
+    const harness = await mountEffort({
+      route: { type: "home" },
+      model: "test-provider/variant-model",
+      children: () => <Prompt />,
+      state: shared.path,
+      configEffort: null,
+    })
+    try {
+      await frameWhere(harness.app, (f) => f.includes("Failed to load the agent effort default"), "permission warning")
+      expect(harness.local.effort.current()).toBe("medium")
+      expect(harness.local.effort.newSessionMetadata()).toBeUndefined()
+    } finally {
+      await chmod(file, 0o600)
+      await harness.dispose()
+    }
+  })
+
+  test("a missing stored default is silent and does not block the first write", async () => {
+    await using shared = await tmpdir()
+    const harness = await mountEffort({
+      route: { type: "home" },
+      model: "test-provider/variant-model",
+      children: () => <Prompt />,
+      state: shared.path,
+    })
+    try {
+      harness.local.effort.set("thorough")
+      expect(await fileJson(`${shared.path}/effort.json`)).toEqual({ agentEffort: "thorough" })
+      await harness.app.renderOnce()
+      expect(await captureFrame(harness.app)).not.toContain("Failed to load the agent effort default")
+    } finally {
+      await harness.dispose()
+    }
+  })
+
+  test.each(["before selection", "after queued selection"])(
+    "orders a deferred initial read %s before writes and rolls back to the latest saved value",
+    async (ordering) => {
+      await using shared = await tmpdir()
+      // Join like the implementation does: a forward-slash template path never
+      // equals path.join's all-backslashes result on Windows, so the readJson /
+      // writeJsonAtomic spies below would silently pass every call through.
+      const file = path.join(shared.path, "effort.json")
+      await Bun.write(file, '{"agentEffort":"medium"}')
+      const persistence = await import("../../../src/util/persistence")
+      const readJson = persistence.readJson
+      const writeJsonAtomic = persistence.writeJsonAtomic
+      let release!: (value: unknown) => void
+      const initialRead = new Promise<unknown>((resolve) => {
+        release = resolve
+      })
+      const reads = spyOn(persistence, "readJson").mockImplementation(<T,>(path: string): Promise<T> =>
+        path === file ? (initialRead as Promise<T>) : readJson<T>(path),
+      )
+      const written: unknown[] = []
+      const writes = spyOn(persistence, "writeJsonAtomic").mockImplementation(async (path, value) => {
+        if (path !== file) return writeJsonAtomic(path, value)
+        written.push(value)
+        if (written.length === 2) throw new Error("write failed")
+        await writeJsonAtomic(path, value)
+      })
+      const harness = await mountEffort({
+        route: { type: "home" },
+        model: "test-provider/variant-model",
+        children: () => <Prompt />,
+        state: shared.path,
+      })
+      try {
+        if (ordering === "before selection") {
+          release({ agentEffort: "medium" })
+          await waitUntil(() => harness.local.effort.current() === "medium")
+        }
+        harness.local.effort.set("thorough")
+        expect(harness.local.effort.current()).toBe("thorough")
+        if (ordering === "after queued selection") {
+          // Give a wrongly unordered write time to complete before releasing
+          // the stale snapshot. The correct implementation must still wait.
+          await Bun.sleep(30)
+          expect(written).toEqual([])
+          expect(await Bun.file(file).json()).toEqual({ agentEffort: "medium" })
+          release({ agentEffort: "medium" })
+        }
+        await waitUntil(() => written.length === 1)
+        expect(await fileJson(file, "thorough")).toEqual({ agentEffort: "thorough" })
+        expect(harness.local.effort.current()).toBe("thorough")
+        harness.local.effort.set("fast")
+        await frameWhere(harness.app, (f) => f.includes("Failed to save the agent effort default"), "write warning")
+        expect(written).toEqual([{ agentEffort: "thorough" }, { agentEffort: "fast" }])
+        expect(harness.local.effort.current()).toBe("thorough")
+        expect(harness.local.effort.newSessionMetadata()).toEqual({ agentEffort: "thorough" })
+        expect(await Bun.file(file).json()).toEqual({ agentEffort: "thorough" })
+        // A failed write must not poison the queue for the next selection.
+        harness.local.effort.set("medium")
+        await waitUntil(() => written.length === 3)
+        expect(await fileJson(file, "medium")).toEqual({ agentEffort: "medium" })
+        expect(harness.local.effort.current()).toBe("medium")
+      } finally {
+        reads.mockRestore()
+        writes.mockRestore()
+        release({ agentEffort: "medium" })
+        await harness.dispose()
+      }
+    },
+  )
+
+  test("a home default leaves the sessions that carry their own selection alone", async () => {
+    const shared = await tmpdir()
+    const harness = await mountEffort({
+      route: { type: "home" },
+      model: "test-provider/variant-model",
+      children: () => <DialogAgentEffort />,
+      state: shared.path,
+    })
+    try {
+      await frameWhere(harness.app, (f) => f.includes("Agent effort"), "dialog title")
+      expect(harness.local.effort.current()).toBe("fast")
+
+      harness.app.mockInput.pressArrow("down")
+      harness.app.mockInput.pressArrow("down")
+      harness.app.mockInput.pressEnter()
+      await waitUntil(() => harness.local.effort.current() === "thorough")
+
+      // An existing session keeps the level it was created with.
+      harness.route.navigate({ type: "session", sessionID: SESSION_FAST })
+      await waitUntil(() => harness.local.effort.current() === "fast")
+      await frameWhere(harness.app, (f) => f.includes("Stored on this session"), "session footer")
+
+      // An override on that session is written to the session only: the home
+      // default for new sessions stays what the user picked on home.
+      harness.local.effort.set("medium")
+      await waitUntil(() => harness.updates.length >= 1)
+      expect(harness.updates[0]).toEqual({
+        sessionID: SESSION_FAST,
+        body: { metadata: { agentEffort: "medium", task: "keep-me" } },
+      })
+      expect(await fileJson(`${shared.path}/effort.json`)).toEqual({ agentEffort: "thorough" })
+
+      // A plain session still falls back to the configured default rather than
+      // silently inheriting another session's override.
+      harness.route.navigate({ type: "session", sessionID: SESSION_PLAIN })
+      await waitUntil(() => harness.local.effort.current() === "fast")
+    } finally {
+      await harness.dispose()
+      await shared[Symbol.asyncDispose]()
     }
   })
 
@@ -421,7 +798,7 @@ describe("agent effort selector", () => {
       await frameWhere(harness.app, (f) => lineOf(f, "VariantModel").includes("high"), "variant label")
 
       harness.local.effort.set("fast")
-      await wait(() => harness.updates.length >= 1, 3000)
+      await waitUntil(() => harness.updates.length >= 1)
       expect(harness.updates[0].body.metadata).toEqual({ agentEffort: "fast", task: "keep-me" })
       expect(harness.local.effort.current()).toBe("fast")
       expect(harness.local.model.variant.current()).toBe("high")
@@ -434,7 +811,7 @@ describe("agent effort selector", () => {
         },
         "effort label beside thinking",
       )
-      expect(after).toContain("· fast")
+      expect(after).toContain("fast · high")
     } finally {
       await harness.dispose()
     }
@@ -460,7 +837,7 @@ describe("agent effort selector", () => {
       harness.local.effort.set("fast")
       expect(harness.local.model.variant.current()).toBeUndefined()
 
-      await wait(() => harness.updates.length >= 3, 3000)
+      await waitUntil(() => harness.updates.length >= 3)
       expect(harness.updates.map((update) => update.body.metadata)).toEqual([
         { agentEffort: "fast", task: "keep-me" },
         { agentEffort: "thorough", task: "keep-me" },
@@ -491,7 +868,7 @@ describe("agent effort selector", () => {
       harness.local.effort.set("thorough")
       expect(harness.local.model.variant.current()).toBe("medium")
 
-      await wait(() => harness.updates.length >= 2, 3000)
+      await waitUntil(() => harness.updates.length >= 2)
       expect(harness.updates.map((update) => update.body.metadata)).toEqual([
         { agentEffort: "fast", task: "keep-me" },
         { agentEffort: "thorough", task: "keep-me" },
@@ -514,7 +891,7 @@ describe("agent effort selector", () => {
       harness.local.effort.set("fast")
       expect(harness.local.model.variant.current()).toBe("high")
       expect(harness.local.model.variant.selected()).toBeUndefined()
-      await wait(() => harness.updates.length >= 1, 3000)
+      await waitUntil(() => harness.updates.length >= 1)
       expect(harness.local.effort.current()).toBe("fast")
     } finally {
       await harness.dispose()
@@ -532,7 +909,7 @@ describe("agent effort selector", () => {
       expect(harness.local.model.variant.list()).toEqual([])
       harness.local.effort.set("fast")
       expect(harness.local.model.variant.current()).toBeUndefined()
-      await wait(() => harness.updates.length >= 1, 3000)
+      await waitUntil(() => harness.updates.length >= 1)
       expect(harness.updates[0].body.metadata).toEqual({ agentEffort: "fast", task: "keep-me" })
       expect(harness.local.effort.current()).toBe("fast")
     } finally {
@@ -550,7 +927,7 @@ describe("agent effort selector", () => {
     try {
       harness.local.effort.set("fast")
       harness.local.effort.set("thorough")
-      await wait(() => harness.updates.length >= 1, 3000)
+      await waitUntil(() => harness.updates.length >= 1)
       // The second PATCH must not be in flight while the first is pending:
       // that concurrency is what let a stale write land last.
       await Bun.sleep(100)
@@ -558,7 +935,7 @@ describe("agent effort selector", () => {
       expect(harness.local.effort.current()).toBe("thorough")
 
       harness.release(0)
-      await wait(() => harness.updates.length >= 2, 3000)
+      await waitUntil(() => harness.updates.length >= 2)
       expect(harness.local.effort.current()).toBe("thorough")
       harness.release(1)
       await Bun.sleep(100)
@@ -586,9 +963,9 @@ describe("agent effort selector", () => {
     try {
       harness.local.effort.set("fast")
       harness.local.effort.set("thorough")
-      await wait(() => harness.updates.length >= 1, 3000)
+      await waitUntil(() => harness.updates.length >= 1)
       harness.release(0, "fail")
-      await wait(() => harness.updates.length >= 2, 3000)
+      await waitUntil(() => harness.updates.length >= 2)
       harness.release(1)
       await Bun.sleep(100)
       expect(harness.local.effort.current()).toBe("thorough")

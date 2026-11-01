@@ -1,5 +1,5 @@
 import { Prompt, type PromptRef } from "../component/prompt"
-import { createEffect, createMemo, createSignal, onMount } from "solid-js"
+import { createEffect, createMemo, createSignal, onCleanup, onMount } from "solid-js"
 import { Logo } from "../component/logo"
 import { useSync } from "../context/sync"
 import { Toast } from "../ui/toast"
@@ -9,17 +9,19 @@ import { usePromptRef } from "../context/prompt"
 import { useLocal } from "../context/local"
 import { usePluginRuntime } from "../plugin/runtime"
 import { useEditorContext } from "../context/editor"
-import { useTerminalDimensions } from "@opentui/solid"
+import { useTerminalDimensions } from "../util/terminal-dimensions"
 import { useTuiConfig } from "../config"
 import { HomeSessionDestinationProvider } from "./home/session-destination"
+import { HomeTipPlaceholderProvider, useHomeTipPlaceholder } from "./home/tip-placeholder"
 
 let once = false
+const TIP_ROTATE_MS = 10_000
 const placeholder = {
   normal: ["Fix a TODO in the codebase", "What is the tech stack of this project?", "Fix broken tests"],
   shell: ["ls -la", "git status", "pwd"],
 }
 
-export function Home() {
+function HomeScreen() {
   const pluginRuntime = usePluginRuntime()
   const sync = useSync()
   const route = useRouteData("home")
@@ -35,10 +37,26 @@ export function Home() {
     if (configured === "auto") return Math.max(75, Math.floor(dimensions().width * 0.7))
     return configured ?? 75
   })
+  const tipPlaceholder = useHomeTipPlaceholder()
+  const tipOffset = Math.random()
+  const [tipStep, setTipStep] = createSignal(0)
+  // Placeholders must stay on one line; a wrapped tip would resize the prompt on every rotation.
+  const tipWidth = createMemo(() => Math.min(promptMaxWidth(), dimensions().width - 4) - 6)
+  const tip = createMemo(() => {
+    const list = tipPlaceholder?.tips()
+    if (!list?.length) return
+    const width = tipWidth()
+    const fitting = list.filter((item) => item.length <= width)
+    const pool = fitting.length ? fitting : list
+    const value = pool[Math.floor(tipOffset * pool.length + tipStep()) % pool.length]
+    return value.length > width ? value.slice(0, Math.max(0, width - 1)) + "…" : value
+  })
   let sent = false
 
   onMount(() => {
     editor.clearSelection()
+    const timer = setInterval(() => setTipStep((step) => step + 1), TIP_ROTATE_MS)
+    onCleanup(() => clearInterval(timer))
   })
 
   const bind = (r: PromptRef | undefined) => {
@@ -77,10 +95,15 @@ export function Home() {
             <Logo />
           </pluginRuntime.Slot>
         </box>
-        <box height={1} minHeight={0} flexShrink={1} />
         <box width="100%" maxWidth={promptMaxWidth()} zIndex={1000} paddingTop={1} flexShrink={0}>
           <pluginRuntime.Slot name="home_prompt" mode="replace" ref={bind}>
-            <Prompt ref={bind} right={<pluginRuntime.Slot name="home_prompt_right" />} placeholders={placeholder} />
+            <Prompt
+              ref={bind}
+              right={<pluginRuntime.Slot name="home_prompt_right" />}
+              placeholder={tip()}
+              placeholders={placeholder}
+              centerShortcuts
+            />
           </pluginRuntime.Slot>
         </box>
         <pluginRuntime.Slot name="home_bottom" />
@@ -91,5 +114,13 @@ export function Home() {
         <pluginRuntime.Slot name="home_footer" mode="single_winner" />
       </box>
     </HomeSessionDestinationProvider>
+  )
+}
+
+export function Home() {
+  return (
+    <HomeTipPlaceholderProvider>
+      <HomeScreen />
+    </HomeTipPlaceholderProvider>
   )
 }

@@ -1,4 +1,4 @@
-import { SyntaxStyle, RGBA, type TerminalColors } from "@opentui/core"
+import { SyntaxStyle, RGBA, TextAttributes, type NativeResourceOwner, type TerminalColors } from "@opentui/core"
 import aura from "./assets/aura.json" with { type: "json" }
 import ayu from "./assets/ayu.json" with { type: "json" }
 import carbonfox from "./assets/carbonfox.json" with { type: "json" }
@@ -87,12 +87,40 @@ export type Theme = {
   readonly syntaxOperator: RGBA
   readonly syntaxPunctuation: RGBA
   readonly thinkingOpacity: number
+  // Reasoning labels: `thinkingStreaming` styles the live "Thinking" label,
+  // `thinkingCompleted` the finished "Thought · duration" label (#241). Both
+  // default to `warning` so themes without the keys render unchanged.
+  readonly thinkingStreaming: RGBA
+  readonly thinkingCompleted: RGBA
+  readonly thinkingStreamingStyle: ThemeTextStyle
+  readonly thinkingCompletedStyle: ThemeTextStyle
   _hasSelectedListItemText: boolean
 }
-type ThemeColor = Exclude<keyof Theme, "thinkingOpacity" | "_hasSelectedListItemText">
+export type ThemeTextStyle = { bold?: boolean; italic?: boolean; dim?: boolean; underline?: boolean }
+const THINKING_STYLE_KEYS = ["thinkingStreamingStyle", "thinkingCompletedStyle"] as const
+type ThemeColor = Exclude<
+  keyof Theme,
+  "thinkingOpacity" | "_hasSelectedListItemText" | (typeof THINKING_STYLE_KEYS)[number]
+>
+// Syntax rules only read theme colours plus the thinking opacity, so the
+// plugin-facing theme shape (without the reasoning label keys) is accepted too.
+export type SyntaxTheme = Omit<Theme, "thinkingStreaming" | "thinkingCompleted" | (typeof THINKING_STYLE_KEYS)[number]>
 export type SyntaxStyleOverrides = Record<string, { italic?: boolean }>
 
-export function selectedForeground(theme: Theme, bg?: RGBA): RGBA {
+export function textAttributes(style: ThemeTextStyle | undefined) {
+  if (!style) return TextAttributes.NONE
+  return (
+    (style.bold ? TextAttributes.BOLD : 0) |
+    (style.italic ? TextAttributes.ITALIC : 0) |
+    (style.dim ? TextAttributes.DIM : 0) |
+    (style.underline ? TextAttributes.UNDERLINE : 0)
+  )
+}
+
+export function selectedForeground(
+  theme: Pick<Theme, "_hasSelectedListItemText" | "selectedListItemText" | "background" | "primary">,
+  bg?: RGBA,
+): RGBA {
   // If theme explicitly defines selectedListItemText, use it
   if (theme._hasSelectedListItemText) {
     return theme.selectedListItemText
@@ -120,10 +148,17 @@ type ColorValue = HexColor | RefName | Variant | RGBA
 export type ThemeJson = {
   $schema?: string
   defs?: Record<string, HexColor | RefName>
-  theme: Omit<Record<ThemeColor, ColorValue>, "selectedListItemText" | "backgroundMenu"> & {
+  theme: Omit<
+    Record<ThemeColor, ColorValue>,
+    "selectedListItemText" | "backgroundMenu" | "thinkingStreaming" | "thinkingCompleted"
+  > & {
     selectedListItemText?: ColorValue
     backgroundMenu?: ColorValue
     thinkingOpacity?: number
+    thinkingStreaming?: ColorValue
+    thinkingCompleted?: ColorValue
+    thinkingStreamingStyle?: ThemeTextStyle
+    thinkingCompletedStyle?: ThemeTextStyle
   }
 }
 
@@ -263,9 +298,17 @@ export function resolveTheme(theme: ThemeJson, mode: "dark" | "light") {
     return resolveColor(c[mode], chain)
   }
 
+  const special = new Set<string>([
+    "selectedListItemText",
+    "backgroundMenu",
+    "thinkingOpacity",
+    "thinkingStreaming",
+    "thinkingCompleted",
+    ...THINKING_STYLE_KEYS,
+  ])
   const resolved = Object.fromEntries(
     Object.entries(theme.theme)
-      .filter(([key]) => key !== "selectedListItemText" && key !== "backgroundMenu" && key !== "thinkingOpacity")
+      .filter(([key]) => !special.has(key))
       .map(([key, value]) => {
         return [key, resolveColor(value as ColorValue)]
       }),
@@ -291,10 +334,21 @@ export function resolveTheme(theme: ThemeJson, mode: "dark" | "light") {
   // Handle thinkingOpacity - optional with default of 0.6
   const thinkingOpacity = theme.theme.thinkingOpacity ?? 0.6
 
+  // Reasoning labels fall back to the warning colour the TUI always used, so a
+  // theme file that predates the keys renders exactly as before.
+  const thinkingStreaming =
+    theme.theme.thinkingStreaming === undefined ? resolved.warning : resolveColor(theme.theme.thinkingStreaming)
+  const thinkingCompleted =
+    theme.theme.thinkingCompleted === undefined ? resolved.warning : resolveColor(theme.theme.thinkingCompleted)
+
   return {
     ...resolved,
     _hasSelectedListItemText: hasSelectedListItemText,
     thinkingOpacity,
+    thinkingStreaming,
+    thinkingCompleted,
+    thinkingStreamingStyle: theme.theme.thinkingStreamingStyle ?? {},
+    thinkingCompletedStyle: theme.theme.thinkingCompletedStyle ?? {},
   } as Theme
 }
 
@@ -553,11 +607,11 @@ function generateMutedTextColor(bg: RGBA, isDark: boolean): RGBA {
   return RGBA.fromInts(grayValue, grayValue, grayValue)
 }
 
-export function generateSyntax(theme: Theme) {
-  return SyntaxStyle.fromTheme(getSyntaxRules(theme))
+export function generateSyntax(theme: SyntaxTheme, owner: NativeResourceOwner) {
+  return SyntaxStyle.fromTheme(getSyntaxRules(theme), owner)
 }
 
-export function generateSubtleSyntax(theme: Theme, overrides?: SyntaxStyleOverrides) {
+export function generateSubtleSyntax(theme: SyntaxTheme, owner: NativeResourceOwner, overrides?: SyntaxStyleOverrides) {
   const rules = getSyntaxRules(theme)
   return SyntaxStyle.fromTheme(
     rules.map((rule) => {
@@ -580,10 +634,11 @@ export function generateSubtleSyntax(theme: Theme, overrides?: SyntaxStyleOverri
       }
       return rule
     }),
+    owner,
   )
 }
 
-function getSyntaxRules(theme: Theme) {
+function getSyntaxRules(theme: SyntaxTheme) {
   return [
     {
       scope: ["default"],

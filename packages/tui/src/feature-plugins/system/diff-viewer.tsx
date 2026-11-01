@@ -11,7 +11,8 @@ import {
 import { LANGUAGE_EXTENSIONS } from "../../util/filetype"
 import { useBindings, useCommandShortcut } from "../../keymap"
 import { useTheme } from "../../context/theme"
-import { useTerminalDimensions } from "@opentui/solid"
+import { useRenderer } from "@opentui/solid"
+import { useTerminalDimensions } from "../../util/terminal-dimensions"
 import path from "path"
 import { createEffect, createMemo, createResource, createSignal, For, Match, onCleanup, Show, Switch } from "solid-js"
 import { DiffViewerFileTree } from "./diff-viewer-file-tree"
@@ -89,6 +90,7 @@ function diffSourceLabel(mode: DiffMode) {
 }
 
 function DiffViewer(props: { api: TuiPluginApi }) {
+  const renderer = useRenderer()
   const dimensions = useTerminalDimensions()
   const themeState = useTheme()
   const theme = () => props.api.theme.current
@@ -175,6 +177,16 @@ function DiffViewer(props: { api: TuiPluginApi }) {
 
   onCleanup(() => props.api.ui.dialog.clear())
 
+  // The scroll-restore helpers below chain renderer.requestAnimationFrame
+  // callbacks with no frame ids; when the viewer unmounts mid-chain the
+  // surviving frames still touch destroyed scroll state (#421). The
+  // renderer exposes no cancelAnimationFrame, so every chain captures the
+  // generation at schedule time and stops at the first stale frame.
+  let rafGeneration = 0
+  onCleanup(() => {
+    rafGeneration++
+  })
+
   createEffect(() => {
     setExpandedFileNodes(allExpandedFileTreeDirectories(fileTree()))
     setHighlightedFileNode(undefined)
@@ -211,8 +223,10 @@ function DiffViewer(props: { api: TuiPluginApi }) {
   }
 
   const scrollPatchNodeToTop = (patchNode: BoxRenderable) => {
-    requestAnimationFrame(() => {
-      if (!scroll) return
+    const generation = rafGeneration
+    renderer.requestAnimationFrame(() => {
+      if (generation !== rafGeneration) return
+      if (!scroll || scroll.isDestroyed) return
       const scrollDelta = patchNode.y - scroll.viewport.y
       const contentY = scroll.scrollTop + scrollDelta
       const offset = contentY === 0 ? 0 : 1
@@ -341,10 +355,13 @@ function DiffViewer(props: { api: TuiPluginApi }) {
 
   const scrollToPatchFileIndexAfterRender = (fileIndex: number) => {
     setPendingPatchScrollFileIndex(fileIndex)
-    requestAnimationFrame(() => {
+    const generation = rafGeneration
+    renderer.requestAnimationFrame(() => {
+      if (generation !== rafGeneration) return
       const patchNode = patchNodeByFileIndex.get(fileIndex)
       if (patchNode) scrollPatchNodeToTop(patchNode)
-      requestAnimationFrame(() => {
+      renderer.requestAnimationFrame(() => {
+        if (generation !== rafGeneration) return
         const patchNode = patchNodeByFileIndex.get(fileIndex)
         if (patchNode) scrollPatchNodeToTop(patchNode)
         setPendingPatchScrollFileIndex(undefined)
@@ -353,15 +370,24 @@ function DiffViewer(props: { api: TuiPluginApi }) {
   }
 
   const scrollSinglePatchToTop = () => {
-    requestAnimationFrame(() => {
-      scroll?.scrollTo(0)
-      requestAnimationFrame(() => scroll?.scrollTo(0))
+    const generation = rafGeneration
+    renderer.requestAnimationFrame(() => {
+      if (generation !== rafGeneration) return
+      if (!scroll || scroll.isDestroyed) return
+      scroll.scrollTo(0)
+      renderer.requestAnimationFrame(() => {
+        if (generation !== rafGeneration) return
+        if (!scroll || scroll.isDestroyed) return
+        scroll.scrollTo(0)
+      })
     })
   }
 
   const measurePatchFiller = () => {
-    requestAnimationFrame(() => {
-      if (!scroll) return
+    const generation = rafGeneration
+    renderer.requestAnimationFrame(() => {
+      if (generation !== rafGeneration) return
+      if (!scroll || scroll.isDestroyed) return
       const entries = visiblePatchFiles()
         .map((entry) => patchNodeByFileIndex.get(entry.fileIndex))
         .filter((node): node is BoxRenderable => Boolean(node))
@@ -380,9 +406,12 @@ function DiffViewer(props: { api: TuiPluginApi }) {
     patchNodeByFileIndex.set(fileIndex, element)
     measurePatchFiller()
     if (pendingPatchScrollFileIndex() !== fileIndex) return
-    requestAnimationFrame(() => {
+    const generation = rafGeneration
+    renderer.requestAnimationFrame(() => {
+      if (generation !== rafGeneration) return
       scrollPatchNodeToTop(element)
-      requestAnimationFrame(() => {
+      renderer.requestAnimationFrame(() => {
+        if (generation !== rafGeneration) return
         scrollPatchNodeToTop(element)
         setPendingPatchScrollFileIndex(undefined)
       })

@@ -25,6 +25,7 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { isRecord } from "@/util/record"
 import { RuntimeFlags } from "@/effect/runtime-flags"
+import { Workdir } from "./workdir"
 
 const MCP_RESOURCE_TOOLS = {
   list: "list_mcp_resources",
@@ -49,6 +50,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
   messages: SessionV1.WithParts[]
   promptOps: TaskPromptOps
 }) {
+  const sessions = yield* Session.Service
   const tools: Record<string, AITool> = {}
   const run = yield* EffectBridge.make()
   const plugin = yield* Plugin.Service
@@ -69,6 +71,10 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
 
   const context = (args: Record<string, unknown>, options: ToolExecutionOptions): Tool.Context => ({
     sessionID: input.session.id,
+    // The folder this session works in, which is the project directory unless a
+    // delegated child was given one. It resolves paths only; permission checks
+    // keep measuring against the instance through `external-directory`.
+    cwd: Workdir.of(input.session),
     abort: options.abortSignal!,
     messageID: input.processor.message.id,
     callID: options.toolCallId,
@@ -98,7 +104,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
           tool: { messageID: input.processor.message.id, callID: options.toolCallId },
           ruleset: Permission.merge(input.agent.permission, input.session.permission ?? []),
         })
-        .pipe(Effect.orDie),
+        .pipe(Effect.orDie, Effect.interruptible),
   })
 
   for (const item of yield* registry.tools({
@@ -106,6 +112,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
     providerID: input.model.providerID,
     agent: input.agent,
     permission: input.session.permission,
+    sessionID: input.session.id,
   })) {
     const definition = ToolJsonSchema.fromTool(item)
     const entry: ToolCatalog.Entry = {
@@ -149,7 +156,13 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
               yield* input.processor.completeToolCall(options.toolCallId, output)
             }
             return output
-          }),
+          }).pipe(
+            // Bash already observes ctx.abort and returns captured output after
+            // process teardown. Keep that finalization, but permission waits in
+            // ctx.ask remain interruptible so cancellation cannot authorize work.
+            item.id === "bash" ? Effect.uninterruptible : (effect) => effect,
+          ),
+          { signal: options.abortSignal },
         )
       },
     })
@@ -237,6 +250,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
             }
             return output
           }),
+          { signal: opts.abortSignal },
         )
       },
     })
@@ -320,6 +334,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
             }
             return output
           }),
+          { signal: opts.abortSignal },
         )
       },
     })
@@ -402,6 +417,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
             }
             return output
           }),
+          { signal: opts.abortSignal },
         )
       },
     })
@@ -525,6 +541,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
           }
           return output
         }),
+        { signal: opts.abortSignal },
       )
     tools[key] = item
   }
