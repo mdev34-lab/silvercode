@@ -1,7 +1,14 @@
 import { describe, expect, test } from "bun:test"
 import type { SessionV1 } from "@opencode-ai/core/v1/session"
 import FINISH_NUDGE from "../../src/session/prompt/finish-nudge.txt"
-import { continuesPrompt, resultChunks, textResult, renderTextResult } from "../../src/session/subagent-result"
+import {
+  continuesPrompt,
+  REPETITION_RECOVERY,
+  repetitionRecoveryPromptID,
+  resultChunks,
+  textResult,
+  renderTextResult,
+} from "../../src/session/subagent-result"
 
 // Only the fields consumed by the collector are relevant to this pure boundary test.
 const user = (id: string) => ({ info: { id, role: "user" }, parts: [] }) as unknown as SessionV1.WithParts
@@ -49,7 +56,10 @@ describe("subagent result execution boundary", () => {
     expect(textResult(resultChunks([user("01"), old, user("03"), nudge("05"), last], last))).toEqual({ ok: false })
   })
   test("a nudge after a completed finish does not resurrect the earlier result", () => {
-    const old = assistant("02", "01", [text(envelope), { type: "tool", tool: "finish", state: { status: "completed" } }])
+    const old = assistant("02", "01", [
+      text(envelope),
+      { type: "tool", tool: "finish", state: { status: "completed" } },
+    ])
     const last = assistant("04", "03", [text("")])
     expect(textResult(resultChunks([user("01"), old, nudge("03"), last], last))).toEqual({ ok: false })
   })
@@ -100,7 +110,9 @@ describe("prompt continuation boundaries", () => {
   test("a synthetic user message that is not the runner nudge is a boundary", () => {
     const last = assistant("04", "03", [text("b")])
     const old = assistant("02", "01", [text(envelope)])
-    expect(continuesPrompt([user("01"), old, synthetic("03", "Background task finished"), last], last, "01")).toBe(false)
+    expect(continuesPrompt([user("01"), old, synthetic("03", "Background task finished"), last], last, "01")).toBe(
+      false,
+    )
     expect(resultChunks([user("01"), old, synthetic("03", "Background task finished"), last], last)).toEqual(["b"])
   })
   test("a nudge after a completed finish does not continue the earlier prompt", () => {
@@ -152,16 +164,57 @@ describe("text result envelope", () => {
   })
 })
 
-
 test("rejects nested tags and an unfinished newer result instead of using stale text", () => {
-  expect(textResult(["<silvercode-result>outer<silvercode-result>inner</silvercode-result></silvercode-result>"])).toEqual({ ok: false })
+  expect(
+    textResult(["<silvercode-result>outer<silvercode-result>inner</silvercode-result></silvercode-result>"]),
+  ).toEqual({ ok: false })
   expect(textResult([renderTextResult("earlier"), "<silvercode-result>unfinished"])).toEqual({ ok: false })
 })
 
 test("a corrected later envelope recovers after an unfinished earlier assistant result", () => {
-  expect(textResult(["<silvercode-result>unfinished", renderTextResult("corrected")])).toEqual({ ok: true, text: "corrected" })
+  expect(textResult(["<silvercode-result>unfinished", renderTextResult("corrected")])).toEqual({
+    ok: true,
+    text: "corrected",
+  })
 })
 
 test("a corrected later envelope recovers after a stray closing tag", () => {
   expect(textResult(["</silvercode-result>", renderTextResult("corrected")])).toEqual({ ok: true, text: "corrected" })
+})
+
+describe("repetition recovery continuation", () => {
+  const recovery = (id: string, promptID: string, text = "The previous response was cut off by the repetition guard") =>
+    ({
+      info: { id, role: "user" },
+      parts: [{ type: "text", text, synthetic: true, metadata: { [REPETITION_RECOVERY]: { promptID, attempt: 1 } } }],
+    }) as unknown as SessionV1.WithParts
+
+  test("a recovery message continues the prompt it resumes", () => {
+    const aborted = assistant("02", "01", [text("partial output")])
+    const resumed = assistant("04", "03", [text(envelope)])
+    expect(continuesPrompt([user("01"), aborted, recovery("03", "01"), resumed], resumed, "01")).toBe(true)
+    expect(textResult(resultChunks([user("01"), aborted, recovery("03", "01"), resumed], resumed))).toEqual({
+      ok: true,
+      text: plan,
+    })
+  })
+  test("a recovery only continues its own prompt lineage", () => {
+    const resumed = assistant("04", "03", [text(envelope)])
+    expect(continuesPrompt([user("01"), user("02"), recovery("03", "01"), resumed], resumed, "02")).toBe(false)
+  })
+  test("another synthetic message is still a boundary", () => {
+    const resumed = assistant("03", "02", [text(envelope)])
+    expect(continuesPrompt([user("01"), synthetic("02", "shell marker"), resumed], resumed, "01")).toBe(false)
+  })
+  test("the lineage marker is readable only from a synthetic text part", () => {
+    expect(repetitionRecoveryPromptID(recovery("03", "01"))).toBe("01")
+    expect(repetitionRecoveryPromptID(synthetic("04", "opaque"))).toBeUndefined()
+    expect(repetitionRecoveryPromptID(user("05"))).toBeUndefined()
+    expect(
+      repetitionRecoveryPromptID({
+        info: { id: "06", role: "user" },
+        parts: [{ type: "text", text: "not synthetic", metadata: { [REPETITION_RECOVERY]: { promptID: "01" } } }],
+      } as unknown as SessionV1.WithParts),
+    ).toBeUndefined()
+  })
 })

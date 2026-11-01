@@ -1,5 +1,6 @@
 import type { SessionV1 } from "@opencode-ai/core/v1/session"
 
+import { isRecord } from "@/util/record"
 import FINISH_NUDGE from "./prompt/finish-nudge.txt"
 import REVIEW_STAGNATION_NUDGE from "./prompt/review-stagnation-nudge.txt"
 
@@ -7,14 +8,50 @@ export const TEXT_RESULT_TAG = "silvercode-result"
 
 const NUDGES = new Set([FINISH_NUDGE, REVIEW_STAGNATION_NUDGE].map((text) => text.trim()))
 
-// Only the runner's own finish/stagnation reminder continues a prompt. Any other synthetic-only user
-// message (shell marker, task summary, bridge text) is a boundary, not a continuation.
+// Issue #738: metadata key on the synthetic user message that resumes a guard-aborted generation.
+// It records the prompt the continuation belongs to, so the recovery is recognised as part of the
+// same prompt execution instead of a new user boundary, and so its budget is scoped to that lineage
+// rather than to one runLoop invocation.
+export const REPETITION_RECOVERY = "repetitionRecovery"
+
+/** The prompt a repetition-recovery message continues, or undefined for any other message. */
+export function repetitionRecoveryPromptID(message: SessionV1.WithParts): string | undefined {
+  if (message.info.role !== "user" || message.parts.length !== 1) return undefined
+  const part = message.parts[0]!
+  if (part.type !== "text" || part.synthetic !== true) return undefined
+  const marker = part.metadata?.[REPETITION_RECOVERY]
+  return isRecord(marker) && typeof marker.promptID === "string" ? marker.promptID : undefined
+}
+
+// Issue #783: metadata key on the runner's finish/stagnation nudge. The nudge
+// continues the turn of the prompt it follows, and the answer that obeys it
+// answers that prompt. Recording the prompt the nudge belongs to is what lets
+// the caller settle on that answer instead of the pre-nudge one, and what keeps
+// the nudge from being mistaken for input a caller submitted. Optional: nudges
+// persisted before this marker existed keep working, and ownership then falls
+// back to the stored transcript as before.
+export const FINISH_CONTINUATION = "finishContinuation"
+
+/** The prompt a runner finish/stagnation nudge continues, or undefined for any other message. */
+export function finishContinuationPromptID(message: SessionV1.WithParts): string | undefined {
+  if (message.info.role !== "user" || message.parts.length !== 1) return undefined
+  const part = message.parts[0]!
+  if (part.type !== "text" || part.synthetic !== true) return undefined
+  const marker = part.metadata?.[FINISH_CONTINUATION]
+  return isRecord(marker) && typeof marker.promptID === "string" ? marker.promptID : undefined
+}
+
+// Only the runner's own finish/stagnation reminder and bounded repetition recovery continue a prompt.
+// Any other synthetic-only user message (shell marker, task summary, bridge text) is a boundary, not
+// a continuation.
 const isNudge = (message: SessionV1.WithParts) =>
   message.info.role === "user" &&
   message.parts.length === 1 &&
   message.parts[0]!.type === "text" &&
   message.parts[0]!.synthetic === true &&
-  NUDGES.has(message.parts[0]!.text.trim())
+  (NUDGES.has(message.parts[0]!.text.trim()) ||
+    repetitionRecoveryPromptID(message) !== undefined ||
+    finishContinuationPromptID(message) !== undefined)
 
 const finished = (message: SessionV1.WithParts) =>
   message.parts.some((part) => part.type === "tool" && part.tool === "finish" && part.state.status === "completed")
@@ -37,6 +74,11 @@ function anchorsOf(ordered: readonly SessionV1.WithParts[], current: SessionV1.W
   while (isNudge(ordered[at]!)) {
     const previous = ordered.slice(0, at).findLastIndex((message) => message.info.role === "user")
     if (previous < 0) break
+    // A repetition recovery names the prompt it resumed. If a different user message landed
+    // between that prompt and the recovery, the declared lineage is stale: treat the recovery as
+    // a boundary instead of borrowing whichever prompt happens to precede it.
+    const declared = repetitionRecoveryPromptID(ordered[at]!) ?? finishContinuationPromptID(ordered[at]!)
+    if (declared !== undefined && ordered[previous]!.info.id !== declared) break
     if (ordered.slice(previous + 1, at).some(finished)) break
     at = previous
     anchors.push(at)
@@ -55,7 +97,11 @@ const order = (messages: readonly SessionV1.WithParts[], current: SessionV1.With
  * finish. When the transcript lacks the prompt (minimal fixture), the same two rules apply to every
  * message after `promptID`; an empty history is a direct match.
  */
-export function continuesPrompt(messages: readonly SessionV1.WithParts[], current: SessionV1.WithParts, promptID: string) {
+export function continuesPrompt(
+  messages: readonly SessionV1.WithParts[],
+  current: SessionV1.WithParts,
+  promptID: string,
+) {
   if (current.info.role !== "assistant") return false
   const ordered = order(messages, current)
   const end = ordered.findIndex((message) => message.info.id === current.info.id)
@@ -109,7 +155,10 @@ export function textResult(chunks: readonly (string | undefined)[]) {
     for (const match of source.matchAll(/<\/?silvercode-result>/g)) {
       if (match[0] === open) {
         if (depth > 0) nested = true
-        else { begin = match.index! + open.length; nested = false }
+        else {
+          begin = match.index! + open.length
+          nested = false
+        }
         depth++
       } else if (depth > 0) {
         depth--
