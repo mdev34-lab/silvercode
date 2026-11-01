@@ -261,6 +261,7 @@ export type UserMessage = {
   tools?: {
     [key: string]: boolean
   }
+  noReply?: boolean
 }
 
 export type ProviderAuthError = {
@@ -1808,18 +1809,55 @@ export type ProviderConfig = {
         | {
             field: "reasoning" | "reasoning_content" | "reasoning_text" | string
           }
-      cost?: {
-        input: number
-        output: number
-        cache_read?: number
-        cache_write?: number
-        context_over_200k?: {
-          input: number
-          output: number
-          cache_read?: number
-          cache_write?: number
-        }
-      }
+      cost?:
+        | {
+            input: number
+            output: number
+            cache_read?: number
+            cache_write?: number
+            cache?: {
+              read?: number
+              write?: number
+            }
+            tiers?: Array<{
+              input: number
+              output: number
+              cache_read?: number
+              cache_write?: number
+              cache?: {
+                read?: number
+                write?: number
+              }
+              tier?:
+                | {
+                    type?: "context"
+                    size: number
+                  }
+                | number
+            }>
+            context_over_200k?: {
+              input: number
+              output: number
+              cache_read?: number
+              cache_write?: number
+            }
+          }
+        | Array<{
+            input: number
+            output: number
+            cache_read?: number
+            cache_write?: number
+            cache?: {
+              read?: number
+              write?: number
+            }
+            tier?:
+              | {
+                  type?: "context"
+                  size: number
+                }
+              | number
+          }>
       limit?: {
         context: number
         input?: number
@@ -2060,6 +2098,7 @@ export type Config = {
     max_lines?: number
     max_bytes?: number
   }
+  context?: ConfigV2Context
   compaction?: {
     auto?: boolean
     prune?: boolean
@@ -2994,6 +3033,7 @@ export type V2Event =
   | WorktreeFailed
   | ServerConnected
   | GlobalDisposed
+  | ServerResync
 
 export type V2EventStream = string
 
@@ -3237,14 +3277,6 @@ export type ProjectTime = {
   created: number
   updated: number
   initialized?: number
-}
-
-export type EventServerResync = {
-  id: string
-  type: "server.resync"
-  properties: {
-    reason: "resume-cursor-expired"
-  }
 }
 
 export type EventServerInstanceDisposed = {
@@ -3901,6 +3933,23 @@ export type ConfigV2ReferenceLocal = {
 }
 
 export type AgentEffortLevel = "fast" | "medium" | "thorough"
+
+export type ConfigV2ContextReduction = {
+  enabled?: boolean
+  threshold?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  error_turns?: number
+}
+
+export type ConfigV2ContextProtection = {
+  recent_turns?: number
+  tools?: Array<string>
+  files?: Array<string>
+}
+
+export type ConfigV2Context = {
+  reduction?: ConfigV2ContextReduction
+  protection?: ConfigV2ContextProtection
+}
 
 export type PolicyEffect = "allow" | "deny"
 
@@ -6208,6 +6257,23 @@ export type GlobalDisposed = {
   }
 }
 
+export type ServerResync = {
+  id: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  type: "server.resync"
+  durable?: {
+    aggregateID: string
+    seq: number
+    version: number
+  }
+  location?: LocationRef
+  data: {
+    reason: "resume-cursor-expired"
+  }
+}
+
 export type QuestionV2Request = {
   id: string
   sessionID: string
@@ -7179,6 +7245,14 @@ export type EventGlobalDisposed = {
   type: "global.disposed"
   properties: {
     [key: string]: unknown
+  }
+}
+
+export type EventServerResync = {
+  id: string
+  type: "server.resync"
+  properties: {
+    reason: "resume-cursor-expired"
   }
 }
 
@@ -9507,9 +9581,9 @@ export type ProviderProbeData = {
 
 export type ProviderProbeErrors = {
   /**
-   * InvalidRequestError
+   * Bad request
    */
-  400: InvalidRequestError
+  400: BadRequestError
 }
 
 export type ProviderProbeError = ProviderProbeErrors[keyof ProviderProbeErrors]
@@ -9520,7 +9594,7 @@ export type ProviderProbeResponses = {
    */
   200: {
     outcome: "ok" | "transient" | "error"
-    latencyMs: number
+    latencyMs: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
   }
 }
 

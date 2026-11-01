@@ -6749,7 +6749,12 @@ it.instance(
         expect(recoveryPart.text).toContain("emit the pending tool call")
         // Recognised continuation lineage: the recovery belongs to the prompt it
         // resumes, so provenance/subagent success and the budget can follow it.
-        expect(recoveryPart.metadata?.repetitionRecovery).toEqual({ promptID: task.id, attempt: 1 })
+        expect(recoveryPart.metadata?.repetitionRecovery).toEqual({
+          promptID: task.id,
+          attempt: 1,
+          sequence: 1,
+          assistantIDs: [first!.info.id],
+        })
       }
 
       // Exactly two model requests: the aborted generation and the one recovery.
@@ -7175,9 +7180,12 @@ it.instance(
       expect(continuesPrompt(messages, queuedResult, queuedID)).toBe(true)
       expect(continuesPrompt(messages, queuedResult, primaryID)).toBe(false)
       const [recoveryPart] = recovery.parts
+      const aborted = messages.find((message) => message.info.role === "assistant" && message.info.parentID === primaryID)
       expect(recoveryPart?.type === "text" ? recoveryPart.metadata?.repetitionRecovery : undefined).toEqual({
         promptID: primaryID,
         attempt: 1,
+        sequence: 1,
+        assistantIDs: [aborted!.info.id],
       })
 
       const assistants = messages.filter((message) => message.info.role === "assistant")
@@ -7304,9 +7312,12 @@ it.instance(
       expect(queuedRequest).toContain("queued during the recovery")
       // The one recovery declares the prompt it continued.
       const [recoveryPart] = recovery.parts
+      const aborted = messages.find((message) => message.info.role === "assistant" && message.info.parentID === primaryID)
       expect(recoveryPart?.type === "text" ? recoveryPart.metadata?.repetitionRecovery : undefined).toEqual({
         promptID: primaryID,
         attempt: 1,
+        sequence: 1,
+        assistantIDs: [aborted!.info.id],
       })
     }),
   { config: cfg },
@@ -7602,9 +7613,12 @@ it.instance(
       expect(textParts(result)).toEqual(["Recovered after the silent marker."])
       expect(recovery.parts).toHaveLength(1)
       const [recoveryPart] = recovery.parts
+      const aborted = stored.find((message) => message.info.role === "assistant" && message.info.parentID === primaryID)
       expect(recoveryPart?.type === "text" ? recoveryPart.metadata?.repetitionRecovery : undefined).toEqual({
         promptID: primaryID,
         attempt: 1,
+        sequence: 1,
+        assistantIDs: [aborted!.info.id],
       })
 
       // The marker is persisted with its caller intent and text, has no answer,
@@ -8533,14 +8547,24 @@ it.instance(
         "P1 bash tool never started",
       )
       const p2 = yield* prompt
-        .prompt({ sessionID: chat.id, agent: "work", parts: [{ type: "text", text: "P2 background completion" }] })
+        .prompt({
+          sessionID: chat.id,
+          agent: "work",
+          parts: [
+            {
+              type: "text",
+              synthetic: true,
+              text: '<task id="child" state="completed"><summary>Background task completed</summary><task_result>child result</task_result></task>',
+            },
+          ],
+        })
         .pipe(Effect.forkChild)
       yield* pollWithTimeout(
         Effect.gen(function* () {
           const msgs = yield* sessions.messages({ sessionID: chat.id })
           return (
             msgs.some((m) =>
-              m.parts.some((part) => part.type === "text" && part.text === "P2 background completion"),
+              m.parts.some((part) => part.type === "text" && part.text.includes("Background task completed")),
             ) || undefined
           )
         }),
@@ -8551,8 +8575,11 @@ it.instance(
       const a2 = assistantExit(yield* awaitWithTimeout(Fiber.await(p2), "P2 never settled", "20 seconds"))
       const stored = yield* sessions.messages({ sessionID: chat.id })
       const p1ID = stored.find((m) => m.info.role === "user" && m.parts.some((part) => part.type === "text" && part.text === "P1"))!.info.id
-      const p2ID = stored.find((m) => m.info.role === "user" && m.parts.some((part) => part.type === "text" && part.text === "P2 background completion"))!.info.id
+      const p2ID = stored.find((m) => m.info.role === "user" && m.parts.some((part) => part.type === "text" && part.text.includes("Background task completed")))!.info.id
       expect(yield* llm.calls).toBe(3)
+      const inputs = turnInputs(yield* llm.inputs)
+      expect(JSON.stringify(inputs[1])).not.toContain("Background task completed")
+      expect(JSON.stringify(inputs[2])).toContain("Background task completed")
       expect(a1.info.parentID).toBe(p1ID)
       expect(a2.info.parentID).toBe(p2ID)
       expectCompletedFinish(a1)

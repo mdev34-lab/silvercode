@@ -146,6 +146,11 @@ const expectsReply = (message: SessionV1.WithParts) => message.info.role === "us
 const isCompactionTask = (message: SessionV1.WithParts) =>
   message.info.role === "user" && message.parts.some((part) => part.type === "compaction")
 
+const isBackgroundCompletion = (message: SessionV1.WithParts) =>
+  message.info.role === "user" &&
+  message.parts.length > 0 &&
+  message.parts.every((part) => part.type === "text" && part.synthetic === true && part.text.trimStart().startsWith("<task "))
+
 const isRealUserInput = (message: SessionV1.WithParts) =>
   expectsReply(message) && continuationPromptID(message) === undefined && !isCompactionTask(message)
 
@@ -182,15 +187,18 @@ const pendingToolWork = (
   messages: readonly SessionV1.WithParts[],
   userID: string,
   lineage: (userID: string) => string = lineageResolver(messages),
-) =>
-  messages.some(
+) => {
+  // Only the execution's latest generation can still owe a tool follow-up.
+  // An older tool-calls step whose tools already ran and whose nudge was
+  // answered must not pin the root forever.
+  const latest = messages.findLast(
     (message) =>
       message.info.role === "assistant" &&
       message.info.parentID !== undefined &&
-      lineage(message.info.parentID) === userID &&
-      !settledAnswer(message) &&
-      hasToolWork(message),
+      lineage(message.info.parentID) === userID,
   )
+  return latest !== undefined && !settledAnswer(latest) && hasToolWork(latest)
+}
 
 // The message this generation belongs to (issue #738, #410). Choosing it from
 // the whole transcript - instead of always taking the newest message by
@@ -264,9 +272,14 @@ const generationTarget = (
   if (compactionTask) return compactionTask
   // A tool step is not an answer. Keep the execution that still owns tool work
   // ahead of a newer queued prompt or background completion.
-  const working = users.find(
-    (message) => waiting.has(message.info.id) && expectsReply(message) && pendingToolWork(messages, message.info.id, lineage),
-  )
+  const working = users.find((message) => {
+    if (!waiting.has(message.info.id) || !expectsReply(message) || !pendingToolWork(messages, message.info.id, lineage))
+      return false
+    const at = messages.findIndex((candidate) => candidate.info.id === message.info.id)
+    // A real caller may supersede a tool step; a runner background completion
+    // may not. It waits for the parent tool follow-up and its own turn.
+    return !messages.slice(at + 1).some((candidate) => isRealUserInput(candidate) && !isBackgroundCompletion(candidate))
+  })
   if (working) return working
   const owed = users.find((message) => {
     if (continuationPromptID(message) === undefined || answered(messages, message.info.id)) return false
@@ -283,16 +296,24 @@ const generationTarget = (
   )
   if (pending) return pending
   const latestAssistantAt = messages.findLastIndex((message) => message.info.role === "assistant")
+  const latestAssistantMessage = messages.findLast((message) => message.info.role === "assistant")
+  const completedFinish = latestAssistantMessage?.parts.some(
+    (part) => part.type === "tool" && part.tool === FinishTool.id && part.state.status === "completed",
+  )
   const next = users.findLast(
     (message) =>
-      expectsReply(message) &&
+      (expectsReply(message) || (waiting.size === 0 && !completedFinish)) &&
       messages.findLastIndex((candidate) => candidate.info.id === message.info.id) > latestAssistantAt,
   )
   if (next) return next
-  // Compaction reorders the model view; the owner of the next generation is
-  // the latest assistant by creation time, not by array position.
-  const latestAssistant = MessageV2.latest([...messages]).assistant
-  const ownerID = latestAssistant?.parentID
+  // Compaction reorders the model view; when a summary is present the owner
+  // of the next generation is the latest assistant by creation time. Otherwise
+  // stored array order preserves a clock-rollback nudge answer.
+  const hasSummary = messages.some((message) => message.info.role === "assistant" && message.info.summary === true)
+  const latestAssistant = hasSummary
+    ? MessageV2.latest([...messages]).assistant
+    : messages.findLast((message) => message.info.role === "assistant")?.info
+  const ownerID = latestAssistant?.role === "assistant" ? latestAssistant.parentID : undefined
   const owner = ownerID === undefined ? undefined : users.findLast((message) => message.info.id === ownerID)
   return owner ?? users.findLast(expectsReply) ?? users.at(-1)
 }
@@ -329,6 +350,19 @@ const generationView = (
 // continuation that carried it, or the terminal guard error that ended it.
 // Callers settle on this instead of re-entering the loop and generating for a
 // spent lineage again.
+const compactionPromptID = (messages: readonly SessionV1.WithParts[], taskID: string) => {
+  const at = messages.findIndex((message) => message.info.id === taskID)
+  const prior = at < 0 ? [] : messages.slice(0, at)
+  const priorAssistant = prior.findLast(
+    (message) => message.info.role === "assistant" && message.info.summary !== true,
+  )
+  const priorUser = prior.findLast(isRealUserInput)
+  const lineage = lineageResolver(messages)
+  return priorAssistant?.info.role === "assistant" && priorAssistant.info.parentID
+    ? lineage(priorAssistant.info.parentID)
+    : priorUser?.info.id
+}
+
 const promptAnswer = (messages: readonly SessionV1.WithParts[], promptID: string) => {
   const lineage = lineageResolver(messages)
   const answers = messages.filter(
@@ -1742,31 +1776,52 @@ const layer = Layer.effect(
           const liveWaiters = yield* InstanceState.use(callers, (registry) => waiters(registry, sessionID))
           // An answered nudge is no longer in flight. Keeping it selected here
           // forever hid runner-owned compaction work and settled stale answers.
-          const active = [...pending.entries()].findLast(([, state]) => !state.superseded && state.answer === undefined)
+          const compactionOwed = msgs.some((message) => isCompactionTask(message) && !answered(msgs, message.info.id))
+          const active = [...pending.entries()].findLast(
+            ([, state]) =>
+              (!state.superseded || state.answer !== undefined) &&
+              (state.answer === undefined || !compactionOwed),
+          )
           const awaiting = active?.[1].message.id
           const target = generationTarget(msgs, liveWaiters, awaiting)
           if (!target) throw new Error("No user message found in stream. This should never happen.")
-          const root = turnLineage(msgs, target.info.id)
+          const root = isCompactionTask(target)
+            ? (compactionPromptID(msgs, target.info.id) ?? turnLineage(msgs, target.info.id))
+            : turnLineage(msgs, target.info.id)
           let view = generationView(msgs, target, awaiting)
           // Async input is context for its own turn, never part of the request
           // still finishing an earlier prompt. Silent annotations remain visible.
           const rootAt = view.findIndex((message) => message.info.id === root)
           const scopedLineage = lineageResolver(view)
-          const compactionIDs = new Set(view.filter(isCompactionTask).map((message) => message.info.id))
+          const viewIndex = new Map<string, number>(view.map((message, index) => [message.info.id, index]))
+          // Compaction bookkeeping belongs to the execution that scheduled it.
+          // Resolve that owner causally so another prompt's compaction cannot
+          // leak into this request or inflate this turn's step budget.
+          const compactionOwners = new Map<string, string | undefined>()
+          for (const task of view.filter(isCompactionTask)) {
+            compactionOwners.set(task.info.id, compactionPromptID(view, task.info.id))
+          }
+          const compactionOwner = (message: SessionV1.WithParts) => {
+            if (isCompactionTask(message)) return compactionOwners.get(message.info.id)
+            if (message.info.role === "assistant" && message.info.summary === true)
+              return compactionOwners.get(message.info.parentID)
+            return undefined
+          }
           view = view.filter((message) => {
             const parent = message.info.role === "assistant" ? message.info.parentID : message.info.id
             if (parent === undefined || (message.info.role === "user" && message.info.noReply === true)) return true
-            if (isCompactionTask(message) || (message.info.role === "assistant" && compactionIDs.has(parent))) return true
+            const compactOwner = compactionOwner(message)
+            if (compactOwner !== undefined)
+              return compactOwner === root || (viewIndex.get(compactOwner) ?? -1) < rootAt
             const owner = scopedLineage(parent)
-            return owner === root || view.findIndex((message) => message.info.id === owner) < rootAt
+            return owner === root || (viewIndex.get(owner) ?? -1) < rootAt
           })
           const viewLineage = lineageResolver(view)
           const own = view.filter((message) => {
             const parent = message.info.role === "assistant" ? message.info.parentID : message.info.id
             if (parent === undefined) return false
-            // Compaction bookkeeping belongs to the execution that scheduled it,
-            // even though the compaction user itself is not a caller prompt.
-            if (isCompactionTask(message) || (message.info.role === "assistant" && compactionIDs.has(parent))) return true
+            const compactOwner = compactionOwner(message)
+            if (compactOwner !== undefined) return compactOwner === root
             return viewLineage(parent) === root
           })
           const latest = MessageV2.latest(own)
@@ -1775,15 +1830,18 @@ const layer = Layer.effect(
           const lastAssistant = turn?.info.role === "assistant" ? turn.info : undefined
           const lastUser = target.info
           const state = pending.get(root)
-          const step = own.filter((message) => message.info.role === "assistant").length
+          const step = own.filter(
+            (message) => message.info.role === "assistant" && message.info.summary !== true,
+          ).length
           const finishNudges = msgs.filter(
             (message) =>
               finishContinuationPromptID(message) !== undefined && viewLineage(message.info.id) === root,
           ).length
-          // Every consumer below sees the same owner-scoped transcript as the
-          // provider request. Plugin/reminder replacements therefore reach the
-          // LLM view, and a queued P2 cannot leak into P1's tools or reminders.
-          msgs = view
+          // Every generation consumer below sees the same owner-scoped
+          // transcript as the provider request. Plugin/reminder replacements
+          // therefore reach the LLM view, and a queued P2 cannot leak into P1's
+          // tools or reminders. Canonical `msgs` stays intact for task handling.
+          let request = view
           yield* Effect.logInfo("loop", { "session.id": sessionID, promptID: root, step })
 
           // Snapshot the effective model/variant for this turn. A selection
@@ -1889,7 +1947,7 @@ const layer = Layer.effect(
               // generic finish nudge. Any other agent keeps the generic nudge.
               const repeats = ReviewStagnation.resolveRepeats({ repeats: flags.reviewStagnationRepeats })
               const stagnation = isReviewAgent(lastUser.agent)
-                ? ReviewStagnation.reviewStagnationState(msgs, repeats)
+                ? ReviewStagnation.reviewStagnationState(request, repeats)
                 : undefined
               const stagnated = stagnation?.stagnated === true
               // Hard backstop (issue #176): the nudge above is model-dependent,
@@ -1900,7 +1958,7 @@ const layer = Layer.effect(
               // asking the model again.
               const backstop = stagnated
                 ? ReviewStagnation.reviewStagnationBackstop({
-                    messages: msgs,
+                    messages: request,
                     repeats,
                     recoveryNudge: REVIEW_STAGNATION_NUDGE,
                   })
@@ -1917,7 +1975,7 @@ const layer = Layer.effect(
                   sessionID,
                   agent: lastUser.agent,
                   messageID: lastAssistantMsg.info.id,
-                  messages: msgs,
+                  messages: request,
                   result: backstop.result,
                 })
                 // The completed finish part ends the turn at the top of the
@@ -2060,14 +2118,7 @@ const layer = Layer.effect(
           }
 
           if (task?.type === "compaction") {
-            const taskAt = msgs.findIndex((message) => message.info.id === lastUser.id)
-            const prior = taskAt < 0 ? [] : msgs.slice(0, taskAt)
-            const priorAssistant = prior.findLast((message) => message.info.role === "assistant")
-            const priorUser = prior.findLast(isRealUserInput)
-            const promptID =
-              priorAssistant?.info.role === "assistant" && priorAssistant.info.parentID
-                ? turnLineage(msgs, priorAssistant.info.parentID)
-                : (priorUser?.info.id ?? root)
+            const promptID = compactionPromptID(msgs, lastUser.id) ?? root
             const result = yield* compaction.process({
               messages: msgs,
               parentID: lastUser.id,
@@ -2099,7 +2150,7 @@ const layer = Layer.effect(
           }
           const maxSteps = agent.steps ?? Infinity
           const isLastStep = step + 1 >= maxSteps
-          msgs = yield* SessionReminders.apply({ messages: msgs, agent, session }).pipe(
+          request = yield* SessionReminders.apply({ messages: request, agent, session }).pipe(
             Effect.provideService(RuntimeFlags.Service, flags),
             Effect.provideService(FSUtil.Service, fsys),
             Effect.provideService(Session.Service, sessions),
@@ -2143,7 +2194,7 @@ const layer = Layer.effect(
             .pipe(Effect.onInterrupt(() => finalizeInterruptedAssistant))
 
           const outcome: "break" | "continue" = yield* Effect.gen(function* () {
-            const lastUserMsg = msgs.findLast((m) => m.info.role === "user")
+            const lastUserMsg = request.findLast((m) => m.info.role === "user")
             const bypassAgentCheck = lastUserMsg?.parts.some((p) => p.type === "agent") ?? false
             const promptOps = yield* ops()
 
@@ -2153,7 +2204,7 @@ const layer = Layer.effect(
               model,
               processor: handle,
               bypassAgentCheck,
-              messages: msgs,
+              messages: request,
               promptOps,
             }).pipe(
               Effect.provideService(Session.Service, sessions),
@@ -2180,7 +2231,7 @@ const layer = Layer.effect(
             if (step === 0)
               yield* summary.summarize({ sessionID, messageID: lastUser.id }).pipe(Effect.ignore, Effect.forkIn(scope))
 
-            yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
+            yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: request })
 
             const [skills, env, instructions, mcpInstructions, toolOverview, delegation] = yield* Effect.all([
               sys.skills(agent),
@@ -2201,7 +2252,7 @@ const layer = Layer.effect(
             const effort = AgentEffort.resolve(readAgentEffort(session.metadata), AgentEffort.resolve(configEffort))
             // Compaction can drop the write markers from the visible history, so a
             // compacted session keeps the policy on: it was long enough to compact.
-            const sessionWroteFiles = msgs.some(
+            const sessionWroteFiles = request.some(
               (msg) =>
                 (msg.info.role === "assistant" && msg.info.summary === true) ||
                 msg.parts.some(
@@ -2238,7 +2289,7 @@ const layer = Layer.effect(
               // arrived behind an unanswered one (or behind a recovery
               // instruction) belongs to its own caller and is answered on its
               // own turn; quoting its text here would answer the wrong caller.
-              messages: view,
+              messages: request,
               envelope: {
                 system,
                 tools: Object.entries(tools).map(([name, tool]) => ({
@@ -2582,7 +2633,8 @@ const layer = Layer.effect(
         const ours = msgs.findIndex((msg) => msg.info.id === input.messageID)
         // Synthetic continuations and no-reply markers are not newer input:
         // they extend (or annotate) an existing prompt instead of superseding it.
-        const newerUser = ours < 0 ? undefined : msgs.slice(ours + 1).find(isRealUserInput)
+        const newerUser =
+          ours < 0 ? undefined : msgs.slice(ours + 1).find((message) => isRealUserInput(message) && !isBackgroundCompletion(message))
         // A newer prompt may settle this caller only when this caller is not
         // still in a tool step, and the newer prompt actually has a settled
         // answer (not merely an intermediate tool-call generation).
