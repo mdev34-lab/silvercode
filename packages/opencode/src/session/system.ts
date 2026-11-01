@@ -70,7 +70,13 @@ export function provider(model: Provider.Model) {
 }
 
 export interface Interface {
-  readonly environment: (model: Provider.Model) => Effect.Effect<string[]>
+  /**
+   * @param directory the session's working folder, shown instead of the project
+   * directory when a delegated child works somewhere other than where it was
+   * dispatched from. It never replaces the project directory in the prompt: the
+   * child still has to know which project its permissions are measured against.
+   */
+  readonly environment: (model: Provider.Model, directory?: string) => Effect.Effect<string[]>
   readonly skills: (agent: Agent.Info) => Effect.Effect<string | undefined>
   readonly mcp: (agent: Agent.Info, permission?: PermissionV1.Ruleset) => Effect.Effect<string | undefined>
   readonly delegation: (agent: Agent.Info, permission?: PermissionV1.Ruleset) => Effect.Effect<string | undefined>
@@ -89,8 +95,9 @@ const layer = Layer.effect(
     const global = yield* Global.Service
 
     return Service.of({
-      environment: Effect.fn("SystemPrompt.environment")(function* (model: Provider.Model) {
+      environment: Effect.fn("SystemPrompt.environment")(function* (model: Provider.Model, directory?: string) {
         const ctx = yield* InstanceState.context
+        const cwd = directory ?? ctx.directory
         const shell = Shell.name(Shell.acceptable((yield* config.get()).shell))
         const references = yield* Effect.gen(function* () {
           return (yield* (yield* Reference.Service).list()).filter((reference) => reference.description !== undefined)
@@ -100,7 +107,8 @@ const layer = Layer.effect(
             `You are powered by the model named ${model.api.id}. The exact model ID is ${model.providerID}/${model.api.id}`,
             `Here is some useful information about the environment you are running in:`,
             `<env>`,
-            `  Working directory: ${ctx.directory}`,
+            `  Working directory: ${cwd}`,
+            ...(cwd === ctx.directory ? [] : [`  Project directory: ${ctx.directory}`]),
             `  Desktop directory: ${global.desktop ?? "unavailable (do not infer a path)"}`,
             `  Workspace root folder: ${ctx.worktree}`,
             `  Is directory a git repo: ${ctx.project.vcs === "git" ? "yes" : "no"}`,

@@ -285,6 +285,25 @@ describe("session.system", () => {
     { config: { shell: shellFixture.configured } },
   )
 
+  it.instance(
+    "environment names the session's folder and keeps the project directory visible",
+    () =>
+      Effect.gen(function* () {
+        const prompt = yield* SystemPrompt.Service
+        const model = { providerID: "test", api: { id: "model" } } as Provider.Model
+        const project = (yield* prompt.environment(model))[0]
+        // A child that was given a folder of its own still has to know which
+        // project its permissions are measured against.
+        const child = (yield* prompt.environment(model, "/tmp/child-folder"))[0]
+
+        expect(project).toContain("  Working directory: ")
+        expect(project).not.toContain("  Project directory:")
+        expect(child.split("\n").filter((line) => line.startsWith("  Working directory:"))).toHaveLength(1)
+        expect(child).toContain("  Working directory: /tmp/child-folder")
+        expect(child.split("\n").filter((line) => line.startsWith("  Project directory:"))).toHaveLength(1)
+      }),
+  )
+
   it.effect("skills output is sorted by name and stable across calls", () =>
     Effect.gen(function* () {
       const prompt = yield* SystemPrompt.Service

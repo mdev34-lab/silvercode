@@ -48,9 +48,13 @@ export const GrepTool = Tool.define(
           })
 
           const ins = yield* InstanceState.context
-          const requested = path.isAbsolute(params.path ?? ins.directory)
-            ? (params.path ?? ins.directory)
-            : path.join(ins.directory, params.path ?? ".")
+          // The default search root is the session's working folder, which is the
+          // project directory unless a delegated child was given another one. The
+          // external check below still measures against the instance.
+          const base = ctx.cwd ?? ins.directory
+          const requested = path.isAbsolute(params.path ?? base)
+            ? (params.path ?? base)
+            : path.join(base, params.path ?? ".")
           const requestedInfo = yield* fs.stat(requested).pipe(Effect.catch(() => Effect.succeed(undefined)))
           yield* assertExternalDirectoryEffect(ctx, requested, {
             bypass: false,
