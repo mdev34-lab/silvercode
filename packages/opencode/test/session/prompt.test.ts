@@ -1709,12 +1709,12 @@ withMcpTools.instance(
 )
 
 it.instance(
-  "a truncated write call becomes a guided continuation without tripping the doom-loop guard",
+  "a truncated write retry stays outside the doom-loop identical-triplet condition",
   () =>
     Effect.gen(function* () {
-      // `doom_loop` denied: the guard firing would deny the ask and halt this turn, so a
-      // turn that completes is itself evidence it never fired. Everything else stays
-      // allowed so the write actually executes.
+      // Keep `doom_loop` denied so any guard request, if reached, would halt this turn.
+      // The guard-specific evidence below is the structural check on recorded tool parts;
+      // this scenario does not establish that the runtime denial path was exercised.
       const { dir, llm } = yield* useServerConfig((url) => ({
         ...providerCfg(url),
         permission: { "*": "allow", doom_loop: "deny" },
@@ -1752,8 +1752,8 @@ it.instance(
       yield* llm.tool("edit", { filePath: target, oldString: "line one\n", newString: "line one\n" + second })
       yield* llm.text("done")
 
-      // A doom_loop denial would fail the turn here; the completed loop is the first half
-      // of the guard check.
+      // Completing the loop verifies the scripted recovery path; it does not by itself
+      // show that the doom_loop denial branch was reached.
       const result = yield* prompt.loop({ sessionID: session.id })
       expect(result.info.role).toBe("assistant")
 
@@ -1803,8 +1803,8 @@ it.instance(
           expect(identical).toBe(false)
         }
       }
-      // And the guard was live during the run: had it fired, its `doom_loop` ask would
-      // have been denied and this turn would have failed instead of finishing.
+      // The deny rule is a safety condition only if the guard asks. This run's evidence is
+      // the structural no-triplet check above, not a runtime denial observation.
       expect(parts.some((part) => part.type === "text" && part.text === "done")).toBe(true)
     }),
   20_000,
