@@ -111,3 +111,49 @@ export function subagentReview(part: ToolPart) {
   if (analysis === undefined) return undefined
   return { report: delivery.report, analysis }
 }
+
+/**
+ * A background receipt is not reviewer identity. A caller may use this only
+ * after it has established that the supplied transcript is complete; otherwise
+ * an unseen launch or receipt could make an apparent match ambiguous.
+ */
+export function backgroundReview(input: {
+  receipt: TextPart
+  messages: readonly import("@opencode-ai/sdk/v2").Message[]
+  parts: Readonly<Record<string, readonly Part[] | undefined>>
+  sessions: readonly import("@opencode-ai/sdk/v2").Session[]
+  complete: boolean
+}) {
+  if (!input.complete || !input.receipt.synthetic) return undefined
+  const { receipt, messages, parts, sessions } = input
+  if (messages.some((message) => !parts[message.id])) return undefined
+  const owner = messages.find((message) => message.id === receipt.messageID)
+  if (!owner || owner.role !== "user" || owner.sessionID !== receipt.sessionID) return undefined
+  const envelope = receipt.text.match(/^<task id="([^"\n]+)" run="([^"\n]+)" state="completed">\n(?:<summary>([^\n]*)<\/summary>\n)?<task_result>\n([\s\S]*?)\n<\/task_result>\n<termination reason="success"><\/termination>\n<\/task>$/)
+  if (!envelope) return undefined
+  const [, childID, run, , body] = envelope
+  if (!run.startsWith(`${childID}@`) || !/^\d+$/.test(run.slice(childID.length + 1))) return undefined
+  const child = sessions.filter((session) => session.id === childID)
+  if (child.length !== 1 || child[0].parentID !== receipt.sessionID || !child[0].agent || Agent.canonicalID(child[0].agent) !== "review") return undefined
+  const launches = messages.flatMap((message) => (parts[message.id] ?? []).flatMap((part) => {
+    if (part.type !== "tool" || part.tool !== "task" || part.state.status !== "completed") return []
+    return part.state.metadata?.runId === run ? [{ message, part }] : []
+  }))
+  if (launches.length !== 1) return undefined
+  const { message, part } = launches[0]
+  if (message.role !== "assistant" || message.sessionID !== receipt.sessionID || message.id >= owner.id || part.state.status !== "completed") return undefined
+  const metadata = part.state.metadata
+  if (metadata?.background !== true || metadata.parentSessionId !== receipt.sessionID || metadata.sessionId !== childID ||
+      typeof part.state.input.subagent_type !== "string" || Agent.canonicalID(part.state.input.subagent_type) !== "review") return undefined
+  const receipts = messages.flatMap((message) => (parts[message.id] ?? []).filter((candidate) => {
+    if (message.role !== "user" || candidate.type !== "text" || !candidate.synthetic) return false
+    const open = candidate.text.match(/^<task id="([^"\n]+)" run="([^"\n]+)"(?:\s|>)/)
+    return open?.[1] === childID && open[2] === run
+  }))
+  if (receipts.length !== 1 || receipts[0].id !== receipt.id || receipts[0].type !== "text" || receipts[0].text !== receipt.text) return undefined
+  if (!body || /<\/?(?:task|task_result|task_error|summary|termination)(?:\s|>)/.test(body) || hasQuotedTag(body)) return undefined
+  const delivery = ReviewReport.extract([body])
+  if (!delivery.ok) return undefined
+  const analysis = reviewPresentationAnalysis(delivery.analysis)
+  return analysis === undefined ? undefined : { report: delivery.report, analysis }
+}
