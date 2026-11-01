@@ -71,8 +71,7 @@ const code: Agent.Info = {
   name: "code",
   mode: "all",
   native: true,
-  description:
-    "Software-engineering specialist. Runs in Git/project folders with LSP and repo-aware context.",
+  description: "Software-engineering specialist. Runs in Git/project folders with LSP and repo-aware context.",
   permission: Permission.fromConfig({ "*": "allow" }),
   options: {},
 }
@@ -146,7 +145,10 @@ const it = testEffect(
       Agent.node,
       Layer.mock(Agent.Service, {
         list: () => Effect.succeed([build, think, code, scout, engineerReviewer, hiddenPlanner]),
-        get: (name) => Effect.succeed([build, think, code, scout, engineerReviewer, hiddenPlanner].find(agent=>agent.name===name)!),
+        get: (name) =>
+          Effect.succeed(
+            [build, think, code, scout, engineerReviewer, hiddenPlanner].find((agent) => agent.name === name)!,
+          ),
       }),
     ],
     [
@@ -194,7 +196,10 @@ const itPrimaryTools = testEffect(
       Agent.node,
       Layer.mock(Agent.Service, {
         list: () => Effect.succeed([build, think, code, scout, engineerReviewer, hiddenPlanner]),
-        get: (name) => Effect.succeed([build, think, code, scout, engineerReviewer, hiddenPlanner].find(agent=>agent.name===name)!),
+        get: (name) =>
+          Effect.succeed(
+            [build, think, code, scout, engineerReviewer, hiddenPlanner].find((agent) => agent.name === name)!,
+          ),
       }),
     ],
     [
@@ -217,9 +222,10 @@ const itPrimaryTools = testEffect(
     [
       Config.node,
       Layer.mock(Config.Service)({
-        get: () => Effect.succeed({
-          experimental: { primary_tools: ["edit"] },
-        } as unknown as Effect.Success<ReturnType<Config.Interface["get"]>>),
+        get: () =>
+          Effect.succeed({
+            experimental: { primary_tools: ["edit"] },
+          } as unknown as Effect.Success<ReturnType<Config.Interface["get"]>>),
       }),
     ],
   ]),
@@ -285,23 +291,40 @@ describe("session.system", () => {
     { config: { shell: shellFixture.configured } },
   )
 
-  it.instance(
-    "environment names the session's folder and keeps the project directory visible",
-    () =>
-      Effect.gen(function* () {
-        const prompt = yield* SystemPrompt.Service
-        const model = { providerID: "test", api: { id: "model" } } as Provider.Model
-        const project = (yield* prompt.environment(model))[0]
-        // A child that was given a folder of its own still has to know which
-        // project its permissions are measured against.
-        const child = (yield* prompt.environment(model, "/tmp/child-folder"))[0]
+  it.instance("environment names the session's folder and keeps the project directory visible", () =>
+    Effect.gen(function* () {
+      const prompt = yield* SystemPrompt.Service
+      const model = { providerID: "test", api: { id: "model" } } as Provider.Model
+      const project = (yield* prompt.environment(model))[0]
+      // A child that was given a folder of its own still has to know which
+      // project its permissions are measured against.
+      const child = (yield* prompt.environment(model, "/tmp/child-folder"))[0]
 
-        expect(project).toContain("  Working directory: ")
-        expect(project).not.toContain("  Project directory:")
-        expect(child.split("\n").filter((line) => line.startsWith("  Working directory:"))).toHaveLength(1)
-        expect(child).toContain("  Working directory: /tmp/child-folder")
-        expect(child.split("\n").filter((line) => line.startsWith("  Project directory:"))).toHaveLength(1)
-      }),
+      expect(project).toContain("  Working directory: ")
+      expect(project).not.toContain("  Project directory:")
+      expect(child.split("\n").filter((line) => line.startsWith("  Working directory:"))).toHaveLength(1)
+      expect(child).toContain("  Working directory: /tmp/child-folder")
+      expect(child.split("\n").filter((line) => line.startsWith("  Project directory:"))).toHaveLength(1)
+    }),
+  )
+
+  it.instance("environment does not let a child working directory imply the shell default", () =>
+    Effect.gen(function* () {
+      const prompt = yield* SystemPrompt.Service
+      const model = { providerID: "test", api: { id: "model" } } as Provider.Model
+      const project = (yield* prompt.environment(model))[0]
+      const child = (yield* prompt.environment(model, "/tmp/child-folder"))[0]
+
+      // The shell tool still resolves its default and relative workdir from the
+      // instance/project directory. A child folder must not silently look like
+      // the target of a destructive shell command.
+      expect(child).toContain("  File/search/edit tools use the working directory above.")
+      expect(child).toContain(
+        "  Shell commands run in the project directory by default; a relative shell workdir also resolves from the project directory. To run a shell command in the working directory above, pass its absolute path as shell workdir.",
+      )
+      expect(child).not.toContain("Shell commands run in the working directory by default")
+      expect(project).not.toContain("Shell commands run in the project directory by default")
+    }),
   )
 
   it.effect("skills output is sorted by name and stable across calls", () =>
@@ -364,7 +387,9 @@ describe("session.system", () => {
   it.effect("delegation guidance pushes planner and implementer delegation for primary callers", () =>
     Effect.gen(function* () {
       const prompt = yield* SystemPrompt.Service
-      const output = (yield* delegation(prompt, build)) ?? (yield* Effect.fail(new NamedError.Unknown({ message: "missing delegation output" })))
+      const output =
+        (yield* delegation(prompt, build)) ??
+        (yield* Effect.fail(new NamedError.Unknown({ message: "missing delegation output" })))
 
       expect(output).toContain("`think`")
       expect(output).toContain("`code`")
@@ -398,7 +423,9 @@ describe("session.system", () => {
         permission: Permission.fromConfig({ "*": "allow" }),
         options: {},
       }
-      const output = (yield* delegation(prompt, orchestrator)) ?? (yield* Effect.fail(new NamedError.Unknown({ message: "missing delegation output" })))
+      const output =
+        (yield* delegation(prompt, orchestrator)) ??
+        (yield* Effect.fail(new NamedError.Unknown({ message: "missing delegation output" })))
 
       expect(output).toContain("`think`")
       expect(output).toContain("`code`")
@@ -417,7 +444,9 @@ describe("session.system", () => {
   it.effect("delegation guidance still pushes implementer delegation when the planner is denied", () =>
     Effect.gen(function* () {
       const prompt = yield* SystemPrompt.Service
-      const output = (yield* delegation(prompt, { ...build, permission: Permission.fromConfig({ task: { think: "deny" } }) })) ?? (yield* Effect.fail(new NamedError.Unknown({ message: "missing delegation output" })))
+      const output =
+        (yield* delegation(prompt, { ...build, permission: Permission.fromConfig({ task: { think: "deny" } }) })) ??
+        (yield* Effect.fail(new NamedError.Unknown({ message: "missing delegation output" })))
 
       expect(output).toContain("`code`")
       expect(output).toContain("Delegate by default")
@@ -428,7 +457,9 @@ describe("session.system", () => {
   it.effect("delegation guidance still pushes implementer delegation when the session ruleset denies the planner", () =>
     Effect.gen(function* () {
       const prompt = yield* SystemPrompt.Service
-      const output = (yield* delegation(prompt, build, Permission.fromConfig({ task: { think: "deny" } }) )) ?? (yield* Effect.fail(new NamedError.Unknown({ message: "missing delegation output" })))
+      const output =
+        (yield* delegation(prompt, build, Permission.fromConfig({ task: { think: "deny" } }))) ??
+        (yield* Effect.fail(new NamedError.Unknown({ message: "missing delegation output" })))
 
       expect(output).toContain("`code`")
       expect(output).toContain("Delegate by default")
@@ -439,7 +470,9 @@ describe("session.system", () => {
   it.effect("delegation guidance falls back to the planning nudge when the implementer is denied", () =>
     Effect.gen(function* () {
       const prompt = yield* SystemPrompt.Service
-      const output = (yield* delegation(prompt, { ...build, permission: Permission.fromConfig({ task: { code: "deny" } }) })) ?? (yield* Effect.fail(new NamedError.Unknown({ message: "missing delegation output" })))
+      const output =
+        (yield* delegation(prompt, { ...build, permission: Permission.fromConfig({ task: { code: "deny" } }) })) ??
+        (yield* Effect.fail(new NamedError.Unknown({ message: "missing delegation output" })))
 
       expect(output).toContain("`think`")
       expect(output).toContain("non-trivial implementation planning")
@@ -455,7 +488,9 @@ describe("session.system", () => {
       // (deriveSubagentSessionPermission), so the child could not write and
       // advertising `code` as an implementer would promise a delegation that
       // fails. Planner guidance remains.
-      const output = (yield* delegation(prompt, build, Permission.fromConfig({ edit: { "*": "deny" } }) )) ?? (yield* Effect.fail(new NamedError.Unknown({ message: "missing delegation output" })))
+      const output =
+        (yield* delegation(prompt, build, Permission.fromConfig({ edit: { "*": "deny" } }))) ??
+        (yield* Effect.fail(new NamedError.Unknown({ message: "missing delegation output" })))
 
       expect(output).toContain("`think`")
       expect(output).toContain("non-trivial implementation planning")
@@ -517,11 +552,8 @@ describe("session.system", () => {
       // but the matcher's `*` crosses `/`, so it still denies the child's
       // edits under every src subtree, including the worktree's.
       const output =
-        (yield* delegation(
-          prompt,
-          build,
-          Permission.fromConfig({ edit: { "**/src/**": "deny" } }),
-        )) ?? (yield* Effect.fail(new NamedError.Unknown({ message: "missing delegation output" })))
+        (yield* delegation(prompt, build, Permission.fromConfig({ edit: { "**/src/**": "deny" } }))) ??
+        (yield* Effect.fail(new NamedError.Unknown({ message: "missing delegation output" })))
 
       expect(output).toContain("`code`")
       expect(output).toContain("restrict subagent edits in parts of the worktree")
@@ -864,11 +896,8 @@ describe("session.system", () => {
     Effect.gen(function* () {
       const prompt = yield* SystemPrompt.Service
       const output =
-        (yield* delegation(
-          prompt,
-          build,
-          Permission.fromConfig({ edit: { "src/**": "deny" } }),
-        )) ?? (yield* Effect.fail(new NamedError.Unknown({ message: "missing delegation output" })))
+        (yield* delegation(prompt, build, Permission.fromConfig({ edit: { "src/**": "deny" } }))) ??
+        (yield* Effect.fail(new NamedError.Unknown({ message: "missing delegation output" })))
 
       expect(output).toContain("`code`")
       expect(output).toContain("restrict subagent edits in parts of the worktree")
@@ -890,9 +919,7 @@ describe("session.system", () => {
   )
 
   test("think prompt keeps the up-front plan output contract", async () => {
-    const text = await Bun.file(
-      new URL("../../src/agent/prompt/think.txt", import.meta.url),
-    ).text()
+    const text = await Bun.file(new URL("../../src/agent/prompt/think.txt", import.meta.url)).text()
     expect(text).toContain("overview")
     expect(text).toContain("numbered steps")
     expect(text).toContain("independently verifiable")

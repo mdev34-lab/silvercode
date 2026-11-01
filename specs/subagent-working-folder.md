@@ -26,11 +26,16 @@ where its relative paths resolve; it never changes what the child may reach.
 - Folders are compared the way the platform compares them: case-insensitively on
   Windows, exactly everywhere else. A resume that only re-spells the case is
   therefore the same task on Windows and a different folder elsewhere, where it
-  is refused.
+  is refused. The non-Windows comparison is exact; macOS case-insensitive-volume
+  behavior through realpath has not been verified here.
 - `read`, `grep`, `glob`, `edit`, `write` and `apply_patch` resolve relative
   paths - and, for the search tools, their default root - from the session's
   folder. The system prompt reports it as `Working directory` and keeps the
-  project directory visible as `Project directory`.
+  project directory visible as `Project directory`. When those differ, the
+  prompt and task description say explicitly that file/search/edit tools use
+  the working directory, while shell commands and relative shell `workdir`
+  still use the project directory; an absolute shell `workdir` is the current
+  way to run a command in the child's folder.
 
 ## Permissions
 
@@ -57,9 +62,7 @@ The folder is a resolution base, never a boundary:
 child's default shell folder does not follow its selection:
 
 ```ts
-const cwd = params.workdir
-  ? yield* resolvePath(params.workdir, instanceCtx.directory, shell)
-  : instanceCtx.directory
+const cwd = params.workdir ? yield * resolvePath(params.workdir, instanceCtx.directory, shell) : instanceCtx.directory
 ```
 
 Both branches of that line are in `packages/opencode/src/tool/shell.ts`, which

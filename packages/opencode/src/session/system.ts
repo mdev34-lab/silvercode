@@ -71,10 +71,10 @@ export function provider(model: Provider.Model) {
 
 export interface Interface {
   /**
-   * @param directory the session's working folder, shown instead of the project
-   * directory when a delegated child works somewhere other than where it was
-   * dispatched from. It never replaces the project directory in the prompt: the
-   * child still has to know which project its permissions are measured against.
+   * @param directory the session's file-tool working folder. When it differs
+   * from the instance/project directory, the prompt shows both and says that
+   * shell cwd still uses the project directory. The child still has to know
+   * which project its permissions are measured against.
    */
   readonly environment: (model: Provider.Model, directory?: string) => Effect.Effect<string[]>
   readonly skills: (agent: Agent.Info) => Effect.Effect<string | undefined>
@@ -108,7 +108,13 @@ const layer = Layer.effect(
             `Here is some useful information about the environment you are running in:`,
             `<env>`,
             `  Working directory: ${cwd}`,
-            ...(cwd === ctx.directory ? [] : [`  Project directory: ${ctx.directory}`]),
+            ...(cwd === ctx.directory
+              ? []
+              : [
+                  `  Project directory: ${ctx.directory}`,
+                  `  File/search/edit tools use the working directory above.`,
+                  `  Shell commands run in the project directory by default; a relative shell workdir also resolves from the project directory. To run a shell command in the working directory above, pass its absolute path as shell workdir.`,
+                ]),
             `  Desktop directory: ${global.desktop ?? "unavailable (do not infer a path)"}`,
             `  Workspace root folder: ${ctx.worktree}`,
             `  Is directory a git repo: ${ctx.project.vcs === "git" ? "yes" : "no"}`,
