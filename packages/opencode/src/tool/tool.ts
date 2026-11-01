@@ -39,6 +39,19 @@ export type Context<M extends Metadata = Metadata> = {
   sessionID: SessionID
   messageID: MessageID
   agent: string
+  /**
+   * The working folder this session's file, search, and edit tools resolve
+   * relative paths from and use as their default search root. A delegated child
+   * can work in a folder other than the project it was dispatched from; shell
+   * still uses the instance directory until its coordinated cwd change lands.
+   *
+   * This is a resolution base, never a permission boundary: `external_directory`
+   * approval is still measured against the instance the session runs in, so a
+   * folder chosen outside the project does not grant access to it. Callers that
+   * omit it resolve from that instance directory, which is where every tool
+   * resolved before this field existed.
+   */
+  cwd?: string
   abort: AbortSignal
   callID?: string
   extra?: { [key: string]: unknown }

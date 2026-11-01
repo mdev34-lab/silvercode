@@ -313,6 +313,10 @@ exports[`tool parameters JSON Schema (wire shape) task 1`] = `
       "description": "A short (3-5 words) description of the task",
       "type": "string",
     },
+    "directory": {
+      "description": "Working folder for the child's file, search, and edit tools (read, grep, glob, edit, write, apply_patch); omit to inherit this session's folder. Shell commands still default to the project directory and resolve relative workdir from the project directory, so shell commands meant for this folder must pass an explicit absolute workdir. A resumed task keeps the folder it was created with. Choosing a folder is not an authorization: paths outside the project still ask the usual permissions.",
+      "type": "string",
+    },
     "effort": {
       "description": "Override the child's effort policy; omit to inherit.",
       "enum": [

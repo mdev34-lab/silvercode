@@ -77,9 +77,11 @@ export const EditTool = Tool.define(
           }
 
           const instance = yield* InstanceState.context
+          // Relative paths resolve from the session's working folder, which is the
+          // project directory unless a delegated child was given another one.
           const filePath = path.isAbsolute(params.filePath)
             ? params.filePath
-            : path.join(instance.directory, params.filePath)
+            : path.join(ctx.cwd ?? instance.directory, params.filePath)
           yield* assertExternalDirectoryEffect(ctx, filePath)
 
           let diff = ""

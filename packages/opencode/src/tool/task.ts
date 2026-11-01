@@ -25,6 +25,8 @@ import { Database } from "@opencode-ai/core/database/database"
 import { AgentEffort } from "@opencode-ai/schema/agent-effort"
 import { NotFoundError } from "@/storage/storage"
 import { Permission } from "@/permission"
+import { Workdir } from "@/session/workdir"
+import { FSUtil } from "@opencode-ai/core/fs-util"
 import type { PermissionV1 } from "@opencode-ai/core/v1/permission"
 
 export interface TaskPromptOps {
@@ -114,6 +116,10 @@ const BaseParameterFields = {
   subagent_type: Schema.String.annotate({ description: SUBAGENT_TYPE_FALLBACK }),
   task_id: Schema.optional(Schema.String).annotate({
     description: "Resume a previous subagent session by its task_id",
+  }),
+  directory: Schema.optional(Schema.String).annotate({
+    description:
+      "Working folder for the child's file, search, and edit tools (read, grep, glob, edit, write, apply_patch); omit to inherit this session's folder. Shell commands still default to the project directory and resolve relative workdir from the project directory, so shell commands meant for this folder must pass an explicit absolute workdir. A resumed task keeps the folder it was created with. Choosing a folder is not an authorization: paths outside the project still ask the usual permissions.",
   }),
   command: Schema.optional(Schema.String).annotate({ description: "Triggering command" }),
 }
@@ -216,6 +222,7 @@ export const TaskTool = Tool.define(
     receipts.set(background, receipted)
     const config = yield* Config.Service
     const sessions = yield* Session.Service
+    const fs = yield* FSUtil.Service
     const scope = yield* Scope.Scope
     const database = yield* Database.Service
     const events = yield* EventV2Bridge.Service
@@ -427,6 +434,40 @@ export const TaskTool = Tool.define(
         (session.parentID !== ctx.sessionID || session.agent !== next.name)
       )
         return yield* Effect.fail(new Error("Workflow stages cannot reuse a child owned by another session."))
+      // The folder this dispatch works in. A relative request resolves from the
+      // folder the caller already works in, so it means the same thing whether the
+      // caller is the project session or a child that was given a folder of its
+      // own. Canonicalizing here is what keeps the external boundary honest: a
+      // folder reached through a symlink is recorded as its real target, so an
+      // external tree can never be selected under an internal-looking name.
+      //
+      // Selection is not authorization. Nothing below adds an allow rule, and the
+      // instance this session runs in stays the anchor every `external_directory`
+      // decision is measured against, so this folder - and the paths under it when
+      // it sits outside the project - is reached through the permissions that
+      // already gate them.
+      const parentDirectory = Workdir.of(parent)
+      const requestedDirectory =
+        params.directory === undefined
+          ? undefined
+          : yield* Workdir.resolve({ fs, requested: params.directory, base: parentDirectory })
+      // A session's folder is fixed when it is created. Resume keeps the recorded
+      // selection - or, for a session created before folders were selectable, the
+      // project directory it was created in - so a resumed child cannot silently
+      // start resolving its paths somewhere its earlier work never happened.
+      const recordedDirectory = session ? Workdir.of(session) : undefined
+      if (
+        recordedDirectory !== undefined &&
+        requestedDirectory !== undefined &&
+        !Workdir.same(recordedDirectory, requestedDirectory)
+      )
+        return yield* Effect.fail(
+          new Error(
+            `Task ${session!.id} already works in ${recordedDirectory}. A resumed task keeps its working folder; start a new task to work in ${requestedDirectory}.`,
+          ),
+        )
+      const workdir = recordedDirectory ?? requestedDirectory ?? parentDirectory
+
       const childPermission = deriveSubagentSessionPermission({
         parentSessionPermission: parent.permission ?? [],
         subagent: next,
@@ -441,6 +482,9 @@ export const TaskTool = Tool.define(
           parentID: ctx.sessionID,
           title: params.description + ` (@${next.name} subagent)`,
           agent: next.name,
+          // Recorded once, at creation, so the foreground run, the background run
+          // and every later resume resolve from the same folder.
+          metadata: Workdir.select(undefined, workdir),
           permission: [
             ...childPermission,
             ...childToolDenies.filter(
