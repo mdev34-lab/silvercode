@@ -151,6 +151,9 @@ export function backgroundReview(input: {
     return open?.[1] === childID && open[2] === run
   }))
   if (receipts.length !== 1 || receipts[0].id !== receipt.id || receipts[0].type !== "text" || receipts[0].text !== receipt.text) return undefined
+  // A child that wrote files is explicitly handed off as unreviewed even if
+  // its report says approved. Do not present that pending handoff as a verdict.
+  if (body.startsWith("UNREVIEWED: This child changed files. Parent must run Review before reporting success.\n")) return undefined
   if (!body || /<\/?(?:task|task_result|task_error|summary|termination)(?:\s|>)/.test(body) || hasQuotedTag(body)) return undefined
   const delivery = ReviewReport.extract([body])
   if (!delivery.ok) return undefined

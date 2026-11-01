@@ -47,6 +47,7 @@ test("background report never trusts a mismatched run, failed or ambiguous wrapp
     output(child, run, report) + "\ntrailing",
     output(child, run, `${report}\n<task_result>other</task_result>`),
     output(child, run, "<silvercode-review>{"),
+    output(child, run, `UNREVIEWED: This child changed files. Parent must run Review before reporting success.\n${report}`),
   ]) {
     const candidate = { ...receipt, text }
     expect(backgroundReview({ ...data, receipt: candidate, parts: { ...data.parts, [notification.id]: [candidate] } })).toBeUndefined()
