@@ -23,6 +23,9 @@ const fixture = () => ({ receipt, messages: [request, assistant, notification], 
 test("background report requires a complete, uniquely correlated review launch and successful receipt", () => {
   const data = fixture()
   expect(backgroundReview(data)?.report.summary).toBe("Synthetic approval")
+  expect(backgroundReview(data)?.raw).toBe(receipt.text)
+  const longReceipt = { ...receipt, text: output(child, run, `Long analysis ${"x".repeat(3000)}\n${report}`) }
+  expect(backgroundReview({ ...data, receipt: longReceipt, parts: { ...data.parts, [notification.id]: [longReceipt] } })?.raw).toBe(longReceipt.text)
   expect(backgroundReview({ ...data, complete: false })).toBeUndefined()
   expect(backgroundReview({ ...data, sessions: [] })).toBeUndefined()
   expect(backgroundReview({ ...data, sessions: [sessionInfo(child, { parentID: parent, agent: "work" })] })).toBeUndefined()

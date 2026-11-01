@@ -124,7 +124,7 @@ export function backgroundReview(input: {
   sessions: readonly import("@opencode-ai/sdk/v2").Session[]
   complete: boolean
 }) {
-  if (!input.complete || !input.receipt.synthetic) return undefined
+  if (!input.complete || !input.receipt.synthetic || input.receipt.ignored) return undefined
   const { receipt, messages, parts, sessions } = input
   if (messages.some((message) => !parts[message.id])) return undefined
   const owner = messages.find((message) => message.id === receipt.messageID)
@@ -155,5 +155,5 @@ export function backgroundReview(input: {
   const delivery = ReviewReport.extract([body])
   if (!delivery.ok) return undefined
   const analysis = reviewPresentationAnalysis(delivery.analysis)
-  return analysis === undefined ? undefined : { report: delivery.report, analysis }
+  return analysis === undefined ? undefined : { report: delivery.report, analysis, raw: receipt.text }
 }

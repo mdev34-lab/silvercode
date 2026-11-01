@@ -2702,7 +2702,7 @@ export function reviewFindingLocation(finding: ReviewReport.Finding): string | u
   return file + line
 }
 
-function ReviewFinish(props: { review: { report: ReviewReport.Info; analysis: string }; part?: ToolPart }) {
+function ReviewFinish(props: { review: { report: ReviewReport.Info; analysis: string; raw?: string }; part?: ToolPart }) {
   const { theme } = useTheme()
   const ctx = use()
   const [expanded, setExpanded] = createSignal(false)
@@ -2729,7 +2729,9 @@ function ReviewFinish(props: { review: { report: ReviewReport.Info; analysis: st
   // The envelope is stripped from the default view; the exact canonical
   // JSON stays reachable on demand, re-serialized the same way the runtime
   // delivers it to the parent agent.
-  const rawReport = createMemo(() => capOutputLines(ReviewReport.envelope(report())))
+  // When a delivery supplies the original receipt, preserve it in full rather
+  // than truncating lines or replacing earlier envelopes with reserialized JSON.
+  const rawReport = createMemo(() => props.review.raw ?? capOutputLines(ReviewReport.envelope(report())))
   const revision = createMemo(() => (report().revision ? Locale.truncateMiddle(report().revision, 24) : undefined))
 
   const severityColor = (severity: ReviewReport.Finding["severity"]) =>
