@@ -1772,7 +1772,8 @@ it.instance(
       const executionsOf = (name: string) => executions.filter((part) => part.tool === name)
       const repaired = parts.find((part) => part.type === "tool" && part.tool === "invalid")
       expect(repaired?.type).toBe("tool")
-      if (repaired?.type !== "tool" || repaired.state.status !== "completed") throw new Error("expected a completed repair")
+      if (repaired?.type !== "tool" || repaired.state.status !== "completed")
+        throw new Error("expected a completed repair")
       expect(repaired.state.input).toMatchObject({ tool: "write" })
       expect(repaired.state.output).toContain(target)
       expect(repaired.state.output).toContain("did not execute")
@@ -1783,7 +1784,9 @@ it.instance(
       expect(repaired.state.output).toContain("write replaces the entire file")
       // the fragment's unfinished body is never presented as recovered content: the
       // only echo of the raw text is the provider/parser error inside the parenthetical
-      const recovered = repaired.state.output.slice(repaired.state.output.indexOf("Recovered from the partial arguments:"))
+      const recovered = repaired.state.output.slice(
+        repaired.state.output.indexOf("Recovered from the partial arguments:"),
+      )
       expect(recovered).not.toContain("line two")
       expect(recovered).not.toContain("Report")
 
@@ -6741,7 +6744,7 @@ it.instance(
 
       // Both responses loop: one recovery is allowed, the second trip must stop.
       yield* llm.push(loopingReply(), loopingReply())
-      yield* user(chat.id, "please do the task")
+      const task = yield* user(chat.id, "please do the task")
 
       const result = yield* prompt.loop({ sessionID: chat.id })
       expect(result.info.role).toBe("assistant")
@@ -6762,6 +6765,14 @@ it.instance(
         expect(last.info.error).toBeDefined()
         expect(RepetitionGuard.isStoredError(last.info.error)).toBe(true)
       }
+      // An idle resume of the same prompt returns its terminal result; it does
+      // not reset the recovery budget or spend a third provider request.
+      const resumed = yield* prompt.loop({ sessionID: chat.id, messageID: task.id })
+      expect(resumed.info.id).toBe(result.info.id)
+      expect(yield* llm.calls).toBe(2)
+      expect(yield* llm.misses).toEqual([])
+      const status = yield* SessionStatus.Service
+      expect(yield* status.get(chat.id)).toEqual({ type: "idle" })
     }),
   { config: cfg },
 )
@@ -6922,6 +6933,17 @@ it.instance(
 const settled = <A>(fibers: readonly [Fiber.Fiber<A, unknown>, Fiber.Fiber<A, unknown>], message: string) =>
   awaitWithTimeout(Effect.all([Fiber.await(fibers[0]), Fiber.await(fibers[1])]), message, "15 seconds")
 
+function assistantExit(exit: Exit.Exit<SessionV1.WithParts, unknown>) {
+  expect(Exit.isSuccess(exit)).toBe(true)
+  if (Exit.isFailure(exit)) throw new Error("prompt caller failed")
+  expect(exit.value.info.role).toBe("assistant")
+  if (exit.value.info.role !== "assistant") throw new Error("prompt caller did not receive an assistant")
+  return { ...exit.value, info: exit.value.info }
+}
+
+const textParts = (message: SessionV1.WithParts) =>
+  message.parts.flatMap((part) => (part.type === "text" ? [part.text] : []))
+
 it.instance(
   "repetition-guard recovery: a prompt queued before the first trip keeps its own turn",
   () =>
@@ -6980,22 +7002,26 @@ it.instance(
       yield* Deferred.succeed(gate, void 0)
       const [exitPrimary, exitQueued] = yield* settled([primary, queued], "queued callers never settled")
 
-      expect(Exit.isSuccess(exitPrimary)).toBe(true)
-      expect(Exit.isSuccess(exitQueued)).toBe(true)
-      if (Exit.isSuccess(exitPrimary) && exitPrimary.value.info.role === "assistant") {
-        expect(exitPrimary.value.info.parentID).toBe(primaryID)
-        expect(RepetitionGuard.isStoredError(exitPrimary.value.info.error)).toBe(true)
-      }
-      if (Exit.isSuccess(exitQueued) && exitQueued.value.info.role === "assistant") {
-        expect(exitQueued.value.info.parentID).toBe(queuedID)
-        expect(exitQueued.value.info.error).toBeUndefined()
-      }
+      const primaryResult = assistantExit(exitPrimary)
+      const queuedResult = assistantExit(exitQueued)
+      expect(primaryResult.info.parentID).toBe(primaryID)
+      expect(RepetitionGuard.isStoredError(primaryResult.info.error)).toBe(true)
+      expect(textParts(primaryResult).join("")).toContain(RECOVERY_PREFIX)
+      expect(queuedResult.info.parentID).toBe(queuedID)
+      expect(queuedResult.info.error).toBeUndefined()
+      expect(textParts(queuedResult)).toEqual(["Answered the queued request on its own turn."])
 
       const messages = yield* sessions.messages({ sessionID: chat.id })
+      expect(messages.find((message) => message.info.id === primaryResult.info.id)).toEqual(primaryResult)
+      expect(messages.find((message) => message.info.id === queuedResult.info.id)).toEqual(queuedResult)
+      expect(continuesPrompt(messages, primaryResult, primaryID)).toBe(true)
+      expect(continuesPrompt(messages, queuedResult, queuedID)).toBe(true)
+      expect(continuesPrompt(messages, queuedResult, primaryID)).toBe(false)
       // No synthetic continuation was injected after the newer real input.
       expect(repetitionRecoveriesIn(messages)).toHaveLength(0)
       const assistants = messages.filter((message) => message.info.role === "assistant")
       expect(assistants).toHaveLength(2)
+      expect(assistants.flatMap((message) => message.parts.filter((part) => part.type === "tool"))).toHaveLength(0)
       // The aborted prompt spends exactly one request: no recovery was granted
       // to it once newer real input was waiting, and the queued prompt is a new
       // turn rather than a second attempt at the aborted one.
@@ -7009,6 +7035,8 @@ it.instance(
       // continuation: its own request carries it and no recovery nudge.
       const inputs = turnInputs(yield* llm.inputs)
       expect(inputs).toHaveLength(2)
+      expect(JSON.stringify(inputs[0])).toContain("please do the task")
+      expect(JSON.stringify(inputs[0])).not.toContain("queued before the guard tripped")
       expect(JSON.stringify(inputs[1])).toContain("queued before the guard tripped")
       expect(JSON.stringify(inputs[1])).not.toContain("cut off by the repetition guard")
       // It stays visible in the durable transcript with its exact text.
@@ -7080,8 +7108,8 @@ it.instance(
       yield* Deferred.succeed(gate, void 0)
       const [exitPrimary, exitQueued] = yield* settled([primary, queued], "queued callers never settled")
 
-      expect(Exit.isSuccess(exitPrimary)).toBe(true)
-      expect(Exit.isSuccess(exitQueued)).toBe(true)
+      const primaryResult = assistantExit(exitPrimary)
+      const queuedResult = assistantExit(exitQueued)
       const messages = yield* sessions.messages({ sessionID: chat.id })
       const recoveries = repetitionRecoveriesIn(messages)
       expect(recoveries).toHaveLength(1)
@@ -7089,17 +7117,26 @@ it.instance(
       const recoveryID = recovery.info.id
       // The exhausted lineage ends on its own surfaced error, and the caller
       // waiting on it settles there instead of borrowing the newer answer.
-      if (Exit.isSuccess(exitPrimary) && exitPrimary.value.info.role === "assistant") {
-        expect(exitPrimary.value.info.parentID).toBe(recoveryID)
-        expect(RepetitionGuard.isStoredError(exitPrimary.value.info.error)).toBe(true)
-      }
-      if (Exit.isSuccess(exitQueued) && exitQueued.value.info.role === "assistant") {
-        expect(exitQueued.value.info.parentID).toBe(queuedID)
-        expect(exitQueued.value.info.error).toBeUndefined()
-      }
+      expect(primaryResult.info.parentID).toBe(recoveryID)
+      expect(RepetitionGuard.isStoredError(primaryResult.info.error)).toBe(true)
+      expect(textParts(primaryResult).join("")).toContain(RECOVERY_PREFIX)
+      expect(queuedResult.info.parentID).toBe(queuedID)
+      expect(queuedResult.info.error).toBeUndefined()
+      expect(textParts(queuedResult)).toEqual(["Answered the queued request on its own turn."])
+      expect(messages.find((message) => message.info.id === primaryResult.info.id)).toEqual(primaryResult)
+      expect(messages.find((message) => message.info.id === queuedResult.info.id)).toEqual(queuedResult)
+      expect(continuesPrompt(messages, primaryResult, primaryID)).toBe(true)
+      expect(continuesPrompt(messages, queuedResult, queuedID)).toBe(true)
+      expect(continuesPrompt(messages, queuedResult, primaryID)).toBe(false)
+      const [recoveryPart] = recovery.parts
+      expect(recoveryPart?.type === "text" ? recoveryPart.metadata?.repetitionRecovery : undefined).toEqual({
+        promptID: primaryID,
+        attempt: 1,
+      })
 
       const assistants = messages.filter((message) => message.info.role === "assistant")
       expect(assistants).toHaveLength(3)
+      expect(assistants.flatMap((message) => message.parts.filter((part) => part.type === "tool"))).toHaveLength(0)
       // Two requests for the aborted lineage (trip plus its one recovery) and
       // one new request that answers the queued prompt; nothing replayed, no
       // manual follow-up needed, no unbounded re-entry.
@@ -7111,6 +7148,12 @@ it.instance(
       // The continuation was created before the queued input, never after it.
       const order = messages.map((message) => message.info.id)
       expect(order.indexOf(recoveryID)).toBeLessThan(order.indexOf(queuedID))
+      const inputs = turnInputs(yield* llm.inputs)
+      expect(inputs).toHaveLength(3)
+      expect(JSON.stringify(inputs[0])).toContain("please do the task")
+      expect(JSON.stringify(inputs[1])).toContain("cut off by the repetition guard")
+      expect(JSON.stringify(inputs[1])).not.toContain("queued during the recovery")
+      expect(JSON.stringify(inputs[2])).toContain("queued during the recovery")
     }),
   { config: cfg },
   30_000,
@@ -7173,8 +7216,8 @@ it.instance(
       yield* Deferred.succeed(gate, void 0)
       const [exitPrimary, exitQueued] = yield* settled([primary, queued], "queued callers never settled")
 
-      expect(Exit.isSuccess(exitPrimary)).toBe(true)
-      expect(Exit.isSuccess(exitQueued)).toBe(true)
+      const primaryResult = assistantExit(exitPrimary)
+      const queuedResult = assistantExit(exitQueued)
 
       const messages = yield* sessions.messages({ sessionID: chat.id })
       const recoveries = repetitionRecoveriesIn(messages)
@@ -7183,18 +7226,22 @@ it.instance(
       const recoveryID = recovery.info.id
 
       // Primary caller settles on the recovery that continued its prompt.
-      if (Exit.isSuccess(exitPrimary) && exitPrimary.value.info.role === "assistant") {
-        expect(exitPrimary.value.info.parentID).toBe(recoveryID)
-        expect(exitPrimary.value.info.error).toBeUndefined()
-      }
+      expect(primaryResult.info.parentID).toBe(recoveryID)
+      expect(primaryResult.info.error).toBeUndefined()
+      expect(textParts(primaryResult)).toEqual(["Recovered and finished the task."])
       // Queued caller settles on the answer to its own prompt.
-      if (Exit.isSuccess(exitQueued) && exitQueued.value.info.role === "assistant") {
-        expect(exitQueued.value.info.parentID).toBe(queuedID)
-        expect(exitQueued.value.info.error).toBeUndefined()
-      }
+      expect(queuedResult.info.parentID).toBe(queuedID)
+      expect(queuedResult.info.error).toBeUndefined()
+      expect(textParts(queuedResult)).toEqual(["Answered the queued request on its own turn."])
+      expect(messages.find((message) => message.info.id === primaryResult.info.id)).toEqual(primaryResult)
+      expect(messages.find((message) => message.info.id === queuedResult.info.id)).toEqual(queuedResult)
+      expect(continuesPrompt(messages, primaryResult, primaryID)).toBe(true)
+      expect(continuesPrompt(messages, queuedResult, queuedID)).toBe(true)
+      expect(continuesPrompt(messages, queuedResult, primaryID)).toBe(false)
 
       const assistants = messages.filter((message) => message.info.role === "assistant")
       expect(assistants).toHaveLength(3)
+      expect(assistants.flatMap((message) => message.parts.filter((part) => part.type === "tool"))).toHaveLength(0)
       expect(yield* llm.calls).toBe(3)
       expect(yield* llm.pending).toBe(0)
       expect(yield* llm.misses).toEqual([])
@@ -7218,4 +7265,111 @@ it.instance(
     }),
   { config: cfg },
   30_000,
+)
+
+it.instance(
+  "repetition-guard recovery: two identical no-progress results never answer another prompt",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const events = yield* EventV2Bridge.Service
+      const chat = yield* sessions.create({ title: "Historical recovery" })
+
+      // Older transcripts can contain the original bug: a recovery for the first
+      // prompt was saved after a second real prompt. Its answer belongs to the
+      // first prompt, and the second has no answer at all.
+      const primary = yield* user(chat.id, "first prompt")
+      const aborted: SessionV1.Assistant = {
+        id: MessageID.ascending(),
+        role: "assistant",
+        parentID: primary.id,
+        sessionID: chat.id,
+        mode: "work",
+        agent: "work",
+        cost: 0,
+        path: { cwd: "/tmp", root: "/tmp" },
+        tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+        modelID: ref.modelID,
+        providerID: ref.providerID,
+        time: { created: Date.now(), completed: Date.now() },
+        error: new NamedError.Unknown({
+          message: RepetitionGuard.REPETITION_MESSAGE,
+          ref: RepetitionGuard.ERROR_REF,
+        }).toObject(),
+      }
+      yield* sessions.updateMessage(aborted)
+      const queued = yield* user(chat.id, "second prompt")
+      const continuation = yield* sessions.updateMessage({
+        id: MessageID.ascending(),
+        role: "user",
+        sessionID: chat.id,
+        agent: "work",
+        model: ref,
+        time: { created: Date.now() },
+      })
+      yield* sessions.updatePart({
+        id: PartID.ascending(),
+        messageID: continuation.id,
+        sessionID: chat.id,
+        type: "text",
+        synthetic: true,
+        text: "Recovery for the first prompt",
+        metadata: { repetitionRecovery: { promptID: primary.id, attempt: 1 } },
+      })
+      const otherAnswer: SessionV1.Assistant = {
+        ...aborted,
+        id: MessageID.ascending(),
+        parentID: continuation.id,
+        error: undefined,
+        finish: "stop",
+        time: { created: Date.now(), completed: Date.now() },
+      }
+      yield* sessions.updateMessage(otherAnswer)
+      yield* sessions.updatePart({
+        id: PartID.ascending(),
+        messageID: otherAnswer.id,
+        sessionID: chat.id,
+        type: "text",
+        text: "This answer belongs to the first prompt.",
+      })
+
+      let idleRuns = 0
+      const off = yield* events.listen((event) =>
+        Effect.sync(() => {
+          if (event.type !== SessionStatus.Event.Idle.type) return
+          if (typeof event.data !== "object" || event.data === null || !("sessionID" in event.data)) return
+          if (event.data.sessionID === chat.id) idleRuns++
+        }),
+      )
+      yield* Effect.addFinalizer(() => off)
+
+      // Each real run finds the already-answered continuation and returns the
+      // same unrelated assistant, without contacting the model. Two idle events
+      // prove that the repeated-result backstop was actually exercised.
+      const result = yield* awaitWithTimeout(
+        prompt.loop({ sessionID: chat.id, messageID: queued.id }),
+        "repeated-result fallback never settled",
+        "10 seconds",
+      )
+      expect(idleRuns).toBe(2)
+      expect(yield* llm.calls).toBe(0)
+      expect(yield* llm.misses).toEqual([])
+      expect(result.info.role).toBe("assistant")
+      if (result.info.role !== "assistant") throw new Error("expected an assistant result for the second prompt")
+      expect(result.info.id).not.toBe(otherAnswer.id)
+      expect(result.info.parentID).toBe(queued.id)
+      expect(result.info.error).toMatchObject({
+        name: "UnknownError",
+        data: { message: expect.stringContaining("no progress") },
+      })
+      expect(result.parts.filter((part) => part.type === "text").map((part) => part.text)).toEqual([])
+      const stored = yield* sessions.messages({ sessionID: chat.id })
+      expect(stored.find((message) => message.info.id === result.info.id)).toEqual(result)
+      const status = yield* SessionStatus.Service
+      expect(yield* status.get(chat.id)).toEqual({ type: "idle" })
+    }),
+  { config: cfg },
+  20_000,
 )

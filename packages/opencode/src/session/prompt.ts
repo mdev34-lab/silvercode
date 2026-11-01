@@ -1335,15 +1335,25 @@ const layer = Layer.effect(
       throw new Error("Impossible")
     })
 
-    const abortedResult = Effect.fnUntraced(function* (input: LoopInput) {
+    const terminalResult = Effect.fnUntraced(function* (
+      input: LoopInput,
+      error: NonNullable<SessionV1.Assistant["error"]>,
+      requirePrompt = false,
+    ) {
       const messageID = input.messageID
-      if (!messageID) return yield* lastAssistant(input.sessionID)
+      if (!messageID) {
+        if (requirePrompt) throw new Error("Cannot settle an unanswered prompt without its message ID")
+        return yield* lastAssistant(input.sessionID)
+      }
       const existing = yield* sessions
         .findMessage(input.sessionID, (m) => m.info.role === "assistant" && m.info.parentID === messageID)
         .pipe(Effect.orDie)
       if (Option.isSome(existing)) return existing.value
       const user = yield* sessions.findMessage(input.sessionID, (m) => m.info.id === messageID).pipe(Effect.orDie)
-      if (Option.isNone(user) || user.value.info.role !== "user") return yield* lastAssistant(input.sessionID)
+      if (Option.isNone(user) || user.value.info.role !== "user") {
+        if (requirePrompt) throw new Error(`Cannot settle missing user prompt ${messageID}`)
+        return yield* lastAssistant(input.sessionID)
+      }
 
       const ctx = yield* InstanceState.context
       const now = Date.now()
@@ -1361,11 +1371,14 @@ const layer = Layer.effect(
         providerID: user.value.info.model.providerID,
         time: { created: now, completed: now },
         sessionID: input.sessionID,
-        error: new SessionV1.AbortedError({ message: "Aborted" }).toObject(),
+        error,
       }
       yield* sessions.updateMessage(info)
       return { info, parts: [] }
     })
+
+    const abortedResult = (input: LoopInput) =>
+      terminalResult(input, new SessionV1.AbortedError({ message: "Aborted" }).toObject())
 
     // Hard backstop for a review that ignored the recovery nudge (issue #176).
     // It runs the same `finish` tool the model would have called, so the report
@@ -2142,7 +2155,18 @@ const layer = Layer.effect(
         const newerUser = msgs.slice(ours + 1).find(isRealUserInput)
         if (newerUser && msgs.some((msg) => msg.info.role === "assistant" && msg.info.parentID === newerUser.info.id))
           return result
-        if (repeated) return result
+        if (repeated) {
+          // A stale, already-answered continuation can keep returning an
+          // assistant from another prompt. Stop without misattributing it to
+          // this caller, and persist an honest error on the unanswered prompt.
+          return yield* terminalResult(
+            input,
+            new NamedError.Unknown({
+              message: "The session made no progress and could not answer this prompt. Please retry.",
+            }).toObject(),
+            true,
+          )
+        }
       }
     })
 
