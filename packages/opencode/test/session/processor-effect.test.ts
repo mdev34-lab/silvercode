@@ -2131,6 +2131,43 @@ itDoomDifferentFailureBreaksStreak.live(
   { timeout: 15000 },
 )
 
+// A streak is about the exact call, not just the tool: the same failing tool called
+// with different input is a new attempt, so it breaks the run even though the name
+// matches. If only the name were compared, the third send below would already ask.
+const differentInputAsks: PermissionV1.AskInput[] = []
+const differentInput = { query: "different" }
+const itDoomDifferentInputBreaksStreak = testEffect(
+  doomEnv(
+    differentInputAsks,
+    [lookup, lookup, differentInput, lookup, lookup, lookup].map((input, index) => [
+      ...doomStep(0, [{ id: `different-input-${index}`, name: "lookup", input, outcome: "error" }]),
+      LLMEvent.finish({ reason: "tool-calls" }),
+    ]),
+  ),
+)
+
+itDoomDifferentInputBreaksStreak.live(
+  "session.processor doom loop resets the consecutive failure streak on a different input to the same tool",
+  () =>
+    provideTmpdirInstance(
+      (dir) =>
+        Effect.gen(function* () {
+          const { send } = yield* doomTurn(dir)
+          // same, same, different, same, same: the one differing input is still part
+          // of the two failures before each of these calls, so none is a loop yet.
+          for (let index = 0; index < 5; index++) yield* send()
+          expect(differentInputAsks).toHaveLength(0)
+
+          // same again: the two failures before it are finally identical calls.
+          yield* send()
+          expect(differentInputAsks).toHaveLength(1)
+          expect(differentInputAsks[0]).toMatchObject({ permission: "doom_loop", patterns: ["lookup"] })
+        }),
+      { config: cfg },
+    ),
+  { timeout: 15000 },
+)
+
 const completedAsks: PermissionV1.AskInput[] = []
 const itDoomCompleted = testEffect(
   doomEnv(
