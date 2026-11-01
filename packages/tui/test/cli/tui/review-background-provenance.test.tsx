@@ -20,9 +20,10 @@ test("a synthetic task-looking notification alone cannot establish reviewer prov
   expect(frame).toContain("Background task completed: Synthetic review")
   expect(frame).not.toContain("✓ Approved")
   expect(frame).not.toContain("Raw review report")
+  expect(frame).toContain("Unverified background report")
 })
 
-test("a background launch and matching successful run receipt currently show only the notification", async () => {
+test("a background launch and matching successful run receipt render the review", async () => {
   // This is the launch/receipt shape emitted by TaskTool.backgroundResult and
   // injectBackgroundResult; the receipt itself has no review metadata.
   const id = "ses_grounded_background"
@@ -42,7 +43,7 @@ test("a background launch and matching successful run receipt currently show onl
   }
   const receipt = { ...textPart("receipt", notification, `<task id="${child}" run="${run}" state="completed">\n<summary>Background task completed: Synthetic review</summary>\n<task_result>\n${report}\n</task_result>\n<termination reason="success"></termination>\n</task>`), synthetic: true }
   const childMessage = assistantMessage("msg_child", child, { agent: "review" })
-  const { app } = await mountSessionRoute({ width: 120, height: 45, sessions: [sessionInfo(id), sessionInfo(child, { parentID: id })], messages: {
+  const { app } = await mountSessionRoute({ width: 120, height: 45, sessions: [sessionInfo(id), sessionInfo(child, { parentID: id, agent: "review" })], messages: {
     [id]: [
       { info: request, parts: [textPart("request", request, "Review this synthetic change")] },
       { info: launch, parts: [launchPart] },
@@ -50,9 +51,9 @@ test("a background launch and matching successful run receipt currently show onl
     ],
     [child]: [{ info: childMessage, parts: [] }],
   } })
-  await waitFor(app, () => app.captureCharFrame().includes("Background task completed: Synthetic review") ? true : undefined)
+  await waitFor(app, () => app.captureCharFrame().includes("✗ Needs fixes") ? true : undefined)
   const frame = await spansOf(app)
   expect(frame).toContain("Background task completed: Synthetic review")
-  expect(frame).not.toContain("✗ Needs fixes")
-  expect(frame).not.toContain("Background synthetic finding")
+  expect(frame).toContain("✗ Needs fixes")
+  expect(frame).toContain("Background synthetic finding")
 })

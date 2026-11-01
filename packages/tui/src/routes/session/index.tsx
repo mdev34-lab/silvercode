@@ -43,6 +43,7 @@ import type {
   TextPart,
   ReasoningPart,
   SessionStatus,
+  Message,
 } from "@opencode-ai/sdk/v2"
 import { ReviewReport } from "@opencode-ai/core/review-report"
 import { useLocal } from "../../context/local"
@@ -64,7 +65,7 @@ import { DialogForkFromTimeline } from "./dialog-fork-from-timeline"
 import { DialogSessionRename } from "../../component/dialog-session-rename"
 import { Sidebar } from "./sidebar"
 import { SubagentFooter } from "./subagent-footer.tsx"
-import { reviewPresentationAnalysis, reviewText, subagentReview } from "./review-text"
+import { backgroundReview, reviewPresentationAnalysis, reviewText, subagentReview } from "./review-text"
 import { filetype } from "../../util/filetype"
 import parsers from "../../parsers-config"
 import { errorMessage } from "../../util/error"
@@ -106,7 +107,7 @@ import { collapseDiff } from "../../util/collapse-diff"
 import { usePluginRuntime } from "../../plugin/runtime"
 import { DialogRetryAction } from "../../component/dialog-retry-action"
 import { getRevertDiffFiles } from "../../util/revert-diff"
-import { parseBackgroundResult, type BackgroundResult } from "../../util/background-task"
+import { parseBackgroundResult } from "../../util/background-task"
 import { OPENCODE_BASE_MODE, useBindings, useCommandShortcut, useOpencodeKeymap } from "../../keymap"
 import { usePathFormatter } from "../../context/path-format"
 import { LocationProvider } from "../../context/location"
@@ -1522,12 +1523,52 @@ function UserMessage(props: {
   // task delivery markup. The user text above hides synthetic parts, so each
   // delivered result gets its own history indicator instead of rendering
   // nothing and letting the main agent resume from an unexplained gap.
-  const backgroundResults = createMemo(() =>
-    props.parts
-      .filter((part): part is TextPart => part.type === "text" && part.synthetic === true)
-      .map((part) => parseBackgroundResult(part.text))
-      .filter((result): result is BackgroundResult => result !== undefined),
+  const backgroundParts = createMemo(() =>
+    props.parts.filter((part): part is TextPart => part.type === "text" && part.synthetic === true),
   )
+  const backgroundResults = createMemo(() =>
+    backgroundParts().flatMap((part) => {
+      const result = parseBackgroundResult(part.text)
+      return result ? [{ part, result }] : []
+    }),
+  )
+  const sdk = useSDK()
+  const sync = useSync()
+  const [history, setHistory] = createSignal<{ info: Message; parts: Part[] }[]>()
+  // Sync retains only the newest 100 messages. Read the complete persisted
+  // history before treating a launch/receipt pair as unique. While loading or
+  // on failure the receipt remains visible on the ordinary fallback path.
+  createEffect(on(
+    () => backgroundParts().filter((part) => ReviewReport.TAGS.some((tag) => part.text.includes(`<${tag}`))).map((part) => `${part.id}\n${part.text}`).join("\n"),
+    (key) => {
+      setHistory(undefined)
+      if (!key) return
+      let active = true
+      void sdk.client.session.messages({ sessionID: props.message.sessionID }, { throwOnError: true })
+        .then((response) => { if (active && response.data) setHistory(response.data) })
+        .catch(() => {})
+      onCleanup(() => { active = false })
+    },
+  ))
+  const backgroundCandidate = (receipt: TextPart) => {
+    const snapshot = history()
+    if (!snapshot) return undefined
+    const rows = new Map(snapshot.map((entry) => [entry.info.id, entry.info]))
+    const parts: Record<string, readonly Part[]> = Object.fromEntries(snapshot.map((entry) => [entry.info.id, entry.parts]))
+    // Overlay the live window so a receipt or launch updated during the fetch
+    // cannot be hidden by an older persisted snapshot.
+    for (const message of sync.data.message[props.message.sessionID] ?? []) {
+      rows.set(message.id, message)
+      const current = sync.data.part[message.id]
+      if (current) {
+        const merged = new Map((parts[message.id] ?? []).map((part) => [part.id, part]))
+        for (const part of current) merged.set(part.id, part)
+        parts[message.id] = [...merged.values()]
+      }
+    }
+    return backgroundReview({ receipt, messages: [...rows.values()], parts, sessions: sync.data.session, complete: true })
+  }
+  const hasReviewCandidate = (part: TextPart) => ReviewReport.TAGS.some((tag) => part.text.includes(`<${tag}`) || part.text.includes(`</${tag}`))
   const { theme } = useTheme()
   const [hover, setHover] = createSignal(false)
   const queued = createMemo(() => props.pending !== undefined && props.index > props.pending)
@@ -1600,7 +1641,8 @@ function UserMessage(props: {
         </box>
       </Show>
       <For each={backgroundResults()}>
-        {(result) => {
+        {(entry) => {
+          const result = entry.result
           const completed = () => result.state === "completed"
           const cancelled = () => result.state === "cancelled"
           return (
@@ -1624,9 +1666,17 @@ function UserMessage(props: {
                 </span>{" "}
                 {result.summary} — {cancelled() ? "cancellation" : "result"} delivered to the main agent
               </text>
+              <Show when={hasReviewCandidate(entry.part)}>
+                <Show when={backgroundCandidate(entry.part)} fallback={<box paddingLeft={3}><text fg={theme.text}>{entry.part.text}</text></box>}>
+                  {(review) => <ReviewFinish review={review()} />}
+                </Show>
+              </Show>
             </>
           )
         }}
+      </For>
+      <For each={backgroundParts().filter((part) => !parseBackgroundResult(part.text) && hasReviewCandidate(part))}>
+        {(part) => <box paddingLeft={3}><text fg={theme.text}>{part.text}</text></box>}
       </For>
       <Show when={compaction()}>
         <box
