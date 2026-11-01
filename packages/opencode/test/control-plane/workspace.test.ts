@@ -23,6 +23,7 @@ import { resetDatabase } from "../fixture/db"
 import { disposeAllInstances, provideTmpdirInstance, requireInstance, TestInstance } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
 import { registerAdapter } from "../../src/control-plane/adapters"
+import { waitEvent } from "../../src/control-plane/util"
 import { WorkspaceV2 } from "@opencode-ai/core/workspace"
 import { WorkspaceTable } from "@opencode-ai/core/control-plane/workspace.sql"
 import type { Target, WorkspaceAdapter, WorkspaceInfo } from "../../src/control-plane/types"
@@ -165,6 +166,25 @@ function expectExitContains(exit: Exit.Exit<unknown, unknown>, ...messages: stri
   expect(Exit.isFailure(exit)).toBe(true)
   if (!Exit.isFailure(exit)) return
   for (const message of messages) expect(String(exit.cause)).toContain(message)
+}
+
+// Await the workspace's error transition itself instead of polling status()
+// for it. The sync loop retries with backoff, so "error" is transient, and
+// the first failure lands only after real HTTP plus fiber scheduling — a
+// fixed polling window races both on a loaded host (this exact race failed
+// CI on Windows: still "connecting" when the 1500ms poll expired). The 5000
+// timeout is the product's own waitEvent bound (Workspace TIMEOUT); in the
+// healthy case the event arrives as soon as the transition happens.
+function awaitStatusError(workspaceID: Workspace.Info["id"]) {
+  return Effect.forkChild(
+    waitEvent({
+      timeout: 5000,
+      fn: (event) =>
+        event.workspace === workspaceID &&
+        event.payload.type === Workspace.Event.Status.type &&
+        event.payload.properties.status === "error",
+    }),
+  )
 }
 
 function eventuallyEffect(effect: Effect.Effect<void>, timeout = 1500) {
@@ -1314,13 +1334,10 @@ describe("workspace sync state", () => {
             registerAdapter(instance.project.id, type, remoteAdapter(`${url}/failed`).adapter)
             yield* attachSessionToWorkspace((yield* sessionSvc.create({})).id, info.id)
 
+            const errored = yield* awaitStatusError(info.id)
             yield* workspace.startWorkspaceSyncing(instance.project.id)
-
-            yield* eventuallyEffect(
-              Effect.gen(function* () {
-                expect((yield* workspace.status()).find((item) => item.workspaceID === info.id)?.status).toBe("error")
-              }),
-            )
+            yield* Fiber.join(errored)
+            expect((yield* workspace.status()).find((item) => item.workspaceID === info.id)?.status).toBe("error")
             expect(yield* workspace.isSyncing(info.id)).toBe(false)
             yield* workspace.remove(info.id)
           }),
@@ -1355,13 +1372,10 @@ describe("workspace sync state", () => {
             registerAdapter(instance.project.id, type, remoteAdapter(`${url}/history-failed`).adapter)
             yield* attachSessionToWorkspace((yield* sessionSvc.create({})).id, info.id)
 
+            const errored = yield* awaitStatusError(info.id)
             yield* workspace.startWorkspaceSyncing(instance.project.id)
-
-            yield* eventuallyEffect(
-              Effect.gen(function* () {
-                expect((yield* workspace.status()).find((item) => item.workspaceID === info.id)?.status).toBe("error")
-              }),
-            )
+            yield* Fiber.join(errored)
+            expect((yield* workspace.status()).find((item) => item.workspaceID === info.id)?.status).toBe("error")
             expect(yield* workspace.isSyncing(info.id)).toBe(false)
             yield* workspace.remove(info.id)
           }),
