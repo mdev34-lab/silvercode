@@ -7970,7 +7970,7 @@ it.instance("a finish that completes on the first nudge settles the caller that 
     // stop that ended without finish.
     const finishes = messages
       .flatMap((message) => message.parts)
-      .filter((part) => part.type === "tool" && part.tool === "finish")
+      .filter((part): part is SessionV1.ToolPart => part.type === "tool" && part.tool === "finish")
     expect(finishes).toHaveLength(1)
     expect(finishes[0]?.state.status).toBe("completed")
     expect(result.info.role).toBe("assistant")
@@ -8040,7 +8040,7 @@ it.instance("a finish that completes on the first nudge stops the run when the s
         expect(nudges).toHaveLength(1)
         const finishes = messages
           .flatMap((message) => message.parts)
-          .filter((part) => part.type === "tool" && part.tool === "finish")
+          .filter((part): part is SessionV1.ToolPart => part.type === "tool" && part.tool === "finish")
         expect(finishes).toHaveLength(1)
         expect(finishes[0]?.state.status).toBe("completed")
         expect(result.info.role).toBe("assistant")
