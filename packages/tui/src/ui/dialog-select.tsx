@@ -230,17 +230,16 @@ export function DialogSelect<T>(props: DialogSelectProps<T>) {
 
   const dimensions = useTerminalDimensions()
   // A title column turns descriptions into wrapping text, so how many lines a
-  // row paints is only known after layout. The scrollbox paints exactly the
-  // height it is allowed, so this measures the rows it actually laid out
-  // instead of assuming one line per option: a static count would either clip
-  // wrapped lines or leave the panel with empty rows under the last option.
-  const [laidOutRows, setLaidOutRows] = createSignal(0)
+  // row paints is only known after layout and a one-line-per-option count
+  // cannot size the box. Those rows size the scrollbox to its content instead
+  // (see the contentOptions below), and this only keeps the terminal's cap:
+  // a static estimate here left wrapped lines clipped on the first paint.
   const wrapping = createMemo(() => flat().some((option) => option.titleColumn !== undefined))
   const height = createMemo(() => {
     const cap = Math.floor(dimensions().height / 2) - 6
     // Every other picker keeps this expression exactly as it was.
     if (!wrapping()) return Math.min(rows(), cap)
-    return Math.max(1, Math.min(laidOutRows() || rows(), Math.max(0, cap)))
+    return Math.max(0, cap)
   })
 
   const selected = createMemo(() => flat()[store.selected])
@@ -375,7 +374,14 @@ export function DialogSelect<T>(props: DialogSelectProps<T>) {
     const rowHeight = Math.max(1, target.height)
     if (center) {
       const centerOffset = Math.floor(scroll.height / 2)
-      scroll.scrollBy(y + Math.floor((rowHeight - 1) / 2) - centerOffset)
+      // A row as tall as the window cannot be centered: any centering offset
+      // pushes its first or last line out of the viewport, so it is pinned to
+      // the top and every line it paints stays on screen.
+      if (rowHeight >= scroll.height) {
+        scroll.scrollBy(y)
+      } else {
+        scroll.scrollBy(y + Math.floor((rowHeight - 1) / 2) - centerOffset)
+      }
     } else {
       if (y + rowHeight > scroll.height) {
         scroll.scrollBy(y + rowHeight - scroll.height)
@@ -531,41 +537,6 @@ export function DialogSelect<T>(props: DialogSelectProps<T>) {
   })
 
   let scroll: ScrollBoxRenderable | undefined
-  // The painted rows are the only honest source for a wrapped row's height, so
-  // the scrollbox is sized from the extent they actually laid out to. Rows only
-  // report a height once they have one, and a layout can settle over more than
-  // one pass, so this re-reads until consecutive passes agree and then stops.
-  let measureGeneration = 0
-  function measureLaidOutRows() {
-    // Only the opt-in wrapping layout sizes itself from a measurement: every
-    // other picker keeps the static row math, so it schedules nothing at all.
-    if (!wrapping()) return
-    const generation = ++measureGeneration
-    let previous = -1
-    const settle = () => {
-      if (generation !== measureGeneration) return
-      const children = scroll?.getChildren()
-      if (children && children.length > 0) {
-        const last = children[children.length - 1]
-        const measured = last.y + last.height - children[0].y
-        if (measured > 0) setLaidOutRows(measured)
-      }
-      if (laidOutRows() === previous) return
-      previous = laidOutRows()
-      renderer.requestAnimationFrame(settle)
-    }
-    renderer.requestAnimationFrame(settle)
-  }
-  createEffect(() => {
-    if (!wrapping()) return
-    grouped()
-    dimensions()
-    selected()
-    measureLaidOutRows()
-  })
-  onCleanup(() => {
-    measureGeneration++
-  })
   const ref: DialogSelectRef<T> = {
     get filter() {
       return store.filter
@@ -697,12 +668,14 @@ export function DialogSelect<T>(props: DialogSelectProps<T>) {
             paddingRight={1}
             scrollbarOptions={{ visible: false }}
             scrollAcceleration={scrollAcceleration()}
-            ref={(r: ScrollBoxRenderable) => {
-              scroll = r
-              // The first measurement can run before the list is attached.
-              measureLaidOutRows()
-            }}
+            ref={(r: ScrollBoxRenderable) => (scroll = r)}
             maxHeight={height()}
+            // A wrapping row has no line count to size from, so the content
+            // keeps its own height and `maxHeight` stays a real cap: the box
+            // is compact on the very first paint and only scrolls when the
+            // list genuinely does not fit. Other pickers keep the default
+            // content sizing they always had.
+            {...(wrapping() ? { contentOptions: { minHeight: 0 } } : {})}
           >
             <For each={grouped()}>
               {([category, options], index) => (

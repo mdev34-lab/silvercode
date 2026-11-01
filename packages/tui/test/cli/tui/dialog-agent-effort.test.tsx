@@ -404,13 +404,10 @@ function flatText(frame: string) {
     .join(" ")
     .replace(/\s+/g, " ")
 }
-
 /** The painted panel's rows: its background fill bounds what the dialog occupies. */
 async function panelGeometry(app: Setup, title: string) {
   const spans = await captureSpans(app)
-  const titleSpan = spans.lines
-    .flatMap((line) => line.spans)
-    .find((span) => span.text.trim() === title)
+  const titleSpan = spans.lines.flatMap((line) => line.spans).find((span) => span.text.trim() === title)
   if (!titleSpan) throw new Error(`no ${title} title span in the captured frame`)
   // The panel is whatever the title sits on; everything it paints, including
   // its padding, carries that same fill.
@@ -1310,6 +1307,82 @@ describe("agent effort selector", () => {
     }
   })
 
+
+  test("is already content-tall on the first paint", async () => {
+    // A wrapped row has no line count to size the box from, so an estimate made
+    // before layout clips the last line until a later pass. The panel must be
+    // complete on the frame the title first appears, pumped exactly like a
+    // slow runner would: three renders, no settling and no extra frames.
+    const harness = await mountEffort({
+      route: { type: "home" },
+      model: "test-provider/variant-model",
+      children: () => null,
+      width: 44,
+      height: 40,
+    })
+    try {
+      await frameWhere(harness.app, (f) => f.includes("Home") || true, "mount")
+      harness.dialog.replace(() => <DialogAgentEffort />)
+      await harness.app.renderOnce()
+      const pumpOne = await panelGeometry(harness.app, "Agent effort")
+      for (let pump = 0; pump < 2; pump++) await harness.app.renderOnce()
+      const first = await captureFrame(harness.app)
+      // Nothing resizes the panel after it first paints: an estimate that has
+      // to be corrected later is exactly the defect this guards.
+      expect(pumpOne.height).toBeGreaterThan(0)
+      expect(first).toContain("Agent effort")
+      expect(flatText(first)).toContain("Deep, meticulous work on complex tasks from start to finish")
+      expect(first).toContain("Default for new sessions")
+      // Same frame, no settling: the whole 10-row list is there and the panel
+      // is already its final height, so nothing was clipped on the way in.
+      expect(first.split("\n").filter((line) => line.trim()).length).toBe(11)
+      const panel = await panelGeometry(harness.app, "Agent effort")
+      expect(panel.height).toBe(10 + CHROME)
+      expect(pumpOne).toEqual(panel)
+    } finally {
+      await harness.dispose()
+    }
+  })
+
+  test("pins a row as tall as the window so its last line stays visible", async () => {
+    // 20 rows leave a 4-row window, exactly the height of the wrapped Thorough
+    // row. Centering that row would cut off its last line ("finish") forever;
+    // it is pinned to the top instead, so every line it paints is on screen.
+    const harness = await mountEffort({
+      route: { type: "home" },
+      model: "test-provider/variant-model",
+      children: () => null,
+      width: 44,
+      height: 20,
+    })
+    try {
+      harness.dialog.replace(() => <DialogAgentEffort />)
+      await frameWhere(harness.app, (f) => f.includes("Reliable workhorse"), "first row")
+      harness.app.mockInput.pressArrow("down")
+      harness.app.mockInput.pressArrow("down")
+      const frame = await frameWhere(
+        harness.app,
+        (f) => flatText(f).includes("Deep, meticulous work on complex tasks from start to finish"),
+        "wrapped row fully visible",
+      )
+      const lines = frame.split("\n")
+      const start = lines.findIndex((line) => line.includes("Thorough"))
+      const block = optionBlock(frame, "Thorough")
+      expect(block).toHaveLength(4)
+      // All four painted lines are inside the window, in order, and the footer
+      // still follows them.
+      expect(block[0]).toContain("Thorough  Deep, meticulous")
+      expect(block.slice(1).map((line) => line.trim())).toEqual(["work on complex", "tasks from start to", "finish"])
+      expect(lines.findIndex((line) => line.includes("Default for new sessions"))).toBeGreaterThan(start + 3)
+      const panel = await settledPanel(harness.app, "Agent effort")
+      expect(panel.height).toBe(4 + CHROME)
+      expect(start).toBeGreaterThanOrEqual(panel.top)
+      expect(start + 3).toBeLessThanOrEqual(panel.bottom)
+    } finally {
+      await harness.dispose()
+    }
+  })
+
   test("keeps keyboard selection on a wrapped row visible in a short viewport", async () => {
     const harness = await mountEffort({
       route: { type: "home" },
@@ -1424,7 +1497,7 @@ describe("agent effort selector", () => {
   // writes the sanitized span dumps that the committed PNGs are rendered from.
   // It renders through the production dialog stack, like app.tsx does, so the
   // frames carry the real panel width.
-  test.skipIf(!process.env.TUI_CAPTURE_DIR)("captures the normal, narrow and short layout frames", async () => {
+  test.skipIf(!process.env.TUI_CAPTURE_DIR)("captures the normal, narrow, short and capped layout frames", async () => {
     const dir = process.env.TUI_CAPTURE_DIR
     if (!dir) return
     for (const view of [
@@ -1433,6 +1506,7 @@ describe("agent effort selector", () => {
       // A short viewport caps the list; the cursor walks to the wrapping level
       // so the frame also shows the wrapped selection held on screen.
       { name: "short", width: 44, height: 26, downs: 2 },
+      { name: "capped", width: 44, height: 20, downs: 2 },
     ]) {
       const harness = await mountEffort({
         route: { type: "home" },
@@ -1471,6 +1545,7 @@ describe("agent effort selector", () => {
       }
     }
   })
+
 
 
 })
