@@ -120,11 +120,30 @@ const MAX_FINISH_NUDGES = 3
 const REPETITION_RECOVERY_MAX = 1
 
 // The prompt a turn belongs to: a real user message anchors the lineage, and a
-// repetition recovery points back at the anchor it continues.
+// repetition recovery points back at the anchor it continues. A message that is
+// gone from the visible transcript keeps its own identity so callers still
+// settle on the prompt they asked about instead of borrowing another one.
 const repetitionRecoveryLineage = (messages: readonly SessionV1.WithParts[], userID: string) => {
   const message = messages.findLast((candidate) => candidate.info.id === userID)
   return (message && repetitionRecoveryPromptID(message)) ?? userID
 }
+
+// User input that starts a prompt, as opposed to the runner's own synthetic
+// continuation of one. A newer real input supersedes an in-flight prompt and
+// must get its own turn; a continuation never supersedes anything.
+const isRealUserInput = (message: SessionV1.WithParts) =>
+  message.info.role === "user" && repetitionRecoveryPromptID(message) === undefined
+
+// The answer this prompt already owns, whether it is the recovery that
+// continued it or the terminal guard error that ended it. Callers settle on this
+// instead of re-entering the loop and generating for a spent lineage again.
+const promptAnswer = (messages: readonly SessionV1.WithParts[], promptID: string) =>
+  messages.findLast(
+    (message) =>
+      message.info.role === "assistant" &&
+      message.info.parentID !== undefined &&
+      repetitionRecoveryLineage(messages, message.info.parentID) === promptID,
+  )
 
 const repetitionRecoveries = (messages: readonly SessionV1.WithParts[], promptID: string) =>
   messages.filter((message) => repetitionRecoveryPromptID(message) === promptID).length
@@ -1279,10 +1298,7 @@ const layer = Layer.effect(
       return { info, parts }
     }, Effect.scoped)
 
-    const promptWithEpoch = Effect.fn("SessionPrompt.prompt")(function* (
-      input: PromptInput,
-      initialEpoch?: number,
-    ) {
+    const promptWithEpoch = Effect.fn("SessionPrompt.prompt")(function* (input: PromptInput, initialEpoch?: number) {
       // A prompt submitted right after ESC can race with the abort's epoch bump.
       // If a cancel is still settling, wait for it before capturing the epoch so
       // the new prompt is not poisoned by the previous run's cancellation and
@@ -1451,29 +1467,29 @@ const layer = Layer.effect(
 
           if (!lastUser) throw new Error("No user message found in stream. This should never happen.")
 
-          // Issue #738: a repetition recovery whose own generation tripped the
-          // guard is terminal. The recovery slot for its prompt lineage is
-          // spent, so a later run (a queued caller re-entering the loop) must
-          // not generate for that synthetic message again. Without this, the
-          // surfaced second trip would be followed by a third request for the
-          // same continued prompt.
-          const recoveryMessage = msgs.findLast((message) => message.info.id === lastUser.id)
-          const recoveryLineage = recoveryMessage && repetitionRecoveryPromptID(recoveryMessage)
-          if (
-            recoveryLineage !== undefined &&
-            msgs.some(
-              (message) =>
-                message.info.role === "assistant" &&
-                message.info.parentID === lastUser.id &&
-                RepetitionGuard.isStoredError(message.info.error),
+          // Issue #738: a repetition recovery is a continuation of a prompt, not
+          // a prompt of its own. Once it has an answer - the recovery succeeded
+          // or its own generation tripped the guard too - there is nothing left
+          // for the lineage to generate. Ending the run here keeps a caller that
+          // re-enters the loop (a queued prompt joining a settled turn) from
+          // re-requesting the same synthetic message forever, which is how a
+          // finished recovery turned into an endless busy/idle churn (#410).
+          const continuation = msgs.findLast((message) => message.info.id === lastUser.id)
+          const continuationLineage = continuation && repetitionRecoveryPromptID(continuation)
+          if (continuationLineage !== undefined) {
+            const answer = msgs.findLast(
+              (message): message is SessionV1.WithParts & { info: SessionV1.Assistant } =>
+                message.info.role === "assistant" && message.info.parentID === lastUser.id,
             )
-          ) {
-            yield* Effect.logWarning("repetition recovery already tripped the guard; ending the run", {
-              "session.id": sessionID,
-              messageID: lastUser.id,
-              promptID: recoveryLineage,
-            })
-            break
+            if (answer) {
+              yield* Effect.logInfo("repetition recovery already answered; ending the run", {
+                "session.id": sessionID,
+                messageID: lastUser.id,
+                promptID: continuationLineage,
+                tripped: RepetitionGuard.isStoredError(answer.info.error),
+              })
+              break
+            }
           }
 
           // Snapshot the effective model/variant for this turn. A selection
@@ -1932,38 +1948,63 @@ const layer = Layer.effect(
               // recovery user message and let the model try again with the
               // guard still armed. A second trip terminates with the error
               // surfaced.
-              const lineage = repetitionRecoveryLineage(msgs, lastUser.id)
-              const recoveries = repetitionRecoveries(msgs, lineage)
-              if (recoveries < REPETITION_RECOVERY_MAX && RepetitionGuard.isStoredError(handle.message.error)) {
-                const detail = repetitionGuardDetail(handle.message.error)
-                yield* Effect.logWarning("repetition guard tripped; recovering once with a synthetic continuation", {
-                  "session.id": sessionID,
-                  messageID: handle.message.id,
-                  promptID: lineage,
-                  detail,
-                })
-                const recovery: SessionV1.User = {
-                  id: MessageID.ascending(),
-                  sessionID,
-                  role: "user",
-                  agent: lastUser.agent,
-                  model: selection,
-                  time: { created: Date.now() },
+              if (RepetitionGuard.isStoredError(handle.message.error)) {
+                // Re-read history before choosing to inject. A prompt queued
+                // while this generation was streaming is newer real input: the
+                // recovery nudge must never be appended after it. Doing so
+                // answers the older prompt's continuation in place of the
+                // queued prompt, which then stays unanswered forever (#410).
+                // The aborted prompt ends here and the queued prompt gets its
+                // own turn from its own caller.
+                const current = yield* MessageV2.filterCompactedEffect(sessionID).pipe(
+                  Effect.provideService(Database.Service, database),
+                )
+                const lineage = repetitionRecoveryLineage(current, lastUser.id)
+                const recoveries = repetitionRecoveries(current, lineage)
+                // Only messages persisted after this turn's own prompt can be
+                // newer input; if the prompt is not in the re-read history there
+                // is nothing to compare against.
+                const lastUserAt = current.findLastIndex((message) => message.info.id === lastUser.id)
+                const waiting = lastUserAt < 0 ? undefined : current.slice(lastUserAt + 1).find(isRealUserInput)
+                if (recoveries < REPETITION_RECOVERY_MAX && waiting === undefined) {
+                  const detail = repetitionGuardDetail(handle.message.error)
+                  yield* Effect.logWarning("repetition guard tripped; recovering once with a synthetic continuation", {
+                    "session.id": sessionID,
+                    messageID: handle.message.id,
+                    promptID: lineage,
+                    detail,
+                  })
+                  const recovery: SessionV1.User = {
+                    id: MessageID.ascending(),
+                    sessionID,
+                    role: "user",
+                    agent: lastUser.agent,
+                    model: selection,
+                    time: { created: Date.now() },
+                  }
+                  yield* sessions.updateMessage(recovery)
+                  yield* sessions.updatePart({
+                    id: PartID.ascending(),
+                    messageID: recovery.id,
+                    sessionID,
+                    type: "text",
+                    text: repetitionRecoveryMessage(detail),
+                    synthetic: true,
+                    // Recognised as the runner's own continuation of `lineage`
+                    // by subagent-result (provenance/success) and by the budget
+                    // above, so re-entering the loop cannot restart it.
+                    metadata: { [REPETITION_RECOVERY]: { promptID: lineage, attempt: recoveries + 1 } },
+                  } satisfies SessionV1.TextPart)
+                  return "continue" as const
                 }
-                yield* sessions.updateMessage(recovery)
-                yield* sessions.updatePart({
-                  id: PartID.ascending(),
-                  messageID: recovery.id,
-                  sessionID,
-                  type: "text",
-                  text: repetitionRecoveryMessage(detail),
-                  synthetic: true,
-                  // Recognised as the runner's own continuation of `lineage`
-                  // by subagent-result (provenance/success) and by the budget
-                  // above, so re-entering the loop cannot restart it.
-                  metadata: { [REPETITION_RECOVERY]: { promptID: lineage, attempt: recoveries + 1 } },
-                } satisfies SessionV1.TextPart)
-                return "continue" as const
+                if (waiting !== undefined && recoveries < REPETITION_RECOVERY_MAX)
+                  yield* Effect.logInfo("repetition guard tripped while newer input waits; ending this prompt", {
+                    "session.id": sessionID,
+                    messageID: handle.message.id,
+                    promptID: lineage,
+                    queued: waiting.info.id,
+                  })
+                return "break" as const
               }
               return "break" as const
             }
@@ -2056,6 +2097,7 @@ const layer = Layer.effect(
       // run: cancel releases callers already submitted to the session.
       const epoch = initialEpoch ?? (yield* state.cancelEpoch(input.sessionID))
       let last: SessionV1.WithParts | undefined
+      let joined: SessionV1.WithParts | undefined
       while (true) {
         if ((yield* state.cancelEpoch(input.sessionID)) !== epoch) {
           yield* state.awaitCancel(input.sessionID)
@@ -2066,17 +2108,11 @@ const layer = Layer.effect(
           lastAssistant(input.sessionID),
           runLoop(input.sessionID).pipe(Effect.ensuring(settleOrphanedParts(input.sessionID))),
         )
+        // A run that returns the same terminal assistant again produced no new
+        // work for this caller, so re-entering cannot answer it.
+        const repeated = joined !== undefined && joined.info.id === result.info.id
+        joined = result
         last = result
-        // Issue #738: a run that ends on an unrecovered guard trip is terminal
-        // for every caller, including a queued prompt that joined it. Re-entering
-        // would start a fresh runLoop with a fresh budget and generate once more
-        // for the same continuation - the third request the old local counter
-        // allowed after a reset. The surfaced error is the end of the turn.
-        // A joined caller's queued user message remains visible but unanswered;
-        // returning this errored assistant does not acknowledge it as completed.
-        // Idle resume cannot restart the spent lineage. An explicit new user
-        // prompt can resume with the retained queued input still in history.
-        if (result.info.role === "assistant" && RepetitionGuard.isStoredError(result.info.error)) return result
         if (!input.messageID || (result.info.role === "assistant" && result.info.parentID === input.messageID))
           return result
         // Checked before every other re-entry path: once the run this caller joined was
@@ -2090,11 +2126,23 @@ const layer = Layer.effect(
           .messages({ sessionID: input.sessionID })
           .pipe(Effect.catch(() => Effect.succeed(null)))
         if (!msgs) return result
+        // Issue #738/#410: each caller settles on the answer to its own prompt.
+        // A repetition recovery continues the prompt it declares, so the
+        // recovery's answer - or the terminal guard error that ended the
+        // lineage - belongs to that prompt, and to no other caller. Matching by
+        // lineage also keeps a spent lineage from being regenerated: the run
+        // ended terminally, so any further request would be a fresh budget for
+        // the same aborted prompt.
+        const lineage = repetitionRecoveryLineage(msgs, input.messageID)
+        const answer = promptAnswer(msgs, lineage)
+        if (answer) return answer
         const ours = msgs.findIndex((msg) => msg.info.id === input.messageID)
-        const newerUser = msgs.slice(ours + 1).find((msg) => msg.info.role === "user")
-        if (!newerUser) continue
-        const superseded = msgs.some((msg) => msg.info.role === "assistant" && msg.info.parentID === newerUser.info.id)
-        if (superseded) return result
+        // Synthetic continuations are not newer input: they extend an existing
+        // prompt instead of superseding it.
+        const newerUser = msgs.slice(ours + 1).find(isRealUserInput)
+        if (newerUser && msgs.some((msg) => msg.info.role === "assistant" && msg.info.parentID === newerUser.info.id))
+          return result
+        if (repeated) return result
       }
     })
 

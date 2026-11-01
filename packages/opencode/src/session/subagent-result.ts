@@ -77,7 +77,11 @@ const order = (messages: readonly SessionV1.WithParts[], current: SessionV1.With
  * finish. When the transcript lacks the prompt (minimal fixture), the same two rules apply to every
  * message after `promptID`; an empty history is a direct match.
  */
-export function continuesPrompt(messages: readonly SessionV1.WithParts[], current: SessionV1.WithParts, promptID: string) {
+export function continuesPrompt(
+  messages: readonly SessionV1.WithParts[],
+  current: SessionV1.WithParts,
+  promptID: string,
+) {
   if (current.info.role !== "assistant") return false
   const ordered = order(messages, current)
   const end = ordered.findIndex((message) => message.info.id === current.info.id)
@@ -131,7 +135,10 @@ export function textResult(chunks: readonly (string | undefined)[]) {
     for (const match of source.matchAll(/<\/?silvercode-result>/g)) {
       if (match[0] === open) {
         if (depth > 0) nested = true
-        else { begin = match.index! + open.length; nested = false }
+        else {
+          begin = match.index! + open.length
+          nested = false
+        }
         depth++
       } else if (depth > 0) {
         depth--

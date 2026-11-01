@@ -56,7 +56,10 @@ describe("subagent result execution boundary", () => {
     expect(textResult(resultChunks([user("01"), old, user("03"), nudge("05"), last], last))).toEqual({ ok: false })
   })
   test("a nudge after a completed finish does not resurrect the earlier result", () => {
-    const old = assistant("02", "01", [text(envelope), { type: "tool", tool: "finish", state: { status: "completed" } }])
+    const old = assistant("02", "01", [
+      text(envelope),
+      { type: "tool", tool: "finish", state: { status: "completed" } },
+    ])
     const last = assistant("04", "03", [text("")])
     expect(textResult(resultChunks([user("01"), old, nudge("03"), last], last))).toEqual({ ok: false })
   })
@@ -107,7 +110,9 @@ describe("prompt continuation boundaries", () => {
   test("a synthetic user message that is not the runner nudge is a boundary", () => {
     const last = assistant("04", "03", [text("b")])
     const old = assistant("02", "01", [text(envelope)])
-    expect(continuesPrompt([user("01"), old, synthetic("03", "Background task finished"), last], last, "01")).toBe(false)
+    expect(continuesPrompt([user("01"), old, synthetic("03", "Background task finished"), last], last, "01")).toBe(
+      false,
+    )
     expect(resultChunks([user("01"), old, synthetic("03", "Background task finished"), last], last)).toEqual(["b"])
   })
   test("a nudge after a completed finish does not continue the earlier prompt", () => {
@@ -159,14 +164,18 @@ describe("text result envelope", () => {
   })
 })
 
-
 test("rejects nested tags and an unfinished newer result instead of using stale text", () => {
-  expect(textResult(["<silvercode-result>outer<silvercode-result>inner</silvercode-result></silvercode-result>"])).toEqual({ ok: false })
+  expect(
+    textResult(["<silvercode-result>outer<silvercode-result>inner</silvercode-result></silvercode-result>"]),
+  ).toEqual({ ok: false })
   expect(textResult([renderTextResult("earlier"), "<silvercode-result>unfinished"])).toEqual({ ok: false })
 })
 
 test("a corrected later envelope recovers after an unfinished earlier assistant result", () => {
-  expect(textResult(["<silvercode-result>unfinished", renderTextResult("corrected")])).toEqual({ ok: true, text: "corrected" })
+  expect(textResult(["<silvercode-result>unfinished", renderTextResult("corrected")])).toEqual({
+    ok: true,
+    text: "corrected",
+  })
 })
 
 test("a corrected later envelope recovers after a stray closing tag", () => {
@@ -209,4 +218,3 @@ describe("repetition recovery continuation", () => {
     ).toBeUndefined()
   })
 })
-

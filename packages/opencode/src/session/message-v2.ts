@@ -69,10 +69,9 @@ type Cursor = typeof Cursor.Type
 
 const decodeCursor = Schema.decodeUnknownSync(Cursor)
 
-export class InvalidCursorError extends Schema.TaggedErrorClass<InvalidCursorError>()(
-  "MessageV2.InvalidCursorError",
-  { message: Schema.String },
-) {
+export class InvalidCursorError extends Schema.TaggedErrorClass<InvalidCursorError>()("MessageV2.InvalidCursorError", {
+  message: Schema.String,
+}) {
   static isInstance(input: unknown): input is InvalidCursorError {
     return input instanceof InvalidCursorError
   }
