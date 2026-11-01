@@ -3,6 +3,7 @@ import type { SessionV1 } from "@opencode-ai/core/v1/session"
 import FINISH_NUDGE from "../../src/session/prompt/finish-nudge.txt"
 import {
   continuesPrompt,
+  finishContinuationPromptID,
   REPETITION_RECOVERY,
   repetitionRecoveryPromptID,
   resultChunks,
@@ -216,5 +217,98 @@ describe("repetition recovery continuation", () => {
         parts: [{ type: "text", text: "not synthetic", metadata: { [REPETITION_RECOVERY]: { promptID: "01" } } }],
       } as unknown as SessionV1.WithParts),
     ).toBeUndefined()
+  })
+})
+
+describe("declared continuation root lineage (#788)", () => {
+  const marked = (id: string, promptID: string, recovery = false) =>
+    ({
+      info: { id, role: "user" },
+      parts: [
+        {
+          type: "text",
+          text: recovery ? "The previous response was cut off by the repetition guard" : FINISH_NUDGE,
+          synthetic: true,
+          metadata: recovery
+            ? { [REPETITION_RECOVERY]: { promptID, attempt: 1 } }
+            : { finishContinuation: { promptID } },
+        },
+      ],
+    }) as unknown as SessionV1.WithParts
+  const finish = { type: "tool", tool: "finish", state: { status: "completed" } }
+
+  test("N2 and N3 declare the original root and retain the whole execution", () => {
+    const first = assistant("02", "01", [text(envelope)])
+    const second = assistant("04", "03", [text("second")])
+    const third = assistant("06", "05", [text("third")])
+    const last = assistant("08", "07", [text("last"), finish])
+    const history = [user("01"), first, marked("03", "01"), second, marked("05", "01"), third, marked("07", "01"), last]
+    expect(continuesPrompt(history, last, "01")).toBe(true)
+    expect(resultChunks(history, last)).toEqual([envelope, "second", "third", "last"])
+    expect(continuesPrompt(history, last, "03")).toBe(false)
+  })
+
+  test("mixed recovery and finish markers resolve transitively to their own root", () => {
+    const first = assistant("02", "01", [text(envelope)])
+    const recovered = assistant("04", "03", [text("recovered")])
+    const last = assistant("06", "05", [text("finished"), finish])
+    const history = [user("01"), first, marked("03", "01", true), recovered, marked("05", "01"), last]
+    expect(continuesPrompt(history, last, "01")).toBe(true)
+    expect(resultChunks(history, last)).toEqual([envelope, "recovered", "finished"])
+    const chained = [user("01"), first, marked("03", "01"), recovered, marked("05", "03", true), last]
+    expect(continuesPrompt(chained, last, "01")).toBe(true)
+    expect(resultChunks(chained, last)).toEqual([envelope, "recovered", "finished"])
+  })
+
+  test("clock rollback keeps each async prompt with its own complete execution", () => {
+    const p1 = user("50")
+    const a1 = assistant("51", "50", [text("P1 progress")])
+    const n1 = marked("11", "50")
+    const f1 = assistant("12", "11", [text("P1 done"), finish])
+    const p2 = user("60")
+    const a2 = assistant("61", "60", [text("P2 progress")])
+    const n2 = marked("21", "60")
+    const f2 = assistant("22", "21", [text("P2 done"), finish])
+    const history = [f2, p1, n2, a1, f1, n1, p2, a2]
+    expect(continuesPrompt(history, f1, "50")).toBe(true)
+    expect(continuesPrompt(history, f2, "60")).toBe(true)
+    expect(continuesPrompt(history, f2, "50")).toBe(false)
+    expect(resultChunks(history, f1)).toEqual(["P1 progress", "P1 done"])
+    expect(resultChunks(history, f2)).toEqual(["P2 progress", "P2 done"])
+  })
+
+  test("a declared root cannot jump a real boundary or authorize a stale parent", () => {
+    const stale = assistant("05", "01", [text("stale")])
+    const history = [user("01"), user("03"), marked("04", "01"), stale]
+    expect(continuesPrompt(history, stale, "01")).toBe(false)
+    const late = assistant("06", "04", [text("late")])
+    expect(continuesPrompt([...history, late], late, "01")).toBe(false)
+    expect(resultChunks([...history, late], late)).toEqual(["late"])
+  })
+
+  test("a stale direct assistant after a nudge is not moved before that nudge", () => {
+    const first = assistant("02", "01", [text(envelope)])
+    const nudged = assistant("04", "03", [text("nudged"), finish])
+    const stale = assistant("05", "01", [text("stale")])
+    const history = [user("01"), first, marked("03", "01"), nudged, stale]
+    expect(continuesPrompt(history, stale, "01")).toBe(false)
+    expect(resultChunks(history, stale)).toEqual(["stale"])
+  })
+
+  test("cycles fail closed without borrowing either caller", () => {
+    const answer = assistant("05", "03", [text(envelope)])
+    const history = [user("01"), marked("02", "03"), marked("03", "02"), answer]
+    expect(continuesPrompt(history, answer, "01")).toBe(false)
+    expect(continuesPrompt(history, answer, "02")).toBe(false)
+    expect(continuesPrompt(history, answer, "03")).toBe(false)
+    expect(resultChunks(history, answer)).toEqual([envelope])
+  })
+
+  test("finish metadata on arbitrary caller text is not a runner continuation", () => {
+    const spoof = marked("03", "01")
+    ;(spoof.parts[0] as { text: string }).text = "Caller-controlled text"
+    const answer = assistant("04", "03", [text(envelope)])
+    expect(finishContinuationPromptID(spoof)).toBeUndefined()
+    expect(continuesPrompt([user("01"), spoof, answer], answer, "01")).toBe(false)
   })
 })

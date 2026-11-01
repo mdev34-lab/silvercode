@@ -49,7 +49,10 @@ import { LLM } from "./llm"
 import { RepetitionGuard } from "./llm/repetition-guard"
 import {
   FINISH_CONTINUATION,
+  continuationPromptID,
+  executionOrder,
   finishContinuationPromptID,
+  turnLineage,
   REPETITION_RECOVERY,
   repetitionRecoveryPromptID,
 } from "./subagent-result"
@@ -124,26 +127,6 @@ const MAX_FINISH_NUDGES = 3
 // user prompt its own turn.
 const REPETITION_RECOVERY_MAX = 1
 
-// The prompt a turn belongs to: a real user message anchors the lineage, and a
-// repetition recovery points back at the anchor it continues. A message that is
-// gone from the visible transcript keeps its own identity so callers still
-// settle on the prompt they asked about instead of borrowing another one.
-const repetitionRecoveryLineage = (messages: readonly SessionV1.WithParts[], userID: string) => {
-  const message = messages.findLast((candidate) => candidate.info.id === userID)
-  return (message && repetitionRecoveryPromptID(message)) ?? userID
-}
-
-// The same lineage, including the runner's finish continuation. The nudge names
-// the prompt whose turn it extends, so the answer that continues a nudge still
-// belongs to the caller that asked the prompt (issue #783): a run that completed
-// finish after a nudge settled that caller on the pre-nudge answer, which ended
-// without a finish.
-const turnLineage = (messages: readonly SessionV1.WithParts[], userID: string) => {
-  const message = messages.findLast((candidate) => candidate.info.id === userID)
-  if (!message) return userID
-  return finishContinuationPromptID(message) ?? repetitionRecoveryPromptID(message) ?? userID
-}
-
 // A user message whose submission expects the runner to answer it. `noReply` is
 // persisted with the message, so a silent injection (the background-task marker
 // or any other no-reply note) stays distinguishable from input that is owed an
@@ -158,9 +141,7 @@ const expectsReply = (message: SessionV1.WithParts) => message.info.role === "us
 // nudge that keeps a turn alive) never supersedes anything and never counts as
 // input a caller submitted.
 const isRealUserInput = (message: SessionV1.WithParts) =>
-  expectsReply(message) &&
-  repetitionRecoveryPromptID(message) === undefined &&
-  finishContinuationPromptID(message) === undefined
+  expectsReply(message) && continuationPromptID(message) === undefined
 
 // Whether any assistant already answered this user message. Several assistants
 // can share one parent across the steps of a turn, and a guard trip leaves one
@@ -230,19 +211,25 @@ const generationTarget = (
 ): UserMessage | undefined => {
   const users = messages.filter((message): message is UserMessage => message.info.role === "user")
   const inFlight =
-    continuation === undefined
-      ? undefined
-      : users.findLast((message) => message.info.id === continuation && !answered(messages, continuation))
+    continuation === undefined ? undefined : users.findLast((message) => message.info.id === continuation)
   if (inFlight) return inFlight
-  const owed = users.find(
-    (message) => repetitionRecoveryPromptID(message) !== undefined && !answered(messages, message.info.id),
-  )
+  const owed = users.find((message) => {
+    if (continuationPromptID(message) === undefined || answered(messages, message.info.id)) return false
+    const root = turnLineage(messages, message.info.id)
+    const rootAt = messages.findIndex((candidate) => candidate.info.id === root)
+    const ownAt = messages.findIndex((candidate) => candidate.info.id === message.info.id)
+    return rootAt >= 0 && !messages.slice(rootAt + 1, ownAt).some(isRealUserInput)
+  })
   if (owed) return owed
-  const pending = users.findLast((message) => waiting.has(message.info.id) && !answered(messages, message.info.id))
+  const pending = users.findLast(
+    (message) => waiting.has(message.info.id) && expectsReply(message) && !answered(messages, message.info.id),
+  )
   if (pending) return pending
   const latestAssistantAt = messages.findLastIndex((message) => message.info.role === "assistant")
   const next = users.findLast(
-    (message) => messages.findLastIndex((candidate) => candidate.info.id === message.info.id) > latestAssistantAt,
+    (message) =>
+      (expectsReply(message) || waiting.size === 0) &&
+      messages.findLastIndex((candidate) => candidate.info.id === message.info.id) > latestAssistantAt,
   )
   if (next) return next
   const latestAssistant = messages.findLast(
@@ -263,7 +250,7 @@ const generationView = (
   target: UserMessage,
   continuation?: string,
 ): SessionV1.WithParts[] => {
-  if (!expectsReply(target) && repetitionRecoveryPromptID(target) === undefined) return messages
+  if (!expectsReply(target) && continuationPromptID(target) === undefined) return messages
   // The continuation this run injected continues the generation in progress, so
   // it keeps the transcript even before an assistant answers it: a stored order
   // that places the nudge early must not hide the answer it is nudging.
@@ -277,16 +264,27 @@ const generationView = (
 // continuation that carried it, or the terminal guard error that ended it.
 // Callers settle on this instead of re-entering the loop and generating for a
 // spent lineage again.
-const promptAnswer = (messages: readonly SessionV1.WithParts[], promptID: string) =>
-  messages.findLast(
+const promptAnswer = (messages: readonly SessionV1.WithParts[], promptID: string) => {
+  const answers = messages.filter(
     (message) =>
       message.info.role === "assistant" &&
       message.info.parentID !== undefined &&
       turnLineage(messages, message.info.parentID) === promptID,
   )
+  return (
+    answers.findLast((message) =>
+      message.parts.some(
+        (part) => part.type === "tool" && part.tool === FinishTool.id && part.state.status === "completed",
+      ),
+    ) ?? answers.at(-1)
+  )
+}
 
 const repetitionRecoveries = (messages: readonly SessionV1.WithParts[], promptID: string) =>
-  messages.filter((message) => repetitionRecoveryPromptID(message) === promptID).length
+  messages.filter(
+    (message) =>
+      repetitionRecoveryPromptID(message) !== undefined && turnLineage(messages, message.info.id) === promptID,
+  ).length
 
 // Extracts the repeated-fragment detail from a repetition-guard error message,
 // e.g. "the model streamed the same 96-character fragment 3 times in a row ...".
@@ -1366,6 +1364,12 @@ const layer = Layer.effect(
           ]
         }
 
+        if (part.type === "text" && part.metadata) {
+          // Lineage metadata is runner-owned. Strip caller-supplied reservations
+          // before plugins or persistence can turn ordinary input into a retry.
+          const { [FINISH_CONTINUATION]: _finish, [REPETITION_RECOVERY]: _recovery, ...metadata } = part.metadata
+          return [{ ...part, metadata, messageID: info.id, sessionID: input.sessionID }]
+        }
         return [{ ...part, messageID: info.id, sessionID: input.sessionID }]
       })
 
@@ -1615,97 +1619,86 @@ const layer = Layer.effect(
       function* (sessionID: SessionID) {
         const ctx = yield* InstanceState.context
         let structured: unknown
-        let step = 0
-        let finishNudges = 0
-        // The continuation this run injected and is still owed an answer. Turn
-        // selection reads the transcript back, but a stored timestamp can place
-        // this run's own nudge before the assistant that triggered it (a clock
-        // step between that generation and the nudge), and a read that has not
-        // observed the write yet looks the same. Deriving the turn from that
-        // read alone would select the same prompt again, append another nudge,
-        // and spend the whole nudge budget without asking the model once. The
-        // message this run persisted is therefore kept in flight, together with
-        // the answer this run generated for it (issue #783): while it waits it is
-        // the target of the next generation, and once answered it is the turn
-        // whose finish decides the run. `ending` records the generation this run
-        // ended with, so the caller settles on it instead of on whichever message
-        // the stored creation times place last.
-        let inFlight:
-          | { message: SessionV1.User; part: SessionV1.TextPart; seen: ReadonlySet<string>; answer?: MessageID }
-          | undefined
+        // Durable markers supply prompt-scoped budgets and re-entry state. The
+        // local overlay only bridges a write that the next history read has not
+        // observed yet; executionOrder resolves persisted clock rollback.
+        const local = new Map<MessageID, SessionV1.WithParts>()
+        const unobserved = new Set<MessageID>()
+        const pending = new Map<
+          string,
+          {
+            message: SessionV1.User
+            part: SessionV1.TextPart
+            seen: ReadonlySet<string>
+            answer?: MessageID
+            superseded?: boolean
+          }
+        >()
         let ending: MessageID | undefined
         const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
 
         while (true) {
           yield* status.set(sessionID, { type: "busy" })
-          yield* Effect.logInfo("loop", { "session.id": sessionID, step })
-
-          const stored = yield* MessageV2.filterCompactedEffect(sessionID).pipe(
-            Effect.provideService(Database.Service, database),
+          const stored = executionOrder(
+            yield* MessageV2.filterCompactedEffect(sessionID).pipe(Effect.provideService(Database.Service, database)),
           )
-          // A user message the loop had not already seen when it injected the
-          // continuation supersedes it (new input owns the next turn). Everything
-          // else keeps it in flight even when the stored transcript places it
-          // earlier. Supersession is by identity, not by stored order, so a
-          // skewed clock cannot make the prompt the nudge already continues look
-          // like newer input.
-          if (
-            inFlight !== undefined &&
-            stored.some(
-              (message) =>
-                message.info.role === "user" &&
-                message.info.id !== inFlight!.message.id &&
-                !inFlight!.seen.has(message.info.id),
+          for (const message of stored) {
+            local.set(message.info.id, message)
+            unobserved.delete(message.info.id)
+          }
+          let msgs = executionOrder([
+            ...stored,
+            ...[...unobserved].flatMap((id) => {
+              const message = local.get(id)
+              return message ? [message] : []
+            }),
+          ])
+          for (const [root, state] of pending) {
+            // A new real caller takes the next turn after the generation already
+            // on the wire. Silent annotations and the root itself do not.
+            if (
+              stored.some(
+                (message) =>
+                  isRealUserInput(message) &&
+                  turnLineage(stored, message.info.id) !== root &&
+                  !state.seen.has(message.info.id),
+              )
             )
-          )
-            inFlight = undefined
-          // The generation this run made for its own continuation. It answers
-          // that continuation even when the stored transcript places the answer
-          // (or the continuation) before the assistant the continuation
-          // followed: the run created the two in this order, so the run owns the
-          // order instead of re-deriving one from stored creation times.
-          const answer =
-            inFlight?.answer === undefined
-              ? undefined
-              : (stored.find((message) => message.info.id === inFlight!.answer) ??
-                (yield* MessageV2.get({ sessionID, messageID: inFlight.answer }).pipe(
-                  Effect.provideService(Database.Service, database),
-                  Effect.catch(() => Effect.succeed(undefined)),
-                )))
-          let msgs: SessionV1.WithParts[] = inFlight
-            ? [
-                ...stored.filter(
-                  (message) => message.info.id !== inFlight!.message.id && message.info.id !== answer?.info.id,
-                ),
-                { info: inFlight.message, parts: [inFlight.part] },
-                ...(answer === undefined ? [] : [answer]),
-              ]
-            : stored
+              state.superseded = true
+          }
 
-          // Choose the generation explicitly before deriving turn state. The
-          // newest message by creation time is not necessarily the one that is
-          // owed an answer (issue #738), so both the target and the transcript
-          // it may see are decisions, not side effects of message order. A
-          // continuation only owns the next generation while it is unanswered;
-          // after that its answer decides the turn.
           const liveWaiters = yield* InstanceState.use(callers, (registry) => waiters(registry, sessionID))
-          const awaiting = inFlight === undefined || inFlight.answer !== undefined ? undefined : inFlight.message.id
+          const active = [...pending.entries()].findLast(([, state]) => !state.superseded || state.answer !== undefined)
+          const awaiting = active?.[1].message.id
           const target = generationTarget(msgs, liveWaiters, awaiting)
           if (!target) throw new Error("No user message found in stream. This should never happen.")
-          const view = generationView(msgs, target, awaiting)
-          const latest = MessageV2.latest(view)
+          const root = turnLineage(msgs, target.info.id)
+          let view = generationView(msgs, target, awaiting)
+          // Async input is context for its own turn, never part of the request
+          // still finishing an earlier prompt. Silent annotations remain visible.
+          const rootAt = view.findIndex((message) => message.info.id === root)
+          view = view.filter((message) => {
+            const parent = message.info.role === "assistant" ? message.info.parentID : message.info.id
+            if (parent === undefined || (message.info.role === "user" && message.info.noReply === true)) return true
+            const owner = turnLineage(view, parent)
+            return owner === root || view.findIndex((message) => message.info.id === owner) < rootAt
+          })
+          const own = view.filter((message) => {
+            const parent = message.info.role === "assistant" ? message.info.parentID : message.info.id
+            return parent !== undefined && turnLineage(view, parent) === root
+          })
+          const latest = MessageV2.latest(own)
           const { finished: lastFinished, tasks } = latest
-          // Turn state belongs to the generation this run made for its own
-          // continuation, not to the newest stored creation time: a clock step
-          // between the turn's first answer and the nudge leaves the answer that
-          // completed the turn stored earlier than both.
-          const turn =
-            answer !== undefined && target.info.id === inFlight?.message.id
-              ? answer
-              : view.findLast((message) => message.info.id === latest.assistant?.id)
-          const lastAssistant = turn?.info.role === "assistant" ? turn.info : latest.assistant
-
+          const turn = own.findLast((message) => message.info.role === "assistant")
+          const lastAssistant = turn?.info.role === "assistant" ? turn.info : undefined
           const lastUser = target.info
+          const state = pending.get(root)
+          const step = own.filter((message) => message.info.role === "assistant").length
+          const finishNudges = msgs.filter(
+            (message) =>
+              finishContinuationPromptID(message) !== undefined && turnLineage(msgs, message.info.id) === root,
+          ).length
+          yield* Effect.logInfo("loop", { "session.id": sessionID, promptID: root, step })
 
           // Snapshot the effective model/variant for this turn. A selection
           // that changed mid-task takes effect here, when the turn starts,
@@ -1729,11 +1722,9 @@ const layer = Layer.effect(
           // agent's step cap is reached.
           const activeAgent = yield* agents.get(lastUser.agent)
           const finishRequired = activeAgent !== undefined && activeAgent.finishTool !== false
-          const messagesAfterLastUser = view.slice(view.findLastIndex((msg) => msg.info.id === lastUser.id) + 1)
-          const completedFinish = messagesAfterLastUser
+          const completedFinish = own
             .flatMap((msg) => msg.parts)
-            .reverse()
-            .find(
+            .findLast(
               (part): part is SessionV1.ToolPart =>
                 part.type === "tool" && part.tool === FinishTool.id && part.state.status === "completed",
             )
@@ -1754,7 +1745,12 @@ const layer = Layer.effect(
           // prompt joining a settled run, an idle resume): it must settle on the
           // persisted error instead of spending another request on the same
           // spent prompt. Tool work still in flight keeps its own resolution.
-          if (lastAssistant?.error !== undefined && lastAssistant.parentID === lastUser.id && !hasUnresolvedTools) {
+          if (
+            lastAssistant?.error !== undefined &&
+            answered(view, lastUser.id) &&
+            turnLineage(view, lastAssistant.parentID ?? "") === root &&
+            !hasUnresolvedTools
+          ) {
             yield* Effect.logInfo("prompt already ended terminally; ending the run", {
               "session.id": sessionID,
               messageID: lastAssistant.id,
@@ -1881,6 +1877,13 @@ const layer = Layer.effect(
                 ending = lastAssistant.id
                 break
               }
+              if (state?.superseded) {
+                // The exhausted budget above still stamps its terminal error.
+                // Otherwise settle this generation and let the new caller enter
+                // with its own prompt and budget instead of spending another nudge.
+                ending = lastAssistant.id
+                break
+              }
               if (stagnated) {
                 yield* Effect.logWarning("review repeated identical output without progress, sending recovery nudge", {
                   "session.id": sessionID,
@@ -1894,7 +1897,6 @@ const layer = Layer.effect(
                   messageID: lastAssistant.id,
                 })
               }
-              finishNudges++
               const nudge: SessionV1.User = {
                 id: MessageID.ascending(),
                 sessionID,
@@ -1920,13 +1922,13 @@ const layer = Layer.effect(
               yield* sessions.updatePart(nudgePart)
               // This nudge is owed the next generation: keep it in flight so the
               // turn cannot be re-derived as the prompt that already ended.
-              inFlight = {
+              pending.set(root, {
                 message: nudge,
                 part: nudgePart,
-                seen: new Set(
-                  msgs.filter((message) => message.info.role === "user").map((message) => message.info.id),
-                ),
-              }
+                seen: new Set(msgs.filter(isRealUserInput).map((message) => message.info.id)),
+              })
+              local.set(nudge.id, { info: nudge, parts: [nudgePart] })
+              unobserved.add(nudge.id)
               continue
             }
             if (finishRequired && activeAgent?.steps !== undefined && !completedFinish && step >= activeAgent.steps) {
@@ -1943,8 +1945,7 @@ const layer = Layer.effect(
             break
           }
 
-          step++
-          if (step === 1)
+          if (step === 0)
             yield* title({
               session,
               modelID: selection.modelID,
@@ -1990,7 +1991,7 @@ const layer = Layer.effect(
             throw error
           }
           const maxSteps = agent.steps ?? Infinity
-          const isLastStep = step >= maxSteps
+          const isLastStep = step + 1 >= maxSteps
           msgs = yield* SessionReminders.apply({ messages: msgs, agent, session }).pipe(
             Effect.provideService(RuntimeFlags.Service, flags),
             Effect.provideService(FSUtil.Service, fsys),
@@ -2013,6 +2014,8 @@ const layer = Layer.effect(
             sessionID,
           }
           yield* sessions.updateMessage(msg)
+          local.set(msg.id, { info: msg, parts: [] })
+          unobserved.add(msg.id)
 
           const finalizeInterruptedAssistant = Effect.gen(function* () {
             if (msg.time.completed) return
@@ -2067,7 +2070,7 @@ const layer = Layer.effect(
               })
             }
 
-            if (step === 1)
+            if (step === 0)
               yield* summary.summarize({ sessionID, messageID: lastUser.id }).pipe(Effect.ignore, Effect.forkIn(scope))
 
             yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
@@ -2213,13 +2216,14 @@ const layer = Layer.effect(
                 const current = yield* MessageV2.filterCompactedEffect(sessionID).pipe(
                   Effect.provideService(Database.Service, database),
                 )
-                const lineage = repetitionRecoveryLineage(current, lastUser.id)
-                const recoveries = repetitionRecoveries(current, lineage)
+                const ordered = executionOrder(current)
+                const lineage = turnLineage(ordered, lastUser.id)
+                const recoveries = repetitionRecoveries(ordered, lineage)
                 // Only messages persisted after this turn's own prompt can be
                 // newer input; if the prompt is not in the re-read history there
                 // is nothing to compare against.
-                const lastUserAt = current.findLastIndex((message) => message.info.id === lastUser.id)
-                const waiting = lastUserAt < 0 ? undefined : current.slice(lastUserAt + 1).find(isRealUserInput)
+                const lastUserAt = ordered.findLastIndex((message) => message.info.id === lastUser.id)
+                const waiting = lastUserAt < 0 ? undefined : ordered.slice(lastUserAt + 1).find(isRealUserInput)
                 if (recoveries < REPETITION_RECOVERY_MAX && waiting === undefined) {
                   const detail = repetitionGuardDetail(handle.message.error)
                   yield* Effect.logWarning("repetition guard tripped; recovering once with a synthetic continuation", {
@@ -2237,18 +2241,24 @@ const layer = Layer.effect(
                     time: { created: Date.now() },
                   }
                   yield* sessions.updateMessage(recovery)
-                  yield* sessions.updatePart({
+                  const recoveryPart: SessionV1.TextPart = {
                     id: PartID.ascending(),
                     messageID: recovery.id,
                     sessionID,
                     type: "text",
                     text: repetitionRecoveryMessage(detail),
                     synthetic: true,
-                    // Recognised as the runner's own continuation of `lineage`
-                    // by subagent-result (provenance/success) and by the budget
-                    // above, so re-entering the loop cannot restart it.
+                    // Recognised by result ownership and the persisted budget.
                     metadata: { [REPETITION_RECOVERY]: { promptID: lineage, attempt: recoveries + 1 } },
-                  } satisfies SessionV1.TextPart)
+                  }
+                  yield* sessions.updatePart(recoveryPart)
+                  pending.set(lineage, {
+                    message: recovery,
+                    part: recoveryPart,
+                    seen: new Set(ordered.filter(isRealUserInput).map((message) => message.info.id)),
+                  })
+                  local.set(recovery.id, { info: recovery, parts: [recoveryPart] })
+                  unobserved.add(recovery.id)
                   return "continue" as const
                 }
                 if (waiting !== undefined && recoveries < REPETITION_RECOVERY_MAX)
@@ -2283,7 +2293,15 @@ const layer = Layer.effect(
           // This generation answered the continuation this run injected, when
           // that is the turn it ran for. Record it so the next iteration derives
           // the turn from it rather than from stored creation times.
-          if (inFlight !== undefined && lastUser.id === inFlight.message.id) inFlight.answer = msg.id
+          const generated = yield* MessageV2.get({ sessionID, messageID: msg.id }).pipe(
+            Effect.provideService(Database.Service, database),
+            Effect.catch(() => Effect.succeed(undefined)),
+          )
+          if (generated) {
+            local.set(msg.id, generated)
+            unobserved.delete(msg.id)
+          }
+          if (state !== undefined && lastUser.id === state.message.id) state.answer = msg.id
           ending = msg.id
           if (outcome === "break") break
           continue
@@ -2408,10 +2426,11 @@ const layer = Layer.effect(
           return result
         }
 
-        const msgs = yield* sessions
+        const stored = yield* sessions
           .messages({ sessionID: input.sessionID })
           .pipe(Effect.catch(() => Effect.succeed(null)))
-        if (!msgs) return result
+        if (!stored) return result
+        const msgs = executionOrder(stored)
         // Issue #738/#410: each caller settles on the answer to its own prompt.
         // A repetition recovery continues the prompt it declares, so the
         // recovery's answer - or the terminal guard error that ended the
