@@ -2072,6 +2072,10 @@ const layer = Layer.effect(
         // would start a fresh runLoop with a fresh budget and generate once more
         // for the same continuation - the third request the old local counter
         // allowed after a reset. The surfaced error is the end of the turn.
+        // A joined caller's queued user message remains visible but unanswered;
+        // returning this errored assistant does not acknowledge it as completed.
+        // Idle resume cannot restart the spent lineage. An explicit new user
+        // prompt can resume with the retained queued input still in history.
         if (result.info.role === "assistant" && RepetitionGuard.isStoredError(result.info.error)) return result
         if (!input.messageID || (result.info.role === "assistant" && result.info.parentID === input.messageID))
           return result

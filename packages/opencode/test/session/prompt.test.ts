@@ -61,6 +61,7 @@ import { awaitWithTimeout, pollWithTimeout, testEffect } from "../lib/effect"
 import { httpError, raw, reply, TestLLMServer } from "../lib/llm-server"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { RepetitionGuard } from "../../src/session/llm/repetition-guard"
+import { continuesPrompt } from "../../src/session/subagent-result"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { LocationServiceMap, locationServiceMapLayer } from "@opencode-ai/core/location-services"
@@ -6504,9 +6505,18 @@ it.instance(
       expect(Exit.isSuccess(exitPrimary)).toBe(true)
       expect(Exit.isSuccess(exitQueued)).toBe(true)
 
-      // The joined run re-entered through a fresh runLoop. The budget follows the
-      // persisted continuation lineage (and the terminal guard trip ends it), so
-      // there is no third request and no second recovery.
+      // Both callers joined the same run. A successful Effect exit is not a
+      // successful answer: each caller must receive the surfaced terminal error.
+      if (Exit.isSuccess(exitPrimary) && Exit.isSuccess(exitQueued)) {
+        expect(exitQueued.value.info.id).toBe(exitPrimary.value.info.id)
+        expect(exitQueued.value.info.role).toBe("assistant")
+        if (exitQueued.value.info.role === "assistant") {
+          expect(RepetitionGuard.isStoredError(exitQueued.value.info.error)).toBe(true)
+        }
+      }
+
+      // The budget follows the persisted continuation lineage and the terminal
+      // guard trip ends the joined run: no third request or second recovery.
       expect(yield* llm.calls).toBe(2)
       expect(yield* llm.pending).toBe(0)
       expect(yield* llm.misses).toEqual([])
@@ -6515,8 +6525,56 @@ it.instance(
       expect(repetitionRecoveriesIn(messages)).toHaveLength(1)
       const assistantMessages = messages.filter((m) => m.info.role === "assistant")
       expect(assistantMessages).toHaveLength(2)
-      const last = assistantMessages[assistantMessages.length - 1]
-      if (last && last.info.role === "assistant") expect(RepetitionGuard.isStoredError(last.info.error)).toBe(true)
+      const last = assistantMessages[assistantMessages.length - 1]!
+      expect(last.info.role).toBe("assistant")
+      if (last.info.role === "assistant") expect(RepetitionGuard.isStoredError(last.info.error)).toBe(true)
+      const status = yield* SessionStatus.Service
+      expect(yield* status.get(chat.id)).toEqual({ type: "idle" })
+
+      // The queued prompt is terminal/unanswered, not successfully consumed by
+      // the synthetic continuation of the earlier prompt. Its exact user input
+      // remains in the durable, visible transcript; it has not been dropped.
+      const queuedMessage = messages.find((message) => message.info.id === queuedID)!
+      expect(queuedMessage.info.role).toBe("user")
+      expect(queuedMessage.parts.filter((part) => part.type === "text").map((part) => part.text)).toEqual([
+        "queued while the guard was recovering",
+      ])
+      expect(assistantMessages.some((message) => continuesPrompt(messages, message, queuedID))).toBe(false)
+      expect(JSON.stringify(turnInputs(yield* llm.inputs)[1])).toContain("queued while the guard was recovering")
+
+      // An idle resume alone cannot spend a third automatic request. Recovery
+      // requires an explicit new user action, not a budget reset on re-entry.
+      const resumed = yield* prompt.loop({ sessionID: chat.id })
+      expect(resumed.info.id).toBe(last.info.id)
+      expect(yield* llm.calls).toBe(2)
+      expect(yield* status.get(chat.id)).toEqual({ type: "idle" })
+
+      // Prove recoverability via the actual prompt API, not merely by finding
+      // a row: a deliberate follow-up sees the retained queued text. This is a
+      // new user turn, not an extra automatic guard-recovery allowance.
+      yield* llm.push(reply().text("Handled the retained queued request after explicit user resume.").stop())
+      const followupID = MessageID.ascending()
+      const recovered = yield* prompt.prompt({
+        sessionID: chat.id,
+        messageID: followupID,
+        agent: "work",
+        model: ref,
+        parts: [{ type: "text", text: "Resume the unanswered queued request above." }],
+      })
+      expect(recovered.info.role).toBe("assistant")
+      if (recovered.info.role === "assistant") {
+        expect(recovered.info.parentID).toBe(followupID)
+        expect(recovered.info.error).toBeUndefined()
+      }
+      expect(yield* llm.calls).toBe(3)
+      const inputs = turnInputs(yield* llm.inputs)
+      expect(inputs).toHaveLength(3)
+      expect(JSON.stringify(inputs[2])).toContain("queued while the guard was recovering")
+      expect(JSON.stringify(inputs[2])).toContain("Resume the unanswered queued request above.")
+      expect(repetitionRecoveriesIn(yield* sessions.messages({ sessionID: chat.id }))).toHaveLength(1)
+      expect(yield* llm.pending).toBe(0)
+      expect(yield* llm.misses).toEqual([])
+      expect(yield* status.get(chat.id)).toEqual({ type: "idle" })
     }),
   { config: cfg },
   20_000,
@@ -6542,6 +6600,8 @@ it.instance(
         model: { providerID: ref.providerID, id: ref.modelID },
       })
       const callID = "call_guard_tool"
+      const { directory } = yield* TestInstance
+      const markerFile = path.join(directory, "repetition-tool-executions.txt")
       const toolDone = yield* Deferred.make<void>()
       // Head: the tool call streams and completes. Tail (after the gate): the
       // same generation loops and trips the guard.
@@ -6557,7 +6617,10 @@ it.instance(
                 {
                   index: 0,
                   function: {
-                    arguments: JSON.stringify({ command: "printf 'TOOL_MARKER_CONTENT\\n'", description: "write marker" }),
+                    arguments: JSON.stringify({
+                      command: "printf 'executed\\n' >> repetition-tool-executions.txt; printf 'TOOL_MARKER_CONTENT\\n'",
+                      description: "write marker",
+                    }),
                   },
                 },
               ],
@@ -6609,7 +6672,10 @@ it.instance(
       expect(inputs).toHaveLength(2)
       const recoveryRequest = JSON.stringify(inputs[1])
       expect(recoveryRequest).toContain(callID)
-      expect(recoveryRequest).toContain("TOOL_MARKER_CONTENT")
+      // One output occurrence plus the command's literal marker in its input.
+      expect(recoveryRequest.match(/TOOL_MARKER_CONTENT/g)).toHaveLength(2)
+      expect(yield* Effect.promise(() => readFile(markerFile, "utf8"))).toBe("executed\n")
+      expect(yield* llm.pending).toBe(0)
       expect(yield* llm.misses).toEqual([])
     }),
   { config: cfg },
