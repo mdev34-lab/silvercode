@@ -16,6 +16,7 @@ import { ArgsProvider } from "../../../src/context/args"
 import { ClipboardProvider } from "../../../src/context/clipboard"
 import { DataProvider } from "../../../src/context/data"
 import { DialogAgentEffort } from "../../../src/component/dialog-agent-effort"
+import { DialogSelect } from "../../../src/ui/dialog-select"
 import { Prompt } from "../../../src/component/prompt"
 import { EditorContextProvider } from "../../../src/context/editor"
 import { EpilogueProvider } from "../../../src/context/epilogue"
@@ -379,6 +380,29 @@ async function fileJson(file: string, level?: string): Promise<unknown> {
     await Bun.sleep(10)
   }
   throw new Error(`timed out waiting for ${file}`)
+}
+
+
+/** The lines one option paints: its title row plus any wrapped description rows. */
+function optionBlock(frame: string, level: string) {
+  const lines = frame.split("\n")
+  const start = lines.findIndex((line) => line.includes(level))
+  if (start < 0) throw new Error(`no ${level} row in the captured frame`)
+  const block = [lines[start]]
+  for (const line of lines.slice(start + 1)) {
+    if (!line.trim()) break
+    block.push(line)
+  }
+  return block
+}
+
+/** The background of the widest span on a row, i.e. the fill the row paints. */
+async function rowFills(app: Setup) {
+  const spans = await captureSpans(app)
+  return spans.lines.map((line) => {
+    const widest = line.spans.reduce((acc, span) => (span.width > acc.width ? span : acc), line.spans[0])
+    return widest ? hexOf(widest.bg) : undefined
+  })
 }
 
 describe("agent effort selector", () => {
@@ -979,6 +1003,226 @@ describe("agent effort selector", () => {
       expect(
         (harness.sync.session.get(SESSION_THOROUGH)?.metadata as { agentEffort?: string } | undefined)?.agentEffort,
       ).toBe("thorough")
+    } finally {
+      await harness.dispose()
+    }
+  })
+
+  test("separates the levels with one blank row and aligns their descriptions", async () => {
+    const harness = await mountEffort({
+      route: { type: "home" },
+      model: "test-provider/variant-model",
+      children: () => <DialogAgentEffort />,
+    })
+    try {
+      const frame = await frameWhere(
+        harness.app,
+        (f) => f.includes("Agent effort") && f.includes("Deep, meticulous"),
+        "dialog rows",
+      )
+      const lines = frame.split("\n")
+      const rowOf = (needle: string) => lines.findIndex((line) => line.includes(needle))
+      // One blank row between options, and no more: the levels stop reading as
+      // a packed block without spending the panel on empty rows.
+      expect(rowOf("Medium") - rowOf("Fast")).toBe(2)
+      expect(rowOf("Thorough") - rowOf("Medium")).toBe(2)
+      expect(lines[rowOf("Fast") + 1].trim()).toBe("")
+      expect(lines[rowOf("Medium") + 1].trim()).toBe("")
+      // Each description sits in its own column, on its title's line while the
+      // panel is wide enough, and in the same column for every level.
+      const columns = ["Reliable workhorse", "Smarter agent", "Deep, meticulous"].map((copy) =>
+        lines[rowOf(copy)].indexOf(copy),
+      )
+      expect(new Set(columns).size).toBe(1)
+      expect(rowOf("Reliable workhorse")).toBe(rowOf("Fast"))
+      expect(rowOf("Smarter agent")).toBe(rowOf("Medium"))
+      expect(rowOf("Deep, meticulous")).toBe(rowOf("Thorough"))
+      // The accepted copy, footer and indicator are untouched by the layout.
+      expect(lines[rowOf("Thorough")]).toContain("Deep, meticulous work on complex tasks from start to finish")
+      expect(frame).toContain("Default for new sessions")
+      expect(markerLine(frame)).toContain("Fast")
+    } finally {
+      await harness.dispose()
+    }
+  })
+
+  test("wraps descriptions inside their column in a narrow viewport", async () => {
+    const harness = await mountEffort({
+      route: { type: "home" },
+      model: "test-provider/variant-model",
+      children: () => <DialogAgentEffort />,
+      width: 44,
+    })
+    try {
+      const frame = await frameWhere(
+        harness.app,
+        (f) => f.includes("start to finish") && f.includes("Reliable workhorse"),
+        "narrow rows",
+      )
+      const copy = [
+        ["Fast", "Reliable workhorse for everyday tasks"],
+        ["Medium", "Smarter agent for more demanding work"],
+        ["Thorough", "Deep, meticulous work on complex tasks from start to finish"],
+      ]
+      const blocks = copy.map(([level, description]) => {
+        const block = optionBlock(frame, level)
+        // Nothing is clipped: the full accepted copy is painted, split over the
+        // wrapped rows and read back by joining them.
+        expect(block.map((line) => line.trim()).join(" ")).toContain(description)
+        expect(block.length).toBeGreaterThan(1)
+        return { level, description, block }
+      })
+      // Wrapped rows continue under the description column rather than under
+      // the level name, and every level shares that column.
+      const columns = blocks.map(({ description, block }) => {
+        const column = block[0].indexOf(description.split(" ").slice(0, 2).join(" "))
+        expect(column).toBeGreaterThan(0)
+        for (const line of block.slice(1)) expect(line.search(/\S/)).toBe(column)
+        return column
+      })
+      expect(new Set(columns).size).toBe(1)
+      // The blank row between options survives the wrap.
+      expect(frame.split("\n")[frame.split("\n").findIndex((line) => line.includes("Medium")) - 1].trim()).toBe("")
+      expect(frame).toContain("Default for new sessions")
+    } finally {
+      await harness.dispose()
+    }
+  })
+
+  test("paints the selected row's background across every wrapped line", async () => {
+    const harness = await mountEffort({
+      route: { type: "home" },
+      model: "test-provider/variant-model",
+      children: () => <DialogAgentEffort />,
+      width: 44,
+    })
+    try {
+      await frameWhere(harness.app, (f) => f.includes("start to finish"), "narrow rows")
+      // Walk the cursor to the wrapping level: its highlight must cover the
+      // whole description, not just the title line.
+      harness.app.mockInput.pressArrow("down")
+      harness.app.mockInput.pressArrow("down")
+      const frame = await frameWhere(harness.app, (f) => markerLine(f).includes("Fast"), "marker stays on the level")
+      const fills = await rowFills(harness.app)
+      const lines = frame.split("\n")
+      const start = lines.findIndex((line) => line.includes("Thorough"))
+      const block = optionBlock(frame, "Thorough")
+      expect(block).toHaveLength(3)
+      // The search field paints its own focused fill, so the option area starts
+      // below it; there the only filled rows are the selected level's.
+      const searchRow = lines.findIndex((line) => line.includes("Search"))
+      const highlight = fills[start]
+      expect(highlight).not.toBe(fills[0])
+      const painted = fills.flatMap((fill, index) => (index > searchRow && fill === highlight ? [index] : []))
+      expect(painted).toEqual([start, start + 1, start + 2])
+      // The rows the highlight covers are the wrapped description rows, which
+      // stay aligned under the description column.
+      const column = block[0].indexOf("Deep, meticulous")
+      for (const line of block.slice(1)) expect(line.search(/\S/)).toBe(column)
+      expect(block.map((line) => line.trim()).join(" ")).toContain(
+        "Deep, meticulous work on complex tasks from start to finish",
+      )
+      // The current-level indicator still points at the stored level, which is
+      // not the row the cursor is on now.
+      expect(frame).toContain("●")
+    } finally {
+      await harness.dispose()
+    }
+  })
+
+  test("keeps keyboard selection on a wrapped row visible in a short viewport", async () => {
+    const harness = await mountEffort({
+      route: { type: "home" },
+      model: "test-provider/variant-model",
+      children: () => <DialogAgentEffort />,
+      width: 44,
+      height: 18,
+    })
+    try {
+      await frameWhere(harness.app, (f) => f.includes("Reliable workhorse"), "first row")
+      harness.app.mockInput.pressArrow("down")
+      harness.app.mockInput.pressArrow("down")
+      // The scroll reveals the row by its own height: all three wrapped lines
+      // of the selected level are on screen together.
+      const selected = await frameWhere(harness.app, (f) => f.includes("start to finish"), "wrapped row revealed")
+      const lines = selected.split("\n")
+      const start = lines.findIndex((line) => line.includes("Thorough"))
+      expect(start).toBeGreaterThanOrEqual(0)
+      expect(lines[start + 1].trim()).toBe("on complex tasks from")
+      expect(lines[start + 2].trim()).toBe("start to finish")
+
+      harness.app.mockInput.pressArrow("up")
+      harness.app.mockInput.pressArrow("up")
+      const back = await frameWhere(harness.app, (f) => f.includes("Reliable workhorse"), "first row again")
+      expect(markerLine(back)).toContain("Fast")
+    } finally {
+      await harness.dispose()
+    }
+  })
+
+  test("filters the levels by search and keeps the spacing and footer", async () => {
+    const harness = await mountEffort({
+      route: { type: "home" },
+      model: "test-provider/variant-model",
+      children: () => <DialogAgentEffort />,
+    })
+    try {
+      await frameWhere(harness.app, (f) => f.includes("Agent effort"), "dialog title")
+      await harness.app.mockInput.typeText("tho")
+      const filtered = await frameWhere(
+        harness.app,
+        (f) => f.includes("Thorough") && !f.includes("Medium") && !f.includes("Reliable workhorse"),
+        "filtered rows",
+      )
+      expect(filtered).toContain("Deep, meticulous work on complex tasks from start to finish")
+      expect(filtered).toContain("Default for new sessions")
+
+      harness.app.mockInput.pressBackspace()
+      harness.app.mockInput.pressBackspace()
+      harness.app.mockInput.pressBackspace()
+      const restored = await frameWhere(
+        harness.app,
+        (f) => f.includes("Fast") && f.includes("Medium") && f.includes("Thorough"),
+        "restored rows",
+      )
+      const lines = restored.split("\n")
+      const rowOf = (needle: string) => lines.findIndex((line) => line.includes(needle))
+      expect(rowOf("Medium") - rowOf("Fast")).toBe(2)
+      expect(lines[rowOf("Fast") + 1].trim()).toBe("")
+      expect(restored).toContain("Default for new sessions")
+    } finally {
+      await harness.dispose()
+    }
+  })
+
+  test("leaves other pickers on their packed single-line rows", async () => {
+    const harness = await mountEffort({
+      route: { type: "home" },
+      model: "test-provider/variant-model",
+      children: () => (
+        <DialogSelect
+          options={[
+            { value: "alpha", title: "Alpha", description: "First option" },
+            { value: "bravo", title: "Bravo", description: "Second option" },
+          ]}
+          title="Control picker"
+          current="alpha"
+        />
+      ),
+    })
+    try {
+      const frame = await frameWhere(
+        harness.app,
+        (f) => f.includes("Control picker") && f.includes("Second option"),
+        "control picker",
+      )
+      const lines = frame.split("\n")
+      const rowOf = (needle: string) => lines.findIndex((line) => line.includes(needle))
+      // No opt-in props means the shared picker keeps painting one packed line
+      // per option with the description trailing the title.
+      expect(rowOf("Bravo") - rowOf("Alpha")).toBe(1)
+      expect(lines[rowOf("Alpha")]).toContain("Alpha First option")
+      expect(lines[rowOf("Bravo")]).toContain("Bravo Second option")
     } finally {
       await harness.dispose()
     }

@@ -37,6 +37,10 @@ export interface DialogSelectProps<T> {
   renderFilter?: boolean
   locked?: boolean
   preserveSelection?: boolean
+  // Blank rows inserted above every option after the first (and after a
+  // category header), so rows stop reading as one packed block. Opt-in: the
+  // default 0 keeps every other picker's line math and painted height as is.
+  optionSpacing?: number
   actions?: {
     command: string
     title: string
@@ -62,6 +66,11 @@ export interface DialogSelectOption<T = any> {
   details?: string[]
   footer?: JSX.Element | string
   titleWidth?: number
+  // Fixed width of the title cell: the description then sits in its own
+  // column that wraps under itself instead of trailing the title, and every
+  // row's description starts at the same column. Unset keeps the single-line
+  // title + trailing description layout.
+  titleColumn?: number
   truncateTitle?: boolean | "left"
   category?: string
   categoryView?: JSX.Element
@@ -204,15 +213,32 @@ export function DialogSelect<T>(props: DialogSelectProps<T>) {
   })
 
   const rows = createMemo(() => {
+    const spacing = props.optionSpacing ?? 0
     const headers = grouped().reduce((acc, [category], i) => {
       if (!category) return acc
       return acc + (i > 0 ? 2 : 1)
     }, 0)
-    return flat().reduce((acc, option) => acc + 1 + (option.details?.length ?? 0), headers)
+    // An opt-in blank row sits above every option that does not already start
+    // a group (a category header supplies that separation), so the height cap
+    // counts the same painted lines the scrollbox lays out.
+    const gaps =
+      spacing > 0
+        ? spacing *
+          grouped().reduce((acc, [category, options]) => acc + Math.max(0, options.length - (category ? 0 : 1)), 0)
+        : 0
+    return flat().reduce((acc, option) => acc + 1 + (option.details?.length ?? 0), headers + gaps)
   })
 
   const dimensions = useTerminalDimensions()
-  const height = createMemo(() => Math.min(rows(), Math.floor(dimensions().height / 2) - 6))
+  const height = createMemo(() => {
+    const cap = Math.floor(dimensions().height / 2) - 6
+    // A title column turns descriptions into wrapping text, so how many lines a
+    // row paints is only known after layout: capping by `rows()` would clip the
+    // wrapped lines out of the scrollbox. The terminal cap still bounds the
+    // box, and the scrollbox keeps sizing itself to its content below it.
+    if (flat().some((option) => option.titleColumn !== undefined)) return cap
+    return Math.min(rows(), cap)
+  })
 
   const selected = createMemo(() => flat()[store.selected])
 
@@ -340,12 +366,16 @@ export function DialogSelect<T>(props: DialogSelectProps<T>) {
     const target = scroll.getChildren()[index]
     if (!target) return
     const y = target.y - scroll.y
+    // A row paints several lines when its description wraps, so the reveal and
+    // center math measure the row's own height. For the single-line rows every
+    // other picker has, both values below are exactly the previous ones.
+    const rowHeight = Math.max(1, target.height)
     if (center) {
       const centerOffset = Math.floor(scroll.height / 2)
-      scroll.scrollBy(y - centerOffset)
+      scroll.scrollBy(y + Math.floor((rowHeight - 1) / 2) - centerOffset)
     } else {
-      if (y >= scroll.height) {
-        scroll.scrollBy(y - scroll.height + 1)
+      if (y + rowHeight > scroll.height) {
+        scroll.scrollBy(y + rowHeight - scroll.height)
       }
       if (y < 0) {
         scroll.scrollBy(y)
@@ -650,13 +680,20 @@ export function DialogSelect<T>(props: DialogSelectProps<T>) {
                     </box>
                   </Show>
                   <For each={options}>
-                    {(option) => {
+                    {(option, optionIndex) => {
                       const active = createMemo(() => !props.locked && isDeepEqual(option.value, selected()?.value))
                       const current = createMemo(() => isDeepEqual(option.value, props.current))
+                      // A group's first option already sits under its header
+                      // (or at the top of a flat list); every later option
+                      // carries the blank row.
+                      const spacing = createMemo(() =>
+                        optionIndex() > 0 || (!category && index() > 0) ? (props.optionSpacing ?? 0) : 0,
+                      )
                       return (
                         <box
                           flexDirection="column"
                           position="relative"
+                          marginTop={spacing()}
                           onMouseMove={() => {
                             if (props.locked) return
                             setStore("input", "mouse")
@@ -704,6 +741,7 @@ export function DialogSelect<T>(props: DialogSelectProps<T>) {
                               titleView={option.titleView}
                               footer={flatten() ? (option.category ?? option.footer) : option.footer}
                               titleWidth={option.titleWidth}
+                              titleColumn={option.titleColumn}
                               truncateTitle={option.truncateTitle}
                               description={option.description !== category ? option.description : undefined}
                               active={active()}
@@ -755,6 +793,7 @@ function Option(props: {
   muted?: boolean
   footer?: JSX.Element | string
   titleWidth?: number
+  titleColumn?: number
   truncateTitle?: boolean | "left"
   gutter?: () => JSX.Element
   onMouseOver?: () => void
@@ -767,6 +806,7 @@ function Option(props: {
     if (props.current) return theme.primary
     return theme.text
   })
+  const titleColumn = createMemo(() => props.titleColumn)
 
   return (
     <>
@@ -780,24 +820,47 @@ function Option(props: {
           {props.gutter?.()}
         </box>
       </Show>
-      <text
-        flexGrow={1}
-        fg={text()}
-        attributes={props.active && !props.muted ? TextAttributes.BOLD : undefined}
-        overflow="hidden"
-        wrapMode="none"
-        paddingLeft={3}
+      <Show
+        when={titleColumn() !== undefined && props.description}
+        fallback={
+          <text
+            flexGrow={1}
+            fg={text()}
+            attributes={props.active && !props.muted ? TextAttributes.BOLD : undefined}
+            overflow="hidden"
+            wrapMode="none"
+            paddingLeft={3}
+          >
+            {props.titleView ??
+              (props.truncateTitle === false
+                ? props.title
+                : props.truncateTitle === "left"
+                  ? Locale.truncateLeft(props.title, props.titleWidth ?? 61)
+                  : Locale.truncate(props.title, props.titleWidth ?? 61))}
+            <Show when={props.description}>
+              <span style={{ fg: props.active && !props.muted ? fg : theme.textMuted }}> {props.description}</span>
+            </Show>
+          </text>
+        }
       >
-        {props.titleView ??
-          (props.truncateTitle === false
-            ? props.title
-            : props.truncateTitle === "left"
-              ? Locale.truncateLeft(props.title, props.titleWidth ?? 61)
-              : Locale.truncate(props.title, props.titleWidth ?? 61))}
-        <Show when={props.description}>
-          <span style={{ fg: props.active && !props.muted ? fg : theme.textMuted }}> {props.description}</span>
-        </Show>
-      </text>
+        {/* Opt-in two-column row: the title keeps a fixed cell and the
+            description wraps inside its own column, so wrapped lines stay
+            aligned under the description rather than under the title. */}
+        {/* Width includes the 3-column indent the title keeps. */}
+        <box width={(titleColumn() ?? 0) + 3} flexShrink={0} paddingLeft={3}>
+          <text
+            fg={text()}
+            attributes={props.active && !props.muted ? TextAttributes.BOLD : undefined}
+            overflow="hidden"
+            wrapMode="none"
+          >
+            {props.titleView ?? props.title}
+          </text>
+        </box>
+        <text flexGrow={1} flexShrink={1} fg={props.active && !props.muted ? fg : theme.textMuted} wrapMode="word">
+          {props.description}
+        </text>
+      </Show>
       <Show when={props.footer}>
         <box flexShrink={0}>
           <text fg={props.active && !props.muted ? fg : theme.textMuted}>{props.footer}</text>
