@@ -272,6 +272,18 @@ describe("review assistant text: real transcript fallback", () => {
     expect(frame.match(/Raw review report/g)?.length).toBe(1)
   })
 
+  test("a declined finish cannot turn same-message text into an approval", async () => {
+    const report = ReviewReport.envelope({ version: 1, revision: "synthetic", assessment: "approved", summary: "Undelivered report", findings: [] })
+    const failed = completedTool("finish", { reason: "failure", result: report }, report)
+    const mounted = await mount({ agent: "review", completed: true, parts: [textPart(`Visible analysis.\n\n${report}`), failed] })
+    await settleUntilFrame(mounted.app, "Task failed")
+    const frame = await frameOfSpans(mounted.app)
+    expect(frame).toContain("Visible analysis.")
+    expect(frame).toContain("Task failed")
+    expect(frame).not.toContain("✓ Approved")
+    expect(frame).not.toContain("Raw review report")
+  })
+
   test("a later finish does not repeat an identical prior text review", async () => {
     const report = ReviewReport.envelope({ version: 1, revision: "synthetic", assessment: "approved", summary: "Prior synthetic verdict", findings: [] })
     const mounted = await mount({ agent: "review", completed: true, parts: [textPart(`Prior analysis.\n\n${report}`)] })

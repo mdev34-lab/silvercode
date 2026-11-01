@@ -7,6 +7,15 @@ import type { AssistantMessage, Part, TextPart, ToolPart } from "@opencode-ai/sd
 export function reviewText(message: AssistantMessage, parts: readonly Part[]) {
   if (Agent.canonicalID(message.agent) !== "review" || message.time.completed === undefined || message.error)
     return undefined
+  // A finish in this message can still be declined or declare a non-success;
+  // its text must not pre-announce a verdict that the finish did not deliver.
+  if (parts.some((part) => {
+    if (part.type !== "tool" || part.tool !== "finish") return false
+    if (part.state.status !== "completed") return true
+    if (part.state.metadata?.waiting === true) return true
+    const reason = part.state.input.reason
+    return reason !== undefined && reason !== "success"
+  })) return undefined
   const text = parts.filter((part): part is TextPart => part.type === "text" && !part.ignored && !part.synthetic)
   if (!text.length) return undefined
   const chunks = text.map((part) => part.text)

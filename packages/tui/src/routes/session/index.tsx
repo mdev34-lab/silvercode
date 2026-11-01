@@ -2404,7 +2404,11 @@ function Finish(props: ToolProps) {
   // structurally instead of dumping the raw JSON; only a completed part
   // qualifies, since a running finish can still be declined by the review
   // gate and must not pre-announce its verdict.
-  const review = createMemo(() => (props.part.state.status === "completed" ? parseReviewReport(result()) : undefined))
+  const review = createMemo(() =>
+    props.part.state.status === "completed" && finishBlockView(props.part, props.input)?.tone === "success"
+      ? parseReviewReport(result())
+      : undefined,
+  )
   const [expanded, setExpanded] = createSignal(false)
   const [errorExpanded, setErrorExpanded] = createSignal(false)
   // The block shows the agent's own summary; the tool output also carries
