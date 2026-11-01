@@ -104,13 +104,7 @@ const seed = Effect.fn("TaskToolTest.seed")(function* (title = "Pinned") {
     time: { created: Date.now() },
   })
   // Existing task-mechanics fixtures model non-programming research; routing tests append their explicit intent below.
-  yield* session.updatePart({
-    id: PartID.ascending(),
-    sessionID: chat.id,
-    messageID: user.id,
-    type: "text",
-    text: "Research the requested information",
-  })
+  yield* session.updatePart({id:PartID.ascending(),sessionID:chat.id,messageID:user.id,type:"text",text:"Research the requested information"})
   const assistant: SessionV1.Assistant = {
     id: MessageID.ascending(),
     role: "assistant",
@@ -166,8 +160,7 @@ function reply(input: SessionPrompt.PromptInput, text: string): SessionV1.WithPa
         messageID: id,
         sessionID: input.sessionID,
         type: "text",
-        text:
-          input.agent === "review" ? text : `<silvercode-result>${text || "No additional text."}</silvercode-result>`,
+        text: input.agent === "review" ? text : `<silvercode-result>${text || "No additional text."}</silvercode-result>`,
       },
     ],
   }
@@ -394,19 +387,21 @@ describe("tool.task", () => {
     },
   )
 
-  it.instance("description separates the child file-tool folder from the shell cwd", () =>
-    Effect.gen(function* () {
-      const agent = yield* Agent.Service
-      const build = yield* agent.get("work")
-      const registry = yield* ToolRegistry.Service
-      const description =
-        (yield* registry.tools({ ...ref, agent: build })).find((tool) => tool.id === TaskTool.id)?.description ?? ""
+  it.instance(
+    "description separates the child file-tool folder from the shell cwd",
+    () =>
+      Effect.gen(function* () {
+        const agent = yield* Agent.Service
+        const build = yield* agent.get("work")
+        const registry = yield* ToolRegistry.Service
+        const description =
+          (yield* registry.tools({ ...ref, agent: build })).find((tool) => tool.id === TaskTool.id)?.description ?? ""
 
-      expect(description).toContain("working folder for file/search/edit tools")
-      expect(description).toContain("Shell commands still run in the project directory by default")
-      expect(description).toContain("a relative shell `workdir` resolves from the project directory")
-      expect(description).toContain("pass the child's absolute folder as shell `workdir`")
-    }),
+        expect(description).toContain("working folder for file/search/edit tools")
+        expect(description).toContain("Shell commands still run in the project directory by default")
+        expect(description).toContain("a relative shell `workdir` resolves from the project directory")
+        expect(description).toContain("pass the child's absolute folder as shell `workdir`")
+      }),
   )
 
   it.instance(
@@ -519,11 +514,13 @@ describe("tool.task", () => {
         const agent = yield* Agent.Service
         const build = yield* agent.get("work")
         const registry = yield* ToolRegistry.Service
-        const task = (yield* registry.tools({
-          ...ref,
-          agent: build,
-          permission: Permission.fromConfig({ task: { zebra: "deny" } }),
-        })).find((tool) => tool.id === TaskTool.id)
+        const task = (
+          yield* registry.tools({
+            ...ref,
+            agent: build,
+            permission: Permission.fromConfig({ task: { zebra: "deny" } }),
+          })
+        ).find((tool) => tool.id === TaskTool.id)
         const schema = ToolJsonSchema.fromTool(task!) as {
           properties: { subagent_type: { description: string } }
         }
@@ -857,9 +854,7 @@ describe("tool.task", () => {
         const { assistant } = yield* seed()
         const orphan = yield* sessions.create({ parentID: SessionID.make("ses_missing_ancestor") })
         yield* sessions.updateMessage({ ...assistant, id: MessageID.ascending(), sessionID: orphan.id })
-        const orphanAssistant = (yield* sessions.messages({ sessionID: orphan.id })).find(
-          (m) => m.info.role === "assistant",
-        )!.info
+        const orphanAssistant = (yield* sessions.messages({ sessionID: orphan.id })).find((m) => m.info.role === "assistant")!.info
         const before = (yield* sessions.children(orphan.id)).length
         const tool = yield* TaskTool
         const def = yield* tool.init()
@@ -1622,9 +1617,7 @@ describe("tool.task", () => {
         expect(runs).toBe(1)
 
         yield* Deferred.succeed(done, undefined)
-        expect((yield* jobs.wait({ id: result.metadata.sessionId })).info?.output).toBe(
-          "<silvercode-result>\nbackground done\n</silvercode-result>",
-        )
+        expect((yield* jobs.wait({ id: result.metadata.sessionId })).info?.output).toBe("<silvercode-result>\nbackground done\n</silvercode-result>")
         expect((yield* Deferred.await(injected)).parts[0]?.type).toBe("text")
         expect(runs).toBe(1)
       }),
@@ -1728,9 +1721,9 @@ describe("tool.task", () => {
       expect(result.output).toContain("Background task updated")
       first.resolve()
       expect((yield* jobs.get(started.metadata.sessionId))?.status).toBe("running")
-      expect((yield* Effect.promise(() => updated.promise)).parts).toEqual(
-        expect.arrayContaining([{ type: "text", text: "also inspect cancellation" }]),
-      )
+      expect((yield* Effect.promise(() => updated.promise)).parts).toEqual(expect.arrayContaining([
+        { type: "text", text: "also inspect cancellation" },
+      ]))
 
       second.resolve()
       const waited = yield* jobs.wait({ id: started.metadata.sessionId, timeout: 1_000 })
@@ -2792,102 +2785,100 @@ describe("tool.task", () => {
 
 describe("tool.task - storage failures", () => {
   for (const outcome of ["completed", "defect"] as const) {
-    it.instance(
-      `history recovery failure propagates after ${outcome} and unsubscribes`,
-      () =>
-        Effect.gen(function* () {
-          const sessions = yield* Session.Service
-          const events = yield* EventV2Bridge.Service
-          const jobs = yield* BackgroundJob.Service
-          const { chat, assistant } = yield* seed()
-          const child = yield* sessions.create({ parentID: chat.id, title: "Existing child" })
-          const historyError = new Error("History storage defect")
-          const taskError = new Error("Child execution defect")
-          let unsubscribed = 0
-          let recovered = 0
-          let runExit: Exit.Exit<string, unknown> | undefined
-          const tool = yield* TaskTool.pipe(
-            Effect.provideService(Session.Service, {
-              ...sessions,
-              messages: (input) => {
-                if (input.sessionID !== child.id) return sessions.messages(input)
-                recovered++
-                return Effect.die(historyError)
-              },
-            }),
-            Effect.provideService(EventV2Bridge.Service, {
-              ...events,
-              listen: (listener) =>
-                events.listen(listener).pipe(
-                  Effect.map((unsubscribe) =>
-                    unsubscribe.pipe(
-                      Effect.andThen(
-                        Effect.sync(() => {
-                          unsubscribed++
-                        }),
-                      ),
-                    ),
-                  ),
-                ),
-            }),
-            Effect.provideService(BackgroundJob.Service, {
-              ...jobs,
-              start: (input) =>
-                jobs.start({
-                  ...input,
-                  run: input.run.pipe(
-                    Effect.onExit((exit) =>
+    it.instance(`history recovery failure propagates after ${outcome} and unsubscribes`, () =>
+      Effect.gen(function* () {
+        const sessions = yield* Session.Service
+        const events = yield* EventV2Bridge.Service
+        const jobs = yield* BackgroundJob.Service
+        const { chat, assistant } = yield* seed()
+        const child = yield* sessions.create({ parentID: chat.id, title: "Existing child" })
+        const historyError = new Error("History storage defect")
+        const taskError = new Error("Child execution defect")
+        let unsubscribed = 0
+        let recovered = 0
+        let runExit: Exit.Exit<string, unknown> | undefined
+        const tool = yield* TaskTool.pipe(
+          Effect.provideService(Session.Service, {
+            ...sessions,
+            messages: (input) => {
+              if (input.sessionID !== child.id) return sessions.messages(input)
+              recovered++
+              return Effect.die(historyError)
+            },
+          }),
+          Effect.provideService(EventV2Bridge.Service, {
+            ...events,
+            listen: (listener) =>
+              events.listen(listener).pipe(
+                Effect.map((unsubscribe) =>
+                  unsubscribe.pipe(
+                    Effect.andThen(
                       Effect.sync(() => {
-                        runExit = exit
+                        unsubscribed++
                       }),
                     ),
                   ),
-                }),
-            }),
-          )
-          const def = yield* tool.init()
-          const exit = yield* def
-            .execute(
-              {
-                description: "inspect",
-                prompt: "inspect",
-                subagent_type: "general",
-                task_id: child.id,
-                background: false,
-              },
-              {
-                sessionID: chat.id,
-                messageID: assistant.id,
-                agent: "work",
-                abort: new AbortController().signal,
-                messages: [],
-                metadata: () => Effect.void,
-                ask: () => Effect.void,
-                extra: {
-                  promptOps: {
-                    ...stubOps(),
-                    prompt: (input: SessionPrompt.PromptInput) =>
-                      outcome === "defect" ? Effect.die(taskError) : Effect.succeed(reply(input, "done")),
-                  },
+                ),
+              ),
+          }),
+          Effect.provideService(BackgroundJob.Service, {
+            ...jobs,
+            start: (input) =>
+              jobs.start({
+                ...input,
+                run: input.run.pipe(
+                  Effect.onExit((exit) =>
+                    Effect.sync(() => {
+                      runExit = exit
+                    }),
+                  ),
+                ),
+              }),
+          }),
+        )
+        const def = yield* tool.init()
+        const exit = yield* def
+          .execute(
+            {
+              description: "inspect",
+              prompt: "inspect",
+              subagent_type: "general",
+              task_id: child.id,
+              background: false,
+            },
+            {
+              sessionID: chat.id,
+              messageID: assistant.id,
+              agent: "work",
+              abort: new AbortController().signal,
+              messages: [],
+              metadata: () => Effect.void,
+              ask: () => Effect.void,
+              extra: {
+                promptOps: {
+                  ...stubOps(),
+                  prompt: (input: SessionPrompt.PromptInput) =>
+                    outcome === "defect" ? Effect.die(taskError) : Effect.succeed(reply(input, "done")),
                 },
               },
-            )
-            .pipe(Effect.exit)
-          expect(Exit.isFailure(exit)).toBe(true)
-          expect(recovered).toBe(outcome === "completed" ? 2 : 1)
-          expect(unsubscribed).toBe(1)
-          expect((yield* jobs.get(child.id))?.status).toBe("error")
-          expect(runExit && Exit.isFailure(runExit)).toBe(true)
-          if (!runExit || Exit.isSuccess(runExit)) return
-          expect(runExit.cause.reasons).toContainEqual(expect.objectContaining({ _tag: "Die", defect: historyError }))
-          if (outcome === "defect") {
-            expect(runExit.cause.reasons).toContainEqual(expect.objectContaining({ _tag: "Die", defect: taskError }))
-            expect(runExit.cause.reasons).toHaveLength(2)
-          }
-          if (outcome === "completed" && Exit.isFailure(exit)) {
-            expect(Cause.pretty(exit.cause)).toContain(historyError.message)
-          }
-        }),
+            },
+          )
+          .pipe(Effect.exit)
+        expect(Exit.isFailure(exit)).toBe(true)
+        expect(recovered).toBe(outcome === "completed" ? 2 : 1)
+        expect(unsubscribed).toBe(1)
+        expect((yield* jobs.get(child.id))?.status).toBe("error")
+        expect(runExit && Exit.isFailure(runExit)).toBe(true)
+        if (!runExit || Exit.isSuccess(runExit)) return
+        expect(runExit.cause.reasons).toContainEqual(expect.objectContaining({ _tag: "Die", defect: historyError }))
+        if (outcome === "defect") {
+          expect(runExit.cause.reasons).toContainEqual(expect.objectContaining({ _tag: "Die", defect: taskError }))
+          expect(runExit.cause.reasons).toHaveLength(2)
+        }
+        if (outcome === "completed" && Exit.isFailure(exit)) {
+          expect(Cause.pretty(exit.cause)).toContain(historyError.message)
+        }
+      }),
       { config: FOREGROUND },
     )
   }
@@ -2957,40 +2948,38 @@ describe("tool.task - storage failures", () => {
     )
   }
 
-  it.instance(
-    "resume typed NotFound creates a child for a genuinely missing task",
-    () =>
-      Effect.gen(function* () {
-        const sessions = yield* Session.Service
-        const { chat, assistant } = yield* seed()
-        const missing = SessionID.make("ses_missing_storage_test")
-        const lookup = yield* sessions.get(missing).pipe(Effect.exit)
-        expect(Exit.isFailure(lookup)).toBe(true)
-        if (Exit.isFailure(lookup))
-          expect(lookup.cause.reasons).toContainEqual(
-            expect.objectContaining({ _tag: "Fail", error: expect.any(NotFoundError) }),
-          )
-        const tool = yield* TaskTool
-        const def = yield* tool.init()
-        const result = yield* def.execute(
-          { description: "inspect", prompt: "inspect", subagent_type: "general", task_id: missing, background: false },
-          {
-            sessionID: chat.id,
-            messageID: assistant.id,
-            agent: "work",
-            abort: new AbortController().signal,
-            messages: [],
-            metadata: () => Effect.void,
-            ask: () => Effect.void,
-            extra: { promptOps: stubOps() },
-          },
+  it.instance("resume typed NotFound creates a child for a genuinely missing task", () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const { chat, assistant } = yield* seed()
+      const missing = SessionID.make("ses_missing_storage_test")
+      const lookup = yield* sessions.get(missing).pipe(Effect.exit)
+      expect(Exit.isFailure(lookup)).toBe(true)
+      if (Exit.isFailure(lookup))
+        expect(lookup.cause.reasons).toContainEqual(
+          expect.objectContaining({ _tag: "Fail", error: expect.any(NotFoundError) }),
         )
-        const children = yield* sessions.children(chat.id)
-        expect(children).toHaveLength(1)
-        expect(result.metadata.sessionId).toBe(children[0]?.id)
-        expect(result.metadata.sessionId).not.toBe(missing)
-        expect(result.output).toContain('state="completed"')
-      }),
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const result = yield* def.execute(
+        { description: "inspect", prompt: "inspect", subagent_type: "general", task_id: missing, background: false },
+        {
+          sessionID: chat.id,
+          messageID: assistant.id,
+          agent: "work",
+          abort: new AbortController().signal,
+          messages: [],
+          metadata: () => Effect.void,
+          ask: () => Effect.void,
+          extra: { promptOps: stubOps() },
+        },
+      )
+      const children = yield* sessions.children(chat.id)
+      expect(children).toHaveLength(1)
+      expect(result.metadata.sessionId).toBe(children[0]?.id)
+      expect(result.metadata.sessionId).not.toBe(missing)
+      expect(result.output).toContain('state="completed"')
+    }),
     { config: FOREGROUND },
   )
 })
@@ -3321,12 +3310,7 @@ it.instance("a child that yields for its own subagents keeps its job running and
               ...replied,
               parts: [
                 ...replied.parts,
-                finishPart(
-                  replied.info.id,
-                  input.sessionID,
-                  "waiting_for_subagent",
-                  "<silvercode-result>Delegated work is pending.</silvercode-result>",
-                ),
+                finishPart(replied.info.id, input.sessionID, "waiting_for_subagent", "<silvercode-result>Delegated work is pending.</silvercode-result>"),
               ],
             }
           })
@@ -3541,10 +3525,7 @@ it.instance(
             const finish = yield* (yield* FinishTool).init()
             const accepted = yield* Effect.orDie(
               finish.execute(
-                {
-                  reason: "waiting_for_subagent",
-                  result: "<silvercode-result>Delegated work is pending.</silvercode-result>",
-                },
+                { reason: "waiting_for_subagent", result: "<silvercode-result>Delegated work is pending.</silvercode-result>" },
                 {
                   sessionID: input.sessionID,
                   messageID: dispatch.id,
@@ -3557,12 +3538,7 @@ it.instance(
               ),
             )
             expect(accepted.metadata.waiting).toBe(true)
-            const part = finishPart(
-              dispatch.id,
-              input.sessionID,
-              "waiting_for_subagent",
-              "<silvercode-result>Delegated work is pending.</silvercode-result>",
-            )
+            const part = finishPart(dispatch.id, input.sessionID, "waiting_for_subagent", "<silvercode-result>Delegated work is pending.</silvercode-result>")
             if (part.state.status === "completed") {
               part.state.output = accepted.output
               part.state.metadata = accepted.metadata
@@ -3718,9 +3694,7 @@ testEffect(layer({}, [], [SessionPrompt.node])).instance(
             return Effect.gen(function* () {
               const prompt = yield* SessionPrompt.Service
               const persisted = yield* prompt.prompt({ ...input, noReply: true })
-              expect(
-                persisted.parts.some((part) => part.type === "text" && part.metadata?.reviewLoop?.writesFiles === true),
-              ).toBe(true)
+              expect(persisted.parts.some((part) => part.type === "text" && part.metadata?.reviewLoop?.writesFiles === true)).toBe(true)
               const replied = reply(input, "child final result")
               return {
                 ...replied,
@@ -3804,10 +3778,7 @@ testEffect(layer({}, [], [SessionPrompt.node])).instance(
             const finish = yield* (yield* FinishTool).init()
             const accepted = yield* Effect.orDie(
               finish.execute(
-                {
-                  reason: "waiting_for_subagent",
-                  result: "<silvercode-result>Delegated work is pending.</silvercode-result>",
-                },
+                { reason: "waiting_for_subagent", result: "<silvercode-result>Delegated work is pending.</silvercode-result>" },
                 {
                   sessionID: input.sessionID,
                   messageID: dispatch.id,
@@ -3820,12 +3791,7 @@ testEffect(layer({}, [], [SessionPrompt.node])).instance(
               ),
             )
             expect(accepted.metadata.waiting).toBe(true)
-            const part = finishPart(
-              dispatch.id,
-              input.sessionID,
-              "waiting_for_subagent",
-              "<silvercode-result>Delegated work is pending.</silvercode-result>",
-            )
+            const part = finishPart(dispatch.id, input.sessionID, "waiting_for_subagent", "<silvercode-result>Delegated work is pending.</silvercode-result>")
             if (part.state.status === "completed") {
               part.state.output = accepted.output
               part.state.metadata = accepted.metadata
@@ -4051,10 +4017,7 @@ for (const teardown of [false, true]) {
               const finish = yield* (yield* FinishTool).init()
               const accepted = yield* Effect.orDie(
                 finish.execute(
-                  {
-                    reason: "waiting_for_subagent",
-                    result: "<silvercode-result>Delegated work is pending.</silvercode-result>",
-                  },
+                  { reason: "waiting_for_subagent", result: "<silvercode-result>Delegated work is pending.</silvercode-result>" },
                   {
                     sessionID: input.sessionID,
                     messageID: dispatch.id,
@@ -4067,12 +4030,7 @@ for (const teardown of [false, true]) {
                 ),
               )
               expect(accepted.metadata.waiting).toBe(true)
-              const part = finishPart(
-                dispatch.id,
-                input.sessionID,
-                "waiting_for_subagent",
-                "<silvercode-result>Delegated work is pending.</silvercode-result>",
-              )
+              const part = finishPart(dispatch.id, input.sessionID, "waiting_for_subagent", "<silvercode-result>Delegated work is pending.</silvercode-result>")
               if (part.state.status === "completed") {
                 part.state.output = accepted.output
                 part.state.metadata = accepted.metadata
@@ -4218,21 +4176,12 @@ it.instance(
                   const last = replyParts({ ...input, messageID: user.id }, [""])
                   yield* sessions.updateMessage(last.info)
                   const finish: SessionV1.ToolPart = {
-                    id: PartID.ascending(),
-                    messageID: last.info.id,
-                    sessionID: input.sessionID,
-                    type: "tool",
-                    tool: "finish",
-                    callID: "finish-plan",
-                    state: {
-                      status: "completed",
-                      input: { reason: "success", result: "Task completed" },
-                      output: "Task completed",
-                      title: "finish",
-                      metadata: {},
-                      time: { start: Date.now(), end: Date.now() },
-                    },
-                  }
+                  id: PartID.ascending(), messageID: last.info.id, sessionID: input.sessionID,
+                  type: "tool", tool: "finish", callID: "finish-plan",
+                  state: { status: "completed", input: { reason: "success", result: "Task completed" },
+                    output: "Task completed", title: "finish", metadata: {},
+                    time: { start: Date.now(), end: Date.now() } },
+                }
                   yield* sessions.updatePart(finish)
                   return { info: last.info, parts: [...last.parts, finish] }
                 }),
@@ -4247,92 +4196,51 @@ it.instance(
   { config: FOREGROUND },
 )
 
-it.instance(
-  "does not report a provider-failed child assistant as successful empty output",
-  () =>
-    Effect.gen(function* () {
-      const { chat, assistant } = yield* seed()
-      const def = yield* (yield* TaskTool).init()
-      const exit = yield* def
-        .execute(
-          { description: "quota failure", prompt: "inspect", subagent_type: "general", background: false },
-          {
-            sessionID: chat.id,
-            messageID: assistant.id,
-            agent: "work",
-            abort: new AbortController().signal,
-            messages: [],
-            metadata: () => Effect.void,
-            ask: () => Effect.void,
-            extra: {
-              promptOps: {
-                ...stubOps(),
-                prompt: (input: SessionPrompt.PromptInput) =>
-                  Effect.sync(() => {
-                    const result = reply(input, "")
-                    return {
-                      ...result,
-                      info: {
-                        ...result.info,
-                        error: {
-                          name: "APIError" as const,
-                          data: { message: "Free usage limit reached LOCAL_NESTED_QUOTA", isRetryable: false },
-                        },
-                      },
-                      parts: [],
-                    }
-                  }),
-              },
-            },
-          },
-        )
-        .pipe(Effect.exit)
-      expect(Exit.isFailure(exit)).toBe(true)
-      if (Exit.isFailure(exit)) expect(Cause.pretty(exit.cause)).toContain("LOCAL_NESTED_QUOTA")
-    }),
+it.instance("does not report a provider-failed child assistant as successful empty output", () =>
+  Effect.gen(function* () {
+    const { chat, assistant } = yield* seed()
+    const def = yield* (yield* TaskTool).init()
+    const exit = yield* def.execute(
+      { description: "quota failure", prompt: "inspect", subagent_type: "general", background: false },
+      {
+        sessionID: chat.id, messageID: assistant.id, agent: "work", abort: new AbortController().signal,
+        messages: [], metadata: () => Effect.void, ask: () => Effect.void,
+        extra: { promptOps: {
+          ...stubOps(), prompt: (input: SessionPrompt.PromptInput) => Effect.sync(() => {
+            const result = reply(input, "")
+            return { ...result, info: { ...result.info, error: {
+              name: "APIError" as const, data: { message: "Free usage limit reached LOCAL_NESTED_QUOTA", isRetryable: false },
+            } }, parts: [] }
+          }),
+        } },
+      },
+    ).pipe(Effect.exit)
+    expect(Exit.isFailure(exit)).toBe(true)
+    if (Exit.isFailure(exit)) expect(Cause.pretty(exit.cause)).toContain("LOCAL_NESTED_QUOTA")
+  }),
   { config: FOREGROUND },
 )
 
-it.instance(
-  "keeps the error name if an upstream child error has no data",
-  () =>
-    Effect.gen(function* () {
-      const { chat, assistant } = yield* seed()
-      const def = yield* (yield* TaskTool).init()
-      const exit = yield* def
-        .execute(
-          { description: "quota failure", prompt: "inspect", subagent_type: "general", background: false },
-          {
-            sessionID: chat.id,
-            messageID: assistant.id,
-            agent: "work",
-            abort: new AbortController().signal,
-            messages: [],
-            metadata: () => Effect.void,
-            ask: () => Effect.void,
-            extra: {
-              promptOps: {
-                ...stubOps(),
-                prompt: (input: SessionPrompt.PromptInput) =>
-                  Effect.sync(() => {
-                    const result = reply(input, "")
-                    return {
-                      ...result,
-                      info: {
-                        ...result.info,
-                        error: { name: "APIError" } as NonNullable<SessionV1.Assistant["error"]>,
-                      },
-                      parts: [],
-                    }
-                  }),
-              },
-            },
-          },
-        )
-        .pipe(Effect.exit)
-      expect(Exit.isFailure(exit)).toBe(true)
-      if (Exit.isFailure(exit)) expect(Cause.pretty(exit.cause)).toContain("Subagent failed: APIError")
-    }),
+it.instance("keeps the error name if an upstream child error has no data", () =>
+  Effect.gen(function* () {
+    const { chat, assistant } = yield* seed()
+    const def = yield* (yield* TaskTool).init()
+    const exit = yield* def.execute(
+      { description: "quota failure", prompt: "inspect", subagent_type: "general", background: false },
+      {
+        sessionID: chat.id, messageID: assistant.id, agent: "work", abort: new AbortController().signal,
+        messages: [], metadata: () => Effect.void, ask: () => Effect.void,
+        extra: { promptOps: {
+          ...stubOps(), prompt: (input: SessionPrompt.PromptInput) => Effect.sync(() => {
+            const result = reply(input, "")
+            return { ...result, info: { ...result.info, error: { name: "APIError" } as NonNullable<SessionV1.Assistant["error"]> }, parts: [] }
+          }),
+        } },
+      },
+    ).pipe(Effect.exit)
+    expect(Exit.isFailure(exit)).toBe(true)
+    if (Exit.isFailure(exit)) expect(Cause.pretty(exit.cause)).toContain("Subagent failed: APIError")
+  }),
   { config: FOREGROUND },
 )
 
@@ -4373,708 +4281,312 @@ it.instance("programming Code and Review before Think run with guidance, not a b
           },
         )
         .pipe(Effect.exit)
-      if (process.env.WORK_FLOW_CAPTURE && name === "code" && Exit.isFailure(exit))
-        yield* Effect.promise(() =>
-          Bun.write(
-            "/tmp/wf-runtime-refusal.json",
-            JSON.stringify({
-              error: Cause.pretty(exit.cause),
-              input: { subagent_type: name, description: "Implement requested fix", prompt: "Fix software" },
-            }),
-          ),
-        )
-      // Workflow order is guidance: the child runs and the model is advised.
-      if (name !== "review") expect(Exit.isSuccess(exit)).toBe(true)
+      if (process.env.WORK_FLOW_CAPTURE && name === "code" && Exit.isFailure(exit)) yield* Effect.promise(()=>Bun.write("/tmp/wf-runtime-refusal.json",JSON.stringify({error:Cause.pretty(exit.cause), input:{subagent_type:name,description:"Implement requested fix",prompt:"Fix software"}})))
+    // Workflow order is guidance: the child runs and the model is advised.
+    if (name !== "review") expect(Exit.isSuccess(exit)).toBe(true)
       expect(executed).toBe(true)
-      if (Exit.isSuccess(exit) && name !== "general")
-        expect(exit.value.output).toContain("Workflow guidance (not blocking)")
+      if (Exit.isSuccess(exit) && name !== "general") expect(exit.value.output).toContain("Workflow guidance (not blocking)")
     }
   }),
 )
 
-it.instance("programming persists a fresh successful Think delivery before permitting Code", () =>
-  Effect.gen(function* () {
-    const { chat, assistant } = yield* seed()
-    const sessions = yield* Session.Service
-    const history = yield* sessions.messages({ sessionID: chat.id })
-    const user = history.find((message) => message.info.role === "user")!
-    yield* sessions.updatePart({
-      id: PartID.ascending(),
-      messageID: user.info.id,
-      sessionID: chat.id,
-      type: "text",
-      text: "Fix the Python software bug",
-    })
-    const def = yield* (yield* TaskTool).init()
-    const ctx = {
-      sessionID: chat.id,
-      messageID: assistant.id,
-      agent: "work",
-      abort: new AbortController().signal,
-      messages: [],
-      metadata: () => Effect.void,
-      ask: () => Effect.void,
-      extra: {
-        promptOps: reviewRunOps(
-          ["<silvercode-result>Plan the implementation and tests.</silvercode-result>"],
-          "done",
-          "success",
-        ),
-      },
-    }
-    const planned = yield* def.execute(
-      { description: "plan", prompt: "plan", subagent_type: "think", background: false },
-      ctx,
-    )
-    expect(planned.metadata.background).toBe(false)
-    expect(planned.metadata.workFlow?.agent).toBe("think")
-    yield* sessions.updatePart({
-      id: PartID.ascending(),
-      sessionID: chat.id,
-      messageID: assistant.id,
-      type: "tool",
-      tool: "task",
-      callID: "planning",
-      state: {
-        status: "completed",
-        input: { subagent_type: "think" },
-        output: planned.output,
-        title: "plan",
-        metadata: planned.metadata,
-        time: { start: Date.now(), end: Date.now() },
-      },
-    })
-    const implemented = yield* def.execute(
-      { description: "implement", prompt: "implement plan", subagent_type: "code", background: false },
-      ctx,
-    )
-    expect(implemented.metadata.workFlow?.agent).toBe("code")
-    expect(implemented.metadata.workFlow?.planned).toBe(true)
-  }),
-)
+it.instance("programming persists a fresh successful Think delivery before permitting Code", () => Effect.gen(function* () {
+  const {chat,assistant}=yield* seed()
+  const sessions=yield* Session.Service
+  const history=yield* sessions.messages({sessionID:chat.id})
+  const user=history.find((message)=>message.info.role === "user")!
+  yield* sessions.updatePart({id:PartID.ascending(),messageID:user.info.id,sessionID:chat.id,type:"text",text:"Fix the Python software bug"})
+  const def=yield* (yield* TaskTool).init()
+  const ctx={sessionID:chat.id,messageID:assistant.id,agent:"work",abort:new AbortController().signal,messages:[],metadata:()=>Effect.void,ask:()=>Effect.void,extra:{promptOps:reviewRunOps(["<silvercode-result>Plan the implementation and tests.</silvercode-result>"], "done", "success")}}
+  const planned=yield* def.execute({description:"plan",prompt:"plan",subagent_type:"think",background:false},ctx)
+  expect(planned.metadata.background).toBe(false)
+  expect(planned.metadata.workFlow?.agent).toBe("think")
+  yield* sessions.updatePart({id:PartID.ascending(),sessionID:chat.id,messageID:assistant.id,type:"tool",tool:"task",callID:"planning",state:{status:"completed",input:{subagent_type:"think"},output:planned.output,title:"plan",metadata:planned.metadata,time:{start:Date.now(),end:Date.now()}}})
+  const implemented=yield* def.execute({description:"implement",prompt:"implement plan",subagent_type:"code",background:false},ctx)
+  expect(implemented.metadata.workFlow?.agent).toBe("code")
+  expect(implemented.metadata.workFlow?.planned).toBe(true)
+}))
 
-it.instance("a Think delivery finished after a runner finish nudge still records the workflow stage", () =>
-  Effect.gen(function* () {
-    const { chat, assistant } = yield* seed()
-    const sessions = yield* Session.Service
-    const history = yield* sessions.messages({ sessionID: chat.id })
-    const user = history.find((message) => message.info.role === "user")!
-    yield* sessions.updatePart({
-      id: PartID.ascending(),
-      messageID: user.info.id,
-      sessionID: chat.id,
-      type: "text",
-      text: "Fix the Python software bug",
-    })
-    const ops = reviewRunOps(
-      ["<silvercode-result>Plan the implementation and tests.</silvercode-result>"],
-      "done",
-      "success",
-    )
-    // The child stopped without finish once, so the runner appended a synthetic nudge and the
-    // finishing assistant answers the nudge, not the prompt the task tool issued.
-    const nudged = {
-      ...ops,
-      prompt: (input: SessionPrompt.PromptInput) =>
-        ops.prompt(input).pipe(
-          Effect.flatMap((result) =>
-            Effect.gen(function* () {
-              yield* sessions.updateMessage({
-                id: input.messageID!,
-                sessionID: input.sessionID,
-                role: "user",
-                agent: "think",
-                model: ref,
-                time: { created: Date.now() },
-              })
-              yield* sessions.updatePart({
-                id: PartID.ascending(),
-                messageID: input.messageID!,
-                sessionID: input.sessionID,
-                type: "text",
-                text: "plan",
-              })
-              const nudge = yield* sessions.updateMessage({
-                id: MessageID.ascending(),
-                sessionID: input.sessionID,
-                role: "user",
-                agent: "think",
-                model: ref,
-                time: { created: Date.now() },
-              })
-              yield* sessions.updatePart({
-                id: PartID.ascending(),
-                messageID: nudge.id,
-                sessionID: input.sessionID,
-                type: "text",
-                text: FINISH_NUDGE,
-                synthetic: true,
-              })
-              return { ...result, info: { ...result.info, id: MessageID.ascending(), parentID: nudge.id } }
-            }),
-          ),
-        ),
-    }
-    const def = yield* (yield* TaskTool).init()
-    const planned = yield* def.execute(
-      { description: "plan", prompt: "plan", subagent_type: "think", background: false },
-      {
-        sessionID: chat.id,
-        messageID: assistant.id,
-        agent: "work",
-        abort: new AbortController().signal,
-        messages: [],
-        metadata: () => Effect.void,
-        ask: () => Effect.void,
-        extra: { promptOps: nudged },
-      },
-    )
-    expect(planned.metadata.workFlow?.agent).toBe("think")
-  }),
-)
+it.instance("a Think delivery finished after a runner finish nudge still records the workflow stage", () => Effect.gen(function* () {
+  const {chat,assistant}=yield* seed()
+  const sessions=yield* Session.Service
+  const history=yield* sessions.messages({sessionID:chat.id})
+  const user=history.find((message)=>message.info.role === "user")!
+  yield* sessions.updatePart({id:PartID.ascending(),messageID:user.info.id,sessionID:chat.id,type:"text",text:"Fix the Python software bug"})
+  const ops=reviewRunOps(["<silvercode-result>Plan the implementation and tests.</silvercode-result>"], "done", "success")
+  // The child stopped without finish once, so the runner appended a synthetic nudge and the
+  // finishing assistant answers the nudge, not the prompt the task tool issued.
+  const nudged={...ops,prompt:(input:SessionPrompt.PromptInput)=>ops.prompt(input).pipe(Effect.flatMap((result)=>Effect.gen(function* () {
+    yield* sessions.updateMessage({id:input.messageID!,sessionID:input.sessionID,role:"user",agent:"think",model:ref,time:{created:Date.now()}})
+    yield* sessions.updatePart({id:PartID.ascending(),messageID:input.messageID!,sessionID:input.sessionID,type:"text",text:"plan"})
+    const nudge=yield* sessions.updateMessage({id:MessageID.ascending(),sessionID:input.sessionID,role:"user",agent:"think",model:ref,time:{created:Date.now()}})
+    yield* sessions.updatePart({id:PartID.ascending(),messageID:nudge.id,sessionID:input.sessionID,type:"text",text:FINISH_NUDGE,synthetic:true})
+    return {...result,info:{...result.info,id:MessageID.ascending(),parentID:nudge.id}}
+  })))}
+  const def=yield* (yield* TaskTool).init()
+  const planned=yield* def.execute({description:"plan",prompt:"plan",subagent_type:"think",background:false},{sessionID:chat.id,messageID:assistant.id,agent:"work",abort:new AbortController().signal,messages:[],metadata:()=>Effect.void,ask:()=>Effect.void,extra:{promptOps:nudged}})
+  expect(planned.metadata.workFlow?.agent).toBe("think")
+}))
 
-it.instance("an unclassified request does not block children: Work is advised, not stopped", () =>
-  Effect.gen(function* () {
-    const { chat, assistant } = yield* seed()
-    const sessions = yield* Session.Service
-    const history = yield* sessions.messages({ sessionID: chat.id })
-    const user = history.find((message) => message.info.role === "user")!
-    yield* sessions.updatePart({
-      id: PartID.ascending(),
-      messageID: user.info.id,
-      sessionID: chat.id,
-      type: "text",
-      text: "Fix this",
-    })
-    const def = yield* (yield* TaskTool).init()
-    for (const name of ["think", "code", "review", "explore", "general"]) {
-      let ran = false
-      const exit = yield* def
-        .execute(
-          { description: "cannot bypass question", prompt: "implement", subagent_type: name, background: false },
-          {
-            sessionID: chat.id,
-            messageID: assistant.id,
-            agent: "work",
-            abort: new AbortController().signal,
-            messages: [],
-            metadata: () => Effect.void,
-            ask: () => Effect.void,
-            extra: {
-              promptOps: stubOps({
-                onPrompt: () => {
-                  ran = true
-                },
-              }),
+it.instance("an unclassified request does not block children: Work is advised, not stopped", () => Effect.gen(function* () {
+  const {chat,assistant}=yield* seed()
+  const sessions=yield* Session.Service
+  const history=yield* sessions.messages({sessionID:chat.id})
+  const user=history.find((message)=>message.info.role === "user")!
+  yield* sessions.updatePart({id:PartID.ascending(),messageID:user.info.id,sessionID:chat.id,type:"text",text:"Fix this"})
+  const def=yield* (yield* TaskTool).init()
+  for (const name of ["think","code","review","explore","general"]) {
+    let ran=false
+    const exit=yield* def.execute({description:"cannot bypass question",prompt:"implement",subagent_type:name,background:false},{sessionID:chat.id,messageID:assistant.id,agent:"work",abort:new AbortController().signal,messages:[],metadata:()=>Effect.void,ask:()=>Effect.void,extra:{promptOps:stubOps({onPrompt:()=>{ran=true}})}}).pipe(Effect.exit)
+    // The child is dispatched (Review's own delivery contract may still fail with the stub).
+    expect(ran).toBe(true)
+    void exit
+  }
+}))
+
+it.instance("non-programming root survives nested model prompts and cannot reach Code via General", () => Effect.gen(function* () {
+  const {chat,assistant}=yield* seed()
+  const sessions=yield* Session.Service
+  const history=yield* sessions.messages({sessionID:chat.id})
+  const user=history.find((message)=>message.info.role === "user")!
+  yield* sessions.updatePart({id:PartID.ascending(),messageID:user.info.id,sessionID:chat.id,type:"text",text:"Research hotels and write a report"})
+  const child=yield* sessions.create({parentID:chat.id,agent:"general",title:"research"})
+  const nested=yield* sessions.create({parentID:child.id,agent:"general",title:"nested"})
+  const synthetic=yield* sessions.updateMessage({id:MessageID.ascending(),sessionID:nested.id,role:"user",agent:"general",model:ref,time:{created:Date.now()}})
+  yield* sessions.updatePart({id:PartID.ascending(),sessionID:nested.id,messageID:synthetic.id,type:"text",text:"Implement a Python application"})
+  const reply={...assistant,id:MessageID.ascending(),sessionID:nested.id,parentID:synthetic.id,agent:"general",mode:"general"}
+  yield* sessions.updateMessage(reply)
+  const def=yield* (yield* TaskTool).init()
+  let ran=false
+  const exit=yield* def.execute({description:"bypass",prompt:"implement",subagent_type:"code",background:false},{sessionID:nested.id,messageID:reply.id,agent:"general",abort:new AbortController().signal,messages:[],metadata:()=>Effect.void,ask:()=>Effect.void,extra:{promptOps:stubOps({onPrompt:()=>{ran=true}})}}).pipe(Effect.exit)
+  expect(Exit.isFailure(exit)).toBe(true)
+  expect(ran).toBe(false)
+}))
+
+it.instance("a stale successful child finish cannot authorize Code", () => Effect.gen(function* () {
+  const {chat,assistant}=yield* seed()
+  const sessions=yield* Session.Service
+  const history=yield* sessions.messages({sessionID:chat.id})
+  const user=history.find((message)=>message.info.role === "user")!
+  yield* sessions.updatePart({id:PartID.ascending(),messageID:user.info.id,sessionID:chat.id,type:"text",text:"Fix Python software"})
+  const ops=reviewRunOps(["<silvercode-result>Old plan.</silvercode-result>"],"done","success")
+  const stale={...ops,prompt:(input:SessionPrompt.PromptInput)=>ops.prompt(input).pipe(Effect.map(result=>({...result,info:{...result.info,parentID:MessageID.ascending()}})))}
+  const def=yield* (yield* TaskTool).init()
+  const planned=yield* def.execute({description:"stale plan",prompt:"plan",subagent_type:"think",background:false},{sessionID:chat.id,messageID:assistant.id,agent:"work",abort:new AbortController().signal,messages:[],metadata:()=>Effect.void,ask:()=>Effect.void,extra:{promptOps:stale}})
+  expect(planned.metadata.workFlow).toBeUndefined()
+}))
+
+it.instance("thorough non-programming General forces foreground and stamps successful delivery", () => Effect.gen(function* () {
+  const {chat,assistant}=yield* seed()
+  const sessions=yield* Session.Service
+  yield* sessions.setMetadata({sessionID:chat.id,metadata:{agentEffort:"thorough"}})
+  const def=yield* (yield* TaskTool).init()
+  const ops=reviewRunOps(["<silvercode-result>Research report.</silvercode-result>"],"done","success")
+  const result=yield* def.execute({description:"research",prompt:"research",subagent_type:"general",background:true},{sessionID:chat.id,messageID:assistant.id,agent:"work",abort:new AbortController().signal,messages:[],metadata:()=>Effect.void,ask:()=>Effect.void,extra:{promptOps:ops}})
+  expect(result.metadata.background).toBe(false)
+  expect(result.metadata.workFlow?.agent).toBe("general")
+}))
+
+it.instance("a custom agent renamed to think runs with guidance", () => Effect.gen(function* () {
+  const {chat,assistant}=yield* seed()
+  const sessions=yield* Session.Service
+  const history=yield* sessions.messages({sessionID:chat.id})
+  const user=history.find((message)=>message.info.role === "user")!
+  yield* sessions.updatePart({id:PartID.ascending(),sessionID:chat.id,messageID:user.info.id,type:"text",text:"Implement Python software"})
+  const def=yield* (yield* TaskTool).init()
+  let ran=false
+  const blocked=yield* def.execute({description:"counterfeit planner",prompt:"plan",subagent_type:"fake",background:false},{sessionID:chat.id,messageID:assistant.id,agent:"work",abort:new AbortController().signal,messages:[],metadata:()=>Effect.void,ask:()=>Effect.void,extra:{promptOps:stubOps({onPrompt:()=>{ran=true}})}}).pipe(Effect.exit)
+  expect(Exit.isSuccess(blocked)).toBe(true)
+  expect(ran).toBe(true)
+}),{config:{agent:{fake:{name:"think",mode:"subagent"}}}})
+
+it.instance("programming Code returns to Work instead of recursively launching Review", () => Effect.gen(function* () {
+  const {chat,assistant}=yield* seed()
+  const sessions=yield* Session.Service
+  const history=yield* sessions.messages({sessionID:chat.id})
+  const user=history.find((message)=>message.info.role === "user")!
+  yield* sessions.updatePart({id:PartID.ascending(),messageID:user.info.id,sessionID:chat.id,type:"text",text:"Fix Python software"})
+  const child=yield* sessions.create({parentID:chat.id,agent:"code",title:"implementation"})
+  const own={...assistant,id:MessageID.ascending(),sessionID:child.id,agent:"code",mode:"code"}
+  yield* sessions.updateMessage(own)
+  const def=yield* (yield* TaskTool).init()
+  let ran=false
+  const blocked=yield* def.execute({description:"recursive review",prompt:"review",subagent_type:"review",background:false},{sessionID:child.id,messageID:own.id,agent:"code",abort:new AbortController().signal,messages:[],metadata:()=>Effect.void,ask:()=>Effect.void,extra:{promptOps:stubOps({onPrompt:()=>{ran=true}})}}).pipe(Effect.exit)
+  expect(Exit.isFailure(blocked)).toBe(true)
+  expect(ran).toBe(false)
+}))
+
+for (const reason of ["failure","cancelled","waiting_for_subagent"] as const) it.instance(`programming ${reason} child cannot stamp planning proof`, () => Effect.gen(function* () {
+  const {chat,assistant}=yield* seed()
+  const sessions=yield* Session.Service
+  const history=yield* sessions.messages({sessionID:chat.id})
+  const user=history.find((message)=>message.info.role === "user")!
+  yield* sessions.updatePart({id:PartID.ascending(),messageID:user.info.id,sessionID:chat.id,type:"text",text:"Fix Python software"})
+  const def=yield* (yield* TaskTool).init()
+  const result=yield* def.execute({description:"plan",prompt:"plan",subagent_type:"think",background:true},{sessionID:chat.id,messageID:assistant.id,agent:"work",abort:new AbortController().signal,messages:[],metadata:()=>Effect.void,ask:()=>Effect.void,extra:{promptOps:reviewRunOps(["<silvercode-result>Blocked plan.</silvercode-result>"],"blocked",reason)}}).pipe(Effect.exit)
+  if (Exit.isSuccess(result)) expect(result.value.metadata.workFlow).toBeUndefined()
+  else expect(Exit.isFailure(result)).toBe(true)
+}))
+
+it.instance("independent primary Code keeps its normal Review dispatch contract", () => Effect.gen(function* () {
+  const {chat,assistant}=yield* seed()
+  const sessions=yield* Session.Service
+  const history=yield* sessions.messages({sessionID:chat.id})
+  const user=history.find((message)=>message.info.role === "user")!
+  if(user.info.role!=="user") return
+  yield* sessions.updateMessage({...user.info,agent:"code"})
+  yield* sessions.updateMessage({...assistant,agent:"code",mode:"code"})
+  yield* sessions.updatePart({id:PartID.ascending(),sessionID:chat.id,messageID:user.info.id,type:"text",text:"Fix Python software"})
+  const def=yield* (yield* TaskTool).init()
+  const result=yield* def.execute({description:"review implementation",prompt:"review",subagent_type:"review",background:false},{sessionID:chat.id,messageID:assistant.id,agent:"code",abort:new AbortController().signal,messages:[],metadata:()=>Effect.void,ask:()=>Effect.void,extra:{promptOps:reviewRunOps([reviewEnvelope(REVIEW_REPORT_APPROVED)],"done","success")}})
+  expect(result.metadata.review?.report.assessment).toBe("approved")
+}),{config:FOREGROUND})
+
+  it.instance(
+    "promoted programming Think does not produce foreground planning proof",
+    () =>
+      Effect.gen(function* () {
+        const jobs = yield* BackgroundJob.Service
+        const { chat, assistant } = yield* seed()
+        const sessions = yield* Session.Service
+        const history = yield* sessions.messages({sessionID:chat.id})
+        const user = history.find(message=>message.info.role === "user")!
+        yield* sessions.updatePart({id:PartID.ascending(),messageID:user.info.id,sessionID:chat.id,type:"text",text:"Fix Python software"})
+        const tool = yield* TaskTool
+        const def = yield* tool.init()
+        const ready = yield* Deferred.make<void>()
+        const done = yield* Deferred.make<void>()
+        const injected = yield* Deferred.make<SessionPrompt.PromptInput>()
+        let runs = 0
+        const promptOps: TaskPromptOps = {
+          cancel: () => Effect.void,
+          resolvePromptParts: (template) => Effect.succeed([{ type: "text" as const, text: template }]),
+          prompt: (input) => {
+            if (input.sessionID === chat.id) {
+              return Deferred.succeed(injected, input).pipe(Effect.as(reply(input, "injected")))
+            }
+            return Effect.gen(function* () {
+              runs += 1
+              yield* Deferred.succeed(ready, undefined)
+              yield* Deferred.await(done)
+              return reply(input, "background done")
+            })
+          },
+        }
+
+        const fiber = yield* def
+          .execute(
+            {
+              description: "inspect bug",
+              prompt: "look into the cache key path",
+              subagent_type: "think",
+              background: false,
             },
-          },
-        )
-        .pipe(Effect.exit)
-      // The child is dispatched (Review's own delivery contract may still fail with the stub).
-      expect(ran).toBe(true)
-      void exit
-    }
-  }),
-)
-
-it.instance("non-programming root survives nested model prompts and cannot reach Code via General", () =>
-  Effect.gen(function* () {
-    const { chat, assistant } = yield* seed()
-    const sessions = yield* Session.Service
-    const history = yield* sessions.messages({ sessionID: chat.id })
-    const user = history.find((message) => message.info.role === "user")!
-    yield* sessions.updatePart({
-      id: PartID.ascending(),
-      messageID: user.info.id,
-      sessionID: chat.id,
-      type: "text",
-      text: "Research hotels and write a report",
-    })
-    const child = yield* sessions.create({ parentID: chat.id, agent: "general", title: "research" })
-    const nested = yield* sessions.create({ parentID: child.id, agent: "general", title: "nested" })
-    const synthetic = yield* sessions.updateMessage({
-      id: MessageID.ascending(),
-      sessionID: nested.id,
-      role: "user",
-      agent: "general",
-      model: ref,
-      time: { created: Date.now() },
-    })
-    yield* sessions.updatePart({
-      id: PartID.ascending(),
-      sessionID: nested.id,
-      messageID: synthetic.id,
-      type: "text",
-      text: "Implement a Python application",
-    })
-    const reply = {
-      ...assistant,
-      id: MessageID.ascending(),
-      sessionID: nested.id,
-      parentID: synthetic.id,
-      agent: "general",
-      mode: "general",
-    }
-    yield* sessions.updateMessage(reply)
-    const def = yield* (yield* TaskTool).init()
-    let ran = false
-    const exit = yield* def
-      .execute(
-        { description: "bypass", prompt: "implement", subagent_type: "code", background: false },
-        {
-          sessionID: nested.id,
-          messageID: reply.id,
-          agent: "general",
-          abort: new AbortController().signal,
-          messages: [],
-          metadata: () => Effect.void,
-          ask: () => Effect.void,
-          extra: {
-            promptOps: stubOps({
-              onPrompt: () => {
-                ran = true
-              },
-            }),
-          },
-        },
-      )
-      .pipe(Effect.exit)
-    expect(Exit.isFailure(exit)).toBe(true)
-    expect(ran).toBe(false)
-  }),
-)
-
-it.instance("a stale successful child finish cannot authorize Code", () =>
-  Effect.gen(function* () {
-    const { chat, assistant } = yield* seed()
-    const sessions = yield* Session.Service
-    const history = yield* sessions.messages({ sessionID: chat.id })
-    const user = history.find((message) => message.info.role === "user")!
-    yield* sessions.updatePart({
-      id: PartID.ascending(),
-      messageID: user.info.id,
-      sessionID: chat.id,
-      type: "text",
-      text: "Fix Python software",
-    })
-    const ops = reviewRunOps(["<silvercode-result>Old plan.</silvercode-result>"], "done", "success")
-    const stale = {
-      ...ops,
-      prompt: (input: SessionPrompt.PromptInput) =>
-        ops
-          .prompt(input)
-          .pipe(Effect.map((result) => ({ ...result, info: { ...result.info, parentID: MessageID.ascending() } }))),
-    }
-    const def = yield* (yield* TaskTool).init()
-    const planned = yield* def.execute(
-      { description: "stale plan", prompt: "plan", subagent_type: "think", background: false },
-      {
-        sessionID: chat.id,
-        messageID: assistant.id,
-        agent: "work",
-        abort: new AbortController().signal,
-        messages: [],
-        metadata: () => Effect.void,
-        ask: () => Effect.void,
-        extra: { promptOps: stale },
-      },
-    )
-    expect(planned.metadata.workFlow).toBeUndefined()
-  }),
-)
-
-it.instance("thorough non-programming General forces foreground and stamps successful delivery", () =>
-  Effect.gen(function* () {
-    const { chat, assistant } = yield* seed()
-    const sessions = yield* Session.Service
-    yield* sessions.setMetadata({ sessionID: chat.id, metadata: { agentEffort: "thorough" } })
-    const def = yield* (yield* TaskTool).init()
-    const ops = reviewRunOps(["<silvercode-result>Research report.</silvercode-result>"], "done", "success")
-    const result = yield* def.execute(
-      { description: "research", prompt: "research", subagent_type: "general", background: true },
-      {
-        sessionID: chat.id,
-        messageID: assistant.id,
-        agent: "work",
-        abort: new AbortController().signal,
-        messages: [],
-        metadata: () => Effect.void,
-        ask: () => Effect.void,
-        extra: { promptOps: ops },
-      },
-    )
-    expect(result.metadata.background).toBe(false)
-    expect(result.metadata.workFlow?.agent).toBe("general")
-  }),
-)
-
-it.instance(
-  "a custom agent renamed to think runs with guidance",
-  () =>
-    Effect.gen(function* () {
-      const { chat, assistant } = yield* seed()
-      const sessions = yield* Session.Service
-      const history = yield* sessions.messages({ sessionID: chat.id })
-      const user = history.find((message) => message.info.role === "user")!
-      yield* sessions.updatePart({
-        id: PartID.ascending(),
-        sessionID: chat.id,
-        messageID: user.info.id,
-        type: "text",
-        text: "Implement Python software",
-      })
-      const def = yield* (yield* TaskTool).init()
-      let ran = false
-      const blocked = yield* def
-        .execute(
-          { description: "counterfeit planner", prompt: "plan", subagent_type: "fake", background: false },
-          {
-            sessionID: chat.id,
-            messageID: assistant.id,
-            agent: "work",
-            abort: new AbortController().signal,
-            messages: [],
-            metadata: () => Effect.void,
-            ask: () => Effect.void,
-            extra: {
-              promptOps: stubOps({
-                onPrompt: () => {
-                  ran = true
-                },
-              }),
+            {
+              sessionID: chat.id,
+              messageID: assistant.id,
+              agent: "work",
+              abort: new AbortController().signal,
+              extra: { promptOps },
+              messages: [],
+              metadata: () => Effect.void,
+              ask: () => Effect.void,
             },
-          },
-        )
-        .pipe(Effect.exit)
-      expect(Exit.isSuccess(blocked)).toBe(true)
-      expect(ran).toBe(true)
-    }),
-  { config: { agent: { fake: { name: "think", mode: "subagent" } } } },
-)
+          )
+          .pipe(Effect.forkChild)
 
-it.instance("programming Code returns to Work instead of recursively launching Review", () =>
-  Effect.gen(function* () {
-    const { chat, assistant } = yield* seed()
-    const sessions = yield* Session.Service
-    const history = yield* sessions.messages({ sessionID: chat.id })
-    const user = history.find((message) => message.info.role === "user")!
-    yield* sessions.updatePart({
-      id: PartID.ascending(),
-      messageID: user.info.id,
-      sessionID: chat.id,
-      type: "text",
-      text: "Fix Python software",
-    })
-    const child = yield* sessions.create({ parentID: chat.id, agent: "code", title: "implementation" })
-    const own = { ...assistant, id: MessageID.ascending(), sessionID: child.id, agent: "code", mode: "code" }
-    yield* sessions.updateMessage(own)
-    const def = yield* (yield* TaskTool).init()
-    let ran = false
-    const blocked = yield* def
-      .execute(
-        { description: "recursive review", prompt: "review", subagent_type: "review", background: false },
-        {
-          sessionID: child.id,
-          messageID: own.id,
-          agent: "code",
-          abort: new AbortController().signal,
-          messages: [],
-          metadata: () => Effect.void,
-          ask: () => Effect.void,
-          extra: {
-            promptOps: stubOps({
-              onPrompt: () => {
-                ran = true
-              },
-            }),
-          },
-        },
-      )
-      .pipe(Effect.exit)
-    expect(Exit.isFailure(blocked)).toBe(true)
-    expect(ran).toBe(false)
-  }),
-)
+        yield* Deferred.await(ready)
+        const job = (yield* jobs.list())[0]
+        expect(job).toBeDefined()
+        if (!job) throw new Error("task job not found")
+        expect(job.metadata?.parentSessionId).toBe(chat.id)
+        yield* jobs.promote(job.id)
 
-for (const reason of ["failure", "cancelled", "waiting_for_subagent"] as const)
-  it.instance(`programming ${reason} child cannot stamp planning proof`, () =>
-    Effect.gen(function* () {
-      const { chat, assistant } = yield* seed()
-      const sessions = yield* Session.Service
-      const history = yield* sessions.messages({ sessionID: chat.id })
-      const user = history.find((message) => message.info.role === "user")!
-      yield* sessions.updatePart({
-        id: PartID.ascending(),
-        messageID: user.info.id,
-        sessionID: chat.id,
-        type: "text",
-        text: "Fix Python software",
-      })
-      const def = yield* (yield* TaskTool).init()
-      const result = yield* def
-        .execute(
-          { description: "plan", prompt: "plan", subagent_type: "think", background: true },
-          {
-            sessionID: chat.id,
-            messageID: assistant.id,
-            agent: "work",
-            abort: new AbortController().signal,
-            messages: [],
-            metadata: () => Effect.void,
-            ask: () => Effect.void,
-            extra: {
-              promptOps: reviewRunOps(["<silvercode-result>Blocked plan.</silvercode-result>"], "blocked", reason),
-            },
-          },
-        )
-        .pipe(Effect.exit)
-      if (Exit.isSuccess(result)) expect(result.value.metadata.workFlow).toBeUndefined()
-      else expect(Exit.isFailure(result)).toBe(true)
-    }),
+        const result = yield* Fiber.join(fiber)
+        expect(result.metadata.background).toBe(true)
+        expect(result.metadata.workFlow).toBeUndefined()
+        expect(result.output).toContain(`state="running"`)
+        expect((yield* jobs.get(result.metadata.sessionId))?.status).toBe("running")
+        expect(runs).toBe(1)
+
+        yield* Deferred.succeed(done, undefined)
+        expect((yield* jobs.wait({ id: result.metadata.sessionId })).info?.output).toBe("<silvercode-result>\nbackground done\n</silvercode-result>")
+        expect((yield* Deferred.await(injected)).parts[0]?.type).toBe("text")
+        expect(runs).toBe(1)
+      }),
+    { config: FOREGROUND },
   )
 
-it.instance(
-  "independent primary Code keeps its normal Review dispatch contract",
-  () =>
-    Effect.gen(function* () {
-      const { chat, assistant } = yield* seed()
-      const sessions = yield* Session.Service
-      const history = yield* sessions.messages({ sessionID: chat.id })
-      const user = history.find((message) => message.info.role === "user")!
-      if (user.info.role !== "user") return
-      yield* sessions.updateMessage({ ...user.info, agent: "code" })
-      yield* sessions.updateMessage({ ...assistant, agent: "code", mode: "code" })
-      yield* sessions.updatePart({
-        id: PartID.ascending(),
-        sessionID: chat.id,
-        messageID: user.info.id,
-        type: "text",
-        text: "Fix Python software",
-      })
-      const def = yield* (yield* TaskTool).init()
-      const result = yield* def.execute(
-        { description: "review implementation", prompt: "review", subagent_type: "review", background: false },
-        {
-          sessionID: chat.id,
-          messageID: assistant.id,
-          agent: "code",
-          abort: new AbortController().signal,
-          messages: [],
-          metadata: () => Effect.void,
-          ask: () => Effect.void,
-          extra: { promptOps: reviewRunOps([reviewEnvelope(REVIEW_REPORT_APPROVED)], "done", "success") },
-        },
-      )
-      expect(result.metadata.review?.report.assessment).toBe("approved")
-    }),
-  { config: FOREGROUND },
-)
+  it.instance(
+    "forced foreground programming Think aborts without planning proof",
+    () =>
+      Effect.gen(function* () {
+        const { chat, assistant } = yield* seed()
+        const sessions=yield* Session.Service
+        const history=yield* sessions.messages({sessionID:chat.id})
+        const user=history.find(message=>message.info.role === "user")!
+        yield* sessions.updatePart({id:PartID.ascending(),sessionID:chat.id,messageID:user.info.id,type:"text",text:"Fix Python software"})
+        const tool = yield* TaskTool
+        const def = yield* tool.init()
+        const ready = defer<SessionPrompt.PromptInput>()
+        const cancelled = defer<SessionID>()
+        const abort = new AbortController()
+        const promptOps: TaskPromptOps = {
+          cancel: (sessionID) =>
+            Effect.sync(() => {
+              cancelled.resolve(sessionID)
+            }),
+          resolvePromptParts: (template) => Effect.succeed([{ type: "text" as const, text: template }]),
+          prompt: (input) =>
+            Effect.promise(() => {
+              ready.resolve(input)
+              return cancelled.promise
+            }).pipe(Effect.as(reply(input, "cancelled"))),
+        }
 
-it.instance(
-  "promoted programming Think does not produce foreground planning proof",
-  () =>
-    Effect.gen(function* () {
-      const jobs = yield* BackgroundJob.Service
-      const { chat, assistant } = yield* seed()
-      const sessions = yield* Session.Service
-      const history = yield* sessions.messages({ sessionID: chat.id })
-      const user = history.find((message) => message.info.role === "user")!
-      yield* sessions.updatePart({
-        id: PartID.ascending(),
-        messageID: user.info.id,
-        sessionID: chat.id,
-        type: "text",
-        text: "Fix Python software",
-      })
-      const tool = yield* TaskTool
-      const def = yield* tool.init()
-      const ready = yield* Deferred.make<void>()
-      const done = yield* Deferred.make<void>()
-      const injected = yield* Deferred.make<SessionPrompt.PromptInput>()
-      let runs = 0
-      const promptOps: TaskPromptOps = {
-        cancel: () => Effect.void,
-        resolvePromptParts: (template) => Effect.succeed([{ type: "text" as const, text: template }]),
-        prompt: (input) => {
-          if (input.sessionID === chat.id) {
-            return Deferred.succeed(injected, input).pipe(Effect.as(reply(input, "injected")))
-          }
-          return Effect.gen(function* () {
-            runs += 1
-            yield* Deferred.succeed(ready, undefined)
-            yield* Deferred.await(done)
-            return reply(input, "background done")
-          })
-        },
-      }
+        const fiber = yield* def
+          .execute(
+            {
+              description: "inspect bug",
+              prompt: "look into the cache key path",
+              subagent_type: "think",
+              background: false,
+            },
+            {
+              sessionID: chat.id,
+              messageID: assistant.id,
+              agent: "work",
+              abort: abort.signal,
+              extra: { promptOps },
+              messages: [],
+              metadata: () => Effect.void,
+              ask: () => Effect.void,
+            },
+          )
+          .pipe(Effect.forkChild)
 
-      const fiber = yield* def
-        .execute(
-          {
-            description: "inspect bug",
-            prompt: "look into the cache key path",
-            subagent_type: "think",
-            background: false,
-          },
-          {
-            sessionID: chat.id,
-            messageID: assistant.id,
-            agent: "work",
-            abort: new AbortController().signal,
-            extra: { promptOps },
-            messages: [],
-            metadata: () => Effect.void,
-            ask: () => Effect.void,
-          },
-        )
-        .pipe(Effect.forkChild)
+        const input = yield* Effect.promise(() => ready.promise)
+        abort.abort()
+        expect(yield* Effect.promise(() => cancelled.promise)).toBe(input.sessionID)
 
-      yield* Deferred.await(ready)
-      const job = (yield* jobs.list())[0]
-      expect(job).toBeDefined()
-      if (!job) throw new Error("task job not found")
-      expect(job.metadata?.parentSessionId).toBe(chat.id)
-      yield* jobs.promote(job.id)
+        const exit = yield* Fiber.await(fiber)
+        expect(Exit.isSuccess(exit)).toBe(true)
+        if(Exit.isSuccess(exit)) expect(exit.value.metadata.workFlow).toBeUndefined()
+      }),
+    { config: FOREGROUND },
+  )
 
-      const result = yield* Fiber.join(fiber)
-      expect(result.metadata.background).toBe(true)
-      expect(result.metadata.workFlow).toBeUndefined()
-      expect(result.output).toContain(`state="running"`)
-      expect((yield* jobs.get(result.metadata.sessionId))?.status).toBe("running")
-      expect(runs).toBe(1)
-
-      yield* Deferred.succeed(done, undefined)
-      expect((yield* jobs.wait({ id: result.metadata.sessionId })).info?.output).toBe(
-        "<silvercode-result>\nbackground done\n</silvercode-result>",
-      )
-      expect((yield* Deferred.await(injected)).parts[0]?.type).toBe("text")
-      expect(runs).toBe(1)
-    }),
-  { config: FOREGROUND },
-)
-
-it.instance(
-  "forced foreground programming Think aborts without planning proof",
-  () =>
-    Effect.gen(function* () {
-      const { chat, assistant } = yield* seed()
-      const sessions = yield* Session.Service
-      const history = yield* sessions.messages({ sessionID: chat.id })
-      const user = history.find((message) => message.info.role === "user")!
-      yield* sessions.updatePart({
-        id: PartID.ascending(),
-        sessionID: chat.id,
-        messageID: user.info.id,
-        type: "text",
-        text: "Fix Python software",
-      })
-      const tool = yield* TaskTool
-      const def = yield* tool.init()
-      const ready = defer<SessionPrompt.PromptInput>()
-      const cancelled = defer<SessionID>()
-      const abort = new AbortController()
-      const promptOps: TaskPromptOps = {
-        cancel: (sessionID) =>
-          Effect.sync(() => {
-            cancelled.resolve(sessionID)
-          }),
-        resolvePromptParts: (template) => Effect.succeed([{ type: "text" as const, text: template }]),
-        prompt: (input) =>
-          Effect.promise(() => {
-            ready.resolve(input)
-            return cancelled.promise
-          }).pipe(Effect.as(reply(input, "cancelled"))),
-      }
-
-      const fiber = yield* def
-        .execute(
-          {
-            description: "inspect bug",
-            prompt: "look into the cache key path",
-            subagent_type: "think",
-            background: false,
-          },
-          {
-            sessionID: chat.id,
-            messageID: assistant.id,
-            agent: "work",
-            abort: abort.signal,
-            extra: { promptOps },
-            messages: [],
-            metadata: () => Effect.void,
-            ask: () => Effect.void,
-          },
-        )
-        .pipe(Effect.forkChild)
-
-      const input = yield* Effect.promise(() => ready.promise)
-      abort.abort()
-      expect(yield* Effect.promise(() => cancelled.promise)).toBe(input.sessionID)
-
-      const exit = yield* Fiber.await(fiber)
-      expect(Exit.isSuccess(exit)).toBe(true)
-      if (Exit.isSuccess(exit)) expect(exit.value.metadata.workFlow).toBeUndefined()
-    }),
-  { config: FOREGROUND },
-)
-
-it.instance(
-  "Code after a truncated Think output runs (guidance only)",
-  () =>
-    Effect.gen(function* () {
-      const { chat, assistant } = yield* seed()
-      const sessions = yield* Session.Service
-      const history = yield* sessions.messages({ sessionID: chat.id })
-      const user = history.find((message) => message.info.role === "user")!
-      yield* sessions.updatePart({
-        id: PartID.ascending(),
-        sessionID: chat.id,
-        messageID: user.info.id,
-        type: "text",
-        text: "Implement Python software",
-      })
-      const def = yield* (yield* TaskTool).init()
-      const ctx = {
-        sessionID: chat.id,
-        messageID: assistant.id,
-        agent: "work",
-        abort: new AbortController().signal,
-        messages: [],
-        metadata: () => Effect.void,
-        ask: () => Effect.void,
-        extra: {
-          promptOps: reviewRunOps(
-            [`<silvercode-result>${"Detailed plan. ".repeat(200)}</silvercode-result>`],
-            "done",
-            "success",
-          ),
-        },
-      }
-      const planned = yield* def.execute(
-        { description: "long plan", prompt: "plan", subagent_type: "think", background: false },
-        ctx,
-      )
-      expect(planned.metadata.truncated).toBe(true)
-      yield* sessions.updatePart({
-        id: PartID.ascending(),
-        sessionID: chat.id,
-        messageID: assistant.id,
-        type: "tool",
-        tool: "task",
-        callID: "truncated-plan",
-        state: {
-          status: "completed",
-          input: { subagent_type: "think" },
-          output: planned.output,
-          title: "plan",
-          metadata: planned.metadata,
-          time: { start: Date.now(), end: Date.now() },
-        },
-      })
-      const blocked = yield* def
-        .execute({ description: "implement", prompt: "implement", subagent_type: "code", background: false }, ctx)
-        .pipe(Effect.exit)
-      expect(Exit.isSuccess(blocked)).toBe(true)
-    }),
-  { config: { tool_output: { max_bytes: 300, max_lines: 20 } } },
-)
+it.instance("Code after a truncated Think output runs (guidance only)",()=>Effect.gen(function*(){
+ const {chat,assistant}=yield* seed()
+ const sessions=yield* Session.Service
+ const history=yield* sessions.messages({sessionID:chat.id})
+ const user=history.find(message=>message.info.role === "user")!
+ yield* sessions.updatePart({id:PartID.ascending(),sessionID:chat.id,messageID:user.info.id,type:"text",text:"Implement Python software"})
+ const def=yield* (yield* TaskTool).init()
+ const ctx={sessionID:chat.id,messageID:assistant.id,agent:"work",abort:new AbortController().signal,messages:[],metadata:()=>Effect.void,ask:()=>Effect.void,extra:{promptOps:reviewRunOps([`<silvercode-result>${"Detailed plan. ".repeat(200)}</silvercode-result>`],"done","success")}}
+ const planned=yield* def.execute({description:"long plan",prompt:"plan",subagent_type:"think",background:false},ctx)
+ expect(planned.metadata.truncated).toBe(true)
+ yield* sessions.updatePart({id:PartID.ascending(),sessionID:chat.id,messageID:assistant.id,type:"tool",tool:"task",callID:"truncated-plan",state:{status:"completed",input:{subagent_type:"think"},output:planned.output,title:"plan",metadata:planned.metadata,time:{start:Date.now(),end:Date.now()}}})
+ const blocked=yield* def.execute({description:"implement",prompt:"implement",subagent_type:"code",background:false},ctx).pipe(Effect.exit)
+ expect(Exit.isSuccess(blocked)).toBe(true)
+}),{config:{tool_output:{max_bytes:300,max_lines:20}}})

@@ -1,9 +1,4 @@
-import {
-  ownerOrNone as workflowOwner,
-  ancestry as workflowAncestry,
-  knownDepth as workflowKnownDepth,
-  route as workRoute,
-} from "@/session/work-flow"
+import { ownerOrNone as workflowOwner, ancestry as workflowAncestry, knownDepth as workflowKnownDepth, route as workRoute } from "@/session/work-flow"
 import { WorkFlow } from "@opencode-ai/core/work-flow"
 import { sessionAgent } from "../session/session-agent"
 import * as Tool from "./tool"
@@ -349,17 +344,14 @@ export const TaskTool = Tool.define(
       const rootRole = Option.isSome(foundOwner) ? yield* sessionAgent(sessions, foundOwner.value) : undefined
       const inheritedWorkflow = Option.isSome(foundOwner) && WorkFlow.ownsRole(allRoles, workIdentity, rootRole)
       if (Option.isNone(foundOwner))
-        advice.push(
-          "The workflow root of this session is unknown (an ancestor session is missing), so workflow stages could not be checked.",
-        )
+        advice.push("The workflow root of this session is unknown (an ancestor session is missing), so workflow stages could not be checked.")
       const programming = coordinator && admission.kind === "programming"
       if (inheritedWorkflow && admission.kind === "programming" && !coordinator)
         advice.push(
           "Programming stage children should not delegate implementation or substitute workflow stages; return the result to Work.",
         )
       const planner = WorkFlow.ownsRole(allRoles, thinkIdentity, callerName) && admission.kind === "programming"
-      if (planner)
-        advice.push("A programming Think should return a read-only plan rather than delegate implementation.")
+      if (planner) advice.push("A programming Think should return a read-only plan rather than delegate implementation.")
       if (
         coordinator &&
         admission.kind === "programming" &&
@@ -377,9 +369,7 @@ export const TaskTool = Tool.define(
         : undefined
       const reviewIdentity = yield* agent.get("review")
       if (programming && next === reviewIdentity && !workflow?.implemented)
-        advice.push(
-          "Programming Review is meant to follow a successful Code implementation; it does not replace Think or Code.",
-        )
+        advice.push("Programming Review is meant to follow a successful Code implementation; it does not replace Think or Code.")
       if (programming && codeIdentity?.native === true && next === codeIdentity && !workflow?.planned)
         advice.push(
           "A successful Think planning task is expected in this request before Code. A pending, cancelled or failed plan does not count.",
@@ -516,10 +506,7 @@ export const TaskTool = Tool.define(
       const persisted = owned ? readAgentEffort(nextSession.metadata) : undefined
       const configEffort = typeof cfg.agent?.effort === "string" ? cfg.agent.effort : undefined
       const effort = AgentEffort.resolve(
-        params.effort ??
-          persisted ??
-          readAgentEffort(parent.metadata) ??
-          (Option.isSome(lineage) ? readAgentEffort(lineage.value.owner.metadata) : undefined),
+        params.effort ?? persisted ?? readAgentEffort(parent.metadata) ?? (Option.isSome(lineage) ? readAgentEffort(lineage.value.owner.metadata) : undefined),
         AgentEffort.resolve(configEffort),
       )
       // Persist the resolved level before execution so both foreground and
@@ -1232,10 +1219,7 @@ export const TaskTool = Tool.define(
           Effect.map((result) =>
             advice.length === 0
               ? result
-              : {
-                  ...result,
-                  output: `${result.output}\n\nWorkflow guidance (not blocking):\n- ${advice.join("\n- ")}`,
-                },
+              : { ...result, output: `${result.output}\n\nWorkflow guidance (not blocking):\n- ${advice.join("\n- ")}` },
           ),
           Effect.orDie,
         )
