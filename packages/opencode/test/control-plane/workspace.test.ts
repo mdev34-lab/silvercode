@@ -169,16 +169,17 @@ function expectExitContains(exit: Exit.Exit<unknown, unknown>, ...messages: stri
 }
 
 // Await the workspace's error transition itself instead of polling status()
-// for it. The sync loop retries with backoff, so "error" is transient, and
-// the first failure lands only after real HTTP plus fiber scheduling — a
-// fixed polling window races both on a loaded host (this exact race failed
-// CI on Windows: still "connecting" when the 1500ms poll expired). The 5000
-// timeout is the product's own waitEvent bound (Workspace TIMEOUT); in the
-// healthy case the event arrives as soon as the transition happens.
+// for it. The sync loop retries with backoff, so "error" is transient (the
+// next attempt flips back to "connecting" after 1s), and a level poll can
+// miss the window entirely on a loaded host. Subscribing for the transition
+// before sync starts records it whenever it fires, and the join resumes in
+// the same instant (setStatus updates state before emitting), so the
+// assertions below observe the error state directly. The observation bound
+// is unchanged from the original poll: 1500ms.
 function awaitStatusError(workspaceID: Workspace.Info["id"]) {
   return Effect.forkChild(
     waitEvent({
-      timeout: 5000,
+      timeout: 1500,
       fn: (event) =>
         event.workspace === workspaceID &&
         event.payload.type === Workspace.Event.Status.type &&
