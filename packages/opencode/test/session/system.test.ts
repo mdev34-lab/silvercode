@@ -285,6 +285,46 @@ describe("session.system", () => {
     { config: { shell: shellFixture.configured } },
   )
 
+  it.instance(
+    "environment names the session's folder and keeps the project directory visible",
+    () =>
+      Effect.gen(function* () {
+        const prompt = yield* SystemPrompt.Service
+        const model = { providerID: "test", api: { id: "model" } } as Provider.Model
+        const project = (yield* prompt.environment(model))[0]
+        // A child that was given a folder of its own still has to know which
+        // project its permissions are measured against.
+        const child = (yield* prompt.environment(model, "/tmp/child-folder"))[0]
+
+        expect(project).toContain("  Working directory: ")
+        expect(project).not.toContain("  Project directory:")
+        expect(child.split("\n").filter((line) => line.startsWith("  Working directory:"))).toHaveLength(1)
+        expect(child).toContain("  Working directory: /tmp/child-folder")
+        expect(child.split("\n").filter((line) => line.startsWith("  Project directory:"))).toHaveLength(1)
+      }),
+  )
+
+  it.instance(
+    "environment does not let a child working directory imply the shell default",
+    () =>
+      Effect.gen(function* () {
+        const prompt = yield* SystemPrompt.Service
+        const model = { providerID: "test", api: { id: "model" } } as Provider.Model
+        const project = (yield* prompt.environment(model))[0]
+        const child = (yield* prompt.environment(model, "/tmp/child-folder"))[0]
+
+        // The shell tool still resolves its default and relative workdir from the
+        // instance/project directory. A child folder must not silently look like
+        // the target of a destructive shell command.
+        expect(child).toContain("  File/search/edit tools use the working directory above.")
+        expect(child).toContain(
+          "  Shell commands run in the project directory by default; a relative shell workdir also resolves from the project directory. To run a shell command in the working directory above, pass its absolute path as shell workdir.",
+        )
+        expect(child).not.toContain("Shell commands run in the working directory by default")
+        expect(project).not.toContain("Shell commands run in the project directory by default")
+      }),
+  )
+
   it.effect("skills output is sorted by name and stable across calls", () =>
     Effect.gen(function* () {
       const prompt = yield* SystemPrompt.Service

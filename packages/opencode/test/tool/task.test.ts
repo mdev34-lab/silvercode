@@ -9,6 +9,7 @@ import { BackgroundJob } from "@/background/job"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { Config } from "@/config/config"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
+import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Ripgrep } from "@opencode-ai/core/ripgrep"
 import { Session } from "@/session/session"
 import { NotFoundError } from "@/storage/storage"
@@ -64,6 +65,7 @@ const layer = <R = never>(
       EventV2Bridge.node,
       Config.node,
       CrossSpawnSpawner.node,
+      FSUtil.node,
       Session.node,
       SessionProjector.node,
       SessionRunState.node,
@@ -383,6 +385,23 @@ describe("tool.task", () => {
         },
       },
     },
+  )
+
+  it.instance(
+    "description separates the child file-tool folder from the shell cwd",
+    () =>
+      Effect.gen(function* () {
+        const agent = yield* Agent.Service
+        const build = yield* agent.get("work")
+        const registry = yield* ToolRegistry.Service
+        const description =
+          (yield* registry.tools({ ...ref, agent: build })).find((tool) => tool.id === TaskTool.id)?.description ?? ""
+
+        expect(description).toContain("working folder for file/search/edit tools")
+        expect(description).toContain("Shell commands still run in the project directory by default")
+        expect(description).toContain("a relative shell `workdir` resolves from the project directory")
+        expect(description).toContain("pass the child's absolute folder as shell `workdir`")
+      }),
   )
 
   it.instance(

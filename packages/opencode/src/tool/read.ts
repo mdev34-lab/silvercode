@@ -247,9 +247,12 @@ export const ReadTool = Tool.define<
             () => Effect.succeed(undefined),
           ),
         )
+      // Relative paths resolve from the session's working folder, which is the
+      // project directory unless a delegated child was given another one.
+      const cwd = ctx.cwd ?? instance.directory
       let filepath = params.filePath
       if (!path.isAbsolute(filepath)) {
-        filepath = path.resolve(instance.directory, filepath)
+        filepath = path.resolve(cwd, filepath)
       }
       if (process.platform === "win32") {
         filepath = FSUtil.normalizePath(filepath)
@@ -267,7 +270,7 @@ export const ReadTool = Tool.define<
         if (pipeAt > 0) {
           const candidate = unquote(params.filePath.slice(0, pipeAt).trim())
           if (candidate) {
-            const resolved = path.isAbsolute(candidate) ? candidate : path.resolve(instance.directory, candidate)
+            const resolved = path.isAbsolute(candidate) ? candidate : path.resolve(cwd, candidate)
             const normalized = process.platform === "win32" ? FSUtil.normalizePath(resolved) : resolved
             const piped = yield* statOrUndefined(normalized)
             if (piped) {

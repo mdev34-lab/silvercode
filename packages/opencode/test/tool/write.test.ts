@@ -85,6 +85,21 @@ describe("tool.write", () => {
       }),
     )
 
+    it.instance("resolves a relative path from the session's working folder", () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const cwd = path.join(test.directory, "child")
+        yield* Effect.promise(() => fs.mkdir(cwd, { recursive: true }))
+
+        yield* run({ filePath: "relative.txt", content: "child content" }, { ...ctx, cwd })
+
+        // The project copy is untouched: the folder decides, and nothing narrows
+        // or widens the permission that already gated this write.
+        expect(yield* Effect.promise(() => fs.readFile(path.join(cwd, "relative.txt"), "utf-8"))).toBe("child content")
+        expect(yield* Effect.promise(() => fs.readdir(test.directory))).not.toContain("relative.txt")
+      }),
+    )
+
     it.instance("handles relative paths by resolving to instance directory", () =>
       Effect.gen(function* () {
         const test = yield* TestInstance
