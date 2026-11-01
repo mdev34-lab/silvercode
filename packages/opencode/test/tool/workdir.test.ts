@@ -202,7 +202,10 @@ describe("a folder request is read by the platform's rules", () => {
   test("a relative, an absolute and a traversed spelling are told apart", () => {
     expect(Workdir.classify("child")).toBe("relative")
     expect(Workdir.classify("../child")).toBe("relative")
-    expect(Workdir.classify(path.join("/srv", "project", "child"))).toBe("absolute")
+    expect(Workdir.classify(path.join("child", "..", "child"))).toBe("relative")
+    // A POSIX-looking `/srv/...` is drive-rooted on Windows, not absolute.
+    // Resolve a native path so this control uses the runner's absolute spelling.
+    expect(Workdir.classify(path.resolve("srv", "project", "child"))).toBe("absolute")
   })
 
   test("Windows spellings are read by the same rules on any runner", () => {
