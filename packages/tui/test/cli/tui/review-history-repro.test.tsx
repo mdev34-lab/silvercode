@@ -106,3 +106,43 @@ test("a completed finish is an execution boundary even with the same user parent
   expect(result).toContain("✗ Needs fixes")
   expect(result).toContain("Earlier analysis.")
 })
+
+test("a report split across assistant messages follows the runtime newline join", async () => {
+  const user = userMessage("msg_001", SESSION, { agent: "review" })
+  const first = assistantMessage("msg_002", SESSION, { agent: "review", mode: "review", parentID: user.id, time: { created: 1_700_000_001_000, completed: 1_700_000_002_000 } })
+  const second = assistantMessage("msg_003", SESSION, { agent: "review", mode: "review", parentID: user.id, time: { created: 1_700_000_010_000, completed: 1_700_000_011_000 } })
+  const [opening, ...body] = latest.split("\n")
+  const entries = [
+    { info: user, parts: [textPart("request", user, "Synthetic review request")] },
+    { info: first, parts: [textPart("first", first, `Earlier analysis.\n${opening}`)] },
+    { info: second, parts: [textPart("second", second, body.join("\n"))] },
+  ]
+  const runtime = entries as unknown as SessionV1.WithParts[]
+  const canonical = ReviewReport.extract(resultChunks(runtime, runtime[2]))
+  expect(canonical.ok && canonical.report.assessment).toBe("needs-fixes")
+  const { app } = await mountSessionRoute({ width: 120, height: 45, sessions: [sessionInfo(SESSION)], messages: { [SESSION]: entries } })
+  await waitFor(app, () => app.captureCharFrame().includes("Later synthetic finding") ? true : undefined)
+  const result = await spansOf(app)
+  expect(result).toContain("Earlier analysis.")
+  expect(result).toContain("✗ Needs fixes")
+})
+
+test("a malformed later report cannot leave an earlier approval as current", async () => {
+  const user = userMessage("msg_001", SESSION, { agent: "review" })
+  const first = assistantMessage("msg_002", SESSION, { agent: "review", mode: "review", parentID: user.id, time: { created: 1_700_000_001_000, completed: 1_700_000_002_000 } })
+  const second = assistantMessage("msg_003", SESSION, { agent: "review", mode: "review", parentID: user.id, time: { created: 1_700_000_010_000, completed: 1_700_000_011_000 } })
+  const invalid = "<silvercode-review>{invalid}</silvercode-review>"
+  const entries = [
+    { info: user, parts: [textPart("request", user, "Synthetic review request")] },
+    { info: first, parts: [textPart("first", first, `Earlier analysis.\n${old}`)] },
+    { info: second, parts: [textPart("second", second, `Malformed later report.\n${invalid}`)] },
+  ]
+  const runtime = entries as unknown as SessionV1.WithParts[]
+  expect(ReviewReport.extract(resultChunks(runtime, runtime[2])).ok).toBe(false)
+  const { app } = await mountSessionRoute({ width: 120, height: 45, sessions: [sessionInfo(SESSION)], messages: { [SESSION]: entries } })
+  await waitFor(app, () => app.captureCharFrame().includes("Malformed later report.") ? true : undefined)
+  const result = await spansOf(app)
+  expect(result).toContain("Earlier analysis.")
+  expect(result).toContain("Malformed later report.")
+  expect(result).not.toContain("✓ Approved")
+})
