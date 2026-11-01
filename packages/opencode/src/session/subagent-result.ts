@@ -23,6 +23,24 @@ export function repetitionRecoveryPromptID(message: SessionV1.WithParts): string
   return isRecord(marker) && typeof marker.promptID === "string" ? marker.promptID : undefined
 }
 
+// Issue #783: metadata key on the runner's finish/stagnation nudge. The nudge
+// continues the turn of the prompt it follows, and the answer that obeys it
+// answers that prompt. Recording the prompt the nudge belongs to is what lets
+// the caller settle on that answer instead of the pre-nudge one, and what keeps
+// the nudge from being mistaken for input a caller submitted. Optional: nudges
+// persisted before this marker existed keep working, and ownership then falls
+// back to the stored transcript as before.
+export const FINISH_CONTINUATION = "finishContinuation"
+
+/** The prompt a runner finish/stagnation nudge continues, or undefined for any other message. */
+export function finishContinuationPromptID(message: SessionV1.WithParts): string | undefined {
+  if (message.info.role !== "user" || message.parts.length !== 1) return undefined
+  const part = message.parts[0]!
+  if (part.type !== "text" || part.synthetic !== true) return undefined
+  const marker = part.metadata?.[FINISH_CONTINUATION]
+  return isRecord(marker) && typeof marker.promptID === "string" ? marker.promptID : undefined
+}
+
 // Only the runner's own finish/stagnation reminder and bounded repetition recovery continue a prompt.
 // Any other synthetic-only user message (shell marker, task summary, bridge text) is a boundary, not
 // a continuation.
@@ -31,7 +49,9 @@ const isNudge = (message: SessionV1.WithParts) =>
   message.parts.length === 1 &&
   message.parts[0]!.type === "text" &&
   message.parts[0]!.synthetic === true &&
-  (NUDGES.has(message.parts[0]!.text.trim()) || repetitionRecoveryPromptID(message) !== undefined)
+  (NUDGES.has(message.parts[0]!.text.trim()) ||
+    repetitionRecoveryPromptID(message) !== undefined ||
+    finishContinuationPromptID(message) !== undefined)
 
 const finished = (message: SessionV1.WithParts) =>
   message.parts.some((part) => part.type === "tool" && part.tool === "finish" && part.state.status === "completed")
@@ -57,7 +77,7 @@ function anchorsOf(ordered: readonly SessionV1.WithParts[], current: SessionV1.W
     // A repetition recovery names the prompt it resumed. If a different user message landed
     // between that prompt and the recovery, the declared lineage is stale: treat the recovery as
     // a boundary instead of borrowing whichever prompt happens to precede it.
-    const declared = repetitionRecoveryPromptID(ordered[at]!)
+    const declared = repetitionRecoveryPromptID(ordered[at]!) ?? finishContinuationPromptID(ordered[at]!)
     if (declared !== undefined && ordered[previous]!.info.id !== declared) break
     if (ordered.slice(previous + 1, at).some(finished)) break
     at = previous

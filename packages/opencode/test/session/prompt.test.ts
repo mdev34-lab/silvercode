@@ -61,7 +61,7 @@ import { awaitWithTimeout, pollWithTimeout, testEffect } from "../lib/effect"
 import { httpError, raw, reply, TestLLMServer } from "../lib/llm-server"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { RepetitionGuard } from "../../src/session/llm/repetition-guard"
-import { continuesPrompt } from "../../src/session/subagent-result"
+import { continuesPrompt, finishContinuationPromptID } from "../../src/session/subagent-result"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { LocationServiceMap, locationServiceMapLayer } from "@opencode-ai/core/location-services"
@@ -7905,6 +7905,152 @@ it.instance("a finish nudge owns the next generation even when the stored transc
             expect(result.info.error.data.message).toContain("did not complete the required finish tool after 3 nudges")
           }
         }
+      }),
+      Effect.sync(() => void (Date.now = real)),
+    )
+  }),
+  { config: cfg },
+  30_000,
+)
+// Issue #783: the finish nudge is the runner's own continuation of the turn it
+// follows, and the run injects it only because the turn ended without finish.
+// The answer that obeys it answers the prompt the turn belongs to. Two things
+// used to go wrong once finish completed on that first nudge:
+//
+// - Ownership: the assistant that completed finish has the nudge as its parent,
+//   so `prompt()` settled the caller on the *pre-nudge* answer instead - an
+//   answer that ended without finish, i.e. the run returned an incomplete
+//   looking result while the finish it had completed sat on another message.
+// - Chronology: turn selection and the finish check read the transcript back by
+//   stored creation time. A clock step between the turn's first answer and the
+//   nudge stores the nudge (and the answer that completes finish) *before* the
+//   prompt, so the loop re-derived the spent prompt, spent the remaining nudge
+//   budget on new requests, and stamped the terminal guard error over the turn:
+//   three spurious generations after a finish that had already succeeded.
+//
+// Both are the same fix: the run keeps its own continuation and the answer it
+// made for it in flight and in the order it created them, ends on the generation
+// that completed finish, and names the prompt the continuation belongs to so the
+// caller settles on that answer. Only the ownership path (a real waiting caller)
+// can observe the first; the rollback below is the positive control for the
+// second.
+it.instance("a finish that completes on the first nudge settles the caller that asked the prompt", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig((url) => ({ ...providerCfg(url), agent: { work: { finishTool: true } } }))
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const status = yield* SessionStatus.Service
+    const chat = yield* sessions.create({
+      title: "Pinned",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+    yield* llm.text("FIRST_ANSWER_TEXT")
+    yield* llm.tool("finish", { reason: "success", result: "all done" })
+
+    const result = yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "work",
+      parts: [{ type: "text", text: "hello" }],
+    })
+    const messages = yield* sessions.messages({ sessionID: chat.id })
+    const hits = yield* llm.hits
+    const nudges = messages.filter((message) => finishContinuationPromptID(message) !== undefined)
+
+    // One request for the prompt and exactly one generation for the nudge: the
+    // turn ends when finish completes, so there is no further request and no
+    // second nudge.
+    expect(hits).toHaveLength(2)
+    expect(hits[0]?.body && JSON.stringify(hits[0].body).includes(FINISH_NUDGE_MARKER)).toBe(false)
+    expect(JSON.stringify(hits[1]?.body)).toContain(FINISH_NUDGE_MARKER)
+    expect(JSON.stringify(hits[1]?.body)).toContain("FIRST_ANSWER_TEXT")
+    expect(nudges).toHaveLength(1)
+
+    // finish ran once, and the answer that carries it is the answer the caller
+    // got: the run completed the turn, so it must not hand back the pre-nudge
+    // stop that ended without finish.
+    const finishes = messages
+      .flatMap((message) => message.parts)
+      .filter((part) => part.type === "tool" && part.tool === "finish")
+    expect(finishes).toHaveLength(1)
+    expect(finishes[0]?.state.status).toBe("completed")
+    expect(result.info.role).toBe("assistant")
+    expect(result.info.id).toBe(finishes[0]?.messageID)
+    if (result.info.role === "assistant") expect(result.info.finish).not.toBe("error")
+    expect(result.parts.some((part) => part.type === "tool" && part.tool === "finish" && part.state.status === "completed")).toBe(
+      true,
+    )
+
+    // The continuation declares the prompt whose turn it extends, so ownership
+    // survives a later read of the persisted transcript.
+    const asked = messages.find((message) => message.info.role === "user")
+    expect(nudges[0] ? finishContinuationPromptID(nudges[0]) : undefined).toBe(asked?.info.id)
+    expect(yield* status.get(chat.id)).toEqual({ type: "idle" })
+  }),
+  { config: cfg },
+  30_000,
+)
+
+it.instance("a finish that completes on the first nudge stops the run when the stored order is rolled back", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig((url) => ({ ...providerCfg(url), agent: { work: { finishTool: true } } }))
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const status = yield* SessionStatus.Service
+    const chat = yield* sessions.create({
+      title: "Pinned",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+    const real = Date.now
+    let skew = 0
+    Date.now = () => real() + skew
+    yield* Effect.ensuring(
+      Effect.gen(function* () {
+        // Stepping the clock back once the first answer is on the wire stores
+        // the nudge and the answer that completes finish before the prompt.
+        yield* llm.push(reply().text("FIRST_ANSWER_TEXT").stop().onSend(() => void (skew = -60_000)))
+        yield* llm.push(reply().tool("finish", { reason: "success", result: "all done" }))
+        // Queued in case the run keeps generating: any request past the two the
+        // turn needs is the spurious work this control exists to catch.
+        yield* llm.text("EXTRA_GENERATION")
+        yield* llm.text("EXTRA_GENERATION")
+        yield* llm.text("EXTRA_GENERATION")
+
+        const result = yield* prompt.prompt({
+          sessionID: chat.id,
+          agent: "work",
+          parts: [{ type: "text", text: "hello" }],
+        })
+        const messages = yield* sessions.messages({ sessionID: chat.id })
+        const hits = yield* llm.hits
+        const nudges = messages.filter((message) => finishContinuationPromptID(message) !== undefined)
+        const asked = messages.find((message) => message.info.role === "user" && finishContinuationPromptID(message) === undefined)
+
+        // The rollback really did invert the stored order: the nudge sits before
+        // the prompt it continues, which is the shape that used to re-derive the
+        // spent prompt.
+        const nudgeAt = messages.findIndex((message) => finishContinuationPromptID(message) !== undefined)
+        const askedAt = messages.findIndex((message) => message.info.id === asked?.info.id)
+        expect(nudgeAt).toBeGreaterThanOrEqual(0)
+        expect(askedAt).toBeGreaterThan(nudgeAt)
+
+        // Two requests: the prompt and the one nudge generation. The successful
+        // finish ends the turn, so no budget is spent and no terminal error is
+        // stamped over it.
+        expect(hits).toHaveLength(2)
+        expect(nudges).toHaveLength(1)
+        const finishes = messages
+          .flatMap((message) => message.parts)
+          .filter((part) => part.type === "tool" && part.tool === "finish")
+        expect(finishes).toHaveLength(1)
+        expect(finishes[0]?.state.status).toBe("completed")
+        expect(result.info.role).toBe("assistant")
+        expect(result.info.id).toBe(finishes[0]?.messageID)
+        if (result.info.role === "assistant") {
+          expect(result.info.finish).not.toBe("error")
+          expect(result.info.error).toBeUndefined()
+        }
+        expect(messages.some((message) => message.info.role === "assistant" && message.info.error !== undefined)).toBe(false)
+        expect(yield* status.get(chat.id)).toEqual({ type: "idle" })
       }),
       Effect.sync(() => void (Date.now = real)),
     )
