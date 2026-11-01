@@ -313,6 +313,10 @@ exports[`tool parameters JSON Schema (wire shape) task 1`] = `
       "description": "A short (3-5 words) description of the task",
       "type": "string",
     },
+    "directory": {
+      "description": "Working folder for the child; relative paths resolve from it. Omit to inherit this session's folder. A resumed task keeps the folder it was created with. Choosing a folder is not an authorization: paths outside the project still ask the usual permissions.",
+      "type": "string",
+    },
     "effort": {
       "description": "Override the child's effort policy; omit to inherit.",
       "enum": [
