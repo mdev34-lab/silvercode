@@ -84,6 +84,26 @@ describe("ToolCatalog.deferred", () => {
     }),
   )
 
+  it.effect("matches legacy bash tool_search names against the renamed shell tool", () =>
+    Effect.sync(() => {
+      // #780: configs written before the rename defer/always-load `bash`; the tool is `shell` now.
+      expect(
+        ToolCatalog.deferred({
+          id: "shell",
+          source: "builtin",
+          options: ToolCatalog.options({ defer: ["bash"] }),
+        }),
+      ).toBe(true)
+      expect(
+        ToolCatalog.deferred({
+          id: "shell",
+          source: "builtin",
+          options: ToolCatalog.options({ defer: ["*"], always_load: ["bash"] }),
+        }),
+      ).toBe(false)
+    }),
+  )
+
   it.effect("never defers core builtin tools", () =>
     Effect.sync(() => {
       for (const id of ToolCatalog.CORE_TOOLS) {

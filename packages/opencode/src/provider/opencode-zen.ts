@@ -34,6 +34,7 @@
  * and Request options.
  */
 
+import { Wildcard } from "@opencode-ai/core/util/wildcard"
 import { Identifier } from "@/id/id"
 import { isRecord } from "@/util/record"
 import { ProviderError } from "./error"
@@ -920,7 +921,15 @@ export function createFetch(input: FetchInput = {}): ZenFetch {
     const callerHadNoTools = !Array.isArray(payload["tools"]) || payload["tools"].length === 0
     const callerTools: unknown[] = Array.isArray(payload["tools"]) ? [...payload["tools"]] : []
     const callerToolNames = new Set(callerTools.map(toolNameOf).filter(Boolean))
-    const injectedOnlyNames = new Set(ZEN_FINGERPRINT_TOOLS.filter((name) => !callerToolNames.has(name)))
+    // #780: the fingerprint names are wire-protocol constants and predate the
+    // bash -> shell tool rename. A fingerprint tool counts as caller-provided
+    // when the catalog carries it under its canonical spelling too, so a model
+    // hallucinating the legacy `bash` name produces a caller-visible invalid
+    // call for the runtime repair instead of being silently stripped as if
+    // the gateway had injected it.
+    const injectedOnlyNames = new Set(
+      ZEN_FINGERPRINT_TOOLS.filter((name) => !callerToolNames.has(name) && !callerToolNames.has(Wildcard.canonical(name))),
+    )
 
     // 2026-10-14: the gateway now rejects requests carrying the synthetic
     // fingerprint quartet (empty-schema "OpenCode built-in" tools) with

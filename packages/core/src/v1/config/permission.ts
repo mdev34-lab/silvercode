@@ -41,8 +41,29 @@ const InputObject = Schema.StructWithRest(
 
 const InputSchema = Schema.Union([Action, InputObject])
 
+// #780: `bash` is the pre-rename spelling of the `shell` permission. Config layers merge
+// by object key, so letting both spellings survive would let an older layer's `bash`
+// outrank a newer layer's `shell` (or the reverse) purely by key position once merged.
+// Fold the legacy key into `shell` as each layer is decoded, preserving entry order:
+// two rule objects deep-merge per pattern and otherwise the later entry wins — exactly
+// how an already-canonical config behaves across layers.
+export function canonicalize<T extends Record<string, Rule | undefined>>(permission: T): T {
+  if (!("bash" in permission)) return permission
+  const out: Record<string, Rule> = {}
+  for (const [key, value] of globalThis.Object.entries(permission)) {
+    if (value === undefined) continue
+    const canonical = key === "bash" ? "shell" : key
+    const existing = out[canonical]
+    out[canonical] =
+      existing !== undefined && typeof existing === "object" && typeof value === "object"
+        ? { ...existing, ...value }
+        : value
+  }
+  return out as T
+}
+
 const normalizeInput = (input: Schema.Schema.Type<typeof InputSchema>): Schema.Schema.Type<typeof InputObject> =>
-  typeof input === "string" ? { "*": input } : input
+  typeof input === "string" ? { "*": input } : canonicalize(input)
 
 export const Info = InputSchema.pipe(
   Schema.decodeTo(InputObject, {

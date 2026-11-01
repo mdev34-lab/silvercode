@@ -1753,6 +1753,46 @@ it.instance(
 )
 
 it.instance(
+  "a hallucinated legacy bash call is repaired as invalid and never executes (#780)",
+  () =>
+    Effect.gen(function* () {
+      const { dir, llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+
+      const session = yield* sessions.create({
+        title: "Legacy bash hallucination",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      yield* prompt.prompt({
+        sessionID: session.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "run the marker command" }],
+      })
+
+      const marker = path.join(dir, "bash-hallucination-ran.txt")
+      // The model calls the pre-rename name `bash`; the catalog only publishes `shell`,
+      // so this must route to the invalid-tool repair with zero execution.
+      yield* llm.tool("bash", { command: `touch ${marker}` })
+      yield* llm.text("done")
+
+      const result = yield* prompt.loop({ sessionID: session.id })
+      expect(result.info.role).toBe("assistant")
+
+      const parts = (yield* sessions.messages({ sessionID: session.id })).flatMap((message) => message.parts)
+      const repaired = parts.find((part) => part.type === "tool" && part.tool === "invalid")
+      expect(repaired?.type).toBe("tool")
+      if (repaired?.type === "tool" && repaired.state.status === "completed") {
+        expect(repaired.state.input).toMatchObject({ tool: "bash" })
+      }
+      expect(parts.some((part) => part.type === "tool" && part.tool === "shell")).toBe(false)
+      expect(yield* Effect.promise(() => Bun.file(marker).exists())).toBe(false)
+    }),
+  20_000,
+)
+
+it.instance(
   "a truncated write retry completes without a doom-loop ask under deny policy",
   () =>
     Effect.gen(function* () {

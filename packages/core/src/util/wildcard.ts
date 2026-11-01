@@ -27,3 +27,8 @@ export function matchAction(action: string, pattern: string) {
   if (match(action, pattern)) return true
   return (LEGACY_ACTION_ALIASES[action] ?? []).some((legacy) => match(legacy, pattern))
 }
+
+/** Canonical spelling of a tool/permission name: legacy `bash` folds to `shell` (#780). */
+export function canonical(name: string) {
+  return name === "bash" ? "shell" : name
+}

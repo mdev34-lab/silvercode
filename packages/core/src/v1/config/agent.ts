@@ -82,9 +82,13 @@ const normalize = (agent: Schema.Schema.Type<typeof AgentSchema>): Schema.Schema
       permission.edit = action
       continue
     }
-    permission[tool] = action
+    // #780: `tools: { bash: ... }` is the pre-rename spelling of the shell tool.
+    permission[tool === "bash" ? "shell" : tool] = action
   }
-  globalThis.Object.assign(permission, agent.permission)
+  globalThis.Object.assign(
+    permission,
+    agent.permission ? ConfigPermissionV1.canonicalize(agent.permission) : undefined,
+  )
 
   const steps = agent.steps ?? agent.maxSteps
   return { ...agent, options, permission, ...(steps !== undefined ? { steps } : {}) }

@@ -41,10 +41,13 @@ interface State {
 }
 
 export function evaluate(permission: string, pattern: string, ...rulesets: PermissionV1.Ruleset[]): PermissionV1.Rule {
+  // doom_loop rules key on the tool id, so their patterns are action names: a legacy
+  // `bash` pattern must still gate the tool now published as `shell` (#780).
+  const matchPattern = permission === "doom_loop" ? Wildcard.matchAction : Wildcard.match
   return (
     rulesets
       .flat()
-      .findLast((rule) => Wildcard.matchAction(permission, rule.permission) && Wildcard.match(pattern, rule.pattern)) ?? {
+      .findLast((rule) => Wildcard.matchAction(permission, rule.permission) && matchPattern(pattern, rule.pattern)) ?? {
       action: "ask",
       permission,
       pattern: "*",

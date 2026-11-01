@@ -249,6 +249,21 @@ test("legacy bash wildcard permission patterns still match shell (wildcard, not 
   expect(Permission.disabled(["shell"], ruleset)).toEqual(new Set(["shell"]))
 })
 
+test("legacy doom_loop bash patterns still gate the renamed shell tool", () => {
+  // #780: doom_loop rules key on the tool id. A legacy `bash` pattern must still gate the
+  // tool now published as `shell`, with the same wildcard + findLast semantics.
+  const ruleset: Permission.Ruleset = [{ permission: "doom_loop", pattern: "bash", action: "deny" }]
+  expect(Permission.evaluate("doom_loop", "shell", ruleset).action).toBe("deny")
+  expect(Permission.evaluate("doom_loop", "shell", [{ permission: "doom_loop", pattern: "ba*", action: "deny" }]).action).toBe("deny")
+  expect(Permission.evaluate("doom_loop", "shell", [
+    { permission: "doom_loop", pattern: "bash", action: "deny" },
+    { permission: "doom_loop", pattern: "shell", action: "allow" },
+  ]).action).toBe("allow")
+  expect(Permission.evaluate("doom_loop", "read", ruleset).action).toBe("ask")
+  // Non-doom_loop resources are filenames/patterns, not tool ids: no aliasing there.
+  expect(Permission.evaluate("edit", "shell", [{ permission: "edit", pattern: "bash", action: "deny" }]).action).toBe("ask")
+})
+
 test("canonical shell and legacy bash rules resolve by ruleset order (last wins)", () => {
   const legacyFirst = Permission.fromConfig({ bash: "deny", shell: "allow" })
   const canonicalFirst = Permission.fromConfig({ shell: "allow", bash: "deny" })

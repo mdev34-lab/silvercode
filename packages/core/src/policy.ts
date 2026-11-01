@@ -34,9 +34,12 @@ const layer = Layer.effect(
       }),
       hasStatements: () => statements.length > 0,
       evaluate: EffectRuntime.fn("Policy.evaluate")(function* (action, resource, fallback) {
+        // doom_loop resources are tool ids (action names), so legacy `bash` patterns
+        // must still gate the tool now published as `shell` (#780).
+        const matchResource = action === "doom_loop" ? Wildcard.matchAction : Wildcard.match
         return (
           statements.findLast(
-            (statement) => Wildcard.matchAction(action, statement.action) && Wildcard.match(resource, statement.resource),
+            (statement) => Wildcard.matchAction(action, statement.action) && matchResource(resource, statement.resource),
           )?.effect ?? fallback
         )
       }),

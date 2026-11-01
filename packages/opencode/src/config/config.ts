@@ -37,8 +37,18 @@ import { withTransientReadRetry } from "@/util/effect-http-client"
 
 // Custom merge function that concatenates array fields instead of replacing them
 // Keep remeda's deep conditional merge type out of hot config-loading paths; TS profiling showed it dominates here.
+// #780: fold the legacy `bash` permission key into `shell` before merging layers, so two
+// layers spelling the same permission differently still resolve by layer order instead
+// of by object key position after the merge. Schema decoding already canonicalizes file
+// configs; this also covers operands that reach the merge without decoding.
+function canonicalizePermission(config: Info): Info {
+  const permission = config.permission
+  if (!permission || typeof permission !== "object" || !("bash" in permission)) return config
+  return { ...config, permission: ConfigPermissionV1.canonicalize(permission) }
+}
+
 function mergeConfig(target: Info, source: Info): Info {
-  return mergeDeep(target, source) as Info
+  return mergeDeep(canonicalizePermission(target), canonicalizePermission(source)) as Info
 }
 
 function mergeConfigConcatArrays(target: Info, source: Info): Info {
@@ -600,7 +610,10 @@ const layer = Layer.effect(
 
         if (Flag.OPENCODE_PERMISSION) {
           try {
-            result.permission = mergeDeep(result.permission ?? {}, JSON.parse(Flag.OPENCODE_PERMISSION))
+            result.permission = mergeDeep(
+              ConfigPermissionV1.canonicalize(result.permission ?? {}),
+              ConfigPermissionV1.canonicalize(JSON.parse(Flag.OPENCODE_PERMISSION)),
+            )
           } catch (err) {
             yield* Effect.logWarning("OPENCODE_PERMISSION contains invalid JSON, skipping", { err })
           }
@@ -614,9 +627,10 @@ const layer = Layer.effect(
               perms.edit = action
               continue
             }
-            perms[tool] = action
+            // #780: `tools: { bash: ... }` is the pre-rename spelling of the shell tool.
+            perms[tool === "bash" ? "shell" : tool] = action
           }
-          result.permission = mergeDeep(perms, result.permission ?? {})
+          result.permission = mergeDeep(perms, ConfigPermissionV1.canonicalize(result.permission ?? {}))
         }
 
         if (!result.username) {

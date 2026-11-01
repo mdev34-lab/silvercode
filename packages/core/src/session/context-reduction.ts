@@ -4,6 +4,7 @@ import type { Model } from "@opencode-ai/llm"
 import type { SessionContext } from "@opencode-ai/schema/session-context"
 import type { Config } from "../config"
 import { Glob } from "../util/glob"
+import { Wildcard } from "../util/wildcard"
 import { Token } from "../util/token"
 import type { SessionMessage } from "./message"
 
@@ -300,7 +301,9 @@ const protect = (messages: readonly SessionMessage.Message[], policy: Policy): P
 const PATH_KEYS = ["file", "filePath", "filename", "path", "source", "target"]
 
 const protectedTool = (tool: SessionMessage.AssistantTool, policy: Policy) => {
-  if (policy.protection.tools.includes(tool.name)) return true
+  // #780: policies may spell the shell tool `bash` and archived calls may carry the old
+  // name; compare canonical spellings so protection crosses the rename both ways.
+  if (policy.protection.tools.some((name) => Wildcard.canonical(name) === Wildcard.canonical(tool.name))) return true
   if (policy.protection.files.length === 0) return false
   const input = tool.state.status === "pending" ? undefined : tool.state.input
   if (typeof input !== "object" || input === null) return false

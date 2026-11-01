@@ -6,6 +6,7 @@ import { Cause, Effect, Exit, Layer, Option } from "effect"
 import { NamedError } from "@opencode-ai/core/util/error"
 import { FetchHttpClient, HttpClient, HttpClientResponse } from "effect/unstable/http"
 import { Config } from "@/config/config"
+import { Permission } from "../../src/permission"
 import { ConfigManaged } from "@/config/managed"
 import { ConfigParse } from "../../src/config/parse"
 import { Npm } from "@opencode-ai/core/npm"
@@ -791,7 +792,64 @@ Ordered permissions`,
     )
 
     const config = yield* Config.use.get()
-    expect(Object.keys(named(config.agent?.ordered)?.permission ?? {})).toEqual(["bash", "*", "edit"])
+    expect(Object.keys(named(config.agent?.ordered)?.permission ?? {})).toEqual(["shell", "*", "edit"])
+  }),
+)
+
+// #780: `bash` and `shell` are two spellings of one permission. Layered merging must keep
+// layer precedence across spellings instead of letting object key position decide.
+it.effect("layered permission merge keeps last-layer precedence across bash/shell spellings", () =>
+  withConfigTree(
+    {
+      global: { permission: { shell: "ask" } },
+      project: { permission: { bash: "allow" } },
+      local: { permission: { shell: "deny" } },
+    },
+    Effect.gen(function* () {
+      const config = yield* Config.use.get()
+      expect(Permission.evaluate("shell", "ls", Permission.fromConfig(config.permission ?? {})).action).toBe("deny")
+    }),
+  ),
+)
+
+it.effect("layered permission merge keeps last-layer precedence for symmetric bash/shell spellings", () =>
+  withConfigTree(
+    {
+      global: { permission: { bash: "ask" } },
+      project: { permission: { shell: "allow" } },
+      local: { permission: { bash: "deny" } },
+    },
+    Effect.gen(function* () {
+      const config = yield* Config.use.get()
+      expect(Permission.evaluate("shell", "ls", Permission.fromConfig(config.permission ?? {})).action).toBe("deny")
+    }),
+  ),
+)
+
+it.instance(
+  "managed shell deny overrides user config carrying both bash and shell spellings",
+  Effect.gen(function* () {
+    yield* writeManagedSettingsEffect({
+      $schema: "https://opencode.ai/config.json",
+      permission: { shell: "deny" },
+    })
+
+    const config = yield* Config.use.get()
+    expect(Permission.evaluate("shell", "ls", Permission.fromConfig(config.permission ?? {})).action).toBe("deny")
+  }),
+  { config: { permission: { shell: "ask", bash: "allow" } } },
+)
+
+it.instance("agent tools shell plus mixed bash/shell permission resolves to one canonical permission", () =>
+  Effect.gen(function* () {
+    const test = yield* TestInstance
+    yield* writeConfigEffect(test.directory, {
+      $schema: "https://opencode.ai/config.json",
+      agent: { test: { tools: { shell: true }, permission: { bash: "allow", shell: "deny" } } },
+    })
+
+    const config = yield* Config.use.get()
+    expect(named(config.agent?.["test"])?.permission).toEqual({ shell: "deny" })
   }),
 )
 
@@ -1154,7 +1212,7 @@ it.instance("migrates legacy tools config to permissions - allow", () =>
 
     const config = yield* Config.use.get()
     expect(named(config.agent?.["test"])?.permission).toEqual({
-      bash: "allow",
+      shell: "allow",
       read: "allow",
     })
   }),
@@ -1170,7 +1228,7 @@ it.instance("migrates legacy tools config to permissions - deny", () =>
 
     const config = yield* Config.use.get()
     expect(named(config.agent?.["test"])?.permission).toEqual({
-      bash: "deny",
+      shell: "deny",
       webfetch: "deny",
     })
   }),
@@ -1912,6 +1970,20 @@ describe("OPENCODE_PERMISSION env var", () => {
         expect(config).toBeDefined()
       }),
     ),
+  )
+
+  it.instance("OPENCODE_PERMISSION shell deny wins over config carrying both spellings", () =>
+    withProcessEnv(
+      "OPENCODE_PERMISSION",
+      JSON.stringify({ shell: "deny" }),
+      Effect.gen(function* () {
+        const config = yield* Config.use.get()
+        expect(Permission.evaluate("shell", "ls", Permission.fromConfig(config.permission ?? {})).action).toBe(
+          "deny",
+        )
+      }),
+    ),
+    { config: { permission: { shell: "ask", bash: "allow" } } },
   )
 })
 

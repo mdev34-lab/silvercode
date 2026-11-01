@@ -1334,6 +1334,65 @@ describe("OpenCodeZen", () => {
       expect(body.choices[0].message.tool_calls).toEqual([customCall])
     })
 
+    test("passes a hallucinated bash call through when the caller catalog carries shell (#780)", async () => {
+      // The catalog publishes the tool as `shell`; a model calling the legacy
+      // fingerprint name `bash` made a caller-visible invalid call, not a
+      // gateway-injected one. The guard must keep it so the runtime's
+      // invalid-tool repair handles it (and nothing executes).
+      const shellTools = [{ type: "function", function: { name: "shell" } }]
+      const response = await jsonGuard(
+        { model: "big-pickle", messages: [], tools: shellTools },
+        new Response(completionJson([bashCall], null), { headers: { "content-type": "application/json" } }),
+      )
+
+      const body = (await response.json()) as any
+      expect(body.choices[0].finish_reason).toBe("tool_calls")
+      expect(body.choices[0].message.tool_calls).toEqual([bashCall])
+    })
+
+    test("does not fail a required tool_choice for a hallucinated bash call when the caller carries shell (#780)", async () => {
+      const shellTools = [{ type: "function", function: { name: "shell" } }]
+      const response = await jsonGuard(
+        { model: "big-pickle", messages: [], tools: shellTools, tool_choice: "required" },
+        new Response(completionJson([bashCall], null), { headers: { "content-type": "application/json" } }),
+      )
+
+      const body = (await response.json()) as any
+      expect(body.choices[0].message.tool_calls).toEqual([bashCall])
+    })
+
+    test("keeps streamed hallucinated bash fragments when the caller catalog carries shell (#780)", async () => {
+      const shellTools = [{ type: "function", function: { name: "shell" } }]
+      const response = await streamGuard(
+        { model: "big-pickle", messages: [], tools: shellTools, stream: true },
+        sseFrames(
+          {
+            id: "chatcmpl-9",
+            object: "chat.completion.chunk",
+            choices: [
+              {
+                index: 0,
+                delta: { tool_calls: [{ index: 0, id: "call_b", type: "function", function: { name: "bash", arguments: "{\"command\":\"ls\"}" } }] },
+                finish_reason: null,
+              },
+            ],
+          },
+          {
+            id: "chatcmpl-9",
+            object: "chat.completion.chunk",
+            choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
+          },
+        ),
+      )
+
+      const chunks = dataLines(await response.text())
+      const names = chunks.flatMap((chunk: any) =>
+        (chunk.choices?.[0]?.delta?.tool_calls ?? []).map((call: any) => call.function?.name),
+      )
+      expect(names).toEqual(["bash"])
+      expect(chunks.at(-1).choices[0].finish_reason).toBe("tool_calls")
+    })
+
     test("fails an explicit required tool_choice when only injected calls would remain", async () => {
       await expect(
         jsonGuard(

@@ -80,10 +80,13 @@ export class NotFoundError extends Schema.TaggedErrorClass<NotFoundError>()("Per
 export type Error = BlockedError | CorrectedError
 
 export function evaluate(action: string, resource: string, ...rulesets: Permission.Ruleset[]): Permission.Rule {
+  // doom_loop rules key on the tool id, so their resources are action names: a legacy
+  // `bash` pattern must still gate the tool now published as `shell` (#780).
+  const matchResource = action === "doom_loop" ? Wildcard.matchAction : Wildcard.match
   return (
     rulesets
       .flat()
-      .findLast((rule) => Wildcard.matchAction(action, rule.action) && Wildcard.match(resource, rule.resource)) ?? {
+      .findLast((rule) => Wildcard.matchAction(action, rule.action) && matchResource(resource, rule.resource)) ?? {
       action,
       resource: "*",
       effect: "ask",

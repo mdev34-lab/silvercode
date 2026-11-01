@@ -861,13 +861,13 @@ function scrollShellFinal(p: ToolProps<typeof ShellTool>): string {
   const time = span(p.frame.state)
   if (code === undefined) {
     if (!time) {
-      return "bash completed"
+      return "shell completed"
     }
 
-    return `bash completed · ${time}`
+    return `shell completed · ${time}`
   }
 
-  return `bash completed (exit ${code})${time ? ` · ${time}` : ""}`
+  return `shell completed (exit ${code})${time ? ` · ${time}` : ""}`
 }
 
 function scrollReadStart(p: ToolProps<typeof ReadTool>): string {
