@@ -405,6 +405,46 @@ function flatText(frame: string) {
     .replace(/\s+/g, " ")
 }
 
+/** The painted panel's rows: its background fill bounds what the dialog occupies. */
+async function panelGeometry(app: Setup, title: string) {
+  const spans = await captureSpans(app)
+  const titleRow = spans.lines.findIndex((line) => line.spans.some((span) => span.text.includes(title)))
+  if (titleRow < 0) throw new Error(`no ${title} title row in the captured frame`)
+  const widest = (line: (typeof spans.lines)[number]) =>
+    line.spans.reduce((acc, span) => (span.width > acc.width ? span : acc), line.spans[0])
+  const panel = hexOf(widest(spans.lines[titleRow]).bg)
+  const rows = spans.lines.flatMap((line, index) =>
+    line.spans.some((span) => hexOf(span.bg) === panel && span.width > 10) ? [index] : [],
+  )
+  if (rows.length === 0) throw new Error("no painted panel rows in the captured frame")
+  return { top: rows[0], bottom: rows[rows.length - 1], height: rows[rows.length - 1] - rows[0] + 1 }
+}
+
+/**
+ * The panel geometry once it stops moving. A wrapping row can only be measured
+ * after it has laid out, so the first frame or two resize the panel; assertions
+ * read it only after three reads agree.
+ */
+async function settledPanel(app: Setup, title: string) {
+  let signature = ""
+  let same = 0
+  for (let attempt = 0; attempt < 60; attempt++) {
+    const geometry = await panelGeometry(app, title)
+    const next = `${geometry.top}:${geometry.bottom}`
+    same = next === signature ? same + 1 : 0
+    signature = next
+    if (same >= 2) return geometry
+    await Bun.sleep(20)
+  }
+  throw new Error("panel geometry never settled")
+}
+
+/** The last row above the footer that still paints text. */
+function lastPaintedAbove(frame: string, footerRow: number) {
+  const lines = frame.split("\n")
+  return lines.slice(0, footerRow).reduce((last, line, index) => (line.trim() ? index : last), -1)
+}
+
 /** The background of the widest span on a row, i.e. the fill the row paints. */
 async function rowFills(app: Setup) {
   const spans = await captureSpans(app)
@@ -1028,9 +1068,12 @@ describe("agent effort selector", () => {
       harness.dialog.replace(() => <DialogAgentEffort />)
       const frame = await frameWhere(
         harness.app,
-        (f) => f.includes("Agent effort") && f.includes("Deep, meticulous"),
+        (f) =>
+          f.includes("Agent effort") &&
+          flatText(f).includes("Deep, meticulous work on complex tasks from start to finish"),
         "dialog rows",
       )
+      await settledPanel(harness.app, "Agent effort")
       const lines = frame.split("\n")
       const rowOf = (needle: string) => lines.findIndex((line) => line.includes(needle))
       // One blank row between options, and no more: the levels stop reading as
@@ -1059,6 +1102,122 @@ describe("agent effort selector", () => {
       expect(markerLine(frame)).toContain("Fast")
     } finally {
       await harness.dispose()
+    }
+  })
+
+
+  // The panel's own chrome: paddingTop 1, title 1, gap 1, search 1, gap 1,
+  // the option rows, gap 1, footer 1, paddingBottom 1.
+  const CHROME = 8
+
+  test("sizes the dialog to the rows it paints, not to the terminal cap", async () => {
+    // The three levels paint 6 rows at a normal width (one blank row between
+    // them, Thorough wrapping to two lines) and 10 rows at a narrow one. The
+    // panel must follow those rows, so the same content is the same height in
+    // a 40-row terminal and an 80-row one, and the footer stays right under
+    // the last row instead of at the bottom of an oversized box.
+    for (const view of [
+      { name: "normal", width: 120, height: 40, rows: 6 },
+      { name: "tall", width: 120, height: 80, rows: 6 },
+      { name: "narrow", width: 44, height: 40, rows: 10 },
+    ]) {
+      const harness = await mountEffort({
+        route: { type: "home" },
+        model: "test-provider/variant-model",
+        children: () => null,
+        width: view.width,
+        height: view.height,
+      })
+      try {
+        harness.dialog.replace(() => <DialogAgentEffort />)
+        const frame = await frameWhere(
+          harness.app,
+          (f) =>
+            flatText(f).includes("Deep, meticulous work on complex tasks from start to finish") &&
+            f.includes("Default for new sessions"),
+          view.name,
+        )
+        const panel = await settledPanel(harness.app, "Agent effort")
+        const settled = await captureFrame(harness.app)
+        const lines = settled.split("\n")
+        const footerRow = lines.findIndex((line) => line.includes("Default for new sessions"))
+
+        expect(panel.height).toBe(view.rows + CHROME)
+        // The footer is the panel's last content row, with the panel's usual
+        // bottom padding under it.
+        expect(footerRow).toBe(panel.bottom - 1)
+        // Exactly one blank row separates the last painted option row from the
+        // footer: the dialog's normal gap, not dead space.
+        expect(lastPaintedAbove(frame, footerRow)).toBe(footerRow - 2)
+        expect(lines[footerRow - 1].trim()).toBe("")
+      } finally {
+        await harness.dispose()
+      }
+    }
+  })
+
+  test("keeps the panel compact around a single filtered level", async () => {
+    const harness = await mountEffort({
+      route: { type: "home" },
+      model: "test-provider/variant-model",
+      children: () => null,
+      width: 120,
+      height: 40,
+    })
+    try {
+      harness.dialog.replace(() => <DialogAgentEffort />)
+      await frameWhere(harness.app, (f) => f.includes("Agent effort"), "dialog title")
+      await harness.app.mockInput.typeText("tho")
+      await frameWhere(harness.app, (f) => f.includes("Thorough") && !f.includes("Medium"), "filtered")
+      const panel = await settledPanel(harness.app, "Agent effort")
+      const frame = await captureFrame(harness.app)
+      const lines = frame.split("\n")
+      const footerRow = lines.findIndex((line) => line.includes("Default for new sessions"))
+      // Only Thorough is left, and its copy wraps to two rows.
+      expect(panel.height).toBe(2 + CHROME)
+      expect(footerRow).toBe(panel.bottom - 1)
+      expect(lastPaintedAbove(frame, footerRow)).toBe(footerRow - 2)
+      expect(lines[footerRow - 1].trim()).toBe("")
+    } finally {
+      await harness.dispose()
+    }
+  })
+
+  test("keeps the footer directly under the list in a short viewport", async () => {
+    for (const view of [
+      // 26 rows leaves a 7-row cap, one row more than the 6 rows the levels
+      // need: the panel must still stop at the content.
+      { name: "short with room", width: 120, height: 26, rows: 6 },
+      // 20 rows leaves a 4-row cap, so the list scrolls and the footer sits
+      // under the capped viewport instead of a taller one.
+      { name: "short capped", width: 44, height: 20, rows: 4 },
+    ]) {
+      const harness = await mountEffort({
+        route: { type: "home" },
+        model: "test-provider/variant-model",
+        children: () => null,
+        width: view.width,
+        height: view.height,
+      })
+      try {
+        harness.dialog.replace(() => <DialogAgentEffort />)
+        await frameWhere(harness.app, (f) => f.includes("Default for new sessions"), view.name)
+        const panel = await settledPanel(harness.app, "Agent effort")
+        const frame = await captureFrame(harness.app)
+        const lines = frame.split("\n")
+        const footerRow = lines.findIndex((line) => line.includes("Default for new sessions"))
+        expect(panel.height).toBe(view.rows + CHROME)
+        expect(footerRow).toBe(panel.bottom - 1)
+        expect(lastPaintedAbove(frame, footerRow)).toBe(footerRow - 2)
+        expect(lines[footerRow - 1].trim()).toBe("")
+        // Nothing paints below the footer inside the panel.
+        expect(lines.slice(footerRow + 1, panel.bottom + 1).every((line) => line.trim() === "")).toBe(true)
+        // The selected level and its wrap stay on screen.
+        expect(markerLine(frame)).toContain("Fast")
+        expect(frame).toContain("for everyday tasks")
+      } finally {
+        await harness.dispose()
+      }
     }
   })
 
@@ -1254,12 +1413,15 @@ describe("agent effort selector", () => {
   // writes the sanitized span dumps that the committed PNGs are rendered from.
   // It renders through the production dialog stack, like app.tsx does, so the
   // frames carry the real panel width.
-  test.skipIf(!process.env.TUI_CAPTURE_DIR)("captures the normal and narrow layout frames", async () => {
+  test.skipIf(!process.env.TUI_CAPTURE_DIR)("captures the normal, narrow and short layout frames", async () => {
     const dir = process.env.TUI_CAPTURE_DIR
     if (!dir) return
     for (const view of [
-      { name: "normal", width: 120, height: 40 },
-      { name: "narrow", width: 44, height: 40 },
+      { name: "normal", width: 120, height: 40, downs: 0 },
+      { name: "narrow", width: 44, height: 40, downs: 0 },
+      // A short viewport caps the list; the cursor walks to the wrapping level
+      // so the frame also shows the wrapped selection held on screen.
+      { name: "short", width: 44, height: 26, downs: 2 },
     ]) {
       const harness = await mountEffort({
         route: { type: "home" },
@@ -1270,7 +1432,14 @@ describe("agent effort selector", () => {
       })
       try {
         harness.dialog.replace(() => <DialogAgentEffort />)
-        await frameWhere(harness.app, (f) => f.includes("Agent effort") && f.includes("Thorough"), view.name)
+        await frameWhere(harness.app, (f) => f.includes("Agent effort"), view.name)
+        for (let press = 0; press < view.downs; press++) harness.app.mockInput.pressArrow("down")
+        await frameWhere(
+          harness.app,
+          (f) => flatText(f).includes("start to finish") && f.includes("Default for new sessions"),
+          view.name,
+        )
+        await settledPanel(harness.app, "Agent effort")
         const spans = await captureSpans(harness.app)
         const lines = spans.lines.map((line) =>
           line.spans.map((span) => ({
@@ -1281,11 +1450,16 @@ describe("agent effort selector", () => {
           })),
         )
         await mkdir(dir, { recursive: true })
-        await Bun.write(path.join(dir, `agent-effort-${view.name}.json`), JSON.stringify({ cols: spans.cols, rows: spans.rows, lines }))
+        await Bun.write(
+          path.join(dir, `agent-effort-${view.name}.json`),
+          JSON.stringify({ cols: spans.cols, rows: spans.rows, lines }),
+        )
         console.log(`\n=== ${view.name} (${spans.cols}x${spans.rows}) ===\n${await captureFrame(harness.app)}`)
       } finally {
         await harness.dispose()
       }
     }
   })
+
+
 })

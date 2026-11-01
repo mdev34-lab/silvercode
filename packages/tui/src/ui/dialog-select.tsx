@@ -229,14 +229,17 @@ export function DialogSelect<T>(props: DialogSelectProps<T>) {
   })
 
   const dimensions = useTerminalDimensions()
+  // A title column turns descriptions into wrapping text, so how many lines a
+  // row paints is only known after layout. The scrollbox paints exactly the
+  // height it is allowed, so this measures the rows it actually laid out
+  // instead of assuming one line per option: a static count would either clip
+  // wrapped lines or leave the panel with empty rows under the last option.
+  const [laidOutRows, setLaidOutRows] = createSignal(0)
+  const wrapping = createMemo(() => flat().some((option) => option.titleColumn !== undefined))
   const height = createMemo(() => {
-    const cap = Math.floor(dimensions().height / 2) - 6
-    // A title column turns descriptions into wrapping text, so how many lines a
-    // row paints is only known after layout: capping by `rows()` would clip the
-    // wrapped lines out of the scrollbox. The terminal cap still bounds the
-    // box, and the scrollbox keeps sizing itself to its content below it.
-    if (flat().some((option) => option.titleColumn !== undefined)) return cap
-    return Math.min(rows(), cap)
+    const cap = Math.max(0, Math.floor(dimensions().height / 2) - 6)
+    if (!wrapping()) return Math.min(rows(), cap)
+    return Math.max(1, Math.min(laidOutRows() || rows(), cap))
   })
 
   const selected = createMemo(() => flat()[store.selected])
@@ -527,6 +530,39 @@ export function DialogSelect<T>(props: DialogSelectProps<T>) {
   })
 
   let scroll: ScrollBoxRenderable | undefined
+  // The painted rows are the only honest source for a wrapped row's height, so
+  // the scrollbox is sized from the extent they actually laid out to. A layout
+  // can settle over more than one pass, so this re-reads until two passes agree
+  // and then stops.
+  function measureLaidOutRows() {
+    const children = scroll?.getChildren()
+    if (!children || children.length === 0) return
+    const last = children[children.length - 1]
+    const measured = last.y + last.height - children[0].y
+    if (measured > 0) setLaidOutRows(measured)
+  }
+  let measureGeneration = 0
+  createEffect(() => {
+    if (!wrapping()) return
+    grouped()
+    dimensions()
+    selected()
+    const generation = ++measureGeneration
+    let previous = -1
+    let passes = 0
+    const settle = () => {
+      if (generation !== measureGeneration) return
+      measureLaidOutRows()
+      const measured = laidOutRows()
+      if (measured === previous || ++passes > 3) return
+      previous = measured
+      renderer.requestAnimationFrame(settle)
+    }
+    renderer.requestAnimationFrame(settle)
+  })
+  onCleanup(() => {
+    measureGeneration++
+  })
   const ref: DialogSelectRef<T> = {
     get filter() {
       return store.filter
