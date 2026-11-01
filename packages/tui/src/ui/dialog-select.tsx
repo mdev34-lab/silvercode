@@ -237,9 +237,10 @@ export function DialogSelect<T>(props: DialogSelectProps<T>) {
   const [laidOutRows, setLaidOutRows] = createSignal(0)
   const wrapping = createMemo(() => flat().some((option) => option.titleColumn !== undefined))
   const height = createMemo(() => {
-    const cap = Math.max(0, Math.floor(dimensions().height / 2) - 6)
+    const cap = Math.floor(dimensions().height / 2) - 6
+    // Every other picker keeps this expression exactly as it was.
     if (!wrapping()) return Math.min(rows(), cap)
-    return Math.max(1, Math.min(laidOutRows() || rows(), cap))
+    return Math.max(1, Math.min(laidOutRows() || rows(), Math.max(0, cap)))
   })
 
   const selected = createMemo(() => flat()[store.selected])
@@ -536,9 +537,11 @@ export function DialogSelect<T>(props: DialogSelectProps<T>) {
   // one pass, so this re-reads until consecutive passes agree and then stops.
   let measureGeneration = 0
   function measureLaidOutRows() {
+    // Only the opt-in wrapping layout sizes itself from a measurement: every
+    // other picker keeps the static row math, so it schedules nothing at all.
+    if (!wrapping()) return
     const generation = ++measureGeneration
     let previous = -1
-    let passes = 0
     const settle = () => {
       if (generation !== measureGeneration) return
       const children = scroll?.getChildren()
@@ -547,7 +550,7 @@ export function DialogSelect<T>(props: DialogSelectProps<T>) {
         const measured = last.y + last.height - children[0].y
         if (measured > 0) setLaidOutRows(measured)
       }
-      if (laidOutRows() === previous || ++passes > 6) return
+      if (laidOutRows() === previous) return
       previous = laidOutRows()
       renderer.requestAnimationFrame(settle)
     }

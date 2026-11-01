@@ -408,11 +408,13 @@ function flatText(frame: string) {
 /** The painted panel's rows: its background fill bounds what the dialog occupies. */
 async function panelGeometry(app: Setup, title: string) {
   const spans = await captureSpans(app)
-  const titleRow = spans.lines.findIndex((line) => line.spans.some((span) => span.text.includes(title)))
-  if (titleRow < 0) throw new Error(`no ${title} title row in the captured frame`)
-  const widest = (line: (typeof spans.lines)[number]) =>
-    line.spans.reduce((acc, span) => (span.width > acc.width ? span : acc), line.spans[0])
-  const panel = hexOf(widest(spans.lines[titleRow]).bg)
+  const titleSpan = spans.lines
+    .flatMap((line) => line.spans)
+    .find((span) => span.text.trim() === title)
+  if (!titleSpan) throw new Error(`no ${title} title span in the captured frame`)
+  // The panel is whatever the title sits on; everything it paints, including
+  // its padding, carries that same fill.
+  const panel = hexOf(titleSpan.bg)
   const rows = spans.lines.flatMap((line, index) =>
     line.spans.some((span) => hexOf(span.bg) === panel && span.width > 10) ? [index] : [],
   )
@@ -421,21 +423,22 @@ async function panelGeometry(app: Setup, title: string) {
 }
 
 /**
- * The panel geometry once it stops moving. A wrapping row can only be measured
- * after it has laid out, so the first frame or two resize the panel; assertions
- * read it only after three reads agree.
+ * Waits for the frame to stop moving, then reads the panel once. A wrapping row
+ * can only be measured after it has laid out, so the first frame or two resize
+ * the panel; comparing painted text is cheap enough to poll, and the geometry
+ * itself is read from a single span capture afterwards.
  */
 async function settledPanel(app: Setup, title: string) {
-  let signature = ""
+  let signature: string | undefined
   let same = 0
-  for (let attempt = 0; attempt < 120; attempt++) {
-    const geometry = await panelGeometry(app, title)
-    const next = `${geometry.top}:${geometry.bottom}`
-    same = next === signature ? same + 1 : 0
-    signature = next
-    // Three agreeing reads: one late resize alone must not be read as settled.
-    if (same >= 3) return geometry
-    await Bun.sleep(25)
+  for (let attempt = 0; attempt < 200; attempt++) {
+    await app.renderOnce()
+    const frame = app.captureCharFrame()
+    same = frame === signature ? same + 1 : 0
+    signature = frame
+    // Four agreeing frames: one late resize alone must not read as settled.
+    if (same >= 3) return panelGeometry(app, title)
+    await Bun.sleep(10)
   }
   throw new Error("panel geometry never settled")
 }
@@ -1381,7 +1384,12 @@ describe("agent effort selector", () => {
     const harness = await mountEffort({
       route: { type: "home" },
       model: "test-provider/variant-model",
-      children: () => (
+      children: () => null,
+    })
+    try {
+      // Opened through the same dialog stack, so the geometry below is the
+      // panel a user sees and not a bare component on the root.
+      harness.dialog.replace(() => (
         <DialogSelect
           options={[
             { value: "alpha", title: "Alpha", description: "First option" },
@@ -1390,9 +1398,7 @@ describe("agent effort selector", () => {
           title="Control picker"
           current="alpha"
         />
-      ),
-    })
-    try {
+      ))
       const frame = await frameWhere(
         harness.app,
         (f) => f.includes("Control picker") && f.includes("Second option"),
@@ -1405,6 +1411,10 @@ describe("agent effort selector", () => {
       expect(rowOf("Bravo") - rowOf("Alpha")).toBe(1)
       expect(lines[rowOf("Alpha")]).toContain("Alpha First option")
       expect(lines[rowOf("Bravo")]).toContain("Bravo Second option")
+      // And it keeps the static one-row-per-option height in a terminal tall
+      // enough for far more: two options plus the panel chrome, which is one
+      // row shorter than the effort menu's because this picker has no footer.
+      expect((await settledPanel(harness.app, "Control picker")).height).toBe(2 + CHROME - 1)
     } finally {
       await harness.dispose()
     }
