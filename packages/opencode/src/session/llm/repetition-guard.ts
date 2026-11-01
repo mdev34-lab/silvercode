@@ -1,4 +1,5 @@
 import { LLMEvent } from "@opencode-ai/llm"
+import { isRecord } from "@/util/record"
 import { Effect, Stream } from "effect"
 
 // SessionRetry.retryable excludes messages with this prefix, so a tripped
@@ -56,6 +57,19 @@ export class RepetitionDetectedError extends Error {
   constructor(readonly detail: string) {
     super(`${REPETITION_MESSAGE}: ${detail}`)
   }
+}
+
+// Stable identity for a tripped guard on the persisted assistant message.
+// MessageV2.fromError records this marker in UnknownError.data.ref; the error
+// keeps its name and message text, so every existing renderer and the retry
+// exclusion see exactly what they saw before. Recovery reads the marker instead
+// of matching REPETITION_MESSAGE, because a provider HTTP error can quote the
+// guard text while being a different failure entirely (issue #738).
+export const ERROR_REF = "repetition-guard"
+
+/** True when a persisted `Assistant["error"]` is the harness's own guard abort. */
+export function isStoredError(error: unknown): boolean {
+  return isRecord(error) && error.name === "UnknownError" && isRecord(error.data) && error.data.ref === ERROR_REF
 }
 
 type GuardOptions = {

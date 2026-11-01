@@ -58,8 +58,10 @@ import { Ripgrep } from "@opencode-ai/core/ripgrep"
 import { Format } from "../../src/format"
 import { TestInstance } from "../fixture/fixture"
 import { awaitWithTimeout, pollWithTimeout, testEffect } from "../lib/effect"
-import { reply, TestLLMServer } from "../lib/llm-server"
+import { httpError, raw, reply, TestLLMServer } from "../lib/llm-server"
 import { RuntimeFlags } from "@/effect/runtime-flags"
+import { RepetitionGuard } from "../../src/session/llm/repetition-guard"
+import { continuesPrompt } from "../../src/session/subagent-result"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { LocationServiceMap, locationServiceMapLayer } from "@opencode-ai/core/location-services"
@@ -1551,7 +1553,13 @@ it.instance(
         filename: "historical.txt",
         url: "data:text/plain;base64,aGlzdG9yaWNhbCBjb250ZW50",
       })
-      yield* sessions.updatePart({id:PartID.ascending(),messageID,sessionID:session.id,type:"text",text:"Save this attachment"})
+      yield* sessions.updatePart({
+        id: PartID.ascending(),
+        messageID,
+        sessionID: session.id,
+        type: "text",
+        text: "Save this attachment",
+      })
       const target = path.join(dir, "historical.txt")
 
       yield* llm.tool("attachment", { action: "list" })
@@ -1807,7 +1815,8 @@ it.instance(
       const executionsOf = (name: string) => executions.filter((part) => part.tool === name)
       const repaired = parts.find((part) => part.type === "tool" && part.tool === "invalid")
       expect(repaired?.type).toBe("tool")
-      if (repaired?.type !== "tool" || repaired.state.status !== "completed") throw new Error("expected a completed repair")
+      if (repaired?.type !== "tool" || repaired.state.status !== "completed")
+        throw new Error("expected a completed repair")
       expect(repaired.state.input).toMatchObject({ tool: "write" })
       expect(repaired.state.output).toContain(target)
       expect(repaired.state.output).toContain("did not execute")
@@ -1818,7 +1827,9 @@ it.instance(
       expect(repaired.state.output).toContain("write replaces the entire file")
       // the fragment's unfinished body is never presented as recovered content: the
       // only echo of the raw text is the provider/parser error inside the parenthetical
-      const recovered = repaired.state.output.slice(repaired.state.output.indexOf("Recovered from the partial arguments:"))
+      const recovered = repaired.state.output.slice(
+        repaired.state.output.indexOf("Recovered from the partial arguments:"),
+      )
       expect(recovered).not.toContain("line two")
       expect(recovered).not.toContain("Report")
 
@@ -4334,7 +4345,7 @@ unixNoLLMServer(
         const code =
           'const cp=require("node:child_process");const fs=require("node:fs");' +
           'const d=cp.spawn(process.execPath,["-e","setTimeout(()=>{},60000)"],{detached:true,stdio:"inherit"});' +
-          "d.unref();fs.writeFileSync(Bun.argv[1],String(d.pid));process.stdout.write(\"STARTED\");process.exit(0)"
+          'd.unref();fs.writeFileSync(Bun.argv[1],String(d.pid));process.stdout.write("STARTED");process.exit(0)'
         const command = `${bin} -e ${squote(code)} ${squote(pidFile)}`
 
         const start = Date.now()
@@ -5745,11 +5756,7 @@ it.instance(
 
       yield* Deferred.succeed(releaseInterrupt, void 0)
 
-      const [exitCancel, exitA, exitB] = yield* Effect.all([
-        Fiber.await(cancelFiber),
-        Fiber.await(a),
-        Fiber.await(b),
-      ])
+      const [exitCancel, exitA, exitB] = yield* Effect.all([Fiber.await(cancelFiber), Fiber.await(a), Fiber.await(b)])
       expect(Exit.isSuccess(exitCancel)).toBe(true)
       expect(Exit.isSuccess(exitA)).toBe(true)
       expect(Exit.isSuccess(exitB)).toBe(true)
@@ -6003,11 +6010,15 @@ it.instance("loop sends a reduced context projection and keeps canonical history
       })
     }
     const canonical = () =>
-      sessions.messages({ sessionID: chat.id }).pipe(
-        Effect.map((msgs) =>
-          msgs.flatMap((m) => m.parts.flatMap((p) => (p.type === "tool" && p.state.status === "completed" ? [p.state.output] : []))),
-        ),
-      )
+      sessions
+        .messages({ sessionID: chat.id })
+        .pipe(
+          Effect.map((msgs) =>
+            msgs.flatMap((m) =>
+              m.parts.flatMap((p) => (p.type === "tool" && p.state.status === "completed" ? [p.state.output] : [])),
+            ),
+          ),
+        )
     const before = yield* canonical()
     expect(before).toHaveLength(10)
 
@@ -6086,7 +6097,12 @@ it.instance(
       // resolves. Whether or not the SDK already executed the call, a retry
       // would issue it again: the turn must end as a terminal interruption
       // instead, and the command must never run twice.
-      yield* llm.push(reply().tool("bash", { command: `printf 'replay\\n' >> ${JSON.stringify(target)}` }).cut().item())
+      yield* llm.push(
+        reply()
+          .tool("bash", { command: `printf 'replay\\n' >> ${JSON.stringify(target)}` })
+          .cut()
+          .item(),
+      )
       yield* user(chat.id, "hello")
 
       const result = yield* prompt.loop({ sessionID: chat.id })
@@ -6207,94 +6223,154 @@ it.instance(
   { timeout: 30_000 },
 )
 
-it.instance("cancel while edit permission is pending removes the request and prevents a late write", () =>
-  Effect.gen(function* () {
-    const { dir, llm } = yield* useServerConfig((url) => ({ ...providerCfg(url), permission: { "*": "allow", edit: "ask" }, permission_timeout: { enabled: false } }))
-    const file = path.join(dir, "abort-locked.txt")
-    yield* Effect.promise(() => Bun.write(file, "ORIGINAL_CONTENT\n"))
-    const prompt = yield* SessionPrompt.Service
-    const sessions = yield* Session.Service
-    const permission = yield* Permission.Service
-    const chat = yield* sessions.create({ title: "Pinned" })
-    yield* llm.push(reply().tool("read", { filePath: file }))
-    yield* llm.push(reply().tool("edit", { filePath: file, oldString: "ORIGINAL_CONTENT", newString: "ABORTED_TURN_OVERWRITE" }))
-    yield* user(chat.id, "Read and revise the report")
-    const first = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
-    const request = yield* pollWithTimeout(permission.list().pipe(Effect.map((items) => items.find((r) => r.sessionID === chat.id))), "edit permission did not arrive")
-    yield* prompt.cancel(chat.id)
-    yield* Fiber.await(first)
-    const remaining = yield* permission.list()
-    // Probe the stale UI reply even if it should now be rejected.
-    yield* permission.reply({ requestID: request.id, reply: "once" }).pipe(Effect.ignore)
-    yield* Effect.sleep("100 millis")
-    expect(yield* Effect.promise(() => Bun.file(file).text())).toBe("ORIGINAL_CONTENT\n")
-    expect(remaining.some((r) => r.id === request.id)).toBe(false)
-    // A fresh edit of the same path must acquire the prior turn's semaphore.
-    yield* llm.push(reply().tool("edit", { filePath: file, oldString: "ORIGINAL_CONTENT", newString: "FRESH_TURN_WRITE" }))
-    yield* llm.text("fresh done")
-    yield* user(chat.id, "Revise the report")
-    const fresh = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
-    const next = yield* pollWithTimeout(permission.list().pipe(Effect.map((items) => items.find((r) => r.sessionID === chat.id))), "fresh edit remained locked")
-    yield* permission.reply({ requestID: next.id, reply: "once" })
-    yield* Fiber.join(fresh).pipe(Effect.timeout("5 seconds"))
-    expect(yield* Effect.promise(() => Bun.file(file).text())).toBe("FRESH_TURN_WRITE\n")
-  }), { timeout: 20000 })
+it.instance(
+  "cancel while edit permission is pending removes the request and prevents a late write",
+  () =>
+    Effect.gen(function* () {
+      const { dir, llm } = yield* useServerConfig((url) => ({
+        ...providerCfg(url),
+        permission: { "*": "allow", edit: "ask" },
+        permission_timeout: { enabled: false },
+      }))
+      const file = path.join(dir, "abort-locked.txt")
+      yield* Effect.promise(() => Bun.write(file, "ORIGINAL_CONTENT\n"))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const permission = yield* Permission.Service
+      const chat = yield* sessions.create({ title: "Pinned" })
+      yield* llm.push(reply().tool("read", { filePath: file }))
+      yield* llm.push(
+        reply().tool("edit", { filePath: file, oldString: "ORIGINAL_CONTENT", newString: "ABORTED_TURN_OVERWRITE" }),
+      )
+      yield* user(chat.id, "Read and revise the report")
+      const first = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+      const request = yield* pollWithTimeout(
+        permission.list().pipe(Effect.map((items) => items.find((r) => r.sessionID === chat.id))),
+        "edit permission did not arrive",
+      )
+      yield* prompt.cancel(chat.id)
+      yield* Fiber.await(first)
+      const remaining = yield* permission.list()
+      // Probe the stale UI reply even if it should now be rejected.
+      yield* permission.reply({ requestID: request.id, reply: "once" }).pipe(Effect.ignore)
+      yield* Effect.sleep("100 millis")
+      expect(yield* Effect.promise(() => Bun.file(file).text())).toBe("ORIGINAL_CONTENT\n")
+      expect(remaining.some((r) => r.id === request.id)).toBe(false)
+      // A fresh edit of the same path must acquire the prior turn's semaphore.
+      yield* llm.push(
+        reply().tool("edit", { filePath: file, oldString: "ORIGINAL_CONTENT", newString: "FRESH_TURN_WRITE" }),
+      )
+      yield* llm.text("fresh done")
+      yield* user(chat.id, "Revise the report")
+      const fresh = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+      const next = yield* pollWithTimeout(
+        permission.list().pipe(Effect.map((items) => items.find((r) => r.sessionID === chat.id))),
+        "fresh edit remained locked",
+      )
+      yield* permission.reply({ requestID: next.id, reply: "once" })
+      yield* Fiber.join(fresh).pipe(Effect.timeout("5 seconds"))
+      expect(yield* Effect.promise(() => Bun.file(file).text())).toBe("FRESH_TURN_WRITE\n")
+    }),
+  { timeout: 20000 },
+)
 
-it.instance("cancel while a question is pending removes it before a stale answer can complete the tool", () =>
-  Effect.gen(function* () {
-    const { llm } = yield* useServerConfig(providerCfg)
-    const prompt = yield* SessionPrompt.Service
-    const sessions = yield* Session.Service
-    const questions = yield* Question.Service
-    const chat = yield* sessions.create({ title: "Pinned" })
-    yield* llm.push(reply().tool("question", { questions: [{ question: "Continue?", header: "Choice", options: [{ label: "Yes", description: "Continue" }] }] }))
-    yield* user(chat.id, "ask a question")
-    const first = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
-    const request = yield* pollWithTimeout(questions.list().pipe(Effect.map((items) => items.find((r) => r.sessionID === chat.id))), "question did not arrive")
-    yield* prompt.cancel(chat.id)
-    yield* Fiber.await(first)
-    expect((yield* questions.list()).some((r) => r.id === request.id)).toBe(false)
-    const late = yield* questions.reply({ requestID: request.id, answers: [["Yes"]] }).pipe(Effect.exit)
-    expect(Exit.isFailure(late)).toBe(true)
-  }), { timeout: 20000 })
+it.instance(
+  "cancel while a question is pending removes it before a stale answer can complete the tool",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const questions = yield* Question.Service
+      const chat = yield* sessions.create({ title: "Pinned" })
+      yield* llm.push(
+        reply().tool("question", {
+          questions: [
+            { question: "Continue?", header: "Choice", options: [{ label: "Yes", description: "Continue" }] },
+          ],
+        }),
+      )
+      yield* user(chat.id, "ask a question")
+      const first = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+      const request = yield* pollWithTimeout(
+        questions.list().pipe(Effect.map((items) => items.find((r) => r.sessionID === chat.id))),
+        "question did not arrive",
+      )
+      yield* prompt.cancel(chat.id)
+      yield* Fiber.await(first)
+      expect((yield* questions.list()).some((r) => r.id === request.id)).toBe(false)
+      const late = yield* questions.reply({ requestID: request.id, answers: [["Yes"]] }).pipe(Effect.exit)
+      expect(Exit.isFailure(late)).toBe(true)
+    }),
+  { timeout: 20000 },
+)
 
 const itAbortMcp = testEffect(makeHttp({ mcpTools: { probe_lookup: mcpTool("lookup", "Look up a note") } }))
-itAbortMcp.instance("cancel while an MCP permission is pending removes it before late approval", () =>
-  Effect.gen(function* () {
-    const { llm } = yield* useServerConfig((url) => ({ ...providerCfg(url), permission: { "*": "allow", probe_lookup: "ask" }, permission_timeout: { enabled: false }, tool_search: { enabled: false } }))
-    const prompt = yield* SessionPrompt.Service
-    const sessions = yield* Session.Service
-    const permissions = yield* Permission.Service
-    const chat = yield* sessions.create({ title: "Pinned" })
-    yield* llm.push(reply().tool("probe_lookup", { query: "milk" }))
-    yield* user(chat.id, "look up note")
-    const first = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
-    const request = yield* pollWithTimeout(permissions.list().pipe(Effect.map((items) => items.find((r) => r.sessionID === chat.id))), "MCP permission did not arrive")
-    yield* prompt.cancel(chat.id)
-    yield* Fiber.await(first)
-    expect((yield* permissions.list()).some((r) => r.id === request.id)).toBe(false)
-    const late = yield* permissions.reply({ requestID: request.id, reply: "once" }).pipe(Effect.exit)
-    expect(Exit.isFailure(late)).toBe(true)
-  }), { timeout: 20000 })
+itAbortMcp.instance(
+  "cancel while an MCP permission is pending removes it before late approval",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig((url) => ({
+        ...providerCfg(url),
+        permission: { "*": "allow", probe_lookup: "ask" },
+        permission_timeout: { enabled: false },
+        tool_search: { enabled: false },
+      }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const permissions = yield* Permission.Service
+      const chat = yield* sessions.create({ title: "Pinned" })
+      yield* llm.push(reply().tool("probe_lookup", { query: "milk" }))
+      yield* user(chat.id, "look up note")
+      const first = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+      const request = yield* pollWithTimeout(
+        permissions.list().pipe(Effect.map((items) => items.find((r) => r.sessionID === chat.id))),
+        "MCP permission did not arrive",
+      )
+      yield* prompt.cancel(chat.id)
+      yield* Fiber.await(first)
+      expect((yield* permissions.list()).some((r) => r.id === request.id)).toBe(false)
+      const late = yield* permissions.reply({ requestID: request.id, reply: "once" }).pipe(Effect.exit)
+      expect(Exit.isFailure(late)).toBe(true)
+    }),
+  { timeout: 20000 },
+)
 
-it.instance("cancel while bash permission is pending cannot run the command on late approval", () =>
-  Effect.gen(function* () {
-    const { dir, llm } = yield* useServerConfig((url) => ({ ...providerCfg(url), permission: { "*": "allow", bash: "ask" }, permission_timeout: { enabled: false } }))
-    const file = path.join(dir, "aborted-command.txt")
-    const prompt = yield* SessionPrompt.Service
-    const sessions = yield* Session.Service
-    const permissions = yield* Permission.Service
-    const chat = yield* sessions.create({ title: "Pinned" })
-    yield* llm.push(reply().tool("bash", { command: "echo SHOULD_NOT_RUN > aborted-command.txt", description: "write marker", workdir: dir }))
-    yield* user(chat.id, "Write a report marker")
-    const first = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
-    const request = yield* pollWithTimeout(permissions.list().pipe(Effect.map((items) => items.find((r) => r.sessionID === chat.id))), "bash permission did not arrive")
-    yield* prompt.cancel(chat.id)
-    yield* Fiber.await(first)
-    const late = yield* permissions.reply({ requestID: request.id, reply: "once" }).pipe(Effect.exit)
-    expect(Exit.isFailure(late)).toBe(true)
-    expect(yield* Effect.promise(() => Bun.file(file).exists())).toBe(false)
-  }), { timeout: 20000 })
+it.instance(
+  "cancel while bash permission is pending cannot run the command on late approval",
+  () =>
+    Effect.gen(function* () {
+      const { dir, llm } = yield* useServerConfig((url) => ({
+        ...providerCfg(url),
+        permission: { "*": "allow", bash: "ask" },
+        permission_timeout: { enabled: false },
+      }))
+      const file = path.join(dir, "aborted-command.txt")
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const permissions = yield* Permission.Service
+      const chat = yield* sessions.create({ title: "Pinned" })
+      yield* llm.push(
+        reply().tool("bash", {
+          command: "echo SHOULD_NOT_RUN > aborted-command.txt",
+          description: "write marker",
+          workdir: dir,
+        }),
+      )
+      yield* user(chat.id, "Write a report marker")
+      const first = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+      const request = yield* pollWithTimeout(
+        permissions.list().pipe(Effect.map((items) => items.find((r) => r.sessionID === chat.id))),
+        "bash permission did not arrive",
+      )
+      yield* prompt.cancel(chat.id)
+      yield* Fiber.await(first)
+      const late = yield* permissions.reply({ requestID: request.id, reply: "once" }).pipe(Effect.exit)
+      expect(Exit.isFailure(late)).toBe(true)
+      expect(yield* Effect.promise(() => Bun.file(file).exists())).toBe(false)
+    }),
+  { timeout: 20000 },
+)
 it.instance("a child can finish on the next generation after writing its result envelope", () =>
   Effect.gen(function* () {
     const { llm } = yield* useServerConfig((url) => ({
@@ -6305,116 +6381,196 @@ it.instance("a child can finish on the next generation after writing its result 
     const sessions = yield* Session.Service
     const parent = yield* sessions.create({ title: "Parent" })
     const child = yield* sessions.create({
-      title: "Child", parentID: parent.id,
+      title: "Child",
+      parentID: parent.id,
       permission: [{ permission: "*", pattern: "*", action: "allow" }],
     })
     const plan = "Create the scene, place the camera, then validate the HTML."
     yield* llm.push(reply().text(`<silvercode-result>${plan}</silvercode-result>`).tool("glob", { pattern: "*" }))
     yield* llm.push(reply().tool("finish", { reason: "success", result: "Task completed" }).stop())
     const result = yield* prompt.prompt({
-      sessionID: child.id, agent: "general", model: ref,
+      sessionID: child.id,
+      agent: "general",
+      model: ref,
       parts: [{ type: "text", text: "Plan the scene, inspect file names, then finish." }],
     })
     expect(yield* llm.calls).toBe(2)
     expectCompletedFinish(result)
     const history = yield* sessions.messages({ sessionID: child.id })
-    expect(history.some((message) => message.info.id !== result.info.id && message.parts.some(
-      (part) => part.type === "text" && part.text.includes(plan),
-    ))).toBe(true)
+    expect(
+      history.some(
+        (message) =>
+          message.info.id !== result.info.id &&
+          message.parts.some((part) => part.type === "text" && part.text.includes(plan)),
+      ),
+    ).toBe(true)
     expectNoFinishNudge(history)
   }),
 )
 
-
-it.instance("cancel registered custom tool permission prevents a late side effect", () =>
-  Effect.acquireUseRelease(
-    Effect.sync(() => {
-      const previous = process.env.OPENCODE_DISABLE_CONFIG_DEP_INSTALL
-      process.env.OPENCODE_DISABLE_CONFIG_DEP_INSTALL = "1"
-      return previous
-    }),
-    () => Effect.gen(function* () {
-    const dir = (yield* TestInstance).directory
-    const tools = path.join(dir, ".opencode", "tools")
-    const marker = path.join(dir, "plugin-late-write.txt")
-    yield* Effect.promise(() => Bun.write(path.join(tools, "plugin_write.ts"), `export default {
+it.instance(
+  "cancel registered custom tool permission prevents a late side effect",
+  () =>
+    Effect.acquireUseRelease(
+      Effect.sync(() => {
+        const previous = process.env.OPENCODE_DISABLE_CONFIG_DEP_INSTALL
+        process.env.OPENCODE_DISABLE_CONFIG_DEP_INSTALL = "1"
+        return previous
+      }),
+      () =>
+        Effect.gen(function* () {
+          const dir = (yield* TestInstance).directory
+          const tools = path.join(dir, ".opencode", "tools")
+          const marker = path.join(dir, "plugin-late-write.txt")
+          yield* Effect.promise(() =>
+            Bun.write(
+              path.join(tools, "plugin_write.ts"),
+              `export default {
       description: "Request permission then write a marker", args: {},
       async execute(args, ctx) {
         await ctx.ask({ permission: "plugin_write", patterns: ["*"], always: ["*"], metadata: {} })
         await Bun.write(${JSON.stringify(marker)}, "LATE_SIDE_EFFECT")
         return "written"
       }
-    }`))
-    const { llm } = yield* useServerConfig((url) => ({ ...providerCfg(url), permission: { "*": "allow", plugin_write: "ask" }, permission_timeout: { enabled: false }, tool_search: { enabled: false } }))
-    expect((yield* (yield* ToolRegistry.Service).all()).some((t) => t.id === "plugin_write")).toBe(true)
-    const prompt = yield* SessionPrompt.Service
+    }`,
+            ),
+          )
+          const { llm } = yield* useServerConfig((url) => ({
+            ...providerCfg(url),
+            permission: { "*": "allow", plugin_write: "ask" },
+            permission_timeout: { enabled: false },
+            tool_search: { enabled: false },
+          }))
+          expect((yield* (yield* ToolRegistry.Service).all()).some((t) => t.id === "plugin_write")).toBe(true)
+          const prompt = yield* SessionPrompt.Service
+          const sessions = yield* Session.Service
+          const permissions = yield* Permission.Service
+          const chat = yield* sessions.create({ title: "Pinned" })
+          yield* llm.push(reply().tool("plugin_write", {}))
+          yield* user(chat.id, "Generate a report with the custom tool")
+          const first = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+          const request = yield* pollWithTimeout(
+            permissions.list().pipe(Effect.map((items) => items.find((r) => r.sessionID === chat.id))),
+            "custom tool permission did not arrive",
+          )
+          yield* prompt.cancel(chat.id)
+          yield* Fiber.await(first)
+          const remaining = yield* permissions.list()
+          yield* permissions.reply({ requestID: request.id, reply: "once" }).pipe(Effect.ignore)
+          yield* Effect.sleep("100 millis")
+          expect(yield* Effect.promise(() => Bun.file(marker).exists())).toBe(false)
+          expect(remaining.some((r) => r.id === request.id)).toBe(false)
+          // Cancellation must not poison the next legitimate plugin invocation.
+          yield* llm.push(reply().tool("plugin_write", {}))
+          yield* llm.text("approved plugin invocation completed")
+          yield* user(chat.id, "Generate the report again with approval")
+          const fresh = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+          const next = yield* pollWithTimeout(
+            permissions.list().pipe(Effect.map((items) => items.find((r) => r.sessionID === chat.id))),
+            "fresh custom tool permission did not arrive",
+          )
+          yield* permissions.reply({ requestID: next.id, reply: "once" })
+          yield* Fiber.join(fresh).pipe(Effect.timeout("5 seconds"))
+          expect(yield* Effect.promise(() => Bun.file(marker).text())).toBe("LATE_SIDE_EFFECT")
+        }),
+      (previous) =>
+        Effect.sync(() => {
+          if (previous === undefined) delete process.env.OPENCODE_DISABLE_CONFIG_DEP_INSTALL
+          else process.env.OPENCODE_DISABLE_CONFIG_DEP_INSTALL = previous
+        }),
+    ),
+  { timeout: 20000 },
+)
+
+withMcpTools.instance(
+  "captured MCP executor still runs after the request becomes programming (advisory workflow)",
+  () =>
+    Effect.gen(function* () {
+      yield* useServerConfig((url) => ({
+        ...providerCfg(url),
+        tool_search: { enabled: false },
+        permission: { "*": "allow" },
+      }))
+      const sessions = yield* Session.Service
+      const agents = yield* AgentSvc.Service
+      const provider = yield* ProviderSvc.Service
+      const chat = yield* sessions.create({ title: "overlap" })
+      const seeded = yield* seed(chat.id)
+      yield* user(chat.id, "Research notes and write a report")
+      const { SessionTools } = yield* Effect.promise(() => import("../../src/session/tools"))
+      const tools = yield* SessionTools.resolve({
+        agent: yield* agents.get("work"),
+        model: yield* provider.getModel(ref.providerID, ref.modelID),
+        session: chat,
+        processor: {
+          message: seeded.assistant,
+          updateToolCall: () => Effect.succeed(undefined),
+          completeToolCall: () => Effect.void,
+          waitForOtherTools: () => Effect.void,
+        },
+        bypassAgentCheck: false,
+        messages: yield* sessions.messages({ sessionID: chat.id }),
+        promptOps: {
+          resolvePromptParts: () => Effect.succeed([]),
+          cancel: () => Effect.void,
+          prompt: () => Effect.die("No child expected"),
+        },
+      })
+      const execute = tools.notes_search_notes?.execute
+      expect(execute).toBeDefined()
+      yield* user(chat.id, "Implement API endpoint")
+      const exit = yield* Effect.tryPromise(() =>
+        execute!({ query: "private" }, { toolCallId: "old", messages: [], abortSignal: new AbortController().signal }),
+      ).pipe(Effect.exit)
+      // Classification is guidance, not a gate: the captured MCP call runs after the request turns into programming.
+      expect(Exit.isSuccess(exit)).toBe(true)
+      if (Exit.isFailure(exit)) expect(Cause.pretty(exit.cause)).not.toContain("Task scope changed")
+    }),
+)
+
+withMcpTools.instance("an explicit permission deny still removes the MCP tool whatever the classification", () =>
+  Effect.gen(function* () {
+    yield* useServerConfig((url) => ({
+      ...providerCfg(url),
+      tool_search: { enabled: false },
+      permission: { "*": "allow", notes_search_notes: "deny" },
+    }))
     const sessions = yield* Session.Service
-    const permissions = yield* Permission.Service
-    const chat = yield* sessions.create({ title: "Pinned" })
-    yield* llm.push(reply().tool("plugin_write", {}))
-    yield* user(chat.id, "Generate a report with the custom tool")
-    const first = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
-    const request = yield* pollWithTimeout(permissions.list().pipe(Effect.map((items) => items.find((r) => r.sessionID === chat.id))), "custom tool permission did not arrive")
-    yield* prompt.cancel(chat.id)
-    yield* Fiber.await(first)
-    const remaining = yield* permissions.list()
-    yield* permissions.reply({ requestID: request.id, reply: "once" }).pipe(Effect.ignore)
-    yield* Effect.sleep("100 millis")
-    expect(yield* Effect.promise(() => Bun.file(marker).exists())).toBe(false)
-    expect(remaining.some((r) => r.id === request.id)).toBe(false)
-    // Cancellation must not poison the next legitimate plugin invocation.
-    yield* llm.push(reply().tool("plugin_write", {}))
-    yield* llm.text("approved plugin invocation completed")
-    yield* user(chat.id, "Generate the report again with approval")
-    const fresh = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
-    const next = yield* pollWithTimeout(permissions.list().pipe(Effect.map((items) => items.find((r) => r.sessionID === chat.id))), "fresh custom tool permission did not arrive")
-    yield* permissions.reply({ requestID: next.id, reply: "once" })
-    yield* Fiber.join(fresh).pipe(Effect.timeout("5 seconds"))
-    expect(yield* Effect.promise(() => Bun.file(marker).text())).toBe("LATE_SIDE_EFFECT")
-    }),
-    (previous) => Effect.sync(() => {
-      if (previous === undefined) delete process.env.OPENCODE_DISABLE_CONFIG_DEP_INSTALL
-      else process.env.OPENCODE_DISABLE_CONFIG_DEP_INSTALL = previous
-    }),
-  ), { timeout: 20000 })
-
-withMcpTools.instance("captured MCP executor still runs after the request becomes programming (advisory workflow)",()=>Effect.gen(function*(){
- yield* useServerConfig(url=>({...providerCfg(url),tool_search:{enabled:false},permission:{"*":"allow"}}))
- const sessions=yield* Session.Service
- const agents=yield* AgentSvc.Service
- const provider=yield* ProviderSvc.Service
- const chat=yield* sessions.create({title:"overlap"})
- const seeded=yield* seed(chat.id)
- yield* user(chat.id,"Research notes and write a report")
- const {SessionTools}=yield* Effect.promise(()=>import("../../src/session/tools"))
- const tools=yield* SessionTools.resolve({agent:yield* agents.get("work"),model:yield* provider.getModel(ref.providerID,ref.modelID),session:chat,processor:{message:seeded.assistant,updateToolCall:()=>Effect.succeed(undefined),completeToolCall:()=>Effect.void,waitForOtherTools:()=>Effect.void},bypassAgentCheck:false,messages:yield* sessions.messages({sessionID:chat.id}),promptOps:{resolvePromptParts:()=>Effect.succeed([]),cancel:()=>Effect.void,prompt:()=>Effect.die("No child expected")}})
- const execute=tools.notes_search_notes?.execute
- expect(execute).toBeDefined()
- yield* user(chat.id,"Implement API endpoint")
- const exit=yield* Effect.tryPromise(()=>execute!({query:"private"},{toolCallId:"old",messages:[],abortSignal:new AbortController().signal})).pipe(Effect.exit)
- // Classification is guidance, not a gate: the captured MCP call runs after the request turns into programming.
- expect(Exit.isSuccess(exit)).toBe(true)
- if(Exit.isFailure(exit)) expect(Cause.pretty(exit.cause)).not.toContain("Task scope changed")
-}))
-
-withMcpTools.instance("an explicit permission deny still removes the MCP tool whatever the classification",()=>Effect.gen(function*(){
- yield* useServerConfig(url=>({...providerCfg(url),tool_search:{enabled:false},permission:{"*":"allow","notes_search_notes":"deny"}}))
- const sessions=yield* Session.Service
- const agents=yield* AgentSvc.Service
- const provider=yield* ProviderSvc.Service
- const chat=yield* sessions.create({title:"overlap"})
- const seeded=yield* seed(chat.id)
- yield* user(chat.id,"Research notes and write a report")
- const {SessionTools}=yield* Effect.promise(()=>import("../../src/session/tools"))
- const tools=yield* SessionTools.resolve({agent:yield* agents.get("work"),model:yield* provider.getModel(ref.providerID,ref.modelID),session:chat,processor:{message:seeded.assistant,updateToolCall:()=>Effect.succeed(undefined),completeToolCall:()=>Effect.void,waitForOtherTools:()=>Effect.void},bypassAgentCheck:false,messages:yield* sessions.messages({sessionID:chat.id}),promptOps:{resolvePromptParts:()=>Effect.succeed([]),cancel:()=>Effect.void,prompt:()=>Effect.die("No child expected")}})
- const execute=tools.notes_search_notes?.execute
- yield* user(chat.id,"Implement API endpoint")
- // The tool is offered; the deny is enforced at execution, whatever the classification.
- expect(execute).toBeDefined()
- const exit=yield* Effect.tryPromise(()=>execute!({query:"private"},{toolCallId:"deny",messages:[],abortSignal:new AbortController().signal})).pipe(Effect.exit)
- expect(Exit.isFailure(exit)).toBe(true)
- if(Exit.isFailure(exit)) expect(Cause.pretty(exit.cause).toLowerCase()).toMatch(/denied|deny|permission/)
-}))
+    const agents = yield* AgentSvc.Service
+    const provider = yield* ProviderSvc.Service
+    const chat = yield* sessions.create({ title: "overlap" })
+    const seeded = yield* seed(chat.id)
+    yield* user(chat.id, "Research notes and write a report")
+    const { SessionTools } = yield* Effect.promise(() => import("../../src/session/tools"))
+    const tools = yield* SessionTools.resolve({
+      agent: yield* agents.get("work"),
+      model: yield* provider.getModel(ref.providerID, ref.modelID),
+      session: chat,
+      processor: {
+        message: seeded.assistant,
+        updateToolCall: () => Effect.succeed(undefined),
+        completeToolCall: () => Effect.void,
+        waitForOtherTools: () => Effect.void,
+      },
+      bypassAgentCheck: false,
+      messages: yield* sessions.messages({ sessionID: chat.id }),
+      promptOps: {
+        resolvePromptParts: () => Effect.succeed([]),
+        cancel: () => Effect.void,
+        prompt: () => Effect.die("No child expected"),
+      },
+    })
+    const execute = tools.notes_search_notes?.execute
+    yield* user(chat.id, "Implement API endpoint")
+    // The tool is offered; the deny is enforced at execution, whatever the classification.
+    expect(execute).toBeDefined()
+    const exit = yield* Effect.tryPromise(() =>
+      execute!({ query: "private" }, { toolCallId: "deny", messages: [], abortSignal: new AbortController().signal }),
+    ).pipe(Effect.exit)
+    expect(Exit.isFailure(exit)).toBe(true)
+    if (Exit.isFailure(exit)) expect(Cause.pretty(exit.cause).toLowerCase()).toMatch(/denied|deny|permission/)
+  }),
+)
 
 // ---------------------------------------------------------------------------
 // Regression for #292: ESC interruption must not poison the next prompt.
@@ -6449,7 +6605,8 @@ it.instance(
       expect(Exit.isSuccess(exitFirst)).toBe(true)
       if (Exit.isSuccess(exitFirst)) {
         expect(exitFirst.value.info.role).toBe("assistant")
-        if (exitFirst.value.info.role === "assistant") expect(exitFirst.value.info.error?.name).toBe("MessageAbortedError")
+        if (exitFirst.value.info.role === "assistant")
+          expect(exitFirst.value.info.error?.name).toBe("MessageAbortedError")
       }
       yield* pollWithTimeout(
         Effect.gen(function* () {
@@ -6500,3 +6657,1183 @@ it.instance(
   10_000,
 )
 
+// ---------------------------------------------------------------------------
+// Issue #738: repetition-guard recovery at the run-loop level
+// ---------------------------------------------------------------------------
+
+// A non-periodic fragment above MIN_UNIT_CHARS so the guard confirms it at its
+// full length; a small prefix streams first so some text is persisted before
+// the guard aborts.
+const RECOVERY_PREFIX = "Here is the persisted prefix: "
+const RECOVERY_FRAGMENT = "x".repeat(59) + "y"
+
+const loopingReply = () =>
+  reply()
+    .text(RECOVERY_PREFIX)
+    .text(RECOVERY_FRAGMENT)
+    .text(RECOVERY_FRAGMENT)
+    .text(RECOVERY_FRAGMENT)
+    .text(RECOVERY_FRAGMENT)
+
+// Recovery messages are identified by the runner's own lineage marker, not by
+// their text, so the tests cannot confuse them with other synthetic messages.
+const repetitionRecoveriesIn = (messages: SessionV1.WithParts[]) =>
+  messages.filter(
+    (message) =>
+      message.info.role === "user" &&
+      message.parts.some(
+        (part) => part.type === "text" && part.synthetic === true && part.metadata?.repetitionRecovery !== undefined,
+      ),
+  )
+
+it.instance(
+  "repetition-guard recovery injects one synthetic recovery message and continues the turn",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({
+        title: "Pinned",
+        agent: "work",
+        model: { providerID: ref.providerID, id: ref.modelID },
+      })
+
+      const normalReply = reply().text("The model recovered and continued with the task.").stop()
+
+      yield* llm.push(loopingReply(), normalReply)
+      const task = yield* user(chat.id, "please do the task")
+
+      const result = yield* prompt.loop({ sessionID: chat.id })
+      expect(result.info.role).toBe("assistant")
+
+      const messages = yield* sessions.messages({ sessionID: chat.id })
+      const assistantMessages = messages.filter((m) => m.info.role === "assistant")
+
+      // The aborted generation kept its persisted partial text and surfaced the error.
+      const first = assistantMessages[0]
+      expect(first).toBeDefined()
+      if (first && first.info.role === "assistant") {
+        const persisted = first.parts
+          .filter((p) => p.type === "text")
+          .map((p) => (typeof p.text === "string" ? p.text : ""))
+          .join("")
+        expect(persisted).toContain(RECOVERY_PREFIX)
+        expect(first.info.error).toBeDefined()
+      }
+
+      // Exactly one synthetic recovery user message, with the repeated-fragment
+      // detail and an honest account of what happened (never "nothing happened").
+      const recoveries = repetitionRecoveriesIn(messages)
+      expect(recoveries).toHaveLength(1)
+      const [recovery] = recoveries
+      const [recoveryPart] = recovery.parts
+      expect(recoveryPart.type).toBe("text")
+      if (recoveryPart.type === "text") {
+        expect(recoveryPart.text).toContain("cut off by the repetition guard")
+        expect(recoveryPart.text).toContain(`${RECOVERY_FRAGMENT.length}-character fragment`)
+        expect(recoveryPart.text).toContain("preserved in the transcript")
+        // The earlier copies of the fragment were already streamed and are
+        // still in the transcript; the recovery may not claim they vanished.
+        expect(recoveryPart.text).toContain("including the earlier copies of that fragment")
+        expect(recoveryPart.text).not.toContain("discarded")
+        expect(recoveryPart.text).toContain("Do not repeat that fragment again")
+        expect(recoveryPart.text).toContain("emit the pending tool call")
+        // Recognised continuation lineage: the recovery belongs to the prompt it
+        // resumes, so provenance/subagent success and the budget can follow it.
+        expect(recoveryPart.metadata?.repetitionRecovery).toEqual({ promptID: task.id, attempt: 1 })
+      }
+
+      // Exactly two model requests: the aborted generation and the one recovery.
+      expect(yield* llm.calls).toBe(2)
+      expect(yield* llm.pending).toBe(0)
+      expect(yield* llm.misses).toEqual([])
+
+      // The errored generation's persisted text stays visible to the recovery
+      // request instead of being erased by the errored-assistant conversion
+      // filter. Only transcript state is replayed; nothing is re-executed.
+      const inputs = turnInputs(yield* llm.inputs)
+      expect(inputs).toHaveLength(2)
+      expect(JSON.stringify(inputs[1])).toContain(RECOVERY_PREFIX)
+
+      // The recovery generation completed without a second guard trip and with no
+      // tool activity, so the doom-loop detector (3 identical completed tool calls)
+      // can never be satisfied by a single recovery.
+      const last = assistantMessages[assistantMessages.length - 1]
+      expect(last).toBeDefined()
+      if (last && last.info.role === "assistant") expect(last.info.error).toBeUndefined()
+      expect(assistantMessages.flatMap((m) => m.parts.filter((p) => p.type === "tool")).length).toBe(0)
+    }),
+  { config: cfg },
+)
+
+it.instance(
+  "repetition-guard recovery: a second guard trip terminates with the error surfaced",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({
+        title: "Pinned",
+        agent: "work",
+        model: { providerID: ref.providerID, id: ref.modelID },
+      })
+
+      // Both responses loop: one recovery is allowed, the second trip must stop.
+      yield* llm.push(loopingReply(), loopingReply())
+      const task = yield* user(chat.id, "please do the task")
+
+      const result = yield* prompt.loop({ sessionID: chat.id })
+      expect(result.info.role).toBe("assistant")
+
+      const messages = yield* sessions.messages({ sessionID: chat.id })
+      const assistantMessages = messages.filter((m) => m.info.role === "assistant")
+
+      // Exactly one recovery was attempted; the turn did not loop forever.
+      expect(assistantMessages).toHaveLength(2)
+      expect(repetitionRecoveriesIn(messages)).toHaveLength(1)
+      // The second trip surfaces the error and stops deterministically, without
+      // asking the model a third time.
+      expect(yield* llm.calls).toBe(2)
+      expect(yield* llm.pending).toBe(0)
+      const last = assistantMessages[assistantMessages.length - 1]
+      expect(last).toBeDefined()
+      if (last && last.info.role === "assistant") {
+        expect(last.info.error).toBeDefined()
+        expect(RepetitionGuard.isStoredError(last.info.error)).toBe(true)
+      }
+      // An idle resume of the same prompt returns its terminal result; it does
+      // not reset the recovery budget or spend a third provider request.
+      const resumed = yield* prompt.loop({ sessionID: chat.id, messageID: task.id })
+      expect(resumed.info.id).toBe(result.info.id)
+      expect(yield* llm.calls).toBe(2)
+      expect(yield* llm.misses).toEqual([])
+      const status = yield* SessionStatus.Service
+      expect(yield* status.get(chat.id)).toEqual({ type: "idle" })
+    }),
+  { config: cfg },
+)
+
+// OpenAI-compatible SSE chunk, matching the shape the provider adapter parses.
+const sseChunk = (delta: Record<string, unknown>, finish?: string) => ({
+  id: "chatcmpl-test",
+  object: "chat.completion.chunk",
+  choices: [{ delta, ...(finish ? { finish_reason: finish } : {}) }],
+})
+
+it.instance(
+  "repetition-guard recovery keeps a completed tool call visible in the recovery request",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({
+        title: "Pinned",
+        agent: "work",
+        model: { providerID: ref.providerID, id: ref.modelID },
+      })
+      const callID = "call_guard_tool"
+      const { directory } = yield* TestInstance
+      const markerFile = path.join(directory, "repetition-tool-executions.txt")
+      const toolDone = yield* Deferred.make<void>()
+      // Head: the tool call streams and completes. Tail (after the gate): the
+      // same generation loops and trips the guard.
+      yield* llm.push(
+        raw({
+          head: [
+            sseChunk({ role: "assistant" }),
+            sseChunk({
+              tool_calls: [{ index: 0, id: callID, type: "function", function: { name: "bash", arguments: "" } }],
+            }),
+            sseChunk({
+              tool_calls: [
+                {
+                  index: 0,
+                  function: {
+                    arguments: JSON.stringify({
+                      command:
+                        "printf 'executed\\n' >> repetition-tool-executions.txt; printf 'TOOL_MARKER_CONTENT\\n'",
+                      description: "write marker",
+                    }),
+                  },
+                },
+              ],
+            }),
+          ],
+          wait: deferredAsPromise(toolDone),
+          tail: [
+            sseChunk({ content: RECOVERY_PREFIX }),
+            sseChunk({ content: RECOVERY_FRAGMENT }),
+            sseChunk({ content: RECOVERY_FRAGMENT }),
+            sseChunk({ content: RECOVERY_FRAGMENT }),
+            sseChunk({ content: RECOVERY_FRAGMENT }),
+            sseChunk({}, "tool_calls"),
+          ],
+        }),
+        reply().text("The model recovered with the tool result in hand.").stop(),
+      )
+
+      yield* user(chat.id, "please run the marker command")
+      const fiber = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+      yield* llm.wait(1)
+
+      // Wait for the completed bash tool call before opening the gate, so the
+      // part is settled before the guard aborts the stream (the reported shape).
+      yield* pollWithTimeout(
+        sessions.messages({ sessionID: chat.id }).pipe(
+          Effect.map((msgs) => {
+            const part = msgs.flatMap((m) => m.parts).find((candidate) => candidate.type === "tool")
+            return part && part.type === "tool" && part.state.status === "completed" ? true : undefined
+          }),
+        ),
+        "timed out waiting for the guard-trip tool call to complete",
+      )
+      yield* Deferred.succeed(toolDone, void 0)
+      yield* Fiber.join(fiber)
+
+      // The aborted generation's tool call executed exactly once and stayed the
+      // only call in the transcript.
+      const messages = yield* sessions.messages({ sessionID: chat.id })
+      const toolParts = messages.flatMap((m) => m.parts.filter((p) => p.type === "tool"))
+      expect(toolParts).toHaveLength(1)
+      expect(toolParts[0]?.state.status).toBe("completed")
+
+      // The recovery request sees the completed call and its recorded output,
+      // instead of the errored-assistant filter erasing the generation and
+      // letting the model re-issue a finished call.
+      expect(yield* llm.calls).toBe(2)
+      const inputs = turnInputs(yield* llm.inputs)
+      expect(inputs).toHaveLength(2)
+      const recoveryRequest = JSON.stringify(inputs[1])
+      expect(recoveryRequest).toContain(callID)
+      // One output occurrence plus the command's literal marker in its input.
+      expect(recoveryRequest.match(/TOOL_MARKER_CONTENT/g)).toHaveLength(2)
+      expect(yield* Effect.promise(() => readFile(markerFile, "utf8"))).toBe("executed\n")
+      expect(yield* llm.pending).toBe(0)
+      expect(yield* llm.misses).toEqual([])
+    }),
+  { config: cfg },
+  20_000,
+)
+
+it.instance(
+  "repetition-guard recovery: an HTTP 400 that quotes the guard text is not a guard trip",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({
+        title: "Pinned",
+        agent: "work",
+        model: { providerID: ref.providerID, id: ref.modelID },
+      })
+
+      // A provider rejection whose message quotes the guard text must not be
+      // mistaken for the harness's own abort (typed identity, not text match).
+      yield* llm.push(
+        httpError(400, {
+          error: {
+            message: `${RepetitionGuard.REPETITION_MESSAGE}: the model streamed the same 96-character fragment 3 times in a row`,
+            type: "invalid_request_error",
+            code: "invalid_request_error",
+          },
+        }),
+      )
+      yield* user(chat.id, "please do the task")
+
+      const result = yield* prompt.loop({ sessionID: chat.id })
+      expect(result.info.role).toBe("assistant")
+      if (result.info.role === "assistant") {
+        expect(result.info.error?.name).toBe("APIError")
+        expect(RepetitionGuard.isStoredError(result.info.error)).toBe(false)
+      }
+
+      // No recovery request, no synthetic recovery message: the failure is
+      // surfaced once as the provider reported it.
+      const messages = yield* sessions.messages({ sessionID: chat.id })
+      expect(repetitionRecoveriesIn(messages)).toHaveLength(0)
+      expect(messages.filter((m) => m.info.role === "assistant")).toHaveLength(1)
+      expect(yield* llm.calls).toBe(1)
+    }),
+  { config: cfg },
+  20_000,
+)
+
+// ---------------------------------------------------------------------------
+// Issue #738 / #410: a prompt queued while a guard trip is being recovered is
+// a NEW prompt, not a retry. Each caller must settle on the response to its own
+// prompt, and the queued prompt must actually be answered exactly once.
+// ---------------------------------------------------------------------------
+
+const settled = <A>(fibers: readonly [Fiber.Fiber<A, unknown>, Fiber.Fiber<A, unknown>], message: string) =>
+  awaitWithTimeout(Effect.all([Fiber.await(fibers[0]), Fiber.await(fibers[1])]), message, "15 seconds")
+
+function assistantExit(exit: Exit.Exit<SessionV1.WithParts, unknown>) {
+  expect(Exit.isSuccess(exit)).toBe(true)
+  if (Exit.isFailure(exit)) throw new Error("prompt caller failed")
+  expect(exit.value.info.role).toBe("assistant")
+  if (exit.value.info.role !== "assistant") throw new Error("prompt caller did not receive an assistant")
+  return { ...exit.value, info: exit.value.info }
+}
+
+const textParts = (message: SessionV1.WithParts) =>
+  message.parts.flatMap((part) => (part.type === "text" ? [part.text] : []))
+
+it.instance(
+  "repetition-guard recovery: a prompt queued before the first trip keeps its own turn",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({
+        title: "Pinned",
+        agent: "work",
+        model: { providerID: ref.providerID, id: ref.modelID },
+      })
+
+      const gate = yield* Deferred.make<void>()
+      // Gen1 streams only after the gate opens, so the queued prompt lands
+      // before the guard can trip.
+      yield* llm.push(
+        loopingReply().wait(deferredAsPromise(gate)),
+        reply().text("Answered the queued request on its own turn.").stop(),
+      )
+
+      const primaryID = MessageID.ascending()
+      const primary = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          messageID: primaryID,
+          agent: "work",
+          model: ref,
+          parts: [{ type: "text", text: "please do the task" }],
+        })
+        .pipe(Effect.forkChild)
+      yield* llm.wait(1)
+      yield* waitForBusy(chat.id)
+
+      const queuedID = MessageID.ascending()
+      const queued = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          messageID: queuedID,
+          agent: "work",
+          model: ref,
+          parts: [{ type: "text", text: "queued before the guard tripped" }],
+        })
+        .pipe(Effect.forkChild)
+      yield* pollWithTimeout(
+        sessions
+          .messages({ sessionID: chat.id })
+          .pipe(
+            Effect.map((msgs) =>
+              msgs.some((msg) => msg.info.role === "user" && msg.info.id === queuedID) ? true : undefined,
+            ),
+          ),
+        "timed out waiting for the queued prompt to save",
+      )
+
+      yield* Deferred.succeed(gate, void 0)
+      const [exitPrimary, exitQueued] = yield* settled([primary, queued], "queued callers never settled")
+
+      const primaryResult = assistantExit(exitPrimary)
+      const queuedResult = assistantExit(exitQueued)
+      expect(primaryResult.info.parentID).toBe(primaryID)
+      expect(RepetitionGuard.isStoredError(primaryResult.info.error)).toBe(true)
+      expect(textParts(primaryResult).join("")).toContain(RECOVERY_PREFIX)
+      expect(queuedResult.info.parentID).toBe(queuedID)
+      expect(queuedResult.info.error).toBeUndefined()
+      expect(textParts(queuedResult)).toEqual(["Answered the queued request on its own turn."])
+
+      const messages = yield* sessions.messages({ sessionID: chat.id })
+      expect(messages.find((message) => message.info.id === primaryResult.info.id)).toEqual(primaryResult)
+      expect(messages.find((message) => message.info.id === queuedResult.info.id)).toEqual(queuedResult)
+      expect(continuesPrompt(messages, primaryResult, primaryID)).toBe(true)
+      expect(continuesPrompt(messages, queuedResult, queuedID)).toBe(true)
+      expect(continuesPrompt(messages, queuedResult, primaryID)).toBe(false)
+      // No synthetic continuation was injected after the newer real input.
+      expect(repetitionRecoveriesIn(messages)).toHaveLength(0)
+      const assistants = messages.filter((message) => message.info.role === "assistant")
+      expect(assistants).toHaveLength(2)
+      expect(assistants.flatMap((message) => message.parts.filter((part) => part.type === "tool"))).toHaveLength(0)
+      // The aborted prompt spends exactly one request: no recovery was granted
+      // to it once newer real input was waiting, and the queued prompt is a new
+      // turn rather than a second attempt at the aborted one.
+      expect(yield* llm.calls).toBe(2)
+      expect(yield* llm.pending).toBe(0)
+      expect(yield* llm.misses).toEqual([])
+      const status = yield* SessionStatus.Service
+      expect(yield* status.get(chat.id)).toEqual({ type: "idle" })
+
+      // The queued input was neither dropped nor answered with another prompt's
+      // continuation: its own request carries it and no recovery nudge.
+      const inputs = turnInputs(yield* llm.inputs)
+      expect(inputs).toHaveLength(2)
+      expect(JSON.stringify(inputs[0])).toContain("please do the task")
+      expect(JSON.stringify(inputs[0])).not.toContain("queued before the guard tripped")
+      expect(JSON.stringify(inputs[1])).toContain("queued before the guard tripped")
+      expect(JSON.stringify(inputs[1])).not.toContain("cut off by the repetition guard")
+      // It stays visible in the durable transcript with its exact text.
+      const queuedMessage = messages.find((message) => message.info.id === queuedID)!
+      expect(queuedMessage.parts.filter((part) => part.type === "text").map((part) => part.text)).toEqual([
+        "queued before the guard tripped",
+      ])
+    }),
+  { config: cfg },
+  30_000,
+)
+
+it.instance(
+  "repetition-guard recovery: a prompt queued during a recovery that trips again gets its own turn",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({
+        title: "Pinned",
+        agent: "work",
+        model: { providerID: ref.providerID, id: ref.modelID },
+      })
+
+      const gate = yield* Deferred.make<void>()
+      yield* llm.push(
+        loopingReply(),
+        // The single allowed recovery is gated so the queued prompt lands while
+        // it is generating, and this recovery trips too.
+        loopingReply().wait(deferredAsPromise(gate)),
+        reply().text("Answered the queued request on its own turn.").stop(),
+      )
+
+      const primaryID = MessageID.ascending()
+      const primary = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          messageID: primaryID,
+          agent: "work",
+          model: ref,
+          parts: [{ type: "text", text: "please do the task" }],
+        })
+        .pipe(Effect.forkChild)
+      yield* llm.wait(2)
+      yield* waitForBusy(chat.id)
+
+      const queuedID = MessageID.ascending()
+      const queued = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          messageID: queuedID,
+          agent: "work",
+          model: ref,
+          parts: [{ type: "text", text: "queued during the recovery" }],
+        })
+        .pipe(Effect.forkChild)
+      yield* pollWithTimeout(
+        sessions
+          .messages({ sessionID: chat.id })
+          .pipe(
+            Effect.map((msgs) =>
+              msgs.some((msg) => msg.info.role === "user" && msg.info.id === queuedID) ? true : undefined,
+            ),
+          ),
+        "timed out waiting for the queued prompt to save",
+      )
+
+      yield* Deferred.succeed(gate, void 0)
+      const [exitPrimary, exitQueued] = yield* settled([primary, queued], "queued callers never settled")
+
+      const primaryResult = assistantExit(exitPrimary)
+      const queuedResult = assistantExit(exitQueued)
+      const messages = yield* sessions.messages({ sessionID: chat.id })
+      const recoveries = repetitionRecoveriesIn(messages)
+      expect(recoveries).toHaveLength(1)
+      const [recovery] = recoveries
+      const recoveryID = recovery.info.id
+      // The exhausted lineage ends on its own surfaced error, and the caller
+      // waiting on it settles there instead of borrowing the newer answer.
+      expect(primaryResult.info.parentID).toBe(recoveryID)
+      expect(RepetitionGuard.isStoredError(primaryResult.info.error)).toBe(true)
+      expect(textParts(primaryResult).join("")).toContain(RECOVERY_PREFIX)
+      expect(queuedResult.info.parentID).toBe(queuedID)
+      expect(queuedResult.info.error).toBeUndefined()
+      expect(textParts(queuedResult)).toEqual(["Answered the queued request on its own turn."])
+      expect(messages.find((message) => message.info.id === primaryResult.info.id)).toEqual(primaryResult)
+      expect(messages.find((message) => message.info.id === queuedResult.info.id)).toEqual(queuedResult)
+      expect(continuesPrompt(messages, primaryResult, primaryID)).toBe(true)
+      expect(continuesPrompt(messages, queuedResult, queuedID)).toBe(true)
+      expect(continuesPrompt(messages, queuedResult, primaryID)).toBe(false)
+      const [recoveryPart] = recovery.parts
+      expect(recoveryPart?.type === "text" ? recoveryPart.metadata?.repetitionRecovery : undefined).toEqual({
+        promptID: primaryID,
+        attempt: 1,
+      })
+
+      const assistants = messages.filter((message) => message.info.role === "assistant")
+      expect(assistants).toHaveLength(3)
+      expect(assistants.flatMap((message) => message.parts.filter((part) => part.type === "tool"))).toHaveLength(0)
+      // Two requests for the aborted lineage (trip plus its one recovery) and
+      // one new request that answers the queued prompt; nothing replayed, no
+      // manual follow-up needed, no unbounded re-entry.
+      expect(yield* llm.calls).toBe(3)
+      expect(yield* llm.pending).toBe(0)
+      expect(yield* llm.misses).toEqual([])
+      const status = yield* SessionStatus.Service
+      expect(yield* status.get(chat.id)).toEqual({ type: "idle" })
+      // The continuation was created before the queued input, never after it.
+      const order = messages.map((message) => message.info.id)
+      expect(order.indexOf(recoveryID)).toBeLessThan(order.indexOf(queuedID))
+      const inputs = turnInputs(yield* llm.inputs)
+      expect(inputs).toHaveLength(3)
+      expect(JSON.stringify(inputs[0])).toContain("please do the task")
+      expect(JSON.stringify(inputs[1])).toContain("cut off by the repetition guard")
+      expect(JSON.stringify(inputs[1])).not.toContain("queued during the recovery")
+      expect(JSON.stringify(inputs[2])).toContain("queued during the recovery")
+    }),
+  { config: cfg },
+  30_000,
+)
+
+it.instance(
+  "repetition-guard recovery: a successful recovery and a queued prompt each settle on their own answer",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({
+        title: "Pinned",
+        agent: "work",
+        model: { providerID: ref.providerID, id: ref.modelID },
+      })
+
+      const gate = yield* Deferred.make<void>()
+      yield* llm.push(
+        loopingReply(),
+        reply().text("Recovered and finished the task.").stop().wait(deferredAsPromise(gate)),
+        reply().text("Answered the queued request on its own turn.").stop(),
+      )
+
+      const primaryID = MessageID.ascending()
+      const primary = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          messageID: primaryID,
+          agent: "work",
+          model: ref,
+          parts: [{ type: "text", text: "please do the task" }],
+        })
+        .pipe(Effect.forkChild)
+      yield* llm.wait(2)
+      yield* waitForBusy(chat.id)
+
+      const queuedID = MessageID.ascending()
+      const queued = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          messageID: queuedID,
+          agent: "work",
+          model: ref,
+          parts: [{ type: "text", text: "queued during the recovery" }],
+        })
+        .pipe(Effect.forkChild)
+      yield* pollWithTimeout(
+        sessions
+          .messages({ sessionID: chat.id })
+          .pipe(
+            Effect.map((msgs) =>
+              msgs.some((msg) => msg.info.role === "user" && msg.info.id === queuedID) ? true : undefined,
+            ),
+          ),
+        "timed out waiting for the queued prompt to save",
+      )
+
+      yield* Deferred.succeed(gate, void 0)
+      const [exitPrimary, exitQueued] = yield* settled([primary, queued], "queued callers never settled")
+
+      const primaryResult = assistantExit(exitPrimary)
+      const queuedResult = assistantExit(exitQueued)
+
+      const messages = yield* sessions.messages({ sessionID: chat.id })
+      const recoveries = repetitionRecoveriesIn(messages)
+      expect(recoveries).toHaveLength(1)
+      const [recovery] = recoveries
+      const recoveryID = recovery.info.id
+
+      // Primary caller settles on the recovery that continued its prompt.
+      expect(primaryResult.info.parentID).toBe(recoveryID)
+      expect(primaryResult.info.error).toBeUndefined()
+      expect(textParts(primaryResult)).toEqual(["Recovered and finished the task."])
+      // Queued caller settles on the answer to its own prompt.
+      expect(queuedResult.info.parentID).toBe(queuedID)
+      expect(queuedResult.info.error).toBeUndefined()
+      expect(textParts(queuedResult)).toEqual(["Answered the queued request on its own turn."])
+      expect(messages.find((message) => message.info.id === primaryResult.info.id)).toEqual(primaryResult)
+      expect(messages.find((message) => message.info.id === queuedResult.info.id)).toEqual(queuedResult)
+      expect(continuesPrompt(messages, primaryResult, primaryID)).toBe(true)
+      expect(continuesPrompt(messages, queuedResult, queuedID)).toBe(true)
+      expect(continuesPrompt(messages, queuedResult, primaryID)).toBe(false)
+
+      const assistants = messages.filter((message) => message.info.role === "assistant")
+      expect(assistants).toHaveLength(3)
+      expect(assistants.flatMap((message) => message.parts.filter((part) => part.type === "tool"))).toHaveLength(0)
+      expect(yield* llm.calls).toBe(3)
+      expect(yield* llm.pending).toBe(0)
+      expect(yield* llm.misses).toEqual([])
+      const status = yield* SessionStatus.Service
+      expect(yield* status.get(chat.id)).toEqual({ type: "idle" })
+
+      // The queued prompt's own turn keeps the lineage it inherited: the
+      // original prompt, the synthetic continuation and the recovered answer are
+      // all still in its request, and it is asked once.
+      const queuedRequest = JSON.stringify(turnInputs(yield* llm.inputs)[2])
+      expect(queuedRequest).toContain("please do the task")
+      expect(queuedRequest).toContain("cut off by the repetition guard")
+      expect(queuedRequest).toContain("Recovered and finished the task.")
+      expect(queuedRequest).toContain("queued during the recovery")
+      // The one recovery declares the prompt it continued.
+      const [recoveryPart] = recovery.parts
+      expect(recoveryPart?.type === "text" ? recoveryPart.metadata?.repetitionRecovery : undefined).toEqual({
+        promptID: primaryID,
+        attempt: 1,
+      })
+    }),
+  { config: cfg },
+  30_000,
+)
+
+// ---------------------------------------------------------------------------
+// Issue #738 countercontrols: the generation target is explicit, so a stored
+// recovery is answered before a later prompt, an older unanswered caller is
+// answered instead of a no-progress fallback, and a silent no-reply marker
+// cannot suppress the one recovery it has no caller to receive.
+// ---------------------------------------------------------------------------
+
+const seedUser = (sessionID: SessionID, text: string, created: number) =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const msg = yield* sessions.updateMessage({
+      id: MessageID.ascending(),
+      role: "user",
+      sessionID,
+      agent: "work",
+      model: ref,
+      time: { created },
+    })
+    yield* sessions.updatePart({
+      id: PartID.ascending(),
+      messageID: msg.id,
+      sessionID,
+      type: "text",
+      text,
+    })
+    return msg
+  })
+
+const seedAborted = (sessionID: SessionID, parentID: MessageID, created: number, text = "partial output") =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const msg: SessionV1.Assistant = {
+      id: MessageID.ascending(),
+      role: "assistant",
+      parentID,
+      sessionID,
+      mode: "work",
+      agent: "work",
+      cost: 0,
+      path: { cwd: "/tmp", root: "/tmp" },
+      tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+      modelID: ref.modelID,
+      providerID: ref.providerID,
+      time: { created, completed: created },
+      error: new NamedError.Unknown({
+        message: `${RepetitionGuard.REPETITION_MESSAGE}: the model streamed the same 60-character fragment 3 times in a row`,
+        ref: RepetitionGuard.ERROR_REF,
+      }).toObject(),
+    }
+    yield* sessions.updateMessage(msg)
+    yield* sessions.updatePart({
+      id: PartID.ascending(),
+      messageID: msg.id,
+      sessionID,
+      type: "text",
+      text,
+    })
+    return msg
+  })
+
+const seedRecovery = (sessionID: SessionID, promptID: MessageID, created: number, text = "recovery instruction") =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const msg = yield* sessions.updateMessage({
+      id: MessageID.ascending(),
+      role: "user",
+      sessionID,
+      agent: "work",
+      model: ref,
+      time: { created },
+    })
+    yield* sessions.updatePart({
+      id: PartID.ascending(),
+      messageID: msg.id,
+      sessionID,
+      type: "text",
+      synthetic: true,
+      text,
+      metadata: { repetitionRecovery: { promptID, attempt: 1 } },
+    })
+    return msg
+  })
+
+const seedAnswer = (sessionID: SessionID, parentID: MessageID, created: number, text: string) =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const msg: SessionV1.Assistant = {
+      id: MessageID.ascending(),
+      role: "assistant",
+      parentID,
+      sessionID,
+      mode: "work",
+      agent: "work",
+      cost: 0,
+      path: { cwd: "/tmp", root: "/tmp" },
+      tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+      modelID: ref.modelID,
+      providerID: ref.providerID,
+      time: { created, completed: created },
+      finish: "stop",
+    }
+    yield* sessions.updateMessage(msg)
+    yield* sessions.updatePart({
+      id: PartID.ascending(),
+      messageID: msg.id,
+      sessionID,
+      type: "text",
+      text,
+    })
+    return msg
+  })
+
+it.instance(
+  "repetition-guard recovery: an owed recovery is answered before a prompt stored after it",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Owed recovery" })
+      const base = Date.now()
+
+      // The historical shape: the first prompt tripped, its one recovery was
+      // stored, and a second prompt landed after it but was never answered.
+      const first = yield* seedUser(chat.id, "first prompt", base)
+      yield* seedAborted(chat.id, first.id, base + 1)
+      const recovery = yield* seedRecovery(chat.id, first.id, base + 2)
+      const second = yield* seedUser(chat.id, "second prompt", base + 3)
+
+      yield* llm.push(
+        reply().text("Recovered the first prompt.").stop(),
+        reply().text("Answered the second prompt.").stop(),
+      )
+
+      const result = yield* prompt.loop({ sessionID: chat.id, messageID: second.id })
+      expect(result.info.role).toBe("assistant")
+      if (result.info.role !== "assistant") throw new Error("expected an assistant result")
+      expect(result.info.parentID).toBe(second.id)
+      expect(result.info.error).toBeUndefined()
+      expect(textParts(result)).toEqual(["Answered the second prompt."])
+
+      // The stored recovery consumed the recovery request itself; the later
+      // prompt did not steal it, and the recovery no longer dangles.
+      const stored = yield* sessions.messages({ sessionID: chat.id })
+      const recoveryAnswer = stored.find(
+        (message) => message.info.role === "assistant" && message.info.parentID === recovery.id,
+      )
+      expect(recoveryAnswer).toBeDefined()
+      if (!recoveryAnswer || recoveryAnswer.info.role !== "assistant") throw new Error("missing recovery answer")
+      expect(recoveryAnswer.info.error).toBeUndefined()
+      expect(textParts(recoveryAnswer)).toEqual(["Recovered the first prompt."])
+      expect(repetitionRecoveriesIn(stored)).toHaveLength(1)
+
+      // The original caller settles on its own lineage's answer.
+      const original = yield* prompt.loop({ sessionID: chat.id, messageID: first.id })
+      expect(original.info.id).toBe(recoveryAnswer.info.id)
+
+      expect(yield* llm.calls).toBe(2)
+      expect(yield* llm.pending).toBe(0)
+      expect(yield* llm.misses).toEqual([])
+
+      // The recovery generation is scoped to its own history: the prompt that
+      // arrived after it is not quoted into that request, and the second
+      // generation carries both the recovery answer and its own prompt.
+      const inputs = turnInputs(yield* llm.inputs)
+      expect(inputs).toHaveLength(2)
+      expect(JSON.stringify(inputs[0])).toContain("first prompt")
+      expect(JSON.stringify(inputs[0])).toContain("recovery instruction")
+      expect(JSON.stringify(inputs[0])).not.toContain("second prompt")
+      expect(JSON.stringify(inputs[1])).toContain("second prompt")
+      // The second prompt predates the recovery's answer, so that answer is not
+      // quoted into its request either direction of the lineage.
+      expect(JSON.stringify(inputs[1])).not.toContain("Recovered the first prompt.")
+
+      const assistants = stored.filter((message) => message.info.role === "assistant")
+      expect(assistants).toHaveLength(3)
+      expect(assistants.flatMap((message) => message.parts.filter((part) => part.type === "tool"))).toHaveLength(0)
+      const status = yield* SessionStatus.Service
+      expect(yield* status.get(chat.id)).toEqual({ type: "idle" })
+    }),
+  { config: cfg },
+  20_000,
+)
+
+it.instance(
+  "repetition-guard recovery: an earlier-created prompt stored later is still answered, not failed",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Late persisted prompt" })
+      const base = Date.now()
+
+      const first = yield* seedUser(chat.id, "first prompt", base)
+      yield* seedAborted(chat.id, first.id, base + 1)
+      // The recovery belongs to the first prompt and carries an answer.
+      const recovery = yield* seedRecovery(chat.id, first.id, base + 2)
+      const firstAnswer = yield* seedAnswer(chat.id, recovery.id, base + 3, "Answer for the first prompt.")
+      // The second prompt was created before the recovery but stored after it
+      // (asynchronous parts), so the newest message by creation time is the
+      // already answered recovery while this caller is still waiting.
+      const second = yield* seedUser(chat.id, "second prompt", base + 1)
+      expect(second.id > recovery.id).toBe(true)
+
+      yield* llm.push(reply().text("Answered the second prompt.").stop())
+      const result = yield* prompt.loop({ sessionID: chat.id, messageID: second.id })
+      expect(result.info.role).toBe("assistant")
+      if (result.info.role !== "assistant") throw new Error("expected an assistant result")
+      expect(result.info.parentID).toBe(second.id)
+      expect(result.info.error).toBeUndefined()
+      expect(result.parts.filter((part) => part.type === "text").map((part) => part.text)).toEqual([
+        "Answered the second prompt.",
+      ])
+      expect(result.info.id).not.toBe(firstAnswer.id)
+      expect(result.info.id).not.toBe(recovery.id)
+
+      // The possible answer was generated: one request, no no-progress error,
+      // and the first lineage's stored answer is untouched.
+      expect(yield* llm.calls).toBe(1)
+      expect(yield* llm.pending).toBe(0)
+      expect(yield* llm.misses).toEqual([])
+      const stored = yield* sessions.messages({ sessionID: chat.id })
+      const storedFirst = stored.find((message) => message.info.id === firstAnswer.id)
+      expect(storedFirst?.info.role).toBe("assistant")
+      if (storedFirst?.info.role === "assistant") expect(storedFirst.info.error).toBeUndefined()
+      expect(storedFirst?.parts.flatMap((part) => (part.type === "text" ? [part.text] : []))).toEqual([
+        "Answer for the first prompt.",
+      ])
+      expect(stored.find((message) => message.info.id === result.info.id)).toEqual(result)
+      expect(repetitionRecoveriesIn(stored)).toHaveLength(1)
+      expect(continuesPrompt(stored, result, second.id)).toBe(true)
+      expect(continuesPrompt(stored, result, first.id)).toBe(false)
+      const status = yield* SessionStatus.Service
+      expect(yield* status.get(chat.id)).toEqual({ type: "idle" })
+    }),
+  { config: cfg },
+  20_000,
+)
+
+it.instance(
+  "repetition-guard recovery: a silent no-reply marker does not suppress the one recovery",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Silent marker" })
+      const gate = yield* Deferred.make<void>()
+
+      // The guard trip happens while a background task injects a silent marker
+      // (noReply) - a message with no caller waiting for it.
+      yield* llm.push(
+        loopingReply().wait(deferredAsPromise(gate)),
+        reply().text("Recovered after the silent marker.").stop(),
+      )
+      const primaryID = MessageID.ascending()
+      const primary = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          messageID: primaryID,
+          agent: "work",
+          model: ref,
+          parts: [{ type: "text", text: "please do the task" }],
+        })
+        .pipe(Effect.forkChild)
+      yield* llm.wait(1)
+      yield* waitForBusy(chat.id)
+
+      const marker = yield* prompt.prompt({
+        sessionID: chat.id,
+        noReply: true,
+        agent: "work",
+        model: ref,
+        parts: [{ type: "text", text: "Background task completed silently", synthetic: true }],
+      })
+      yield* Deferred.succeed(gate, void 0)
+      const result = assistantExit(yield* awaitWithTimeout(Fiber.await(primary), "primary never settled", "15 seconds"))
+
+      // The sole recovery still runs for the prompt that actually tripped.
+      const stored = yield* sessions.messages({ sessionID: chat.id })
+      const recoveries = repetitionRecoveriesIn(stored)
+      expect(recoveries).toHaveLength(1)
+      const [recovery] = recoveries
+      expect(result.info.parentID).toBe(recovery.info.id)
+      expect(result.info.error).toBeUndefined()
+      expect(textParts(result)).toEqual(["Recovered after the silent marker."])
+      expect(recovery.parts).toHaveLength(1)
+      const [recoveryPart] = recovery.parts
+      expect(recoveryPart?.type === "text" ? recoveryPart.metadata?.repetitionRecovery : undefined).toEqual({
+        promptID: primaryID,
+        attempt: 1,
+      })
+
+      // The marker is persisted with its caller intent and text, has no answer,
+      // and did not take the recovery's generation.
+      const storedMarker = stored.find((message) => message.info.id === marker.info.id)
+      expect(storedMarker?.info.role === "user" ? storedMarker.info.noReply : undefined).toBe(true)
+      expect(
+        stored.find((message) => message.info.role === "assistant" && message.info.parentID === marker.info.id),
+      ).toBe(undefined)
+      expect(storedMarker?.parts.flatMap((part) => (part.type === "text" ? [part.text] : []))).toEqual([
+        "Background task completed silently",
+      ])
+
+      expect(yield* llm.calls).toBe(2)
+      expect(yield* llm.pending).toBe(0)
+      expect(yield* llm.misses).toEqual([])
+      // The silent marker is context for the recovery, not a caller to answer.
+      const inputs = turnInputs(yield* llm.inputs)
+      expect(inputs).toHaveLength(2)
+      expect(JSON.stringify(inputs[1])).toContain("cut off by the repetition guard")
+      expect(JSON.stringify(inputs[1])).toContain("Background task completed silently")
+
+      // Re-entering an answered lineage does not spend a third request or start
+      // a busy/idle churn loop.
+      const resumed = yield* prompt.loop({ sessionID: chat.id, messageID: primaryID })
+      expect(resumed.info.id).toBe(result.info.id)
+      expect(yield* llm.calls).toBe(2)
+      const status = yield* SessionStatus.Service
+      expect(yield* status.get(chat.id)).toEqual({ type: "idle" })
+    }),
+  { config: cfg },
+  20_000,
+)
+
+it.instance(
+  "repetition-guard recovery: a synthetic prompt with its own caller keeps priority",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Synthetic caller" })
+      const gate = yield* Deferred.make<void>()
+
+      // Synthetic parts do not mean "no caller": this prompt is awaited and
+      // must get its own turn instead of being dropped as if it were a marker.
+      yield* llm.push(
+        loopingReply().wait(deferredAsPromise(gate)),
+        reply().text("Answered the synthetic queued prompt.").stop(),
+      )
+      const primaryID = MessageID.ascending()
+      const primary = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          messageID: primaryID,
+          agent: "work",
+          model: ref,
+          parts: [{ type: "text", text: "please do the task" }],
+        })
+        .pipe(Effect.forkChild)
+      yield* llm.wait(1)
+      yield* waitForBusy(chat.id)
+
+      const queuedID = MessageID.ascending()
+      const queued = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          messageID: queuedID,
+          agent: "work",
+          model: ref,
+          parts: [{ type: "text", text: "synthetic queued prompt", synthetic: true }],
+        })
+        .pipe(Effect.forkChild)
+      yield* pollWithTimeout(
+        sessions
+          .messages({ sessionID: chat.id })
+          .pipe(
+            Effect.map((msgs) =>
+              msgs.some((msg) => msg.info.role === "user" && msg.info.id === queuedID) ? true : undefined,
+            ),
+          ),
+        "timed out waiting for the synthetic prompt to save",
+      )
+
+      yield* Deferred.succeed(gate, void 0)
+      const [exitPrimary, exitQueued] = yield* settled([primary, queued], "callers never settled")
+      const primaryResult = assistantExit(exitPrimary)
+      const queuedResult = assistantExit(exitQueued)
+
+      expect(primaryResult.info.parentID).toBe(primaryID)
+      expect(RepetitionGuard.isStoredError(primaryResult.info.error)).toBe(true)
+      expect(queuedResult.info.parentID).toBe(queuedID)
+      expect(queuedResult.info.error).toBeUndefined()
+      expect(textParts(queuedResult)).toEqual(["Answered the synthetic queued prompt."])
+
+      const stored = yield* sessions.messages({ sessionID: chat.id })
+      // No recovery was injected after awaited input, and the synthetic prompt
+      // is still present verbatim.
+      expect(repetitionRecoveriesIn(stored)).toHaveLength(0)
+      expect(
+        stored
+          .find((message) => message.info.id === queuedID)
+          ?.parts.flatMap((part) => (part.type === "text" ? [part.text] : [])),
+      ).toEqual(["synthetic queued prompt"])
+      expect(yield* llm.calls).toBe(2)
+      expect(yield* llm.pending).toBe(0)
+      expect(yield* llm.misses).toEqual([])
+      const inputs = turnInputs(yield* llm.inputs)
+      expect(inputs).toHaveLength(2)
+      expect(JSON.stringify(inputs[1])).toContain("synthetic queued prompt")
+      expect(JSON.stringify(inputs[1])).not.toContain("cut off by the repetition guard")
+      const status = yield* SessionStatus.Service
+      expect(yield* status.get(chat.id)).toEqual({ type: "idle" })
+    }),
+  { config: cfg },
+  20_000,
+)
+
+it.instance(
+  "repetition-guard recovery: a stored answer for another prompt is never returned to an unanswered caller",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const events = yield* EventV2Bridge.Service
+      const chat = yield* sessions.create({ title: "Historical recovery" })
+
+      // Older transcripts can contain the original bug: a recovery for the first
+      // prompt was saved after a second real prompt. Its answer belongs to the
+      // first prompt, and the second has no answer at all.
+      const primary = yield* user(chat.id, "first prompt")
+      const aborted: SessionV1.Assistant = {
+        id: MessageID.ascending(),
+        role: "assistant",
+        parentID: primary.id,
+        sessionID: chat.id,
+        mode: "work",
+        agent: "work",
+        cost: 0,
+        path: { cwd: "/tmp", root: "/tmp" },
+        tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+        modelID: ref.modelID,
+        providerID: ref.providerID,
+        time: { created: Date.now(), completed: Date.now() },
+        error: new NamedError.Unknown({
+          message: RepetitionGuard.REPETITION_MESSAGE,
+          ref: RepetitionGuard.ERROR_REF,
+        }).toObject(),
+      }
+      yield* sessions.updateMessage(aborted)
+      const queued = yield* user(chat.id, "second prompt")
+      const continuation = yield* sessions.updateMessage({
+        id: MessageID.ascending(),
+        role: "user",
+        sessionID: chat.id,
+        agent: "work",
+        model: ref,
+        time: { created: Date.now() },
+      })
+      yield* sessions.updatePart({
+        id: PartID.ascending(),
+        messageID: continuation.id,
+        sessionID: chat.id,
+        type: "text",
+        synthetic: true,
+        text: "Recovery for the first prompt",
+        metadata: { repetitionRecovery: { promptID: primary.id, attempt: 1 } },
+      })
+      const otherAnswer: SessionV1.Assistant = {
+        ...aborted,
+        id: MessageID.ascending(),
+        parentID: continuation.id,
+        error: undefined,
+        finish: "stop",
+        time: { created: Date.now(), completed: Date.now() },
+      }
+      yield* sessions.updateMessage(otherAnswer)
+      yield* sessions.updatePart({
+        id: PartID.ascending(),
+        messageID: otherAnswer.id,
+        sessionID: chat.id,
+        type: "text",
+        text: "This answer belongs to the first prompt.",
+      })
+
+      // The second prompt is unanswered, so the run must generate its answer
+      // instead of returning the first lineage's stored answer or failing the
+      // caller preemptively with a no-progress error.
+      yield* llm.push(reply().text("Answered the second prompt.").stop())
+
+      let idleRuns = 0
+      const off = yield* events.listen((event) =>
+        Effect.sync(() => {
+          if (event.type !== SessionStatus.Event.Idle.type) return
+          if (typeof event.data !== "object" || event.data === null || !("sessionID" in event.data)) return
+          if (event.data.sessionID === chat.id) idleRuns++
+        }),
+      )
+      yield* Effect.addFinalizer(() => off)
+
+      const result = yield* awaitWithTimeout(
+        prompt.loop({ sessionID: chat.id, messageID: queued.id }),
+        "unanswered caller never settled",
+        "10 seconds",
+      )
+      // Exactly one run settles the caller: no joined-run churn, no manual retry.
+      expect(idleRuns).toBe(1)
+      expect(yield* llm.calls).toBe(1)
+      expect(yield* llm.pending).toBe(0)
+      expect(yield* llm.misses).toEqual([])
+      expect(result.info.role).toBe("assistant")
+      if (result.info.role !== "assistant") throw new Error("expected an assistant result for the second prompt")
+      // The answer belongs to the caller that waited: never the first prompt's.
+      expect(result.info.id).not.toBe(otherAnswer.id)
+      expect(result.info.parentID).toBe(queued.id)
+      expect(result.info.error).toBeUndefined()
+      expect(result.parts.filter((part) => part.type === "text").map((part) => part.text)).toEqual([
+        "Answered the second prompt.",
+      ])
+      const stored = yield* sessions.messages({ sessionID: chat.id })
+      expect(stored.find((message) => message.info.id === result.info.id)).toEqual(result)
+      // The first lineage's stored answer is untouched and no extra recovery
+      // instruction was injected for it.
+      expect(
+        stored
+          .find((message) => message.info.id === otherAnswer.id)
+          ?.parts.flatMap((part) => (part.type === "text" ? [part.text] : [])),
+      ).toEqual(["This answer belongs to the first prompt."])
+      expect(repetitionRecoveriesIn(stored)).toHaveLength(1)
+      // Ownership is the parent link; the historical out-of-order recovery
+      // between the prompt and its answer is a boundary, so the safe direction
+      // is that the answer never continues the first prompt.
+      expect(continuesPrompt(stored, result, primary.id)).toBe(false)
+      const status = yield* SessionStatus.Service
+      expect(yield* status.get(chat.id)).toEqual({ type: "idle" })
+    }),
+  { config: cfg },
+  20_000,
+)
