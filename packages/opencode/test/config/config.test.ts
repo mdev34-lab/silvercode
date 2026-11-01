@@ -408,6 +408,48 @@ it.effect("updates global config and omits empty shell key in jsonc", () =>
   ),
 )
 
+// #780: the write paths merge with the same narrow rename ordering as the
+// load paths, so a config written by update/updateGlobal evaluates the same
+// way it will load. Only the bash/shell pair is reordered (last write wins
+// between the spellings); unrelated records keep base deep-merge positions.
+it.effect("updateGlobal roundtrip orders the rename pair and keeps base pattern positions", () =>
+  withGlobalConfig(
+    { config: { permission: { shell: "ask", bash: "allow", edit: { "*": "allow", "src/**": "deny" } } } },
+    ({ dir }) =>
+      Effect.gen(function* () {
+        yield* Config.use.updateGlobal({ permission: { shell: "deny", edit: { "*": "allow" } } })
+
+        const written = (yield* FSUtil.use.readJson(path.join(dir, "opencode.json"))) as any
+        const keys = Object.keys(written.permission)
+        expect(keys.indexOf("bash")).toBeLessThan(keys.indexOf("shell"))
+        expect(Object.keys(written.permission.edit)).toEqual(["*", "src/**"])
+        const ruleset = Permission.fromConfig(written.permission)
+        expect(Permission.evaluate("shell", "ls", ruleset).action).toBe("deny")
+        expect(Permission.evaluate("edit", "src/index.ts", ruleset).action).toBe("deny")
+        expect(Permission.evaluate("edit", "README.md", ruleset).action).toBe("allow")
+      }),
+  ),
+)
+
+it.instance("update roundtrip orders the rename pair by last write", () =>
+  Effect.gen(function* () {
+    const test = yield* TestInstance
+    yield* writeConfigEffect(
+      test.directory,
+      { $schema: "https://opencode.ai/config.json", permission: { bash: "allow", shell: "ask" } },
+      "config.json",
+    )
+
+    yield* Config.Service.use((svc) =>
+      svc.update(ConfigParse.schema(ConfigV1.Info, { permission: { bash: "deny" } }, "test:config")),
+    )
+
+    const written = (yield* FSUtil.use.readJson(path.join(test.directory, "config.json"))) as any
+    expect(Object.keys(written.permission)).toEqual(["shell", "bash"])
+    expect(Permission.evaluate("shell", "ls", Permission.fromConfig(written.permission)).action).toBe("deny")
+  }),
+)
+
 it.instance(
   "loads formatter boolean config",
   Effect.gen(function* () {

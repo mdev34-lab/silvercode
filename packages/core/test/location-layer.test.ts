@@ -29,6 +29,8 @@ import { ModelsDev } from "../src/models-dev"
 import { Npm } from "../src/npm"
 import { Project } from "../src/project"
 import { Reference } from "../src/reference"
+import { PermissionV2 } from "../src/permission"
+import { PluginInternal } from "../src/plugin/internal"
 import { ToolRegistry } from "../src/tool/registry"
 import { ApplicationTools } from "../src/tool/application-tools"
 
@@ -187,6 +189,55 @@ describe("LocationServiceMap", () => {
             providerID: "unavailable",
             modelID: "chat",
           })
+        }),
+      ),
+    ),
+  )
+
+  it.live("loads a legacy bash doom_loop permission rule from opencode.json (#780)", () =>
+    Effect.acquireRelease(
+      Effect.promise(() => tmpdir()),
+      (dir) => Effect.promise(() => dir[Symbol.asyncDispose]()),
+    ).pipe(
+      Effect.flatMap((dir) =>
+        Effect.gen(function* () {
+          // The config file was written before the rename: its doom_loop
+          // resource is the legacy tool id. Configured permissions land on
+          // every agent, so the resolved agent ruleset must gate the tool
+          // under its published name (doom_loop resources are tool ids).
+          yield* Effect.promise(() =>
+            fs.writeFile(
+              path.join(dir.path, "opencode.json"),
+              JSON.stringify({
+                permissions: [{ action: "doom_loop", resource: "bash", effect: "deny" }],
+              }),
+            ),
+          )
+
+          const verdicts = yield* Effect.gen(function* () {
+            // Internal plugins (built-in agents + configured permissions)
+            // boot when the location opens; wait for them to be ready.
+            yield* (yield* PluginInternal.Service).ready
+            const code = yield* (yield* AgentV2.Service).get(AgentV2.ID.make("code"))
+            if (!code) throw new Error("code agent missing")
+            return {
+              present: code.permissions.some(
+                (rule) => rule.action === "doom_loop" && rule.resource === "bash" && rule.effect === "deny",
+              ),
+              shell: PermissionV2.evaluate("doom_loop", "shell", code.permissions).effect,
+              read: PermissionV2.evaluate("doom_loop", "read", code.permissions).effect,
+            }
+          }).pipe(
+            Effect.scoped,
+            Effect.provide(
+              LocationServiceMap.Service.get(Location.Ref.make({ directory: AbsolutePath.make(dir.path) })),
+            ),
+          )
+
+          expect(verdicts.present).toBe(true)
+          expect(verdicts.shell).toBe("deny")
+          // Resource-scoped: other tools keep the agent's default verdict.
+          expect(verdicts.read).not.toBe("deny")
         }),
       ),
     ),
