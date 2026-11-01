@@ -136,7 +136,7 @@ export function backgroundReview(input: {
   const child = sessions.filter((session) => session.id === childID)
   if (child.length !== 1 || child[0].parentID !== receipt.sessionID || !child[0].agent || Agent.canonicalID(child[0].agent) !== "review") return undefined
   const launches = messages.flatMap((message) => (parts[message.id] ?? []).flatMap((part) => {
-    if (part.type !== "tool" || part.tool !== "task" || part.state.status !== "completed") return []
+    if (part.type !== "tool" || part.tool !== "task" || !("metadata" in part.state)) return []
     return part.state.metadata?.runId === run ? [{ message, part }] : []
   }))
   if (launches.length !== 1) return undefined
