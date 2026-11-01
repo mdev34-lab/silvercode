@@ -1,4 +1,6 @@
-import { route as workRoute } from "@/session/work-flow"
+import { reviewDepthLimit } from "./review-depth"
+import { routedAgent } from "../session/session-agent"
+import { ancestry as workflowAncestry, route as workRoute } from "@/session/work-flow"
 import { WorkFlow } from "@opencode-ai/core/work-flow"
 import * as Tool from "./tool"
 import { ToolFailure } from "@opencode-ai/llm"
@@ -298,11 +300,19 @@ export const FinishTool = Tool.define(
           const session = yield* sessions
             .get(ctx.sessionID)
             .pipe(Effect.catchIf(NotFoundError.isInstance, () => Effect.succeed(undefined)))
-          // Effective level: session-persisted selection, then configured
-          // default, then medium. The model never supplies a level here —
+          // Effective level: session selection, then root-ultra inheritance for
+          // an unset child, then configured default, then medium. The model never
+          // supplies a level here —
           // finish must not accept a model-selected effort or pass budget.
           const configEffort = typeof cfg.agent?.effort === "string" ? cfg.agent.effort : undefined
-          const effort = AgentEffort.resolve(readAgentEffort(session?.metadata), AgentEffort.resolve(configEffort))
+          const selectedEffort = readAgentEffort(session?.metadata)
+          const lineage = selectedEffort === undefined && session?.parentID
+            ? yield* workflowAncestry(ctx.sessionID).pipe(Effect.provideService(Session.Service, sessions))
+            : Option.none()
+          const effort = AgentEffort.resolve(
+            selectedEffort ?? (Option.isSome(lineage) && readAgentEffort(lineage.value.owner.metadata) === "ultra" ? "ultra" : undefined),
+            AgentEffort.resolve(configEffort),
+          )
           const reviewState = reviewLoopState(messages, { effort })
           const workIdentity = yield* agents.get("work")
           const workflowNotes: string[] = []
@@ -443,7 +453,7 @@ export const FinishTool = Tool.define(
                       code: "task-hidden" as const,
                       reason: "the newest user message hides the task tool for this turn",
                     }
-                  const depthLimit = cfg.subagent_depth ?? 1
+                  const depthLimit = reviewDepthLimit(cfg.subagent_depth, effort, routedAgent(session, messages), resolved)
                   if (depth >= depthLimit)
                     return {
                       available: false as const,

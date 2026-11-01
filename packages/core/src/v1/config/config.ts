@@ -142,7 +142,7 @@ export const Info = Schema.Struct({
     ),
   ).annotate({
     description:
-      "Agent configuration, see https://opencode.ai/docs/agents. The reserved scalar `effort` entry selects the agent effort policy (fast | medium | thorough) and is not a named agent.",
+      "Agent configuration, see https://opencode.ai/docs/agents. The reserved scalar `effort` entry selects the agent effort policy (fast | medium | thorough | ultra) and is not a named agent.",
   }),
   provider: Schema.optional(Schema.Record(Schema.String, ConfigProviderV1.Info)).annotate({
     description: "Custom provider configurations and model overrides",

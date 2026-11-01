@@ -319,8 +319,16 @@ exports[`tool parameters JSON Schema (wire shape) task 1`] = `
         "fast",
         "medium",
         "thorough",
+        "ultra",
       ],
       "type": "string",
+    },
+    "origin_message_ids": {
+      "description": "Ultra review only: root user message IDs for the request and all relevant corrections. Pass the same IDs to slice reviewers. Never select unrelated private topics. Omission in multi-message histories declares missing origin.",
+      "items": {
+        "type": "string",
+      },
+      "type": "array",
     },
     "prompt": {
       "description": "The task for the agent to perform",

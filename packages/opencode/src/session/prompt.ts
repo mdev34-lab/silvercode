@@ -1,3 +1,4 @@
+import { ancestry as workflowAncestry } from "./work-flow"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import path from "path"
@@ -122,6 +123,10 @@ const EFFORT_PROCESS: Record<AgentEffort.Level, string> = {
   medium: [
     "## Agent effort: medium (review passes: at most 2, validation gate: standard)",
     'For work that changes files, an independent synchronous review is expected before finish (without one, finish delivers the result labelled UNREVIEWED, never approved) (`subagent_type: "review"`, `background: false`) when a reviewer can run. Only blocking findings (Critical/Important, or a Needs-fixes report with no findings) or work landed after the last review need another pass, bounded by two; minor findings are logged. After the budget, finish delivers with an honest exhausted/findings-open status. A Review with blocking findings holds finish back until fixed. Declare standard validation evidence (relevant tests) on finish.',
+  ].join("\n\n"),
+  ultra: [
+    "## Agent effort: ultra (review passes: until clean, validation gate: full)",
+    "Aim for clean current independent review, without a pass cap. Known blocking findings hold finish; missing review is labelled UNREVIEWED, never approved. Declare tests, typecheck and parity as applicable. On large diffs Review may fan out up to 3 disjoint slices, subject to the configured depth cap (only unset (legacy-default-1) review-to-review depth is lifted to 2; explicit 0 disables dispatch). Ultra review dispatch attaches selected root origin verbatim with declared gaps: provide origin_message_ids for the request and relevant corrections in multi-message sessions; carry those IDs into slice dispatches. Incomplete origin cannot certify full completion.",
   ].join("\n\n"),
   thorough: [
     "## Agent effort: thorough (review passes: until clean, validation gate: full)",
@@ -1741,10 +1746,17 @@ const layer = Layer.effect(
               .pipe(Effect.map((info) => info.name === agent.name && agent.mode !== "subagent"))
               .pipe(Effect.catchCause(() => Effect.succeed(false)))
             // Resolve the effective effort exactly like finish does:
-            // session-persisted selection, then configuration, then medium.
+            // session selection, then root-ultra for an unset child, then config/medium.
             const effortConfig = yield* config.get()
             const configEffort = typeof effortConfig.agent?.effort === "string" ? effortConfig.agent.effort : undefined
-            const effort = AgentEffort.resolve(readAgentEffort(session.metadata), AgentEffort.resolve(configEffort))
+            const selectedEffort = readAgentEffort(session.metadata)
+            const lineage = selectedEffort === undefined && session.parentID
+              ? yield* workflowAncestry(session.id).pipe(Effect.provideService(Session.Service, sessions))
+              : Option.none()
+            const effort = AgentEffort.resolve(
+              selectedEffort ?? (Option.isSome(lineage) && readAgentEffort(lineage.value.owner.metadata) === "ultra" ? "ultra" : undefined),
+              AgentEffort.resolve(configEffort),
+            )
             // Compaction can drop the write markers from the visible history, so a
             // compacted session keeps the policy on: it was long enough to compact.
             const sessionWroteFiles = msgs.some(

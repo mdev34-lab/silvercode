@@ -235,6 +235,21 @@ describe("tool parameters", () => {
   })
 
   describe("task", () => {
+    test("exposes optional origin_message_ids as a string-array wire parameter", () => {
+      const input = {
+        description: "d",
+        prompt: "p",
+        subagent_type: "review",
+        origin_message_ids: ["root-request", "root-correction"],
+      }
+      expect(parse(Task, input).origin_message_ids).toEqual(input.origin_message_ids)
+      expect(parse(Task, { description: "d", prompt: "p", subagent_type: "review" }).origin_message_ids).toBeUndefined()
+      expect(accepts(Task, { ...input, origin_message_ids: "root-request" })).toBe(false)
+      expect(accepts(Task, { ...input, origin_message_ids: [1] })).toBe(false)
+      const wire = toJsonSchema(Task)
+      expect(wire.properties?.origin_message_ids).toMatchObject({ type: "array", items: { type: "string" } })
+      expect(wire.required).not.toContain("origin_message_ids")
+    })
     test("accepts description + prompt + subagent_type", () => {
       const parsed = parse(Task, { description: "d", prompt: "p", subagent_type: "general" })
       expect(parsed.subagent_type).toBe("general")

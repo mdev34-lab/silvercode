@@ -78,7 +78,8 @@ export type FinishOutcome = {
 /**
  * The first of the two switches: how many independent review passes a level
  * requires. `0` means none are required; `undefined` means until-clean with no
- * finite cap (thorough).
+ * finite cap (thorough and ultra). Ultra differs in delegation depth and origin
+ * anchoring, not pass count.
  */
 export function passLimit(level: AgentEffort.Level): number | undefined {
   if (level === "fast") return 0
@@ -231,14 +232,14 @@ export function evaluateFinish(input: FinishInput): FinishOutcome {
     return { deliver: true, termination: deliverableTermination, ...common }
   }
 
-  // thorough: until-clean, no finite cap.
+  // thorough and ultra: until-clean, no finite cap.
   if (!reviewed || blocking || state.lastReviewVerdict !== "approved" || state.workSinceReview) {
     if (!reviewerAvailable) return unavailable()
     return decline(
       common,
       state.workSinceReview && state.lastReviewVerdict === "approved"
         ? "Work changed after the approved review, so the current tree is no longer covered. Run another synchronous review before finishing."
-        : 'Review required: effort is "thorough", so delivery requires a clean, current independent review from the Review subagent (\`subagent_type: "review"\`, \`background: false\`). Address the outstanding findings and run it again before finishing.',
+        : `Review required: effort is "${effort}", so delivery requires a clean, current independent review from the Review subagent (\`subagent_type: "review"\`, \`background: false\`). Address the outstanding findings and run it again before finishing.`,
     )
   }
   return { deliver: true, termination: "approved", ...common }

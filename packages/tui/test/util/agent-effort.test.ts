@@ -1,6 +1,12 @@
+import { RGBA } from "@opentui/core"
+import { AgentEffort } from "@opencode-ai/schema/agent-effort"
 import { describe, expect, test } from "bun:test"
 import {
   configLevel,
+  defaultLevel,
+  effortRecord,
+  effortColor,
+  effortBadge,
   coupledThinking,
   finishStatus,
   finishStatusLines,
@@ -59,10 +65,11 @@ describe("agent effort resolution", () => {
     expect(mergeEffortMetadata(["not", "a", "record"], "fast")).toEqual({ agentEffort: "fast" })
   })
 
-  test("cycles the dial fast → medium → thorough → fast", () => {
+  test("cycles the dial fast → medium → thorough → ultra → fast", () => {
     expect(nextLevel("fast")).toBe("medium")
     expect(nextLevel("medium")).toBe("thorough")
-    expect(nextLevel("thorough")).toBe("fast")
+    expect(nextLevel("thorough")).toBe("ultra")
+    expect(nextLevel("ultra")).toBe("fast")
   })
 })
 
@@ -280,4 +287,38 @@ describe("honest finish status", () => {
       }),
     ).toEqual(["review: unreviewed"])
   })
+})
+
+
+test("every schema level is safe across utility consumers, including ultra", () => {
+  for (const level of AgentEffort.levels) {
+    expect(metadataLevel(effortRecord(level))).toBe(level)
+    expect(configLevel({ agent: { effort: level } })).toBe(level)
+    expect(resolveEffort({ metadata: effortRecord(level) })).toBe(level)
+    expect(resolveEffort({ config: { agent: { effort: level } } })).toBe(level)
+    expect(defaultLevel({ selected: level })).toBe(level)
+    expect(defaultLevel({ config: { agent: { effort: level } } })).toBe(level)
+    expect(mergeEffortMetadata({ other: true }, level)).toEqual({ other: true, agentEffort: level })
+    expect(AgentEffort.levels).toContain(nextLevel(level))
+    expect(finishStatusLines(finishStatus({ review: { effort: level, reviews: 3, termination: "approved" } })!)[0]).toContain(`${level} · 3 passes`)
+    for (const background of ["#000000", "#ffffff"]) {
+      const theme = { background: RGBA.fromHex(background), text: RGBA.fromHex("#ffffff") }
+      expect(effortBadge(level, theme).bg).toEqual(effortColor(level, theme))
+    }
+  }
+  expect(coupledThinking({ effort: "ultra", variants: ["low", "medium", "high"] })).toBe("high")
+  expect(coupledThinking({ effort: "ultra", variants: ["low"] })).toBeUndefined()
+  expect(coupledThinking({ effort: "ultra", variants: ["high"], chosen: "default" })).toBeUndefined()
+  expect(coupledThinking({ effort: "ultra", variants: ["high"], configured: "low" })).toBeUndefined()
+})
+
+test("ultra matches the approved purple palette on opaque and transparent surfaces", () => {
+  for (const [background, text, expected] of [
+    ["#000000", "#ffffff", "#bc8cff"], ["#ffffff", "#000000", "#8250df"],
+    ["#00000000", "#ffffff", "#bc8cff"], ["#00000000", "#000000", "#8250df"],
+  ]) {
+    const theme = { background: RGBA.fromHex(background), text: RGBA.fromHex(text) }
+    expect(effortColor("ultra", theme)).toEqual(RGBA.fromHex(expected))
+    expect(effortBadge("ultra", theme).fg).toEqual(RGBA.fromHex(expected === "#bc8cff" ? "#000000" : "#ffffff"))
+  }
 })

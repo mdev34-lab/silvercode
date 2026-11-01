@@ -454,35 +454,49 @@ it.instance(
 
 // Activation: a fresh session does not carry the Review Loop policy; the
 // request right after the first file write does (and keeps the effort block).
-it.instance(
-  "review policy appears on the request after the session's first file write",
-  () =>
-    Effect.gen(function* () {
-      const { llm, dir } = yield* useServerConfig
-      const prompt = yield* SessionPrompt.Service
-      const sessions = yield* Session.Service
-      const chat = yield* sessions.create({
-        title: "Pinned",
-        permission: [{ permission: "*", pattern: "*", action: "allow" }],
-      })
-      yield* llm.tool("write", { filePath: `${dir}/first-write.txt`, content: "hello" })
-      yield* llm.hang
-      yield* user(chat.id, "Write a report in first-write.txt")
-      const fiber = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
-      yield* awaitWithTimeout(llm.wait(2), "timed out waiting for the post-write request", "10 seconds")
+for (const [selected, ownerEffort, effort] of [
+  ["medium", undefined, "medium"], ["ultra", undefined, "ultra"],
+  [undefined, "ultra", "ultra"], ["medium", "ultra", "medium"],
+  [undefined, "thorough", "medium"],
+] as const) {
+  it.instance(
+    `review policy appears on the request after the session's first file write (${selected ?? "unset"}/${ownerEffort ?? "root"} -> ${effort})`,
+    () =>
+      Effect.gen(function* () {
+        const { llm, dir } = yield* useServerConfig
+        const prompt = yield* SessionPrompt.Service
+        const sessions = yield* Session.Service
+        const owner = ownerEffort ? yield* sessions.create({ title: "owner", metadata: { agentEffort: ownerEffort } }) : undefined
+        const chat = yield* sessions.create({
+          title: "Pinned",
+          ...(owner ? { parentID: owner.id } : {}),
+          ...(selected ? { metadata: { agentEffort: selected } } : {}),
+          permission: [{ permission: "*", pattern: "*", action: "allow" }],
+        })
+        expect((yield* sessions.get(chat.id)).metadata?.agentEffort).toBe(selected)
+        yield* llm.tool("write", { filePath: `${dir}/first-write.txt`, content: "hello" })
+        yield* llm.hang
+        yield* user(chat.id, "Write a report in first-write.txt")
+        const fiber = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+        yield* awaitWithTimeout(llm.wait(2), "timed out waiting for the post-write request", "10 seconds")
 
-      const hits = (yield* llm.hits).filter((hit) => !reviewerMatch(hit) && bodyString(hit).includes("You are opencode"))
-      expect(hits.length).toBeGreaterThanOrEqual(2)
-      expect(bodyString(hits[0])).not.toContain("## Review Loop")
-      expect(bodyString(hits[0])).not.toContain("## Agent effort")
-      expect(bodyString(hits[1])).toContain("## Review Loop")
-      expect(bodyString(hits[1])).toContain("## Agent effort")
+        const hits = (yield* llm.hits).filter((hit) => !reviewerMatch(hit) && bodyString(hit).includes("You are opencode"))
+        expect(hits.length).toBeGreaterThanOrEqual(2)
+        expect(bodyString(hits[0])).not.toContain("## Review Loop")
+        expect(bodyString(hits[0])).not.toContain("## Agent effort")
+        expect(bodyString(hits[1])).toContain("## Review Loop")
+        expect(bodyString(hits[1])).toContain(`## Agent effort: ${effort}`)
+        if (effort === "ultra") {
+          expect(bodyString(hits[1])).toContain("up to 3 disjoint slices")
+          expect(bodyString(hits[1])).toContain("origin verbatim")
+        }
 
-      yield* prompt.cancel(chat.id)
-      yield* Fiber.await(fiber)
-    }),
-  20_000,
-)
+        yield* prompt.cancel(chat.id)
+        yield* Fiber.await(fiber)
+      }),
+    20_000,
+  )
+}
 
 // Compaction can remove the write markers from the visible history; a
 // compacted session keeps the policy on.

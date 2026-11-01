@@ -208,3 +208,14 @@ test("repeating the current effort is idempotent and targets only its session", 
     metadata: { agentEffort: "thorough" },
   })
 })
+
+
+test("ultra selection survives pending, synced, and configured sources and metadata writes", () => {
+  expect(effortSelection({ override: { agentEffort: "ultra" }, metadata: { agentEffort: "fast" } })).toBe("ultra")
+  expect(effortSelection({ metadata: { agentEffort: "ultra" } })).toBe("ultra")
+  expect(effortSelection({ config: { agent: { effort: "ultra" } } })).toBe("ultra")
+  expect(effortUpdateFor({ sessionID: "ses_ultra", metadata: { keep: true }, level: "ultra" })).toEqual({
+    sessionID: "ses_ultra", metadata: { keep: true, agentEffort: "ultra" },
+  })
+  expect(effortUpdateFor({ sessionID: "ses_ultra", metadata: { agentEffort: "ultra" }, level: "ultra" })).toBeUndefined()
+})

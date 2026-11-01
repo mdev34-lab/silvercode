@@ -28,4 +28,4 @@ bun install
 
 ## Documentation
 
-- [Agent effort](specs/agent-effort.md) — the fast/medium/thorough dial: configuration, review passes, validation gates, and the `task()` override.
+- [Agent effort](specs/agent-effort.md) — the fast/medium/thorough/ultra dial: configuration, review passes, validation gates, and the `task()` override.

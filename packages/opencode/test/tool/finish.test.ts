@@ -1945,3 +1945,81 @@ it.instance("uncertain read-only Work can finish without forcing a scope questio
  const blocked=yield* def.execute({reason:"success",result:"done"},workCtx(chat.id,assistant.id)).pipe(Effect.exit)
  expect(Exit.isSuccess(blocked)).toBe(true)
 }))
+
+for (const [effort, caller, depth, cap, available] of [
+  ["ultra", "review", 1, 0, false],
+  ["ultra", "review", 1, 2, true], ["ultra", "review", 2, 2, false],
+  ["ultra", "code-review", 1, undefined, true],
+  ["ultra", "review", 1, undefined, true], ["ultra", "review", 1, 1, false], ["ultra", "review", 2, undefined, false],
+  ["ultra", "review", 3, 4, true], ["ultra", "review", 4, 4, false],
+  ["ultra", "general", 1, 1, false], ["medium", "review", 1, 1, false],
+  ["thorough", "review", 1, 1, false],
+] as const) {
+  it.instance(`ultra finish availability matrix ${effort}/${caller}/${depth}/${cap}`, () => Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    let parent = yield* sessions.create({ title: "root" })
+    for (let i = 1; i < depth; i++) parent = yield* sessions.create({ parentID: parent.id })
+    const { chat, assistant } = yield* seedSession("child", caller, parent.id)
+    yield* sessions.setMetadata({ sessionID: chat.id, metadata: withAgentEffort({}, effort) })
+    yield* addToolPart(chat.id, assistant.id, "edit")
+    const tool = yield* FinishTool
+    const def = yield* tool.init()
+    const result = yield* def.execute({ reason: "success", result: (caller === "review" || caller === "code-review") ? reviewEnvelope(REVIEW_APPROVED) : "Implemented" }, workCtx(chat.id, assistant.id, undefined, caller))
+    expect(result.metadata.review?.unavailable).toBe(available ? undefined : "subagent-depth")
+    expect(result.metadata.review?.termination).toBe(available ? "unreviewed" : "review-pending")
+  }), { config: { subagent_depth: cap } })
+}
+
+it.instance("ultra top reviewer cannot borrow a slice tool envelope; owns last canonical envelope", () => Effect.gen(function* () {
+  const sessions = yield* Session.Service
+  const { chat, assistant } = yield* seedSession("top", "review")
+  yield* sessions.setMetadata({ sessionID: chat.id, metadata: withAgentEffort({}, "ultra") })
+  yield* addToolPart(chat.id, assistant.id, "task", { subagent_type: "review" }, `<task_result>${reviewEnvelope(REVIEW_APPROVED)}</task_result>`)
+  const tool = yield* FinishTool
+  const def = yield* tool.init()
+  const missing = yield* def.execute({ reason: "success", result: "Slice approved" }, reviewCtx(chat.id, assistant.id)).pipe(Effect.exit)
+  expect(reviewFailure(missing)?.message).toContain("no <silvercode-review> report envelope")
+  const result = yield* def.execute({ reason: "success", result: `${reviewEnvelope(REVIEW_APPROVED)}\nTop synthesis:\n${reviewEnvelope(REVIEW_NEEDS_FIXES)}` }, reviewCtx(chat.id, assistant.id))
+  const parsed = ReviewReport.extract([result.output])
+  expect(parsed.ok).toBe(true)
+  if (parsed.ok) expect(parsed.report.assessment).toBe("needs-fixes")
+}))
+
+it.instance("finish inherits root ultra only when the child has no persisted effort, otherwise honors child/config", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const root = yield* sessions.create({ title: "ultra root" })
+    yield* sessions.setMetadata({ sessionID: root.id, metadata: withAgentEffort({}, "ultra") })
+    const { chat, assistant } = yield* seedSession("review child without effort", "review", root.id)
+    expect((yield* sessions.get(chat.id)).metadata?.agentEffort).toBeUndefined()
+    yield* addToolPart(chat.id, assistant.id, "edit")
+    const def = yield* (yield* FinishTool).init()
+    const finish = () => def.execute(
+      { reason: "success", result: reviewEnvelope(REVIEW_APPROVED) },
+      reviewCtx(chat.id, assistant.id),
+    )
+
+    // No child selection: root ultra wins over configured medium and enables the floor.
+    const inherited = yield* finish()
+    expect(inherited.metadata.review).toMatchObject({ effort: "ultra", termination: "unreviewed" })
+    expect(inherited.metadata.review?.maxIterations).toBeUndefined()
+    expect(inherited.metadata.review?.unavailable).toBeUndefined()
+
+    // A persisted child selection must win even when the root is ultra.
+    yield* sessions.setMetadata({ sessionID: chat.id, metadata: withAgentEffort({}, "medium") })
+    const overridden = yield* finish()
+    expect(overridden.metadata.review).toMatchObject({
+      effort: "medium", maxIterations: 2, unavailable: "subagent-depth", termination: "review-pending",
+    })
+
+    // This fallback is deliberately ultra-only: with no child effort and a thorough
+    // root, finish retains its existing configured-medium fallback.
+    yield* sessions.setMetadata({ sessionID: chat.id, metadata: {} })
+    yield* sessions.setMetadata({ sessionID: root.id, metadata: withAgentEffort({}, "thorough") })
+    const configured = yield* finish()
+    expect(configured.metadata.review).toMatchObject({
+      effort: "medium", maxIterations: 2, unavailable: "subagent-depth", termination: "review-pending",
+    })
+  }),
+  { config: { agent: { effort: "medium" } } },
+)
