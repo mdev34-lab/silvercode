@@ -6,6 +6,7 @@ import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Npm } from "@opencode-ai/core/npm"
 import { EventV2Bridge } from "../../src/event-v2-bridge"
+import { Config } from "@/config/config"
 import { Permission } from "../../src/permission"
 import { InstanceBootstrap } from "../../src/project/bootstrap"
 import { InstanceStore } from "../../src/project/instance-store"
@@ -35,13 +36,31 @@ const stubNpm = Layer.succeed(
 )
 
 const env = AppNodeBuilder.build(
-  LayerNode.group([Permission.node, EventV2Bridge.node, CrossSpawnSpawner.node, InstanceStore.node]),
+  LayerNode.group([Permission.node, EventV2Bridge.node, CrossSpawnSpawner.node, InstanceStore.node, Config.node]),
   [
     [InstanceStore.bootstrapNode, noopBootstrap],
     [Npm.node, stubNpm],
   ],
 )
-const it = testEffect(env)
+const baseIt = testEffect(env)
+const it = {
+  ...baseIt,
+  instance: (...args: Parameters<typeof baseIt.instance>) => {
+    const [name, body, options, testOptions] = args
+    return baseIt.instance(
+      name,
+      Effect.gen(function* () {
+        // Config is lazy per instance. Initialize it before each test's permission readiness
+        // window so startup work cannot consume the fixed waitForPending deadline.
+        const config = yield* Config.Service
+        yield* config.get()
+        return yield* typeof body === "function" ? body() : body
+      }),
+      options,
+      testOptions,
+    )
+  },
+}
 
 let priorDepInstallFlag: string | undefined
 beforeEach(() => {
@@ -241,15 +260,17 @@ it.instance(
   { git: true },
 )
 
-// Guards the #579 quarantine: every fixture in this file routes through a fresh instance
-// config load, and none of them may fork the background dependency install — its
-// in-process Arborist work is the interference that overlapped the readiness windows. Without the beforeEach flag (or if loadInstanceState stops honoring
-// it), the stubbed Npm.install records the attempt and this fails, instead of the flake
-// sneaking back as an intermittent 1s timeout.
-it.instance(
+// Guards the #579 quarantine with an explicit cold config load. The config must not fork
+// the background dependency install; the permission publication wait below starts only after
+// that independent startup phase has completed.
+baseIt.instance(
   "readiness - config startup never forks a background dependency install",
   () =>
     Effect.gen(function* () {
+      const config = yield* Config.Service
+      const loaded = yield* config.get()
+      expect(loaded.permission_timeout).toMatchObject(countdown.permission_timeout)
+
       const fiber = yield* ask(bash("per_timeout_no_dep_install")).pipe(Effect.forkScoped)
 
       const [request] = yield* waitForPending(1)
