@@ -100,17 +100,34 @@ describe("typedActivityHeader", () => {
 })
 
 describe("computeActivitySubGroups", () => {
-  test("merges interleaved kinds in first-appearance order", () => {
+  test("splits interleaved kinds chronologically: a kind change closes the block", () => {
     const group = groupOf([
       tool("a", "read", { filePath: "src/a.ts" }),
       tool("b", "bash", { command: "ls" }),
       tool("c", "read", { filePath: "src/b.ts" }),
     ])
     const subs = computeActivitySubGroups(group)
-    expect(subs.map((sub) => sub.kind)).toEqual(["explore", "bash"])
-    expect(subs[0]!.items.map((item) => item.part.id)).toEqual(["a", "c"])
-    expect(subs[0]!.id).toBe("act-1:explore")
-    expect(subs[1]!.id).toBe("act-1:bash")
+    expect(subs.map((sub) => sub.kind)).toEqual(["explore", "bash", "explore"])
+    expect(subs[0]!.items.map((item) => item.part.id)).toEqual(["a"])
+    expect(subs[1]!.items.map((item) => item.part.id)).toEqual(["b"])
+    expect(subs[2]!.items.map((item) => item.part.id)).toEqual(["c"])
+    expect(subs[0]!.id).toBe("act-1:explore:1")
+    expect(subs[1]!.id).toBe("act-1:bash:1")
+    expect(subs[2]!.id).toBe("act-1:explore:2")
+  })
+
+  test("write, bash, write opens a new edit block after the command", () => {
+    const group = groupOf([
+      tool("a", "write", { filePath: "src/a.ts" }),
+      tool("b", "bash", { command: "ls" }),
+      tool("c", "write", { filePath: "src/b.ts" }),
+    ])
+    const subs = computeActivitySubGroups(group)
+    expect(subs.map((sub) => [sub.kind, sub.id])).toEqual([
+      ["edit", "act-1:edit:1"],
+      ["bash", "act-1:bash:1"],
+      ["edit", "act-1:edit:2"],
+    ])
   })
 
   test("reasoning joins the block of the tool call that follows it", () => {
