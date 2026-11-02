@@ -235,11 +235,15 @@ async function capture(app: Awaited<ReturnType<typeof mountSessionRoute>>["app"]
   await mkdir(dir, { recursive: true })
   await Bun.write(path.join(dir, `${name}.txt`), await frameOf(app))
   const spans = await captureSpans(app)
+  // RGBA components are normalized floats; the recorder keeps 8-bit values so
+  // the evidence can reproduce the exact pixels the renderer drew.
+  const rgba = (color: { r: number; g: number; b: number; a: number }) =>
+    [color.r, color.g, color.b, color.a].map((value) => Math.round(value * 255))
   const lines = spans.lines.map((line) =>
     line.spans.map((span) => ({
       text: span.text,
-      fg: [Math.round(span.fg.r), Math.round(span.fg.g), Math.round(span.fg.b), span.fg.a],
-      bg: [Math.round(span.bg.r), Math.round(span.bg.g), Math.round(span.bg.b), span.bg.a],
+      fg: rgba(span.fg),
+      bg: rgba(span.bg),
       attributes: span.attributes,
       width: span.width,
     })),
