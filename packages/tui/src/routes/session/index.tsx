@@ -121,6 +121,21 @@ const GO_UPSELL_PROVIDERS = new Set(["opencode", "opencode-go"])
 
 export const alwaysSeparate = new WeakSet<BoxRenderable>()
 
+// Rows rendered inside an expanded activity block sit one column closer than
+// the same row at transcript level: the block owns the indent, so every detail
+// line (native tool row, nested reasoning) shares one two-column inner indent.
+const activityDetail = createContext(false)
+
+// The clickable header of one activity block. Detail rows consult it so the
+// first row under a header keeps one blank terminal row above itself, the same
+// separation nested reasoning and tool panels already draw for themselves.
+const activityHeaders = new WeakSet<BoxRenderable>()
+
+// A renderable that already draws its own blank row below its content: tool
+// panels pad their top and bottom by one row. A block boundary consults this so
+// the shared blank row is drawn once, by whichever side already owns it.
+const selfPadded = new WeakSet<BoxRenderable>()
+
 type RetryAction = Extract<SessionStatus, { type: "retry" }>["action"]
 
 function goUpsellKeys(action: RetryAction) {
@@ -1905,6 +1920,12 @@ const PART_MAPPING = {
 
 const INLINE_TOOL_ICON_WIDTH = 2
 
+// Inner indent of an expanded activity block's detail rows, measured from the
+// block header. Tool panels keep their border on the header column and put
+// their content on this same column, so header, rows and panel content share
+// one indent instead of drifting by tool.
+const ACTIVITY_DETAIL_INDENT = 2
+
 // Default content lines shown in a collapsed bash/write/edit block before "Click to expand".
 const COLLAPSED_TOOL_PREVIEW_LINES = 3
 
@@ -1941,11 +1962,21 @@ function ReasoningPart(props: { last: boolean; part: ReasoningPart; message: Ass
     setExpanded((prev) => !prev)
   }
 
+  const detail = useContext(activityDetail)
+
   return (
     <Show when={content() || opaque()}>
       <box
-        ref={(el: BoxRenderable) => alwaysSeparate.add(el)}
-        paddingLeft={3}
+        ref={(el: BoxRenderable) => {
+          alwaysSeparate.add(el)
+          // A tool panel above an expanded block's trailing reasoning already
+          // pads its bottom by one row; do not draw a second blank row.
+          if (detail)
+            setPreLayoutSiblingMargin(el, (previous) =>
+              previous instanceof BoxRenderable && selfPadded.has(previous) ? 0 : 1,
+            )
+        }}
+        paddingLeft={detail ? ACTIVITY_DETAIL_INDENT : 3}
         marginTop={1}
         flexDirection="column"
         flexShrink={0}
@@ -2125,8 +2156,24 @@ function ActivitySubGroupBlock(props: { groupID: string; subID: string }) {
   }
 
   return (
-    <box>
-      <box onMouseOver={() => setHover(true)} onMouseOut={() => setHover(false)} onMouseUp={toggle}>
+    <box
+      ref={(el: BoxRenderable) =>
+        // One blank terminal row between blocks. A block whose last detail row
+        // already ends with its own bottom padding (a tool panel) draws that
+        // row itself, so adding the margin here would double the gap.
+        setPreLayoutSiblingMargin(el, (previous) => {
+          if (!previous) return 0
+          const last = previous.getChildren().at(-1)
+          return last instanceof BoxRenderable && selfPadded.has(last) ? 0 : 1
+        })
+      }
+    >
+      <box
+        ref={(el: BoxRenderable) => activityHeaders.add(el)}
+        onMouseOver={() => setHover(true)}
+        onMouseOut={() => setHover(false)}
+        onMouseUp={toggle}
+      >
         <Switch>
           <Match when={summary().working}>
             <box flexDirection="row" gap={1}>
@@ -2156,7 +2203,9 @@ function ActivitySubGroupBlock(props: { groupID: string; subID: string }) {
         </Switch>
       </box>
       <Show when={expanded()}>
-        <For each={parts()}>{(item) => <ActivityGroupPartRow item={item} />}</For>
+        <activityDetail.Provider value={true}>
+          <For each={parts()}>{(item) => <ActivityGroupPartRow item={item} />}</For>
+        </activityDetail.Provider>
       </Show>
     </box>
   )
@@ -2789,19 +2838,22 @@ export function InlineToolRow(props: {
   onMouseOut?: () => void
   onMouseUp?: () => void
 }) {
+  const detail = useContext(activityDetail)
   return (
     <box
-      paddingLeft={3}
+      paddingLeft={detail ? ACTIVITY_DETAIL_INDENT : 3}
       onMouseOver={props.onMouseOver}
       onMouseOut={props.onMouseOut}
       onMouseUp={props.onMouseUp}
       ref={(el: BoxRenderable) => {
         if (props.separate) alwaysSeparate.add(el)
         setPreLayoutSiblingMargin(el, (previous) => {
-          return props.separate ||
-            (previous instanceof BoxRenderable && (previous.height > 1 || alwaysSeparate.has(previous)))
-            ? 1
-            : 0
+          if (props.separate) return 1
+          if (!(previous instanceof BoxRenderable)) return 0
+          // A tool panel pads its bottom by one row, and inside an activity
+          // block that row is the gap; elsewhere the row keeps its own margin.
+          if (detail && selfPadded.has(previous)) return 0
+          return previous.height > 1 || alwaysSeparate.has(previous) || activityHeaders.has(previous) ? 1 : 0
         })
       }}
     >
@@ -2862,14 +2914,22 @@ function BlockTool(props: {
   const renderer = useRenderer()
   const [hover, setHover] = createSignal(false)
   const error = createMemo(() => (props.part?.state.status === "error" ? props.part.state.error : undefined))
+  // Inside an expanded activity block the panel is one of the block's detail
+  // rows: its own one-row padding is the blank row above and below it, and it
+  // keeps its left border on the block header's column so its content lands on
+  // the shared detail column. At transcript level both offsets stay as they are.
+  const detail = useContext(activityDetail)
   return (
     <box
-      ref={(el: BoxRenderable) => alwaysSeparate.add(el)}
+      ref={(el: BoxRenderable) => {
+        alwaysSeparate.add(el)
+        selfPadded.add(el)
+      }}
       border={["left"]}
       paddingTop={1}
       paddingBottom={1}
-      paddingLeft={2}
-      marginTop={1}
+      paddingLeft={detail ? ACTIVITY_DETAIL_INDENT - 1 : 2}
+      marginTop={detail ? 0 : 1}
       gap={1}
       backgroundColor={hover() ? theme.backgroundMenu : theme.backgroundPanel}
       customBorderChars={SplitBorder.customBorderChars}
