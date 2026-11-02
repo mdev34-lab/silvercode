@@ -1905,7 +1905,7 @@ const PART_MAPPING = {
 
 const INLINE_TOOL_ICON_WIDTH = 2
 
-// Default content lines shown in a collapsed bash/write/edit block before "Click to expand".
+// Default content lines shown in a collapsed shell/write/edit block before "Click to expand".
 const COLLAPSED_TOOL_PREVIEW_LINES = 3
 
 function ReasoningPart(props: { last: boolean; part: ReasoningPart; message: AssistantMessage }) {
@@ -3716,6 +3716,8 @@ const nativeToolRenderers = {
   list_mcp_resources: McpResource,
   list_mcp_resource_templates: McpResource,
   read_mcp_resource: McpResource,
+  shell: Shell,
+  // Legacy persisted parts from before the #780 rename still say "bash".
   bash: Shell,
   glob: Glob,
   read: Read,

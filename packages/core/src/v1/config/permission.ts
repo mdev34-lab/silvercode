@@ -21,6 +21,10 @@ const InputObject = Schema.StructWithRest(
     glob: Schema.optional(Rule),
     grep: Schema.optional(Rule),
     list: Schema.optional(Rule),
+    shell: Schema.optional(Rule),
+    // Legacy spelling of the shell tool permission from before the #780
+    // rename. Kept typed so existing user config parses unchanged; matching
+    // treats it as an alias of "shell".
     bash: Schema.optional(Rule),
     task: Schema.optional(Rule),
     external_directory: Schema.optional(Rule),
@@ -39,6 +43,100 @@ const InputSchema = Schema.Union([Action, InputObject])
 
 const normalizeInput = (input: Schema.Schema.Type<typeof InputSchema>): Schema.Schema.Type<typeof InputObject> =>
   typeof input === "string" ? { "*": input } : input
+
+// The two spellings of the shell tool's permission action across the #780
+// rename. They are one logical permission slot written with either name.
+const SHELL_RENAME_SPELLINGS: readonly string[] = ["bash", "shell"]
+
+// An empty pattern map writes no rule. Treating it as a write can move a broad
+// allow past a deny, or clear a tools-derived deny, without adding any rule.
+function isShellRenameWrite(value: unknown): boolean {
+  if (typeof value === "string") return true
+  if (typeof value !== "object" || value === null || globalThis.Array.isArray(value)) return false
+  return globalThis.Object.keys(value).length > 0
+}
+
+// Drop no-op `bash`/`shell` pattern maps from a layer before it is merged or
+// assigned over another layer. Without this, remeda `mergeDeep` / Object.assign
+// can replace a flat deny with `{}` even though the empty map writes no rule.
+export function stripEmptyShellRules<T>(permission: T): T {
+  if (typeof permission !== "object" || permission === null || globalThis.Array.isArray(permission)) return permission
+  const record = permission as Record<string, unknown>
+  let out = record
+  for (const key of SHELL_RENAME_SPELLINGS) {
+    const value = record[key]
+    if (typeof value !== "object" || value === null || globalThis.Array.isArray(value)) continue
+    if (globalThis.Object.keys(value).length > 0) continue
+    if (out === record) out = { ...record }
+    delete out[key]
+  }
+  return out as T
+}
+
+/**
+ * Permission layers merge with the pre-existing deep-merge contract
+ * (remeda `mergeDeep` / `Object.assign`): an overridden key or pattern keeps
+ * its first-written position, and a flat action replaces a pattern record
+ * wholesale. That contract is unchanged for every permission — with one
+ * rename-scoped exception handled here.
+ *
+ * The rename split one logical permission across two keys (`bash`/`shell`),
+ * so plain deep merge can order the spellings by first-seen position rather
+ * than by last write: e.g. global `shell`, project `bash`, then local
+ * `shell` would leave the local layer's `shell` entry sitting before the
+ * project layer's `bash` entry, and the wrong layer would win under
+ * last-match evaluation. `orderShellRename` runs after a base merge and
+ * fixes ONLY the relative order of the two spellings, permuting them within
+ * the key positions they already occupy: spellings the later layer
+ * (`source`) wrote come after spellings it did not write, in `source`
+ * order. No value changes, no other key moves — a spelling never crosses
+ * `*` or any unrelated key, so single-layer written order and every other
+ * permission keep exact base semantics.
+ */
+export function orderShellRename<T extends object>(merged: T, source: unknown): T {
+  if (typeof source !== "object" || source === null || globalThis.Array.isArray(source)) return merged
+  const record = merged as Record<string, unknown>
+  const keys = globalThis.Object.keys(record)
+  const present = keys.filter((key) => SHELL_RENAME_SPELLINGS.includes(key) && isShellRenameWrite(record[key]))
+  if (present.length < 2) return merged
+  const written = globalThis.Object.keys(source as Record<string, unknown>).filter(
+    (key) => SHELL_RENAME_SPELLINGS.includes(key) && isShellRenameWrite((source as Record<string, unknown>)[key]),
+  )
+  if (written.length === 0) return merged
+  const desired = [
+    ...present.filter((key) => !written.includes(key)),
+    ...written.filter((key) => present.includes(key)),
+  ]
+  if (desired.every((key, index) => key === present[index])) return merged
+  const out: Record<string, unknown> = {}
+  let slot = 0
+  for (const key of keys) {
+    if (!SHELL_RENAME_SPELLINGS.includes(key)) {
+      out[key] = record[key]
+      continue
+    }
+    const replacement = desired[slot++]
+    out[replacement] = record[replacement]
+  }
+  return out as T
+}
+
+/**
+ * Companion for tools-derived permission records: the derived `shell` entry
+ * is a synthetic compat slot (folded from `tools: { bash/shell: ... }`), so
+ * when an explicit permission writes a spelling, the derived entry for that
+ * spelling is cleared first and the base assign/merge then appends the
+ * explicit entry at its own written position instead of inheriting the
+ * derived entry's position. Explicit entries for every other tool keep
+ * base assign semantics.
+ */
+export function clearDerivedShellRename(derived: Record<string, unknown>, explicit: unknown): void {
+  if (typeof explicit !== "object" || explicit === null || globalThis.Array.isArray(explicit)) return
+  const record = explicit as Record<string, unknown>
+  for (const key of SHELL_RENAME_SPELLINGS) {
+    if (isShellRenameWrite(record[key])) delete derived[key]
+  }
+}
 
 export const Info = InputSchema.pipe(
   Schema.decodeTo(InputObject, {

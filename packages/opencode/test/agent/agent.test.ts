@@ -133,6 +133,29 @@ it.instance(
   },
 )
 
+// #780: the doom-loop detector queries exactly this (patterns: [toolName]
+// against the resolved agent ruleset), so config-level doom_loop settings
+// must gate the tool under its published name.
+it.instance(
+  "config doom_loop deny gates the renamed shell tool through agent resolution",
+  () =>
+    Effect.gen(function* () {
+      const work = yield* load((svc) => svc.get("work"))
+      expect(work).toBeDefined()
+      expect(Permission.evaluate("doom_loop", "shell", work!.permission).action).toBe("deny")
+      expect(Permission.evaluate("doom_loop", "read", work!.permission).action).toBe("deny")
+    }),
+  { config: { permission: { doom_loop: "deny" } } },
+)
+
+it.instance("agents keep the default doom_loop ask for the shell tool without config", () =>
+  Effect.gen(function* () {
+    const work = yield* load((svc) => svc.get("work"))
+    expect(work).toBeDefined()
+    expect(Permission.evaluate("doom_loop", "shell", work!.permission).action).toBe("ask")
+  }),
+)
+
 it.instance("explore agent denies edit and write", () =>
   Effect.gen(function* () {
     const explore = yield* load((svc) => svc.get("explore"))

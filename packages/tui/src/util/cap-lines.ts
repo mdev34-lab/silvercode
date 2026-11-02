@@ -3,7 +3,7 @@
 // the scrollback: with no newlines it cannot be folded by the collapsed-preview
 // line budget, and renderers differ in how they treat overflow — the `<code>`
 // renderable used by `write` clips long lines at its width, while the `<text>`
-// renderable used by `bash`/generic output wraps them, jittering the viewport.
+// renderable used by `shell`/generic output wraps them, jittering the viewport.
 // Capping each line before rendering keeps both paths bounded identically.
 export const MAX_OUTPUT_LINE_LENGTH = 2000
 

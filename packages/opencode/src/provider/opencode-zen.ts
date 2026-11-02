@@ -34,6 +34,7 @@
  * and Request options.
  */
 
+import { Wildcard } from "@opencode-ai/core/util/wildcard"
 import { Identifier } from "@/id/id"
 import { isRecord } from "@/util/record"
 import { ProviderError } from "./error"
@@ -69,10 +70,15 @@ export const ZEN_USER_AGENT =
 export const ZEN_PUBLIC_AUTHENTICATION = "Bearer public"
 
 /**
- * Upstream free-tier gate requires all 4 tools in the file-search quartet:
- * {bash, glob, grep, read}. Requests with 0-3 tools or fake names receive 403 FreeTierError.
- * Plain chat callers send no tools, so without injection every such request fails.
- * Caller tools are preserved verbatim; only missing fingerprint names are appended.
+ * The file-search quartet the upstream free-tier gate historically required:
+ * {bash, glob, grep, read}. These names are wire-protocol constants and stay
+ * as-is across the bash -> shell tool rename (#780). Since the 2026-10-14
+ * gate revision (see the injection site in `createFetch`) the quartet is no
+ * longer injected — the gateway rejects the synthetic empty-schema versions
+ * and accepts genuine tool-less requests. The set now only defines which
+ * response tool calls count as adapter-injected for the response guards:
+ * a call naming one of these tools is stripped only when the caller's own
+ * catalog carries neither the name nor its canonical spelling.
  */
 export const ZEN_FINGERPRINT_TOOLS = ["bash", "glob", "grep", "read"] as const
 
@@ -920,7 +926,15 @@ export function createFetch(input: FetchInput = {}): ZenFetch {
     const callerHadNoTools = !Array.isArray(payload["tools"]) || payload["tools"].length === 0
     const callerTools: unknown[] = Array.isArray(payload["tools"]) ? [...payload["tools"]] : []
     const callerToolNames = new Set(callerTools.map(toolNameOf).filter(Boolean))
-    const injectedOnlyNames = new Set(ZEN_FINGERPRINT_TOOLS.filter((name) => !callerToolNames.has(name)))
+    // #780: the fingerprint names are wire-protocol constants and predate the
+    // bash -> shell tool rename. A fingerprint tool counts as caller-provided
+    // when the catalog carries it under its canonical spelling too, so a model
+    // hallucinating the legacy `bash` name produces a caller-visible invalid
+    // call for the runtime repair instead of being silently stripped as if
+    // the gateway had injected it.
+    const injectedOnlyNames = new Set(
+      ZEN_FINGERPRINT_TOOLS.filter((name) => !callerToolNames.has(name) && !callerToolNames.has(Wildcard.canonical(name))),
+    )
 
     // 2026-10-14: the gateway now rejects requests carrying the synthetic
     // fingerprint quartet (empty-schema "OpenCode built-in" tools) with

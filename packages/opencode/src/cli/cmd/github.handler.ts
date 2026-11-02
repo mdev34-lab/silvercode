@@ -823,6 +823,8 @@ export const githubRun = Effect.fn("Cli.github.run")(function* (args: { event?: 
     async function subscribeSessionEvents() {
       const TOOL: Record<string, [string, string]> = {
         todowrite: ["Todo", UI.Style.TEXT_WARNING_BOLD],
+        shell: ["Shell", UI.Style.TEXT_DANGER_BOLD],
+        // Legacy persisted parts from before the #780 rename still say "bash".
         bash: ["Shell", UI.Style.TEXT_DANGER_BOLD],
         edit: ["Edit", UI.Style.TEXT_SUCCESS_BOLD],
         glob: ["Glob", UI.Style.TEXT_INFO_BOLD],

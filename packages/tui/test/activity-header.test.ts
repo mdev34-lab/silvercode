@@ -52,7 +52,10 @@ describe("activityKindOf", () => {
     expect(activityKindOf("glob")).toBe("explore")
     expect(activityKindOf("grep")).toBe("explore")
     expect(activityKindOf("list")).toBe("explore")
-    expect(activityKindOf("bash")).toBe("bash")
+    expect(activityKindOf("shell")).toBe("shell")
+    // Legacy persisted parts from before the #780 rename still say "bash"
+    // and must group with canonical shell calls.
+    expect(activityKindOf("bash")).toBe("shell")
     expect(activityKindOf("write")).toBe("edit")
     expect(activityKindOf("edit")).toBe("edit")
     expect(activityKindOf("apply_patch")).toBe("edit")
@@ -62,11 +65,11 @@ describe("activityKindOf", () => {
 })
 
 describe("typedActivityHeader", () => {
-  test("explore counts distinct files, bash counts calls, edit counts distinct files", () => {
+  test("explore counts distinct files, shell counts calls, edit counts distinct files", () => {
     const explore = groupOf([tool("a", "read", { filePath: "src/a.ts" }), tool("b", "read", { filePath: "src/a.ts" }), tool("c", "grep", { pattern: "x" })]).items
     expect(headerOf("explore", explore).main).toBe("Explored 2 files · 3s")
-    const bash = groupOf([tool("a", "bash", { command: "ls" }), tool("b", "bash", { command: "ls" })]).items
-    expect(headerOf("bash", bash).main).toBe("Ran 2 commands · 3s")
+    const shell = groupOf([tool("a", "shell", { command: "ls" }), tool("b", "shell", { command: "ls" })]).items
+    expect(headerOf("shell", shell).main).toBe("Ran 2 commands · 3s")
     const edit = groupOf([tool("a", "edit", { filePath: "src/a.ts" }), tool("b", "edit", { filePath: "src/a.ts" })]).items
     expect(headerOf("edit", edit).main).toBe("Edited 1 file · 3s")
   })
@@ -74,8 +77,8 @@ describe("typedActivityHeader", () => {
   test("working labels name the work in progress", () => {
     const explore = groupOf([tool("a", "read", { filePath: "src/a.ts" })]).items
     expect(headerOf("explore", explore, true).main).toBe("Exploring files... · 3s")
-    const bash = groupOf([tool("a", "bash", { command: "ls" })]).items
-    expect(headerOf("bash", bash, true).main).toBe("Running command... · 3s")
+    const shell = groupOf([tool("a", "shell", { command: "ls" })]).items
+    expect(headerOf("shell", shell, true).main).toBe("Running command... · 3s")
     const edit = groupOf([tool("a", "edit", { filePath: "src/a.ts" })]).items
     expect(headerOf("edit", edit, true).main).toBe("Editing files... · 3s")
   })
@@ -87,15 +90,15 @@ describe("typedActivityHeader", () => {
   })
 
   test("marker is + collapsed and − expanded, failed counts flag the block", () => {
-    const items = groupOf([tool("a", "bash", { command: "ls" })]).items
+    const items = groupOf([tool("a", "shell", { command: "ls" })]).items
     const failed = structuredClone(items)
     ;(failed[0]!.part.state as { status: string; error: string }).status = "error"
     ;(failed[0]!.part.state as { status: string; error: string }).error = "boom"
     const summary = summarizeActivity(failed.map((item) => item.part))
-    const header = typedActivityHeader("bash", summary, 1, { expanded: true, duration: "3s" })
+    const header = typedActivityHeader("shell", summary, 1, { expanded: true, duration: "3s" })
     expect(header.marker).toBe("−")
     expect(header.failed).toBe("1 failed")
-    expect(typedActivityHeader("bash", summary, 1, { expanded: false, duration: "3s" }).marker).toBe("+")
+    expect(typedActivityHeader("shell", summary, 1, { expanded: false, duration: "3s" }).marker).toBe("+")
   })
 })
 
@@ -103,37 +106,37 @@ describe("computeActivitySubGroups", () => {
   test("splits interleaved kinds chronologically: a kind change closes the block", () => {
     const group = groupOf([
       tool("a", "read", { filePath: "src/a.ts" }),
-      tool("b", "bash", { command: "ls" }),
+      tool("b", "shell", { command: "ls" }),
       tool("c", "read", { filePath: "src/b.ts" }),
     ])
     const subs = computeActivitySubGroups(group)
-    expect(subs.map((sub) => sub.kind)).toEqual(["explore", "bash", "explore"])
+    expect(subs.map((sub) => sub.kind)).toEqual(["explore", "shell", "explore"])
     expect(subs[0]!.items.map((item) => item.part.id)).toEqual(["a"])
     expect(subs[1]!.items.map((item) => item.part.id)).toEqual(["b"])
     expect(subs[2]!.items.map((item) => item.part.id)).toEqual(["c"])
     expect(subs[0]!.id).toBe("act-1:explore:1")
-    expect(subs[1]!.id).toBe("act-1:bash:1")
+    expect(subs[1]!.id).toBe("act-1:shell:1")
     expect(subs[2]!.id).toBe("act-1:explore:2")
   })
 
-  test("write, bash, write opens a new edit block after the command", () => {
+  test("write, shell, write opens a new edit block after the command", () => {
     const group = groupOf([
       tool("a", "write", { filePath: "src/a.ts" }),
-      tool("b", "bash", { command: "ls" }),
+      tool("b", "shell", { command: "ls" }),
       tool("c", "write", { filePath: "src/b.ts" }),
     ])
     const subs = computeActivitySubGroups(group)
     expect(subs.map((sub) => [sub.kind, sub.id])).toEqual([
       ["edit", "act-1:edit:1"],
-      ["bash", "act-1:bash:1"],
+      ["shell", "act-1:shell:1"],
       ["edit", "act-1:edit:2"],
     ])
   })
 
   test("reasoning joins the block of the tool call that follows it", () => {
-    const group = groupOf([reasoning("r1"), tool("a", "bash", { command: "ls" }), tool("b", "read", { filePath: "x" })])
+    const group = groupOf([reasoning("r1"), tool("a", "shell", { command: "ls" }), tool("b", "read", { filePath: "x" })])
     const subs = computeActivitySubGroups(group)
-    expect(subs[0]!.kind).toBe("bash")
+    expect(subs[0]!.kind).toBe("shell")
     expect(subs[0]!.parts.map((item) => item.part.id)).toEqual(["r1", "a"])
   })
 

@@ -155,7 +155,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
             // Bash already observes ctx.abort and returns captured output after
             // process teardown. Keep that finalization, but permission waits in
             // ctx.ask remain interruptible so cancellation cannot authorize work.
-            item.id === "bash" ? Effect.uninterruptible : (effect) => effect,
+            item.id === "shell" ? Effect.uninterruptible : (effect) => effect,
           ),
           { signal: options.abortSignal },
         )

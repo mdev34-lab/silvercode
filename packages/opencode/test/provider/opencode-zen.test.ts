@@ -688,6 +688,101 @@ describe("OpenCodeZen", () => {
       expect(calls[1].body?.tools).toEqual([websearch])
     })
 
+    // The built-in catalog as published after #780 (see CORE_TOOLS): the
+    // shell tool is `shell`, and webfetch/websearch are deferred behind
+    // tool_search so they never appear in the request.
+    const publishedTool = (name: string) => ({
+      type: "function",
+      function: {
+        name,
+        description: `${name} tool`,
+        parameters: { type: "object", properties: { input: { type: "string" } }, required: ["input"] },
+      },
+    })
+    const publishedCatalog = ["tool_search", "shell", "read", "glob", "grep", "edit", "write"].map(publishedTool)
+
+    // Fake gateway enforcing exactly the acceptance rules documented in
+    // opencode-zen.ts (including the 2026-10-14 revision): session header
+    // required, streamed bodies only, synthetic empty-schema fingerprint
+    // stubs rejected, tool catalogs carrying neither web tool rejected,
+    // genuine tool-less requests accepted. No in-repo source documents a
+    // tool-name allowlist on the live gateway, so the fake imposes none —
+    // passing here proves the adapter satisfies every documented rule with
+    // the shell catalog on the wire, not that the live gateway accepts the
+    // `shell` name (unverifiable without a live request).
+    function documentedGate(handler: (input: URL | RequestInfo, init?: RequestInit) => Response | Promise<Response>) {
+      return async (input: URL | RequestInfo, init?: RequestInit): Promise<Response> => {
+        const headers = new Headers(init?.headers)
+        if (!headers.get("x-opencode-session")) {
+          return Response.json({ error: { code: "MissingSessionID" } }, { status: 400 })
+        }
+        const body = jsonBody(init?.body) ?? {}
+        if (body.stream !== true) return Response.json({ error: { code: "FreeTierError" } }, { status: 403 })
+        const tools: any[] = Array.isArray(body.tools) ? body.tools : []
+        const names = tools.map((t) => t?.function?.name ?? t?.name ?? "")
+        const synthetic = tools.some((t, i) => {
+          if (!["bash", "glob", "grep", "read"].includes(names[i])) return false
+          const properties = t?.function?.parameters?.properties
+          return !properties || Object.keys(properties).length === 0
+        })
+        if (synthetic) return Response.json({ error: { code: "FreeTierError" } }, { status: 403 })
+        if (tools.length > 0 && !names.includes("webfetch") && !names.includes("websearch")) {
+          return Response.json({ error: { code: "FreeTierError" } }, { status: 403 })
+        }
+        return handler(input, init)
+      }
+    }
+
+    test("the documented gate fake actually enforces its rules (control)", async () => {
+      const gate = documentedGate(() => sse())
+      const session = { "x-opencode-session": SESSION_ID }
+      const send = (body: Record<string, any>, headers: Record<string, string> = session) =>
+        gate(zenURL, { method: "POST", headers, body: JSON.stringify(body) })
+
+      // Missing session, non-streamed body, synthetic quartet stubs, and a
+      // tool catalog without a web tool are all rejected; a genuine
+      // tool-less request passes. A gate that cannot reject these would
+      // make the catalog test below vacuous.
+      expect((await send({ model: "big-pickle", messages: [], stream: true }, {})).status).toBe(400)
+      expect((await send({ model: "big-pickle", messages: [] })).status).toBe(403)
+      expect(
+        (
+          await send({
+            model: "big-pickle",
+            messages: [],
+            stream: true,
+            tools: [{ type: "function", function: { name: "bash", parameters: { type: "object" } } }],
+          })
+        ).status,
+      ).toBe(403)
+      expect((await send({ model: "big-pickle", messages: [], stream: true, tools: publishedCatalog })).status).toBe(
+        403,
+      )
+      expect((await send({ model: "big-pickle", messages: [], stream: true })).status).toBe(200)
+    })
+
+    test("sends the published shell catalog through the documented wire gate (#780)", async () => {
+      const { calls, upstream } = recorder(documentedGate(() => sse()))
+      const zen = createFetch({ upstream, free: new Set(["big-pickle"]) })
+
+      const response = await zen(zenURL, {
+        method: "POST",
+        body: JSON.stringify({ model: "big-pickle", messages: [], tools: publishedCatalog }),
+      })
+
+      // The adapter's output satisfies every documented gate rule.
+      expect(response.status).toBe(200)
+      expect(calls).toHaveLength(1)
+      const wireNames = calls[0].body?.tools.map((t: any) => t.function?.name)
+      // Caller catalog verbatim (canonical `shell`, no hidden `bash`), then
+      // the upstream web tools the gate requires.
+      expect(wireNames).toEqual([...publishedCatalog.map((t) => t.function.name), ...ZEN_WEB_TOOLS])
+      expect(wireNames).toContain("shell")
+      expect(wireNames).not.toContain("bash")
+      expect(calls[0].body?.tools.slice(0, publishedCatalog.length)).toEqual(publishedCatalog)
+      expect(calls[0].body?.stream).toBe(true)
+    })
+
     test("leaves non-completion requests alone", async () => {
       const { calls, upstream } = recorder(() => Response.json({ data: [] }))
       const zen = createFetch({ upstream })
@@ -1332,6 +1427,99 @@ describe("OpenCodeZen", () => {
       const body = (await response.json()) as any
       expect(body.choices[0].finish_reason).toBe("tool_calls")
       expect(body.choices[0].message.tool_calls).toEqual([customCall])
+    })
+
+    test("passes a hallucinated bash call through when the caller catalog carries shell (#780)", async () => {
+      // The catalog publishes the tool as `shell`; a model calling the legacy
+      // fingerprint name `bash` made a caller-visible invalid call, not a
+      // gateway-injected one. The guard must keep it so the runtime's
+      // invalid-tool repair handles it (and nothing executes).
+      const shellTools = [{ type: "function", function: { name: "shell" } }]
+      const response = await jsonGuard(
+        { model: "big-pickle", messages: [], tools: shellTools },
+        new Response(completionJson([bashCall], null), { headers: { "content-type": "application/json" } }),
+      )
+
+      const body = (await response.json()) as any
+      expect(body.choices[0].finish_reason).toBe("tool_calls")
+      expect(body.choices[0].message.tool_calls).toEqual([bashCall])
+    })
+
+    test("does not fail a required tool_choice for a hallucinated bash call when the caller carries shell (#780)", async () => {
+      const shellTools = [{ type: "function", function: { name: "shell" } }]
+      const response = await jsonGuard(
+        { model: "big-pickle", messages: [], tools: shellTools, tool_choice: "required" },
+        new Response(completionJson([bashCall], null), { headers: { "content-type": "application/json" } }),
+      )
+
+      const body = (await response.json()) as any
+      expect(body.choices[0].message.tool_calls).toEqual([bashCall])
+    })
+
+    test("keeps streamed hallucinated bash fragments when the caller catalog carries shell (#780)", async () => {
+      const shellTools = [{ type: "function", function: { name: "shell" } }]
+      const response = await streamGuard(
+        { model: "big-pickle", messages: [], tools: shellTools, stream: true },
+        sseFrames(
+          {
+            id: "chatcmpl-9",
+            object: "chat.completion.chunk",
+            choices: [
+              {
+                index: 0,
+                delta: { tool_calls: [{ index: 0, id: "call_b", type: "function", function: { name: "bash", arguments: "{\"command\":\"ls\"}" } }] },
+                finish_reason: null,
+              },
+            ],
+          },
+          {
+            id: "chatcmpl-9",
+            object: "chat.completion.chunk",
+            choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
+          },
+        ),
+      )
+
+      const chunks = dataLines(await response.text())
+      const names = chunks.flatMap((chunk: any) =>
+        (chunk.choices?.[0]?.delta?.tool_calls ?? []).map((call: any) => call.function?.name),
+      )
+      expect(names).toEqual(["bash"])
+      expect(chunks.at(-1).choices[0].finish_reason).toBe("tool_calls")
+    })
+
+    test("keeps a hallucinated bash call in an aggregated stream when the caller catalog carries shell (#780)", async () => {
+      // Same preservation through the aggregation path: a non-streaming
+      // caller gets the re-assembled JSON completion, and the aggregator's
+      // own injected-only filter must apply the same canonical-spelling rule.
+      const shellTools = [{ type: "function", function: { name: "shell" } }]
+      const response = await jsonGuard(
+        { model: "big-pickle", messages: [], tools: shellTools },
+        sseFrames(
+          {
+            id: "chatcmpl-9",
+            choices: [
+              {
+                index: 0,
+                delta: {
+                  tool_calls: [
+                    { index: 0, id: "call_b", type: "function", function: { name: "bash", arguments: '{"command":"ls"}' } },
+                  ],
+                },
+                finish_reason: null,
+              },
+            ],
+          },
+          { id: "chatcmpl-9", choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] },
+        ),
+      )
+
+      const body = (await response.json()) as any
+      expect(response.headers.get("content-type")).toContain("application/json")
+      expect(body.choices[0].finish_reason).toBe("tool_calls")
+      expect(body.choices[0].message.tool_calls).toEqual([
+        { id: "call_b", type: "function", function: { name: "bash", arguments: '{"command":"ls"}' } },
+      ])
     })
 
     test("fails an explicit required tool_choice when only injected calls would remain", async () => {
@@ -2470,6 +2658,178 @@ it.live(
             expect(streamResult.toolResults).toHaveLength(1)
             expect(streamResult.toolResults[0].output).toBe("found-test-val")
             expect(executedQuery).toBe("test-val")
+          }),
+        { config: zenProviderConfig(server.url) },
+      )
+    }),
+)
+
+it.live(
+  "runs the renamed shell tool end to end through the fake Zen gateway (#780)",
+  () =>
+    Effect.gen(function* () {
+      const frame = (value: unknown) => `data: ${JSON.stringify(value)}`
+      const shellStream = [
+        frame({
+          id: "chatcmpl-shell",
+          choices: [
+            {
+              index: 0,
+              delta: {
+                tool_calls: [
+                  { index: 0, id: "call_shell_1", type: "function", function: { name: "shell", arguments: '{"command":"ls"}' } },
+                ],
+              },
+              finish_reason: null,
+            },
+          ],
+        }),
+        "",
+        frame({ id: "chatcmpl-shell", choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] }),
+        "",
+        "data: [DONE]",
+        "",
+      ].join("\n")
+
+      const server = yield* Effect.acquireRelease(
+        Effect.promise(() => zenServer(() => shellStream)),
+        (server) => Effect.sync(() => server.server.close()),
+      )
+
+      yield* provideTmpdirInstance(
+        () =>
+          Effect.gen(function* () {
+            const provider = yield* Provider.Service
+            const model = yield* provider.getModel(ProviderV2.ID.opencode, ModelV2.ID.make("deepseek-v4-flash-free"))
+            const language = yield* provider.getLanguage(model)
+
+            const executed: string[] = []
+            const quartile = (name: string) =>
+              tool({
+                description: `${name} tool`,
+                inputSchema: z.object({ input: z.string() }),
+                execute: async () => `${name}-done`,
+              })
+            // The quartet the catalog actually publishes after #780: the host
+            // shell tool is named `shell`; no `bash` tool exists.
+            const tools = {
+              shell: tool({
+                description: "Run a command with the host shell",
+                inputSchema: z.object({ command: z.string() }),
+                execute: async ({ command }: { command: string }) => {
+                  executed.push(command)
+                  return `ran:${command}`
+                },
+              }),
+              glob: quartile("glob"),
+              grep: quartile("grep"),
+              read: quartile("read"),
+            }
+
+            const genResult = yield* Effect.promise(() =>
+              generateText({
+                model: language,
+                tools,
+                messages: [{ role: "user", content: "list the files" }],
+              }),
+            )
+            expect(genResult.finishReason).toBe("tool-calls")
+            expect(genResult.toolCalls).toHaveLength(1)
+            expect(genResult.toolCalls[0].toolName).toBe("shell")
+            expect(genResult.toolResults).toHaveLength(1)
+            expect(genResult.toolResults[0].output).toBe("ran:ls")
+            expect(executed).toEqual(["ls"])
+
+            // On the wire: the canonical catalog verbatim plus the upstream
+            // web tools the gate requires — `shell`, never `bash`.
+            expect(server.requests).toHaveLength(1)
+            const wireNames = server.requests[0].body?.tools?.map((t: any) => t.function?.name)
+            expect(wireNames).toEqual(["shell", "glob", "grep", "read", ...ZEN_WEB_TOOLS])
+            expect(wireNames).not.toContain("bash")
+
+            const streamResult = yield* Effect.promise(async () => {
+              const stream = streamText({
+                model: language,
+                tools,
+                messages: [{ role: "user", content: "list the files" }],
+              })
+              return { finishReason: await stream.finishReason, toolCalls: await stream.toolCalls }
+            })
+            expect(streamResult.finishReason).toBe("tool-calls")
+            expect(streamResult.toolCalls).toHaveLength(1)
+            expect(streamResult.toolCalls[0].toolName).toBe("shell")
+          }),
+        { config: zenProviderConfig(server.url) },
+      )
+    }),
+)
+
+it.live(
+  "strips a bash call when the caller catalog carries no shell tool (#780 negative control)",
+  () =>
+    Effect.gen(function* () {
+      const frame = (value: unknown) => `data: ${JSON.stringify(value)}`
+      const bashStream = [
+        frame({
+          id: "chatcmpl-noshell",
+          choices: [
+            {
+              index: 0,
+              delta: {
+                tool_calls: [
+                  { index: 0, id: "call_bash_1", type: "function", function: { name: "bash", arguments: '{"command":"ls"}' } },
+                ],
+              },
+              finish_reason: null,
+            },
+          ],
+        }),
+        "",
+        frame({ id: "chatcmpl-noshell", choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] }),
+        "",
+        "data: [DONE]",
+        "",
+      ].join("\n")
+
+      const server = yield* Effect.acquireRelease(
+        Effect.promise(() => zenServer(() => bashStream)),
+        (server) => Effect.sync(() => server.server.close()),
+      )
+
+      yield* provideTmpdirInstance(
+        () =>
+          Effect.gen(function* () {
+            const provider = yield* Provider.Service
+            const model = yield* provider.getModel(ProviderV2.ID.opencode, ModelV2.ID.make("deepseek-v4-flash-free"))
+            const language = yield* provider.getLanguage(model)
+
+            const quartile = (name: string) =>
+              tool({
+                description: `${name} tool`,
+                inputSchema: z.object({ input: z.string() }),
+                execute: async () => `${name}-done`,
+              })
+            // Three quartet members but NOT the renamed slot: canonical
+            // membership is what preserves a `bash` call, so without `shell`
+            // in the catalog the guard treats `bash` as adapter-injected and
+            // strips it exactly as it did before the rename.
+            const genResult = yield* Effect.promise(() =>
+              generateText({
+                model: language,
+                tools: { glob: quartile("glob"), grep: quartile("grep"), read: quartile("read") },
+                messages: [{ role: "user", content: "list the files" }],
+              }),
+            )
+            expect(genResult.finishReason).toBe("stop")
+            expect(genResult.toolCalls).toHaveLength(0)
+
+            expect(server.requests).toHaveLength(1)
+            expect(server.requests[0].body?.tools?.map((t: any) => t.function?.name)).toEqual([
+              "glob",
+              "grep",
+              "read",
+              ...ZEN_WEB_TOOLS,
+            ])
           }),
         { config: zenProviderConfig(server.url) },
       )
