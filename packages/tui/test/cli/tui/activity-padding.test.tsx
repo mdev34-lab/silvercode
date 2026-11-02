@@ -193,6 +193,83 @@ function mountReadThenEdit(size: keyof typeof SIZES, filePath = "src/app.py") {
   })
 }
 
+// A reasoning body that exercises the markdown the block must not eat: a title
+// block, a paragraph, a fenced code block, and a trailing paragraph. The blank
+// lines between them are content, so they have to survive.
+const THOUGHT_BODY = [
+  "**Planning the edit**",
+  "",
+  "The App class owns the state, so change the initializer.",
+  "",
+  "```python",
+  "self.ready = True",
+  "```",
+  "",
+  "Then re-read the file to confirm.",
+].join("\n")
+
+const THOUGHT_TITLE = "Thought: Planning the edit"
+const THOUGHT_PARA = "The App class owns the state, so change the initializer."
+const THOUGHT_LAST = "Then re-read the file to confirm."
+
+// `nested` puts the reasoning in a run with two tool calls, so it is a detail
+// row inside an activity block. Without it the reasoning is a transcript-level
+// block of its own. "show" keeps a completed thought open, which is the state
+// whose body spacing this covers; "hide" collapses it to a clickable header.
+function mountThought(size: keyof typeof SIZES, options: { nested: boolean; mode?: "show" | "hide" }) {
+  const session = sessionInfo(SESSION, { title: "Fix the App class" })
+  const user = userMessage("msg_00_user", SESSION)
+  const work = assistantMessage("msg_01_work", SESSION, { time: { created: at(1), completed: at(9) } })
+  const thought = reasoningPart(work.id, "prt_think", THOUGHT_BODY, at(1), at(2))
+  const parts: Part[] = options.nested
+    ? [
+        thought,
+        toolPart("prt_read", work.id, "read", { filePath: "src/app.py", limit: 70, offset: 465 }, {}, at(2), at(3)),
+        toolPart(
+          "prt_edit",
+          work.id,
+          "edit",
+          { filePath: "src/app.py", oldString: "ready = False", newString: "ready = True" },
+          {},
+          at(3),
+          at(4),
+        ),
+      ]
+    : [thought]
+  const messages: NonNullable<MountOptions["messages"]> = {
+    [SESSION]: [
+      { info: user, parts: [textPart("prt_user", user, "Fix the App class")] },
+      { info: work, parts },
+    ],
+  }
+  return mountSessionRoute({
+    ...SIZES[size],
+    sessions: [session],
+    messages,
+    kv: { activity_groups_expanded: true, thinking_mode: options.mode ?? "show" },
+  })
+}
+
+// The colour the renderer recorded for the cell that starts `needle`, as 8-bit
+// RGBA. Colours are part of the accepted rendering, so the spacing change is
+// only correct if these stay put.
+async function colorOf(app: Awaited<ReturnType<typeof mountSessionRoute>>["app"], needle: string) {
+  const spans = await captureSpans(app)
+  const rows = Array.from(
+    spans.lines as unknown as { spans: { text: string; fg: any; bg: any; attributes: number }[] }[],
+  )
+  const rgba = (color: { r: number; g: number; b: number; a: number }) =>
+    [color.r, color.g, color.b, color.a].map((value) => Math.round(value * 255))
+  for (const line of rows) {
+    const text = line.spans.map((span) => span.text).join("")
+    if (!text.includes(needle)) continue
+    const span = line.spans.find((span) => span.text.includes(needle)) ?? line.spans.find((span) => span.text.trim())
+    if (!span) continue
+    return { fg: rgba(span.fg), bg: rgba(span.bg), attributes: span.attributes }
+  }
+  throw new Error(`no span starts "${needle}"`)
+}
+
 // Two command panels in one block: with two or more calls the run becomes an
 // activity block, and the panels are that block's detail rows.
 function mountTwoPanels() {
@@ -562,6 +639,104 @@ describe("activity block spacing", () => {
   // the transcript's own anatomy (the panel's margin and its own padding, the
   // inline row's single blank row), and a non-work call stays on the transcript
   // column with exactly one blank row between it and the block above.
+  // Nested reasoning inside a block has a body too. When it is open (the
+  // "show" display mode, or after clicking it in "hide" mode) the body is the
+  // next row of the block: no blank row between the reasoning header and its
+  // first line of text. The body's own markdown blank lines are content and
+  // are preserved, and the block is compact from the header to its last row.
+  test("normal: an expanded nested reasoning body starts directly under its header", async () => {
+    const { app } = await mountThought("normal", { nested: true })
+    await settle(app)
+    const frame = await settledFrame(app, THOUGHT_LAST)
+    await capture(app, "activity-padding-nested-body-normal")
+
+    const anchor = "− Explored 1 file"
+    // Header -> body: no gap.
+    expectNoBlankRowBetween(frame, anchor, THOUGHT_TITLE, THOUGHT_PARA)
+    // The body is one compact detail area: its markdown blank line before the
+    // fence is content, and so is the one before the trailing paragraph.
+    expect({ rows: between(rowsOf(frame, anchor), THOUGHT_PARA, "```python") }).toEqual({ rows: [""] })
+    // (leading indent trimmed: this asserts the content rows, not the column)
+    expect(between(rowsOf(frame, anchor), "self.ready = True", THOUGHT_LAST).map((line) => line.trim())).toEqual([
+      "```",
+      "",
+    ])
+    // The last line of the body is followed directly by the next detail row.
+    // The body's own blank lines are markdown content, which is why the
+    // whole-block rule is not asserted across a body — only at its seams.
+    expectNoBlankRowBetween(frame, anchor, THOUGHT_LAST, READ_ROW_INPUT)
+
+    // Order and content survive: title, paragraph, fenced block, trailing text.
+    const rows = rowsOf(frame, anchor)
+    expect(rowOf(rows, THOUGHT_TITLE)).toBeLessThan(rowOf(rows, THOUGHT_PARA))
+    expect(rowOf(rows, THOUGHT_PARA)).toBeLessThan(rowOf(rows, "```python"))
+    expect(rowOf(rows, "```python")).toBeLessThan(rowOf(rows, "self.ready = True"))
+    expect(rowOf(rows, "self.ready = True")).toBeLessThan(rowOf(rows, THOUGHT_LAST))
+    // Colours are untouched: the dimmed header accent and the muted body on the
+    // transcript background.
+    expect(await colorOf(app, THOUGHT_TITLE)).toEqual({ fg: [151, 104, 44, 255], bg: [10, 10, 10, 255], attributes: 0 })
+    expect(await colorOf(app, THOUGHT_PARA)).toEqual({ fg: [128, 128, 128, 255], bg: [10, 10, 10, 255], attributes: 0 })
+    expect(await colorOf(app, "self.ready = True")).toEqual({
+      fg: [128, 128, 128, 255],
+      bg: [10, 10, 10, 255],
+      attributes: 0,
+    })
+  })
+
+  // The same reasoning at transcript level keeps the transcript's own blank row
+  // before and after its body: the compaction is activity-only.
+  test("normal: a standalone reasoning body keeps its blank row on both sides", async () => {
+    const { app } = await mountThought("normal", { nested: false })
+    await settle(app)
+    const frame = await settledFrame(app, THOUGHT_LAST)
+
+    expectOneBlankRowBetween(frame, THOUGHT_TITLE, THOUGHT_TITLE, THOUGHT_PARA)
+    expectOneBlankRowBetween(frame, THOUGHT_TITLE, THOUGHT_LAST, "▣  Build · Test Model")
+    // Same body, same content, different surroundings.
+    expect(frame).toContain("self.ready = True")
+    expect(between(rowsOf(frame, THOUGHT_TITLE), THOUGHT_PARA, "```python")).toEqual([""])
+    expect(await colorOf(app, THOUGHT_PARA)).toEqual({ fg: [128, 128, 128, 255], bg: [10, 10, 10, 255], attributes: 0 })
+  })
+
+  // The same compaction at 80 columns: the body follows its header directly and
+  // the block stays compact, so a narrow window does not reintroduce the gap.
+  test("narrow: an expanded nested reasoning body stays compact", async () => {
+    const { app } = await mountThought("narrow", { nested: true })
+    await settle(app)
+    const frame = await settledFrame(app, THOUGHT_LAST)
+    await capture(app, "activity-padding-nested-body-narrow")
+
+    const anchor = "− Explored 1 file"
+    expectNoBlankRowBetween(frame, anchor, THOUGHT_TITLE, THOUGHT_PARA)
+    expectNoBlankRowBetween(frame, anchor, THOUGHT_LAST, READ_ROW_INPUT)
+    expect({ rows: between(rowsOf(frame, anchor), THOUGHT_PARA, "```python") }).toEqual({ rows: [""] })
+  })
+
+  // The header is still the control it was: in "hide" mode clicking the
+  // collapsed thought opens its body, and the opened body is compact inside the
+  // block (the hide mode's own body indent is preserved).
+  test("normal: clicking a nested thought opens a compact body", async () => {
+    const { app } = await mountThought("normal", { nested: true, mode: "hide" })
+    await settle(app)
+    const collapsed = await settledFrame(app, "+ Thought: Planning the edit")
+    expect(collapsed).not.toContain(THOUGHT_PARA)
+
+    const row = collapsed.split("\n").findIndex((line) => line.includes("+ Thought: Planning the edit"))
+    expect(row).toBeGreaterThan(-1)
+    await app.mockMouse.click(collapsed.split("\n")[row]!.indexOf("+ Thought") + 2, row)
+    await settle(app)
+    const frame = await settledFrame(app, THOUGHT_LAST)
+    await capture(app, "activity-padding-nested-body-clicked-normal")
+
+    const anchor = "− Explored 1 file"
+    expectNoBlankRowBetween(frame, anchor, `- ${THOUGHT_TITLE}`, THOUGHT_PARA)
+    expectNoBlankRowBetween(frame, anchor, THOUGHT_LAST, READ_ROW_INPUT)
+    // The collapsed marker is gone and the body is indented two columns past
+    // the reasoning header, as hide mode draws it.
+    expect(frame).not.toContain("+ Thought: Planning the edit")
+    expect(columnOf(frame, THOUGHT_PARA)).toBe(columnOf(frame, `- ${THOUGHT_TITLE}`) + 2)
+  })
+
   test("transcript-level tools keep their own spacing", async () => {
     const { app } = await mountOutsideBlock()
     await settle(app)

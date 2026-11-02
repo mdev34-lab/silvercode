@@ -1992,7 +1992,12 @@ function ReasoningPart(props: { last: boolean; part: ReasoningPart; message: Ass
           />
         </box>
         <Show when={!opaque() && open() && summary().body}>
-          <box paddingLeft={inMinimal() ? 2 : 0} marginTop={1}>
+          {/* The body's top margin is the transcript's row between a reasoning
+              header and the text under it. Inside an activity block that row
+              would be a blank row inside the block, so the body starts on the
+              row after the header; the body's own markdown blank lines are
+              content and stay. */}
+          <box paddingLeft={inMinimal() ? 2 : 0} marginTop={detail ? 0 : 1}>
             <code
               filetype="markdown"
               drawUnstyledText={false}
