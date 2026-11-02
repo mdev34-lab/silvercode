@@ -15,20 +15,21 @@ const consoleCodePage = windowsConsoleCodePage()
 const fileName = "ação-日本.txt"
 const fileText = "ação-日本 ok"
 
+// Commands run as arguments instead of typed input: node-pty defers writes until the terminal reports
+// first output, and a write that lands on a closed console pipe throws on Windows.
+const dirArgs = ["/d", "/c", "dir /b"]
 // `type *.txt` avoids typing a non-ASCII name into the console input codepage.
-const commands = ["dir /b", "type *.txt"]
+const typeArgs = ["/d", "/c", "type *.txt"]
 
 const escapes = (text: string) => text.match(/\u001b\[[0-9;?]*[A-Za-z]/g) ?? []
 
 type Session = {
   onData: (listener: (data: string) => unknown) => unknown
   onExit: (listener: (event: { exitCode: number }) => unknown) => unknown
-  write: (data: string) => void
   kill: () => void
 }
 
-// Resolves once the shell printed what the caller waits for, so the assertion never races the prompt echo.
-const runSession = (session: Session, ready: (output: string) => boolean) =>
+const runSession = (session: Session) =>
   new Promise<{ chunks: string[]; output: string }>((resolve, reject) => {
     const chunks: string[] = []
     let output = ""
@@ -36,21 +37,15 @@ const runSession = (session: Session, ready: (output: string) => boolean) =>
       session.kill()
       reject(new Error(`timed out waiting for the PTY session; output so far: ${JSON.stringify(output)}`))
     }, 30_000)
-    const done = () => {
-      clearTimeout(timer)
-      session.kill()
-      resolve({ chunks, output })
-    }
     session.onData((data) => {
       chunks.push(data)
       output += data
-      if (ready(output)) done()
     })
     session.onExit(() => {
       clearTimeout(timer)
-      resolve({ chunks, output })
+      // Exit follows the socket close, so let any last chunk queued behind it run first.
+      setTimeout(() => resolve({ chunks, output }), 100)
     })
-    for (const command of commands) session.write(`${command}\r`)
   })
 
 const withFixture = async (run: (directory: string) => Promise<void>) => {
@@ -63,14 +58,17 @@ const withFixture = async (run: (directory: string) => Promise<void>) => {
   }
 }
 
+const options = (directory: string) => ({ name: "xterm-256color", cols: 200, rows: 50, cwd: directory })
+
 describe("cmd.exe under ConPTY (#710)", () => {
   windows("passes UTF-8 file content and file names through the node backend", () =>
     withFixture(async (directory) => {
-      const session = spawn(shell, [], { name: "xterm-256color", cols: 200, rows: 50, cwd: directory })
-      const { output } = await runSession(session, (text) => text.includes(fileText))
       // `dir /b` reports names from the wide-character path and keeps them intact either way.
-      expect(output).toContain(fileName)
-      expect(output).toContain(fileText)
+      const listing = await runSession(spawn(shell, dirArgs, options(directory)))
+      expect(listing.output).toContain(fileName)
+
+      const content = await runSession(spawn(shell, typeArgs, options(directory)))
+      expect(content.output).toContain(fileText)
     }),
   )
 
@@ -78,19 +76,19 @@ describe("cmd.exe under ConPTY (#710)", () => {
     "raw output is the console codepage expansion that the decoder reverses",
     () =>
       withFixture(async (directory) => {
+        const listing = await runSession(nodePty.spawn(shell, dirArgs, options(directory)))
+        expect(listing.output).toContain(fileName)
+
         // Before the fix this is what reached the UI: the UTF-8 bytes of the file read as console characters.
         const expanded = iconv.decode(Buffer.from(fileText, "utf8"), String(consoleCodePage))
-        const session = nodePty.spawn(shell, [], { name: "xterm-256color", cols: 200, rows: 50, cwd: directory })
-        const { chunks, output } = await runSession(session, (text) => text.includes(expanded))
-        expect(output).toContain(fileName)
-        expect(output).toContain(expanded)
-        expect(output).not.toContain(fileText)
+        const content = await runSession(nodePty.spawn(shell, typeArgs, options(directory)))
+        expect(content.output).toContain(expanded)
+        expect(content.output).not.toContain(fileText)
 
         const decoder = conptyTextDecoder({ codepage: consoleCodePage })
-        const decoded = chunks.map((chunk) => decoder.decode(chunk)).join("") + decoder.end()
+        const decoded = content.chunks.map((chunk) => decoder.decode(chunk)).join("") + decoder.end()
         expect(decoded).toContain(fileText)
-        expect(decoded).toContain(fileName)
-        expect(escapes(decoded)).toEqual(escapes(output))
+        expect(escapes(decoded)).toEqual(escapes(content.output))
       }),
   )
 })
