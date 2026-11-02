@@ -126,11 +126,6 @@ export const alwaysSeparate = new WeakSet<BoxRenderable>()
 // line (native tool row, nested reasoning) shares one two-column inner indent.
 const activityDetail = createContext(false)
 
-// The clickable header of one activity block. Detail rows consult it so the
-// first row under a header keeps one blank terminal row above itself, the same
-// separation nested reasoning and tool panels already draw for themselves.
-const activityHeaders = new WeakSet<BoxRenderable>()
-
 // A renderable that already draws its own blank row below its content: tool
 // panels pad their top and bottom by one row. A block boundary consults this so
 // the shared blank row is drawn once, by whichever side already owns it.
@@ -1967,17 +1962,12 @@ function ReasoningPart(props: { last: boolean; part: ReasoningPart; message: Ass
   return (
     <Show when={content() || opaque()}>
       <box
-        ref={(el: BoxRenderable) => {
-          alwaysSeparate.add(el)
-          // A tool panel above an expanded block's trailing reasoning already
-          // pads its bottom by one row; do not draw a second blank row.
-          if (detail)
-            setPreLayoutSiblingMargin(el, (previous) =>
-              previous instanceof BoxRenderable && selfPadded.has(previous) ? 0 : 1,
-            )
-        }}
+        ref={(el: BoxRenderable) => alwaysSeparate.add(el)}
         paddingLeft={detail ? ACTIVITY_DETAIL_INDENT : 3}
-        marginTop={1}
+        // Inside a block a nested reasoning row is one more compact detail row
+        // under the header, so it drops the transcript-level blank row; the
+        // panel above it already pads its own bottom.
+        marginTop={detail ? 0 : 1}
         flexDirection="column"
         flexShrink={0}
       >
@@ -2168,12 +2158,7 @@ function ActivitySubGroupBlock(props: { groupID: string; subID: string }) {
         })
       }
     >
-      <box
-        ref={(el: BoxRenderable) => activityHeaders.add(el)}
-        onMouseOver={() => setHover(true)}
-        onMouseOut={() => setHover(false)}
-        onMouseUp={toggle}
-      >
+      <box onMouseOver={() => setHover(true)} onMouseOut={() => setHover(false)} onMouseUp={toggle}>
         <Switch>
           <Match when={summary().working}>
             <box flexDirection="row" gap={1}>
@@ -2850,10 +2835,12 @@ export function InlineToolRow(props: {
         setPreLayoutSiblingMargin(el, (previous) => {
           if (props.separate) return 1
           if (!(previous instanceof BoxRenderable)) return 0
-          // A tool panel pads its bottom by one row, and inside an activity
-          // block that row is the gap; elsewhere the row keeps its own margin.
-          if (detail && selfPadded.has(previous)) return 0
-          return previous.height > 1 || alwaysSeparate.has(previous) || activityHeaders.has(previous) ? 1 : 0
+          // Inside an expanded activity block the detail rows are one compact
+          // list directly under their header: the block's own margin owns the
+          // spacing between blocks, and a tool panel's own bottom padding owns
+          // the row below it, so a detail row never draws a blank row itself.
+          if (detail) return 0
+          return previous.height > 1 || alwaysSeparate.has(previous) ? 1 : 0
         })
       }}
     >
