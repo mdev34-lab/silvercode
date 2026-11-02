@@ -273,10 +273,6 @@ function mountOutsideBlock() {
 // the block's own margin or the panel's padding.
 const PANEL_EDGE = /[┃│┏┓┗┛┡┩└┘┌┐├┤]/g
 
-// A row that holds nothing but panel border glyphs: the panel's own padding or
-// gap row. It belongs to the panel, so it is not a separator between rows.
-const PANEL_OWNED_ROW = /^[┃│]+$/
-
 // Column of the first cell of `needle` on its row. Needles include the row's
 // marker (`−`, `→`, `+`) so columns compare the cells the row starts on.
 function columnOf(frame: string, needle: string) {
@@ -299,15 +295,11 @@ function cropFrom(frame: string, anchor: string) {
     .map((line) => line.slice(left))
 }
 
-// Content rows: panel border glyphs removed, so a padding row reads as blank.
+// Content rows: every panel border glyph removed. What is left is the text the
+// row actually renders, so a row that draws only the panel's border — an empty
+// content row inside a panel — reads as blank, exactly as it looks on screen.
 function rowsOf(frame: string, anchor: string) {
   return cropFrom(frame, anchor).map((line) => line.replace(PANEL_EDGE, "").trimEnd())
-}
-
-// Raw rows: border glyphs kept, so a panel's own padding stays distinguishable
-// from a truly empty terminal row.
-function rawRowsOf(frame: string, anchor: string) {
-  return cropFrom(frame, anchor).map((line) => line.trimEnd())
 }
 
 function rowOf(rows: string[], needle: string) {
@@ -330,13 +322,22 @@ function expectOneBlankRowBetween(frame: string, anchor: string, upper: string, 
   expect({ upper, lower, rows: between(rowsOf(frame, anchor), upper, lower) }).toEqual({ upper, lower, rows: [""] })
 }
 
-// No separator between two rows of the same block: every row in between must be
-// owned by a detail row itself (a panel's padding or gap), never an empty
-// terminal row. This is the corrected rule for a block header and its first
-// detail row, and for two detail rows of one block.
+// No blank row between two rows of the same block — including a row that draws
+// nothing but the panel's border. The rule is "a blank row only between blocks",
+// so any empty content row between a header and its tool call, or between two
+// rows inside a panel, is a violation however it is decorated.
 function expectNoBlankRowBetween(frame: string, anchor: string, upper: string, lower: string) {
-  const raw = between(rawRowsOf(frame, anchor), upper, lower)
-  expect({ upper, lower, blank: raw.filter((line) => line.trim() === "") }).toEqual({ upper, lower, blank: [] })
+  expect({ upper, lower, rows: between(rowsOf(frame, anchor), upper, lower) }).toEqual({
+    upper,
+    lower,
+    rows: [],
+  })
+}
+
+// A whole span inside one block: every content row must carry text.
+function expectNoBlankRows(frame: string, anchor: string, from: string, to: string) {
+  const rows = between(rowsOf(frame, anchor), from, to)
+  expect({ from, to, blank: rows.filter((line) => line === "") }).toEqual({ from, to, blank: [] })
 }
 
 async function settledFrame(app: Awaited<ReturnType<typeof mountSessionRoute>>["app"], needle: string) {
@@ -395,6 +396,9 @@ describe("activity block spacing", () => {
       // exactly one blank row below it.
       expectNoBlankRowBetween(frame, "− Explored 1 file", "− Explored 1 file", READ_ROW_INPUT)
       expectNoBlankRowBetween(frame, "− Edited 1 file", "− Edited 1 file", EDIT_ROW)
+      // Each block is header + one detail row, and nothing blank in between.
+      expectNoBlankRows(frame, "− Explored 1 file", "− Explored 1 file", READ_ROW_INPUT)
+      expectNoBlankRows(frame, "− Edited 1 file", "− Edited 1 file", EDIT_ROW)
       expectOneBlankRowBetween(frame, "− Explored 1 file", READ_ROW_INPUT, "− Edited 1 file")
       // The compact two-column inner indent holds in both directions.
       expect(columnOf(frame, READ_ROW_CELL)).toBe(columnOf(frame, "− Explored 1 file") + 2)
@@ -423,7 +427,10 @@ describe("activity block spacing", () => {
     await settle(app)
     const frame = await settledFrame(app, "Edited 1 file")
 
-    const wrappedHead = `Read ${["src", "packages", "tui", "src", "component", "prompt", "history"].join(path.sep)}${path.sep}`
+    // Needles avoid the separator entirely: the row prefix and the wrapped
+    // continuation are separator-free, so the wrap point does not matter and
+    // the same assertions hold on Windows and POSIX.
+    const wrappedHead = "Read src"
     const wrappedTail = "name-app.py [limit=70, offset=465]"
 
     const rows = rowsOf(frame, "− Explored 1 file")
@@ -455,10 +462,16 @@ describe("activity block spacing", () => {
     // The header is joined to the reasoning that planned the command: the
     // assistant turn starts the transcript's flat run directly under it.
     expectNoBlankRowBetween(frame, anchor, "− Ran 1 command", "+ Thought: Planning the edit")
-    // The panel's top padding row is the panel's own; no blank row is added
-    // between the header and the call it summarizes.
+    // No blank row between the header and the call it summarizes.
     expectNoBlankRowBetween(frame, anchor, "+ Thought: Planning the edit", "$ rg -n")
-    expectNoBlankRowBetween(frame, anchor, "− Ran 1 command", "$ rg -n")
+    // The panel inside a block draws no padding or gap rows of its own: the
+    // command, every output row and the expand hint are consecutive content
+    // rows. Border glyphs are stripped, so a border-only row counts as blank.
+    expectNoBlankRowBetween(frame, anchor, "$ rg -n", "28:class App:")
+    expectNoBlankRowBetween(frame, anchor, "30:        self.name = name", "…")
+    expectNoBlankRowBetween(frame, anchor, "…", "Click to expand")
+    // The whole block, header to the last row of its panel, holds no blank row.
+    expectNoBlankRows(frame, anchor, "− Ran 1 command", "Click to expand")
     // A one-line detail row starts directly under its own header too.
     expectNoBlankRowBetween(frame, anchor, "− Explored 1 file", READ_ROW_INPUT)
     expectNoBlankRowBetween(frame, anchor, "− Edited 1 file", EDIT_ROW)
@@ -466,7 +479,7 @@ describe("activity block spacing", () => {
     // margin here would draw two.
     expectOneBlankRowBetween(frame, anchor, "Click to expand", "− Explored 1 file")
     expectOneBlankRowBetween(frame, anchor, READ_ROW_INPUT, "− Edited 1 file")
-    expectOneBlankRowBetween(frame, anchor, "← Edit src/app.py", "Now verify the edit.")
+    expectOneBlankRowBetween(frame, anchor, EDIT_ROW_CELL, "Now verify the edit.")
   })
 
   // Two command panels are one block's detail rows: the block stays compact
@@ -480,9 +493,12 @@ describe("activity block spacing", () => {
 
     const anchor = "− Ran 2 commands"
     expectNoBlankRowBetween(frame, anchor, "− Ran 2 commands", '$ rg -n "class App" src')
-    expectNoBlankRowBetween(frame, anchor, '$ rg -n "class App" src', "$ ls -la src")
+    expectNoBlankRowBetween(frame, anchor, '$ rg -n "class App" src', "12:class App:")
     expectNoBlankRowBetween(frame, anchor, "12:class App:", "$ ls -la src")
+    expectNoBlankRowBetween(frame, anchor, "$ ls -la src", "widget.py")
     expectNoBlankRowBetween(frame, anchor, "− Explored 1 file", READ_ROW)
+    // Both panels and the seam between them: no blank row anywhere inside.
+    expectNoBlankRows(frame, anchor, "− Ran 2 commands", "widget.py")
     // The last panel's own bottom padding row is the block boundary row.
     expectOneBlankRowBetween(frame, anchor, "widget.py", "− Explored 1 file")
     // Panel content keeps the shared two-column inner indent.
@@ -524,6 +540,8 @@ describe("activity block spacing", () => {
     const anchor = "− Explored 1 file"
     expectNoBlankRowBetween(frame, anchor, "− Explored 1 file", READ_ROW_INPUT)
     expectNoBlankRowBetween(frame, anchor, "− Edited 1 file", EDIT_ROW)
+    // The visible panel tail is consecutive content rows too.
+    expectNoBlankRowBetween(frame, anchor, "…", "Click to expand")
     expectOneBlankRowBetween(frame, anchor, "Click to expand", "− Explored 1 file")
     expectOneBlankRowBetween(frame, anchor, READ_ROW_INPUT, "− Edited 1 file")
   })
@@ -553,9 +571,11 @@ describe("activity block spacing", () => {
     const anchor = "After the todos."
 
     // A lone bash call is not a run: its panel keeps the transcript margin row
-    // above its own top padding row, and its bottom padding row plus the text
-    // margin below it.
+    // above its own top padding row, its own gap row between the command and the
+    // output, and its bottom padding row plus the text margin below it. This is
+    // the anatomy a panel inside a block does not get.
     expect(between(rowsOf(frame, anchor), anchor, "$ ls -la src")).toEqual(["", ""])
+    expect(between(rowsOf(frame, anchor), "$ ls -la src", "widget.py")).toEqual([""])
     expect(between(rowsOf(frame, anchor), "widget.py", "After the command.")).toEqual(["", ""])
 
     // A non-work call ends the run: one blank row below the block's last detail

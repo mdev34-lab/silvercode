@@ -126,10 +126,20 @@ export const alwaysSeparate = new WeakSet<BoxRenderable>()
 // line (native tool row, nested reasoning) shares one two-column inner indent.
 const activityDetail = createContext(false)
 
-// A renderable that already draws its own blank row below its content: tool
-// panels pad their top and bottom by one row. A block boundary consults this so
-// the shared blank row is drawn once, by whichever side already owns it.
+// A renderable that already draws its own blank row below its content: at
+// transcript level tool panels pad their top and bottom by one row. A block
+// boundary consults this so the shared blank row is drawn once, by whichever
+// side already owns it.
 const selfPadded = new WeakSet<BoxRenderable>()
+
+// A tool panel's own spacing: one row of padding above and below, and one blank
+// row between the rows it stacks. Inside an activity block those rows would be
+// blank rows inside the block, and the block owns all of its spacing, so the
+// detail panel draws none of it. At transcript level the panel keeps its
+// anatomy exactly as before.
+function usePanelSpacing() {
+  return useContext(activityDetail) ? 0 : 1
+}
 
 type RetryAction = Extract<SessionStatus, { type: "retry" }>["action"]
 
@@ -2244,6 +2254,7 @@ type ToolProps = {
 }
 function GenericTool(props: ToolProps) {
   const { theme } = useTheme()
+  const spacing = usePanelSpacing()
   const ctx = use()
   const output = createMemo(() => stripAnsi(props.output?.trim() ?? ""))
   const args = createMemo(() => Locale.truncate(input(props.input), Math.max(20, ctx.width - 12)))
@@ -2270,7 +2281,7 @@ function GenericTool(props: ToolProps) {
         part={props.part}
         onClick={collapsed().overflow ? () => setExpanded((prev) => !prev) : undefined}
       >
-        <box gap={1}>
+        <box gap={spacing}>
           <text fg={theme.text}>{limited()}</text>
           <Show when={collapsed().overflow}>
             <text fg={theme.textMuted}>{expanded() ? "Click to collapse" : "Click to expand"}</text>
@@ -2620,6 +2631,7 @@ export function reviewFindingLocation(finding: ReviewReport.Finding): string | u
 
 function ReviewFinish(props: { review: { report: ReviewReport.Info; analysis: string }; part: ToolPart }) {
   const { theme } = useTheme()
+  const spacing = usePanelSpacing()
   const ctx = use()
   const [expanded, setExpanded] = createSignal(false)
   const [rawOpen, setRawOpen] = createSignal(false)
@@ -2658,7 +2670,7 @@ function ReviewFinish(props: { review: { report: ReviewReport.Info; analysis: st
         part={props.part}
         onClick={expandable() ? () => setExpanded((prev) => !prev) : undefined}
       >
-        <box gap={1}>
+        <box gap={spacing}>
           <text fg={theme.text}>
             <span style={{ fg: approved() ? theme.success : theme.error, bold: true }}>
               {approved() ? "✓ Approved" : "✗ Needs fixes"}
@@ -2902,22 +2914,26 @@ function BlockTool(props: {
   const [hover, setHover] = createSignal(false)
   const error = createMemo(() => (props.part?.state.status === "error" ? props.part.state.error : undefined))
   // Inside an expanded activity block the panel is one of the block's detail
-  // rows: its own one-row padding is the blank row above and below it, and it
-  // keeps its left border on the block header's column so its content lands on
-  // the shared detail column. At transcript level both offsets stay as they are.
+  // rows: it draws no padding or gap rows of its own, so the block holds no
+  // blank row inside it, and it keeps its left border on the block header's
+  // column so its content lands on the shared detail column. Only the block's
+  // boundary margin draws a blank row. At transcript level the panel keeps its
+  // padding and gaps, and registers as self-padded so the shared blank row is
+  // drawn once.
   const detail = useContext(activityDetail)
+  const spacing = usePanelSpacing()
   return (
     <box
       ref={(el: BoxRenderable) => {
         alwaysSeparate.add(el)
-        selfPadded.add(el)
+        if (!detail) selfPadded.add(el)
       }}
       border={["left"]}
-      paddingTop={1}
-      paddingBottom={1}
+      paddingTop={spacing}
+      paddingBottom={spacing}
       paddingLeft={detail ? ACTIVITY_DETAIL_INDENT - 1 : 2}
       marginTop={detail ? 0 : 1}
-      gap={1}
+      gap={spacing}
       backgroundColor={hover() ? theme.backgroundMenu : theme.backgroundPanel}
       customBorderChars={SplitBorder.customBorderChars}
       borderColor={theme.background}
@@ -2952,6 +2968,7 @@ function BlockTool(props: {
 
 function Shell(props: ToolProps) {
   const { theme } = useTheme()
+  const spacing = usePanelSpacing()
   const pathFormatter = usePathFormatter()
   const ctx = use()
   const isRunning = createMemo(() => props.part.state.status === "running")
@@ -2992,7 +3009,7 @@ function Shell(props: ToolProps) {
           part={props.part}
           onClick={collapsed().overflow ? () => setExpanded((prev) => !prev) : undefined}
         >
-          <box gap={1}>
+          <box gap={spacing}>
             <Show when={isRunning()} fallback={<text fg={theme.text}>$ {stringValue(props.input.command)}</text>}>
               <Spinner color={theme.text}>{stringValue(props.input.command)}</Spinner>
             </Show>
