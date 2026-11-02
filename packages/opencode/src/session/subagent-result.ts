@@ -1,6 +1,6 @@
 import type { SessionV1 } from "@opencode-ai/core/v1/session"
 
-import { isRecord } from "@/util/record"
+import { isRecord } from "../util/record"
 import FINISH_NUDGE from "./prompt/finish-nudge.txt"
 import REVIEW_STAGNATION_NUDGE from "./prompt/review-stagnation-nudge.txt"
 

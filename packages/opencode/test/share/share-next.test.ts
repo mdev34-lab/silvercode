@@ -14,6 +14,7 @@ import { MessageV2 } from "@/session/message-v2"
 import { MessageID, PartID, type SessionID } from "../../src/session/schema"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { Provider } from "@/provider/provider"
+import { ModelsDev } from "@opencode-ai/core/models-dev"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { ShareNext } from "@/share/share-next"
 import { SessionShareTable } from "@opencode-ai/core/share/sql"
@@ -43,7 +44,18 @@ function requestLayer(client: HttpClient.HttpClient) {
 }
 
 function integrationLayer(client: HttpClient.HttpClient) {
-  const replacement = [httpClient, Layer.succeed(HttpClient.HttpClient, client)] as const
+  // Keep the integration catalog local without changing the shared HTTP client.
+  const catalog = Layer.effect(
+    ModelsDev.Service,
+    Effect.promise(() => Bun.file(new URL("../tool/fixtures/models-api.json", import.meta.url)).json()).pipe(
+      Effect.map((value) =>
+        ModelsDev.Service.of({
+          get: () => Effect.succeed(value as Record<string, ModelsDev.Provider>),
+          refresh: () => Effect.void,
+        }),
+      ),
+    ),
+  )
   return LayerNode.compile(
     LayerNode.group([
       ShareNext.node,
@@ -52,8 +64,10 @@ function integrationLayer(client: HttpClient.HttpClient) {
       SessionProjector.node,
       AccountRepo.node,
       Database.node,
+      ModelsDev.node,
+      httpClient,
     ]),
-    [replacement],
+    [[httpClient, Layer.succeed(HttpClient.HttpClient, client)], [ModelsDev.node, catalog]],
   )
 }
 
@@ -225,6 +239,42 @@ describe("ShareNext", () => {
           expect(seen.map((req) => [req.method, req.url])).toEqual([
             ["POST", "https://legacy-share.example.com/api/share"],
             ["DELETE", "https://legacy-share.example.com/api/share/shr_abc"],
+          ])
+        }).pipe(Effect.provide(integrationLayer(client)))
+      },
+      { config: { enterprise: { url: "https://legacy-share.example.com" } } },
+    ),
+  )
+
+  it.live("integration layer isolates catalog refresh while retaining unrelated HTTP", () =>
+    provideTmpdirInstance(
+      () => {
+        const seen: HttpClientRequest.HttpClientRequest[] = []
+        const client = HttpClient.make((req) => {
+          seen.push(req)
+          if (req.method === "POST") {
+            return Effect.succeed(
+              json(req, { id: "shr_abc", url: "https://legacy-share.example.com/share/abc", secret: "sec_123" }),
+            )
+          }
+          return Effect.succeed(HttpClientResponse.fromWeb(req, new Response(null, { status: 200 })))
+        })
+        return Effect.gen(function* () {
+          const catalog = yield* ModelsDev.Service
+          const models = yield* catalog.get()
+          expect(models.openai?.models).toBeDefined()
+          yield* catalog.refresh(true)
+          const session = yield* (yield* Session.Service).create({ title: "test" })
+          const service = yield* ShareNext.Service
+          yield* service.create(session.id)
+          yield* service.remove(session.id)
+          const http = yield* HttpClient.HttpClient
+          yield* http.execute(HttpClientRequest.get("https://unrelated.example.test/probe"))
+          expect(yield* share(session.id)).toBeUndefined()
+          expect(seen.map((req) => [req.method, req.url])).toEqual([
+            ["POST", "https://legacy-share.example.com/api/share"],
+            ["DELETE", "https://legacy-share.example.com/api/share/shr_abc"],
+            ["GET", "https://unrelated.example.test/probe"],
           ])
         }).pipe(Effect.provide(integrationLayer(client)))
       },
