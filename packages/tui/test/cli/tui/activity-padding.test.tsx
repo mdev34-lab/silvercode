@@ -321,6 +321,7 @@ function pendingToolPart(id: string, messageID: string, tool: string, input: Rec
 
 const PENDING_READ = "~ Reading file..."
 const PENDING_GREP = "~ Searching content..."
+const PENDING_HEADER_LABEL = "Exploring files..."
 
 // Two pending calls in one run: the run is an activity block, so each pending
 // row is a detail row under the block header. `standalone` renders a single
@@ -487,6 +488,28 @@ function columnOf(frame: string, needle: string) {
     .find((line) => line.includes(needle))
   if (!row) throw new Error(`needle "${needle}" not found in frame:\n${frame}`)
   return row.indexOf(needle)
+}
+
+// A running block header draws `− <spinner> Exploring files...`, and the spinner
+// cycles ten glyphs at 80ms, so which glyph a frame catches is a matter of when
+// the capture lands — `⠼` in one run, `⠸` in another. Freezing one animation
+// frame into the needle makes the test depend on render timing; instead the
+// header's real prefix is asserted by shape (marker, one spinner frame, the full
+// label) and the column is measured from the row the renderer actually drew.
+const PENDING_HEADER = /^− [⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] Exploring files\.\.\.$/u
+
+function pendingHeader(frame: string): { column: number; anchor: string } {
+  const row = frame
+    .replace(/\n$/, "")
+    .split("\n")
+    .find((line) => line.includes(PENDING_HEADER_LABEL))
+  if (!row) throw new Error(`pending header "${PENDING_HEADER_LABEL}" not found in frame:\n${frame}`)
+  const column = row.indexOf("−")
+  const anchor = row.slice(column).trimEnd()
+  if (!PENDING_HEADER.test(anchor)) {
+    throw new Error(`pending header does not start with a spinner prefix: ${JSON.stringify(anchor)}`)
+  }
+  return { column, anchor }
 }
 
 // The transcript columns only, starting at `anchor` (a block header marker):
@@ -974,16 +997,17 @@ describe("activity block spacing", () => {
       const frame = await settledFrame(app, PENDING_GREP)
       await capture(app, `activity-padding-pending-${size}`)
 
-      const header = columnOf(frame, "− ⠼ Exploring files...")
+      const header = pendingHeader(frame)
       // The marker column is +2, the same column the completed cases assert for
       // a detail row's icon: not 5 (wrapper indent plus a second text indent).
-      expect(columnOf(frame, PENDING_READ)).toBe(header + 2)
-      expect(columnOf(frame, PENDING_GREP)).toBe(header + 2)
+      expect(columnOf(frame, PENDING_READ)).toBe(header.column + 2)
+      expect(columnOf(frame, PENDING_GREP)).toBe(header.column + 2)
+      expect(columnOf(frame, PENDING_READ)).not.toBe(header.column + 5)
       // Header -> first pending row, and row -> row: no blank row either way.
-      expectNoBlankRowBetween(frame, "− ⠼ Exploring files...", "− ⠼ Exploring files...", PENDING_READ)
-      expectNoBlankRowBetween(frame, "− ⠼ Exploring files...", PENDING_READ, PENDING_GREP)
+      expectNoBlankRowBetween(frame, header.anchor, header.anchor, PENDING_READ)
+      expectNoBlankRowBetween(frame, header.anchor, PENDING_READ, PENDING_GREP)
       // The block boundary below the last pending row is still one blank row.
-      expectOneBlankRowBetween(frame, "− ⠼ Exploring files...", PENDING_GREP, "After the pending calls.")
+      expectOneBlankRowBetween(frame, header.anchor, PENDING_GREP, "After the pending calls.")
       // Pending text, colours and the `~` marker are untouched.
       expect(await colorOf(app, PENDING_READ)).toEqual({
         fg: [238, 238, 238, 255],
