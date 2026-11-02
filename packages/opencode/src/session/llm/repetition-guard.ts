@@ -113,7 +113,7 @@ function repeatedUnitLength(tail: string, repeats: number): number | undefined {
 // Detects a model stuck regenerating the same text without reaching a
 // tool call (issue #94): identical lines, or one fragment verbatim, while
 // the harness pays for every token. Both rules are scoped to a single
-// text part and suppressed inside fenced code blocks (fenced rows are
+// text part or reasoning ID and suppressed inside fenced code blocks (fenced rows are
 // legitimate; the generation-length cap bounds them). Fences are decided
 // by one machine over the line under construction: a line's leading
 // characters are held back from the fragment tail until they settle
@@ -129,139 +129,156 @@ export function guard<E, R>(
     const lineRule = options.thresholds.lineRepeats >= 2 ? options.thresholds.lineRepeats : undefined
     const unitRule = options.thresholds.unitRepeats >= 2 ? options.thresholds.unitRepeats : undefined
 
-    let previousLine: string | undefined
-    let runCount = 0
-    let fenced = false
-    let lineParts: string[] = []
-    let tail: string[] = []
-    let sinceCheck = 0
-    // Fence state of the line under construction: "pending" can still
-    // become a fence line (its prefix is held back), "fence" feeds
-    // nothing, "plain" feeds everything.
-    let lineFence: "pending" | "fence" | "plain" = "pending"
-    let held = ""
+    const detector = () => {
+      let previousLine: string | undefined
+      let runCount = 0
+      let fenced = false
+      let lineParts: string[] = []
+      let tail: string[] = []
+      let sinceCheck = 0
+      // Fence state of the line under construction: "pending" can still
+      // become a fence line (its prefix is held back), "fence" feeds
+      // nothing, "plain" feeds everything.
+      let lineFence: "pending" | "fence" | "plain" = "pending"
+      let held = ""
 
-    const resetRun = () => {
-      previousLine = undefined
-      runCount = 0
-    }
-    const resetUnit = () => {
-      tail = []
-      sinceCheck = 0
-    }
-    const resetLine = () => {
-      lineParts = []
-      lineFence = "pending"
-      held = ""
-    }
-
-    // Retains one unfenced segment; checks the tail every CHECK_EVERY_CHARS.
-    const feed = (segment: string): string | undefined => {
-      if (unitRule === undefined) return undefined
-      tail.push(segment)
-      sinceCheck += segment.length
-      if (sinceCheck < CHECK_EVERY_CHARS) return undefined
-      sinceCheck = 0
-      const text = tail.join("").slice(-TAIL_CHARS)
-      tail = [text]
-      const len = repeatedUnitLength(text, unitRule)
-      if (len === undefined) return undefined
-      return (
-        `the model streamed the same ${len}-character fragment ${unitRule} times in a row without making progress. ` +
-        `Aborted the stream instead of paying for more of the same; retry or rephrase the prompt. ` +
-        `(Override with OPENCODE_EXPERIMENTAL_REPETITION_UNITS.)`
-      )
-    }
-
-    // Consumes the completed line: toggles fences, feeds the separator
-    // (plus anything held back while the fence question was open) to the
-    // fragment tail, and walks the identical-line run. Blank lines are
-    // transparent: paragraph breaks do not reset a run.
-    const onLineComplete = (): string | undefined => {
-      const isFence = lineFence === "fence"
-      const late = lineFence === "pending" ? held : ""
-      const line = lineParts.join("")
-      resetLine()
-      if (isFence) {
-        // A fence boundary starts a fresh tail in both directions.
-        fenced = !fenced
-        resetRun()
-        resetUnit()
-        return undefined
+      const resetRun = () => {
+        previousLine = undefined
+        runCount = 0
       }
-      // Fenced content breaks the run: repetition that resumes after a
-      // code block is not consecutive.
-      if (fenced) {
-        resetRun()
-        return undefined
+      const resetUnit = () => {
+        tail = []
+        sinceCheck = 0
       }
-      if (lineRule !== undefined && NON_WHITESPACE.test(line)) {
-        // Identity is exact: the whole previous significant line.
-        if (line === previousLine) runCount += 1
-        else {
-          previousLine = line
-          runCount = 1
+      const resetLine = () => {
+        lineParts = []
+        lineFence = "pending"
+        held = ""
+      }
+
+      // Retains one unfenced segment; checks the tail every CHECK_EVERY_CHARS.
+      const feed = (segment: string): string | undefined => {
+        if (unitRule === undefined) return undefined
+        tail.push(segment)
+        sinceCheck += segment.length
+        if (sinceCheck < CHECK_EVERY_CHARS) return undefined
+        sinceCheck = 0
+        const text = tail.join("").slice(-TAIL_CHARS)
+        tail = [text]
+        const len = repeatedUnitLength(text, unitRule)
+        if (len === undefined) return undefined
+        return (
+          `the model streamed the same ${len}-character fragment ${unitRule} times in a row without making progress. ` +
+          `Aborted the stream instead of paying for more of the same; retry or rephrase the prompt. ` +
+          `(Override with OPENCODE_EXPERIMENTAL_REPETITION_UNITS.)`
+        )
+      }
+
+      // Consumes the completed line: toggles fences, feeds the separator
+      // (plus anything held back while the fence question was open) to the
+      // fragment tail, and walks the identical-line run. Blank lines are
+      // transparent: paragraph breaks do not reset a run.
+      const onLineComplete = (): string | undefined => {
+        const isFence = lineFence === "fence"
+        const late = lineFence === "pending" ? held : ""
+        const line = lineParts.join("")
+        resetLine()
+        if (isFence) {
+          // A fence boundary starts a fresh tail in both directions.
+          fenced = !fenced
+          resetRun()
+          resetUnit()
+          return undefined
         }
-        if (runCount >= lineRule && line.length >= MIN_LINE_CHARS && ALPHANUMERIC.test(line))
-          return (
-            `the model streamed the same line ("${preview(line)}") ${runCount} times in a row without reaching a tool call. ` +
-            `Aborted the stream instead of paying for more of the same; retry or rephrase the prompt. ` +
-            `(Override with OPENCODE_EXPERIMENTAL_REPETITION_LINES.)`
-          )
-      }
-      return feed(late + "\n")
-    }
-
-    // Streams one text delta through both rules. Fence state settles as
-    // the line's opening characters arrive — inside a fenced block too,
-    // where it recognizes the closer — and a segment is fed only if it
-    // belongs to the unfenced region.
-    const onText = (text: string): string | undefined => {
-      const pieces = text.split("\n")
-      for (let i = 0; i < pieces.length; i++) {
-        if (i > 0) {
-          const detail = onLineComplete()
-          if (detail) return detail
+        // Fenced content breaks the run: repetition that resumes after a
+        // code block is not consecutive.
+        if (fenced) {
+          resetRun()
+          return undefined
         }
-        const piece = pieces[i]
-        lineParts.push(piece)
-        if (lineFence === "pending") {
-          const candidate = held + piece
-          if (FENCE.test(candidate)) {
-            // A fence line's bytes (info string included) never reach the
-            // fragment tail, newline or not.
-            held = ""
-            lineFence = "fence"
-          } else if (FENCE_PENDING.test(candidate)) {
-            held = candidate
-          } else {
-            held = ""
-            lineFence = "plain"
-            if (!fenced) {
-              const detail = feed(candidate)
-              if (detail) return detail
-            }
+        if (lineRule !== undefined && NON_WHITESPACE.test(line)) {
+          // Identity is exact: the whole previous significant line.
+          if (line === previousLine) runCount += 1
+          else {
+            previousLine = line
+            runCount = 1
           }
-          continue
+          if (runCount >= lineRule && line.length >= MIN_LINE_CHARS && ALPHANUMERIC.test(line))
+            return (
+              `the model streamed the same line ("${preview(line)}") ${runCount} times in a row without reaching a tool call. ` +
+              `Aborted the stream instead of paying for more of the same; retry or rephrase the prompt. ` +
+              `(Override with OPENCODE_EXPERIMENTAL_REPETITION_LINES.)`
+            )
         }
-        if (lineFence === "plain" && !fenced) {
-          const detail = feed(piece)
-          if (detail) return detail
-        }
+        return feed(late + "\n")
       }
-      return undefined
+
+      // Streams one text delta through both rules. Fence state settles as
+      // the line's opening characters arrive — inside a fenced block too,
+      // where it recognizes the closer — and a segment is fed only if it
+      // belongs to the unfenced region.
+      const onText = (text: string): string | undefined => {
+        const pieces = text.split("\n")
+        for (let i = 0; i < pieces.length; i++) {
+          if (i > 0) {
+            const detail = onLineComplete()
+            if (detail) return detail
+          }
+          const piece = pieces[i]
+          lineParts.push(piece)
+          if (lineFence === "pending") {
+            const candidate = held + piece
+            if (FENCE.test(candidate)) {
+              // A fence line's bytes (info string included) never reach the
+              // fragment tail, newline or not.
+              held = ""
+              lineFence = "fence"
+            } else if (FENCE_PENDING.test(candidate)) {
+              held = candidate
+            } else {
+              held = ""
+              lineFence = "plain"
+              if (!fenced) {
+                const detail = feed(candidate)
+                if (detail) return detail
+              }
+            }
+            continue
+          }
+          if (lineFence === "plain" && !fenced) {
+            const detail = feed(piece)
+            if (detail) return detail
+          }
+        }
+        return undefined
+      }
+
+      return { onText, finish: () => onLineComplete() }
     }
 
+    let textDetector = detector()
+    const reasoning = new Map<string, ReturnType<typeof detector>>()
     const inspect = (event: LLMEvent): string | undefined => {
       if (LLMEvent.is.textStart(event)) {
-        resetRun()
-        resetUnit()
-        resetLine()
-        fenced = false
+        textDetector = detector()
         return undefined
       }
-      if (!LLMEvent.is.textDelta(event)) return undefined
-      return onText(event.text)
+      if (LLMEvent.is.textDelta(event)) return textDetector.onText(event.text)
+      if (LLMEvent.is.reasoningStart(event)) {
+        reasoning.set(event.id, detector())
+        return undefined
+      }
+      if (LLMEvent.is.reasoningDelta(event)) {
+        const current = reasoning.get(event.id) ?? detector()
+        reasoning.set(event.id, current)
+        return current.onText(event.text)
+      }
+      if (LLMEvent.is.reasoningEnd(event)) {
+        const current = reasoning.get(event.id)
+        reasoning.delete(event.id)
+        return current?.finish()
+      }
+      return undefined
     }
 
     return self.pipe(

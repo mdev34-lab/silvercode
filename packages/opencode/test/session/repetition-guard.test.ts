@@ -442,13 +442,87 @@ describe("RepetitionGuard.guard", () => {
     }),
   )
 
-  it.effect("ignores reasoning and tool-input deltas", () =>
+  it.effect("aborts repeated reasoning deltas", () =>
+    Effect.gen(function* () {
+      const input = [
+        LLMEvent.reasoningStart({ id: "r1" }),
+        ...Array.from({ length: 20 }, () => LLMEvent.reasoningDelta({ id: "r1", text: `${SHORT_LINE}\n` })),
+        LLMEvent.reasoningEnd({ id: "r1" }),
+      ]
+      const error = yield* RepetitionGuard.guard(Stream.fromIterable(input), defaults()).pipe(
+        Stream.runDrain,
+        Effect.flip,
+      )
+      expect(error).toBeInstanceOf(RepetitionGuard.RepetitionDetectedError)
+    }),
+  )
+
+  it.effect("isolates interleaved reasoning IDs from each other and text", () =>
+    Effect.gen(function* () {
+      const input = [
+        LLMEvent.reasoningStart({ id: "a" }),
+        LLMEvent.reasoningStart({ id: "b" }),
+        LLMEvent.textStart({ id: "t" }),
+        ...Array.from({ length: 4 }, () => [
+          LLMEvent.reasoningDelta({ id: "a", text: `${SHORT_LINE}\n` }),
+          LLMEvent.reasoningDelta({ id: "b", text: `${SHORT_LINE}\n` }),
+          LLMEvent.textDelta({ id: "t", text: `${SHORT_LINE}\n` }),
+        ]).flat(),
+        LLMEvent.reasoningEnd({ id: "a" }),
+        LLMEvent.reasoningEnd({ id: "b" }),
+        LLMEvent.textEnd({ id: "t" }),
+      ]
+      const collected = yield* RepetitionGuard.guard(Stream.fromIterable(input), defaults()).pipe(Stream.runCollect)
+      expect(Array.from(collected)).toStrictEqual(input)
+      const interrupted = [...input.slice(0, -3), LLMEvent.reasoningDelta({ id: "a", text: `${SHORT_LINE}\n` })]
+      const error = yield* RepetitionGuard.guard(Stream.fromIterable(interrupted), defaults()).pipe(Stream.runDrain, Effect.flip)
+      expect(error).toBeInstanceOf(RepetitionGuard.RepetitionDetectedError)
+    }),
+  )
+
+  it.effect("flushes a final reasoning line and resets an ended ID", () =>
+    Effect.gen(function* () {
+      const delta = (text: string) => LLMEvent.reasoningDelta({ id: "a", text })
+      const reset = [
+        LLMEvent.reasoningStart({ id: "a" }),
+        delta(`${SHORT_LINE}\n`.repeat(4)),
+        LLMEvent.reasoningEnd({ id: "a" }),
+        LLMEvent.reasoningStart({ id: "a" }),
+        delta(`${SHORT_LINE}\n`.repeat(4)),
+        LLMEvent.reasoningEnd({ id: "a" }),
+      ]
+      const collected = yield* RepetitionGuard.guard(Stream.fromIterable(reset), defaults()).pipe(Stream.runCollect)
+      expect(Array.from(collected)).toStrictEqual(reset)
+      const input = [
+        LLMEvent.reasoningStart({ id: "a" }),
+        delta(`${SHORT_LINE}\n`.repeat(4) + SHORT_LINE),
+        LLMEvent.reasoningEnd({ id: "a" }),
+      ]
+      const error = yield* RepetitionGuard.guard(Stream.fromIterable(input), defaults()).pipe(
+        Stream.runDrain,
+        Effect.flip,
+      )
+      expect(error).toBeInstanceOf(RepetitionGuard.RepetitionDetectedError)
+    }),
+  )
+
+  it.effect("leaves repeated fenced reasoning intact", () =>
+    Effect.gen(function* () {
+      const input = [
+        LLMEvent.reasoningStart({ id: "a" }),
+        LLMEvent.reasoningDelta({ id: "a", text: "\`\`" }),
+        LLMEvent.reasoningDelta({ id: "a", text: "\`\n" + `${FIXTURE_ROW}\n`.repeat(20) + "\`\`\`\n" }),
+        LLMEvent.reasoningEnd({ id: "a" }),
+      ]
+      const collected = yield* RepetitionGuard.guard(Stream.fromIterable(input), defaults()).pipe(Stream.runCollect)
+      expect(Array.from(collected)).toStrictEqual(input)
+    }),
+  )
+
+  it.effect("ignores tool-input deltas", () =>
     Effect.gen(function* () {
       const input = [
         LLMEvent.stepStart({ index: 0 }),
-        LLMEvent.reasoningStart({ id: "reasoning-1" }),
-        ...Array.from({ length: 10 }, () => LLMEvent.reasoningDelta({ id: "reasoning-1", text: ISSUE_LINE })),
-        LLMEvent.reasoningEnd({ id: "reasoning-1" }),
         LLMEvent.toolInputStart({ id: "call-1", name: "lookup" }),
         ...Array.from({ length: 10 }, () =>
           LLMEvent.toolInputDelta({ id: "call-1", name: "lookup", text: ISSUE_LINE }),

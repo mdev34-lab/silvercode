@@ -27,6 +27,18 @@ const contentText = (content: unknown) => {
   return content === undefined ? "" : JSON.stringify(content)
 }
 const childTaskPrompt = "Research CHILD_WAIT_INPUT"
+const rootPrompt = "Research the child wait report"
+const rootConversation = (hit: RequestHit) => {
+  const body = hit.body as Body
+  return hit.url.pathname === "/v1/chat/completions" && body.model === "local-quota-test" &&
+    (body.messages ?? []).some((message) => message.role === "user" && contentText(message.content).includes(rootPrompt))
+}
+const rootAfterChild = (hit: RequestHit, childSent: boolean) =>
+  rootConversation(hit) &&
+  (JSON.stringify(hit.body).includes("child done") ||
+    (childSent &&
+      (hit.body as Body).messages?.at(-1)?.role === "user" &&
+      lastText(hit.body as Body).startsWith("[WARNING] The turn ended without a successful finish call.")))
 const lastText = (body: Body) => {
   const content = body.messages?.at(-1)?.content
   if (typeof content === "string") return content
@@ -154,18 +166,9 @@ describe("headless run provider retry delay (#555)", () => {
       // The root's test-controlled turn stays in the transcript when finish nudges
       // append new user messages. Match that stable content rather than the latest
       // message role/text (or the session's possibly earlier user turn under --continue).
-      const rootPrompt = "Research the child wait report"
-      const rootConversation = (hit: RequestHit) => {
-        const body = hit.body as Body
-        if (hit.url.pathname !== "/v1/chat/completions" || body.model !== "local-quota-test") return false
-        return (body.messages ?? []).some(
-          (message) => message.role === "user" && contentText(message.content).includes(rootPrompt),
-        )
-      }
       const rootAfterProbe = (hit: RequestHit) =>
         rootConversation(hit) && JSON.stringify(hit.body).includes("child wait probe")
-      const rootAfterChild = (hit: RequestHit) =>
-        rootConversation(hit) && JSON.stringify(hit.body).includes("child done")
+      let childSent = false
       const childRequest = (hit: RequestHit) => {
         const body = hit.body as Body
         if (hit.url.pathname !== "/v1/chat/completions" || body.model !== "local-quota-test") return false
@@ -191,12 +194,13 @@ describe("headless run provider retry delay (#555)", () => {
       // by the production retry cap.
       yield* llm.pushMatchRepeat(
         childRequest,
-        reply().tool("finish", { reason: "success", result: envelope("child done") }).stop(),
+        reply().tool("finish", { reason: "success", result: envelope("child done") }).stop().onSend(() => { childSent = true }),
         SessionRetry.RETRY_MAX_RETRIES,
       )
-      // Child results can be present earlier in the transcript even after a
-      // synthetic parent nudge becomes the final user message.
-      yield* llm.pushMatch(rootAfterChild,
+      // A finish reminder may not carry the child's result text. Only route it
+      // after the child's scripted recovery response has actually been sent;
+      // the root identity and exact reminder prefix still scope the match.
+      yield* llm.pushMatch((hit) => rootAfterChild(hit, childSent),
         reply().text("ROOT_FINAL").tool("finish", { reason: "success", result: "done" }).stop())
       const result = yield* opencode.run(rootPrompt, {
         timeoutMs: 50_000, extraArgs: ["--continue", "--dangerously-skip-permissions"], model: "opencode/local-quota-test", env, clockScale: 10,
@@ -256,6 +260,39 @@ describe("headless run provider retry delay (#555)", () => {
         expect(misses).toEqual([])
         expect(pending).toBe(0)
       }, requestDiagnostics)
+    }), 90_000)
+
+  cliIt.live("routes a root finish reminder after a child response without requiring child result text", ({ llm }) =>
+    Effect.gen(function* () {
+      let childSent = false
+      yield* llm.pushMatch(
+        (hit) => (hit.body as Body).messages?.some((message) => contentText(message.content).startsWith(childTaskPrompt)) === true,
+        reply().tool("finish", { reason: "success", result: envelope("child done") }).stop().onSend(() => { childSent = true }),
+      )
+      yield* llm.pushMatch((hit) => rootAfterChild(hit, childSent), reply().text("ROOT_FINAL").tool("finish", { reason: "success", result: "done" }).stop())
+      const request = (messages: Body["messages"]) => fetch(`${llm.url}/chat/completions`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model: "local-quota-test", messages }),
+      }).then((response) => response.text())
+      yield* Effect.promise(() => request([{ role: "user", content: childTaskPrompt }]))
+      const reminder = [
+        { role: "user", content: rootPrompt },
+        { role: "user", content: "[WARNING] The turn ended without a successful finish call." },
+      ]
+      const hit = { url: new URL(`${llm.url}/chat/completions`), body: { model: "local-quota-test", messages: reminder } }
+      expect(rootAfterChild(hit, false)).toBe(false)
+      expect(rootAfterChild({ ...hit, body: { ...hit.body, model: "other" } }, true)).toBe(false)
+      expect(rootAfterChild({ ...hit, url: new URL(`${llm.url}/responses`) }, true)).toBe(false)
+      expect(rootAfterChild({ ...hit, body: { ...hit.body, messages: [{ role: "user", content: childTaskPrompt }, reminder[1]] } }, true)).toBe(false)
+      const response = yield* Effect.promise(() => request([
+        { role: "user", content: "two long waits" },
+        { role: "user", content: rootPrompt },
+        { role: "assistant", content: "child wait probe" },
+        { role: "assistant", content: "ok" },
+        { role: "user", content: "[WARNING] The turn ended without a successful finish call. Call finish" },
+      ]))
+      expect(response).toContain("ROOT_FINAL")
+      expect(yield* llm.misses).toEqual([])
     }), 90_000)
 
   cliIt.live("fails fast instead of hanging when Zen quota reset exceeds the headless retry window", ({ llm, opencode }) =>

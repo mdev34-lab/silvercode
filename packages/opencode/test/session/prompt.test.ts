@@ -6931,6 +6931,106 @@ it.instance(
   20_000,
 )
 
+
+it.instance(
+  "reasoning repetition recovery preserves a completed real tool side effect once",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({
+        title: "Pinned",
+        agent: "work",
+        model: { providerID: ref.providerID, id: ref.modelID },
+      })
+      const callID = "call_guard_tool"
+      const { directory } = yield* TestInstance
+      const markerFile = path.join(directory, "repetition-tool-executions.txt")
+      const toolDone = yield* Deferred.make<void>()
+      // Head: the tool call streams and completes. Tail (after the gate): the
+      // same generation loops and trips the guard.
+      yield* llm.push(
+        raw({
+          head: [
+            sseChunk({ role: "assistant" }),
+            sseChunk({
+              tool_calls: [{ index: 0, id: callID, type: "function", function: { name: "bash", arguments: "" } }],
+            }),
+            sseChunk({
+              tool_calls: [
+                {
+                  index: 0,
+                  function: {
+                    arguments: JSON.stringify({
+                      command:
+                        `node -e "require('fs').appendFileSync('repetition-tool-executions.txt','executed\\n');console.log('TOOL_MARKER_CONTENT')"`,
+                      description: "write marker",
+                    }),
+                  },
+                },
+              ],
+            }),
+          ],
+          wait: deferredAsPromise(toolDone),
+          tail: [
+            sseChunk({ reasoning_content: RECOVERY_PREFIX }),
+            sseChunk({ reasoning_content: RECOVERY_FRAGMENT }),
+            sseChunk({ reasoning_content: RECOVERY_FRAGMENT }),
+            sseChunk({ reasoning_content: RECOVERY_FRAGMENT }),
+            sseChunk({ reasoning_content: RECOVERY_FRAGMENT }),
+            sseChunk({}, "tool_calls"),
+          ],
+        }),
+        reply().text("The model recovered with the tool result in hand.").stop(),
+      )
+
+      yield* user(chat.id, "please run the marker command")
+      const fiber = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+      yield* llm.wait(1)
+
+      // Wait for the completed bash tool call before opening the gate, so the
+      // part is settled before the guard aborts the stream (the reported shape).
+      yield* pollWithTimeout(
+        sessions.messages({ sessionID: chat.id }).pipe(
+          Effect.map((msgs) => {
+            const part = msgs.flatMap((m) => m.parts).find((candidate) => candidate.type === "tool")
+            return part && part.type === "tool" && part.state.status === "completed" ? true : undefined
+          }),
+        ),
+        "timed out waiting for the guard-trip tool call to complete",
+      )
+      yield* Deferred.succeed(toolDone, void 0)
+      yield* Fiber.join(fiber)
+
+      // The aborted generation's tool call executed exactly once and stayed the
+      // only call in the transcript.
+      const messages = yield* sessions.messages({ sessionID: chat.id })
+      expect(repetitionRecoveriesIn(messages)).toHaveLength(1)
+      expect(messages.some((message) => message.info.role === "assistant" && RepetitionGuard.isStoredError(message.info.error))).toBe(true)
+      expect(messages.flatMap((message) => message.parts).some((part) => part.type === "reasoning" && part.text.includes(RECOVERY_PREFIX))).toBe(true)
+      const toolParts = messages.flatMap((m) => m.parts.filter((p) => p.type === "tool"))
+      expect(toolParts).toHaveLength(1)
+      expect(toolParts[0]?.state.status).toBe("completed")
+
+      // The recovery request sees the completed call and its recorded output,
+      // instead of the errored-assistant filter erasing the generation and
+      // letting the model re-issue a finished call.
+      expect(yield* llm.calls).toBe(2)
+      const inputs = turnInputs(yield* llm.inputs)
+      expect(inputs).toHaveLength(2)
+      const recoveryRequest = JSON.stringify(inputs[1])
+      expect(recoveryRequest).toContain(callID)
+      // One output occurrence plus the command's literal marker in its input.
+      expect(recoveryRequest.match(/TOOL_MARKER_CONTENT/g)).toHaveLength(2)
+      expect(yield* Effect.promise(() => readFile(markerFile, "utf8"))).toBe("executed\n")
+      expect(yield* llm.pending).toBe(0)
+      expect(yield* llm.misses).toEqual([])
+    }),
+  { config: cfg },
+  20_000,
+)
+
 it.instance(
   "repetition-guard recovery: an HTTP 400 that quotes the guard text is not a guard trip",
   () =>
@@ -8526,7 +8626,9 @@ it.instance(
       const marker = path.join(dir, "ran")
       yield* llm.push(
         reply().tool("bash", {
-          command: `while [ ! -f '${gate}' ]; do sleep 0.05; done; printf ran >> '${marker}'`,
+          // Use a real gated process without assuming either POSIX shell syntax
+          // or that a native Windows path can be interpreted by Git Bash.
+          command: `node -e "const fs=require('fs');const t=setInterval(()=>{if(fs.existsSync('release')){fs.appendFileSync('ran','ran');clearInterval(t)}},50)"`,
           description: "gated tool",
         }),
         reply().text("P1 done").tool("finish", { reason: "success", result: "P1 done" }),
