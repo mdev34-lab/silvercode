@@ -144,12 +144,12 @@ function mountProposal(size: keyof typeof SIZES, options: Partial<MountOptions> 
 
 // Read-then-edit: the block above ends with a one-line detail row, which is the
 // case where a missing blank row would glue that row to the next block header.
-function mountReadThenEdit(size: keyof typeof SIZES) {
+function mountReadThenEdit(size: keyof typeof SIZES, filePath = "src/app.py") {
   const session = sessionInfo(SESSION, { title: "Fix the App class" })
   const user = userMessage("msg_00_user", SESSION)
   const work = assistantMessage("msg_01_work", SESSION, { time: { created: at(1), completed: at(6) } })
   const parts: Part[] = [
-    toolPart("prt_read", work.id, "read", { filePath: "src/app.py", limit: 70, offset: 465 }, {}, at(1), at(2)),
+    toolPart("prt_read", work.id, "read", { filePath, limit: 70, offset: 465 }, {}, at(1), at(2)),
     toolPart(
       "prt_edit",
       work.id,
@@ -286,6 +286,29 @@ describe("activity block spacing", () => {
       expectOneBlankRowBetween(frame, "− Explored 1 file", "Now verify the edit.", "+ Thought: Verifying the edit")
     })
   }
+
+  // A long read argument wraps inside its row. The wrapped row still counts as
+  // one detail line: it starts after the same blank row, its wrapped text stays
+  // on the row's text column, and exactly one blank row follows its last line.
+  test("narrow: a wrapped detail row keeps the block spacing", async () => {
+    const long = "src/packages/tui/src/component/prompt/history/very-long-file-name-app.py"
+    const { app } = await mountReadThenEdit("narrow", long)
+    await settle(app)
+    const frame = await settledFrame(app, "Edited 1 file")
+
+    const rows = rowsOf(frame, "− Explored 1 file")
+    const header = rowOf(rows, "− Explored 1 file")
+    const first = rowOf(rows, "→ Read src/packages/tui/src/component/prompt/history/")
+    const tail = rowOf(rows, "name-app.py [limit=70, offset=465]")
+    const edited = rowOf(rows, "− Edited 1 file")
+    expect(tail).toBeGreaterThan(first)
+    expect(edited).toBeGreaterThan(tail)
+
+    expect({ rows: rows.slice(header + 1, first) }).toEqual({ rows: [""] })
+    expect({ rows: rows.slice(tail + 1, edited) }).toEqual({ rows: [""] })
+    // The wrapped text keeps the row's own text column instead of drifting.
+    expect(columnOf(frame, "name-app.py [limit=70")).toBe(columnOf(frame, "Read src/packages"))
+  })
 
   // Normal width shows the whole run, so every boundary of the proposal's
   // example (command panel, read, edit) is measured in one frame.
