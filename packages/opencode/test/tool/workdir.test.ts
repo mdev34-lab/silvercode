@@ -281,19 +281,70 @@ describe("a folder request is read by the platform's rules", () => {
     // A POSIX-looking `/srv/...` is drive-rooted on Windows, not absolute.
     // Resolve a native path so this control uses the runner's absolute spelling.
     expect(Workdir.classify(path.resolve("srv", "project", "child"))).toBe("absolute")
+
+    for (const platform of ["linux", "darwin"] as const) {
+      expect(Workdir.classify("/srv/project/child", platform)).toBe("absolute")
+      expect(Workdir.classify("//folder", platform)).toBe("absolute")
+      expect(Workdir.classify("///folder", platform)).toBe("absolute")
+      expect(Workdir.classify("child", platform)).toBe("relative")
+      expect(Workdir.classify("./child", platform)).toBe("relative")
+      expect(Workdir.classify("../child", platform)).toBe("relative")
+    }
   })
 
   test("Windows spellings are read by the same rules on any runner", () => {
     // Absolute, and a UNC path names its own target rather than leaning on the
     // process, so both may be used as they are.
-    expect(Workdir.classify("C:\\projects\\child", "win32")).toBe("absolute")
-    expect(Workdir.classify("C:/projects/child", "win32")).toBe("absolute")
-    expect(Workdir.classify("\\\\server\\share\\child", "win32")).toBe("absolute")
-    // `C:child` follows that drive's current directory and `\child` follows the
-    // process's current drive: neither names a folder the caller asked for.
+    const winAbsolute = [
+      "C:\\",
+      "C:/",
+      "C:\\projects\\child",
+      "C:/projects/child",
+      "\\\\server\\share",
+      "\\\\server\\share\\child",
+      "//server/share",
+      "//server/share/child",
+    ]
+    for (const spelling of winAbsolute) {
+      expect(Workdir.classify(spelling, "win32")).toBe("absolute")
+      expect(path.win32.resolve("C:\\work\\one", spelling)).toBe(path.win32.resolve("D:\\work\\two", spelling))
+    }
+
+    // `C:child` follows that drive's current directory, and `\child`, `/child`,
+    // or an incomplete/over-slashed prefix (`//folder`, `///folder`, `\\folder`)
+    // normalizes to a single leading backslash on the process's current drive:
+    // none of them names a folder the caller asked for.
+    expect(Workdir.classify("C:", "win32")).toBe("process-relative")
     expect(Workdir.classify("C:child", "win32")).toBe("process-relative")
-    expect(Workdir.classify("\\child", "win32")).toBe("process-relative")
-    expect(Workdir.classify("child", "win32")).toBe("relative")
+
+    const ambientDriveRooted = [
+      "\\",
+      "/",
+      "\\child",
+      "/child",
+      "//",
+      "\\\\",
+      "//folder",
+      "///folder",
+      "\\\\folder",
+      "\\\\\\folder",
+      "///server/share",
+      "\\\\\\server\\share",
+      "//server/",
+      "\\\\server\\",
+      "\\/folder",
+      "/\\folder",
+    ]
+    for (const spelling of ambientDriveRooted) {
+      expect(Workdir.classify(spelling, "win32")).toBe("process-relative")
+      const normalized = path.win32.normalize(spelling)
+      expect(normalized.startsWith("\\") && !normalized.startsWith("\\\\")).toBe(true)
+      expect(path.win32.resolve("C:\\work\\one", spelling)).not.toBe(path.win32.resolve("D:\\work\\two", spelling))
+    }
+
+    for (const spelling of ["child", "./child", ".\\child", "../child", "..\\child"]) {
+      expect(Workdir.classify(spelling, "win32")).toBe("relative")
+    }
   })
 
   test("a case difference is the same folder on Windows and a different one elsewhere", () => {
@@ -317,17 +368,24 @@ describe("a folder request is read by the platform's rules", () => {
         const fs = yield* FSUtil.Service
         // `C:` for the drive the temp folder is on.
         const drive = (project.match(/^[A-Za-z]:/) ?? [""])[0]
+        // Existing top-level folder on the temp drive (e.g. `Users`), so any
+        // prefix that leaked through as `"absolute"` and normalized to `\Users`
+        // would hit a real folder on disk unless `classify` refuses it first.
+        const top = path.win32.relative(path.win32.parse(project).root, project).split(path.win32.sep)[0] || "Users"
 
         const driveRelative = yield* settle(Workdir.resolve({ fs, requested: `${drive}child`, base: project }))
         const driveRooted = yield* settle(
           Workdir.resolve({ fs, requested: `\\${path.basename(project)}`, base: project }),
         )
+        const doubleForward = yield* settle(Workdir.resolve({ fs, requested: `//${top}`, base: project }))
+        const tripleForward = yield* settle(Workdir.resolve({ fs, requested: `///${top}`, base: project }))
+        const doubleBack = yield* settle(Workdir.resolve({ fs, requested: `\\\\${top}`, base: project }))
 
-        // Both would otherwise be resolved from state the caller never named.
-        expect(driveRelative.ok).toBe(false)
-        expect(driveRelative.error).toContain("must be an absolute path")
-        expect(driveRooted.ok).toBe(false)
-        expect(driveRooted.error).toContain("must be an absolute path")
+        // All of these would otherwise be resolved from state the caller never named.
+        for (const refused of [driveRelative, driveRooted, doubleForward, tripleForward, doubleBack]) {
+          expect(refused.ok).toBe(false)
+          expect(refused.error).toContain("must be an absolute path")
+        }
       }),
     30_000,
   )

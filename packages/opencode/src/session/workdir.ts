@@ -62,12 +62,14 @@ export function expand(directory: string, home: string = os.homedir()) {
 /**
  * What a request names, in the terms the platform decides with.
  *
- * `absolute` names its own target, including a Windows UNC path
- * (`\\server\share\folder`), which is why those can be used as they are.
- * `relative` is resolved from the session's folder. `process-relative` names a
- * location that depends on state nobody asked about - `C:folder` follows that
- * drive's current directory and `\folder` follows the process's current drive -
- * so it is refused rather than silently resolved from somewhere else.
+ * `absolute` names its own target, including a Windows UNC path with both a
+ * server and share (`\\server\share\folder`), which is why those can be used as
+ * they are. `relative` is resolved from the session's folder.
+ * `process-relative` names a location that depends on state nobody asked about -
+ * `C:folder` follows that drive's current directory, and `\folder`, `/folder`,
+ * or an incomplete/over-slashed prefix such as `//folder`, `///folder`, or
+ * `\\folder` normalizes to `\folder` on the process's current drive - so it is
+ * refused rather than silently resolved from somewhere else.
  *
  * The platform is a parameter so both rule sets can be exercised on either
  * runner: the Linux leg proves the Windows spellings without a Windows machine,
@@ -78,7 +80,7 @@ export type Spelling = "absolute" | "relative" | "process-relative"
 export function classify(requested: string, platform: Platform = process.platform): Spelling {
   if (platform !== "win32") return path.posix.isAbsolute(requested) ? "absolute" : "relative"
   if (/^[A-Za-z]:(?![\\/])/.test(requested)) return "process-relative"
-  if (/^[\\/](?![\\/])/.test(requested)) return "process-relative"
+  if (/^[\\/]/.test(requested) && !path.win32.normalize(requested).startsWith("\\\\")) return "process-relative"
   return path.win32.isAbsolute(requested) ? "absolute" : "relative"
 }
 
