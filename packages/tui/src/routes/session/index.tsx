@@ -43,6 +43,7 @@ import type {
   TextPart,
   ReasoningPart,
   SessionStatus,
+  Message,
 } from "@opencode-ai/sdk/v2"
 import { ReviewReport } from "@opencode-ai/core/review-report"
 import { useLocal } from "../../context/local"
@@ -64,6 +65,8 @@ import { DialogForkFromTimeline } from "./dialog-fork-from-timeline"
 import { DialogSessionRename } from "../../component/dialog-session-rename"
 import { Sidebar } from "./sidebar"
 import { SubagentFooter } from "./subagent-footer.tsx"
+import { backgroundReview, reviewPresentationAnalysis, reviewText, subagentReview } from "./review-text"
+import { createExecutionReviewIndex } from "./review-execution"
 import { filetype } from "../../util/filetype"
 import parsers from "../../parsers-config"
 import { errorMessage } from "../../util/error"
@@ -105,7 +108,7 @@ import { collapseDiff } from "../../util/collapse-diff"
 import { usePluginRuntime } from "../../plugin/runtime"
 import { DialogRetryAction } from "../../component/dialog-retry-action"
 import { getRevertDiffFiles } from "../../util/revert-diff"
-import { parseBackgroundResult, type BackgroundResult } from "../../util/background-task"
+import { parseBackgroundResult } from "../../util/background-task"
 import { OPENCODE_BASE_MODE, useBindings, useCommandShortcut, useOpencodeKeymap } from "../../keymap"
 import { usePathFormatter } from "../../context/path-format"
 import { LocationProvider } from "../../context/location"
@@ -196,6 +199,7 @@ const context = createContext<{
   sync: ReturnType<typeof useSync>
   tui: ReturnType<typeof useTuiConfig>
   activity: () => ActivityGroups
+  reviewExecution?: () => ReturnType<typeof createExecutionReviewIndex>
   activityAllExpanded: () => boolean
   activityExpanded: (groupID: string) => boolean
   toggleActivity: (groupID: string) => void
@@ -247,6 +251,9 @@ export function Session() {
       .toSorted((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
   })
   const messages = createMemo(() => sync.data.message[route.sessionID] ?? [])
+  // The transcript is shared by every assistant row: discover its execution
+  // boundaries once per reactive change, not once per rendered message.
+  const reviewExecution = createMemo(() => createExecutionReviewIndex(messages(), sync.data.part))
   const messagesBeforeRevert = () => {
     const messageID = session()?.revert?.messageID
     if (!messageID) return messages()
@@ -1270,6 +1277,7 @@ export function Session() {
           sync,
           tui: tuiConfig,
           activity,
+          reviewExecution,
           activityAllExpanded,
           activityExpanded,
           toggleActivity,
@@ -1387,7 +1395,7 @@ export function Session() {
                         <></>
                       </Match>
                       <Match when={message.role === "user"}>
-                        <UserMessage
+                        <UserMessageRow
                           index={index()}
                           onMouseUp={() => {
                             if (renderer.getSelection()?.getSelectedText()) return
@@ -1496,7 +1504,7 @@ export function Session() {
   )
 }
 
-function UserMessage(props: {
+function UserMessageRow(props: {
   message: UserMessage
   parts: Part[]
   onMouseUp: () => void
@@ -1521,12 +1529,64 @@ function UserMessage(props: {
   // task delivery markup. The user text above hides synthetic parts, so each
   // delivered result gets its own history indicator instead of rendering
   // nothing and letting the main agent resume from an unexplained gap.
-  const backgroundResults = createMemo(() =>
-    props.parts
-      .filter((part): part is TextPart => part.type === "text" && part.synthetic === true)
-      .map((part) => parseBackgroundResult(part.text))
-      .filter((result): result is BackgroundResult => result !== undefined),
+  const backgroundParts = createMemo(() =>
+    props.parts.filter((part): part is TextPart => part.type === "text" && part.synthetic === true),
   )
+  const backgroundResults = createMemo(() =>
+    backgroundParts().flatMap((part) => {
+      const result = parseBackgroundResult(part.text)
+      return result ? [{ part, result }] : []
+    }),
+  )
+  const sdk = useSDK()
+  const sync = useSync()
+  const [history, setHistory] = createSignal<{ info: Message; parts: Part[] }[]>()
+  const [historyRevision, setHistoryRevision] = createSignal(0)
+  // A removal can affect a launch or duplicate outside this row (or outside
+  // sync's 100-message window). Invalidate immediately and refetch the full
+  // history; the effect cleanup also rejects any older in-flight response.
+  const offHistoryRemoval = sdk.event.on("event", (event) => {
+    const payload = event.payload
+    if ((payload.type !== "message.removed" && payload.type !== "message.part.removed") ||
+        payload.properties.sessionID !== props.message.sessionID) return
+    setHistory(undefined)
+    setHistoryRevision((revision) => revision + 1)
+  })
+  onCleanup(offHistoryRemoval)
+  // Sync retains only the newest 100 messages. Read the complete persisted
+  // history before treating a launch/receipt pair as unique. While loading or
+  // on failure the receipt remains visible on the ordinary fallback path.
+  createEffect(on(
+    () => ({ key: backgroundParts().filter((part) => ReviewReport.TAGS.some((tag) => part.text.includes(`<${tag}`))).map((part) => `${part.id}\n${part.text}`).join("\n"), revision: historyRevision() }),
+    ({ key }) => {
+      setHistory(undefined)
+      if (!key) return
+      let active = true
+      void sdk.client.session.messages({ sessionID: props.message.sessionID }, { throwOnError: true })
+        .then((response) => { if (active && response.data) setHistory(response.data) })
+        .catch(() => {})
+      onCleanup(() => { active = false })
+    },
+  ))
+  const backgroundCandidate = (receipt: TextPart) => {
+    const snapshot = history()
+    if (!snapshot) return undefined
+    const rows = new Map(snapshot.map((entry) => [entry.info.id, entry.info]))
+    const parts: Record<string, readonly Part[]> = Object.fromEntries(snapshot.map((entry) => [entry.info.id, entry.parts]))
+    // Overlay the live window so a receipt or launch updated during the fetch
+    // cannot be hidden by an older persisted snapshot.
+    for (const message of sync.data.message[props.message.sessionID] ?? []) {
+      rows.set(message.id, message)
+      const current = sync.data.part[message.id]
+      if (current) {
+        const merged = new Map((parts[message.id] ?? []).map((part) => [part.id, part]))
+        for (const part of current) merged.set(part.id, part)
+        parts[message.id] = [...merged.values()]
+      }
+    }
+    return backgroundReview({ receipt, messages: [...rows.values()], parts, sessions: sync.data.session, complete: true })
+  }
+  const hasReviewCandidate = (part: TextPart) => ReviewReport.TAGS.some((tag) => part.text.includes(`<${tag}`) || part.text.includes(`</${tag}`))
   const { theme } = useTheme()
   const [hover, setHover] = createSignal(false)
   const queued = createMemo(() => props.pending !== undefined && props.index > props.pending)
@@ -1599,7 +1659,8 @@ function UserMessage(props: {
         </box>
       </Show>
       <For each={backgroundResults()}>
-        {(result) => {
+        {(entry) => {
+          const result = entry.result
           const completed = () => result.state === "completed"
           const cancelled = () => result.state === "cancelled"
           return (
@@ -1623,9 +1684,17 @@ function UserMessage(props: {
                 </span>{" "}
                 {result.summary} — {cancelled() ? "cancellation" : "result"} delivered to the main agent
               </text>
+              <Show when={hasReviewCandidate(entry.part)}>
+                <Show when={backgroundCandidate(entry.part)} fallback={<box paddingLeft={3}><text fg={theme.text}>{entry.part.text}</text></box>}>
+                  {(review) => <ReviewFinish review={review()} />}
+                </Show>
+              </Show>
             </>
           )
         }}
+      </For>
+      <For each={backgroundParts().filter((part) => !parseBackgroundResult(part.text) && hasReviewCandidate(part))}>
+        {(part) => <box paddingLeft={3}><text fg={theme.text}>{part.text}</text></box>}
       </For>
       <Show when={compaction()}>
         <box
@@ -1640,6 +1709,9 @@ function UserMessage(props: {
   )
 }
 
+// Export the real user row for synthetic live-render transcript captures.
+export { UserMessageRow as CaptureUserMessage }
+
 // Exported so tests can render the assistant transcript row directly.
 export function AssistantMessageRow(props: { message: AssistantMessage; parts: Part[]; last: boolean }) {
   const ctx = use()
@@ -1648,6 +1720,60 @@ export function AssistantMessageRow(props: { message: AssistantMessage; parts: P
   const sync = useSync()
   const messages = createMemo(() => sync.data.message[props.message.sessionID] ?? [])
   const model = createMemo(() => Model.name(ctx.providers(), props.message.providerID, props.message.modelID))
+  // Standalone row fixtures may omit the session index; the route supplies one
+  // shared instance for all rows.
+  const localReviewExecution = createMemo(() => ctx.reviewExecution ? undefined : createExecutionReviewIndex(messages(), sync.data.part))
+  const execution = createMemo(() => (ctx.reviewExecution ? ctx.reviewExecution() : localReviewExecution())?.get(props.message.id))
+  const textReview = createMemo(() => execution() ? undefined : reviewText(props.message, props.parts))
+  const matchingFinish = createMemo(() => {
+    const text = textReview()
+    if (!text) return undefined
+    for (const part of props.parts) {
+      if (part.type !== "tool" || part.tool !== "finish" || part.state.status !== "completed") continue
+      if (finishBlockView(part, part.state.input)?.tone !== "success") continue
+      const finish = parseReviewReport(finishResult(part.state.input, part.state.output))
+      if (!finish || JSON.stringify(finish.report) !== JSON.stringify(text.report)) continue
+      const analysis = reviewPresentationAnalysis(finish.analysis)
+      if (analysis === undefined) continue
+      return { part, analysis }
+    }
+    return undefined
+  })
+  const earlierReview = createMemo(() => {
+    const rows = messages()
+    const index = rows.findIndex((row) => row.id === props.message.id)
+    if (index < 0) return undefined
+    for (let i = index - 1; i >= 0; i--) {
+      const row = rows[i]
+      if (row.role !== "assistant" || row.parentID !== props.message.parentID || row.agent !== props.message.agent) break
+      const parts = sync.data.part[row.id]
+      if (!parts) return undefined
+      if (parts.some((part) => part.type === "tool" && part.tool === "finish" && part.state.status === "completed")) break
+      const review = reviewText(row, parts)
+      if (review) return review
+    }
+    return undefined
+  })
+  const repeatedFinish = createMemo(() => {
+    if (execution() || textReview()) return undefined
+    const earlier = earlierReview()
+    if (!earlier) return undefined
+    return props.parts.find((part): part is ToolPart => {
+      if (part.type !== "tool" || part.tool !== "finish" || part.state.status !== "completed") return false
+      if (finishBlockView(part, part.state.input)?.tone !== "success") return false
+      const finish = parseReviewReport(finishResult(part.state.input, part.state.output))
+      if (!finish || JSON.stringify(finish.report) !== JSON.stringify(earlier.report)) return false
+      const analysis = reviewPresentationAnalysis(finish.analysis)
+      return analysis !== undefined && (!analysis.trim() || earlier.analysis.includes(analysis.trim()))
+    })
+  })
+  const displayedTextReview = createMemo(() => {
+    const text = textReview()
+    if (!text) return undefined
+    const analysis = matchingFinish()?.analysis?.trim()
+    if (!analysis || text.analysis.includes(analysis)) return text
+    return { ...text, analysis: [text.analysis, analysis].filter(Boolean).join("\n\n") }
+  })
 
   const final = createMemo(() => {
     return props.message.finish && !["tool-calls", "unknown"].includes(props.message.finish)
@@ -1773,6 +1899,30 @@ export function AssistantMessageRow(props: { message: AssistantMessage; parts: P
               )}
             </Show>
             <Switch>
+              <Match when={part.type === "text" && execution()?.prose?.has(part.id)}>
+                <TextPart last={index() === props.parts.length - 1} part={{ ...(part as TextPart), text: execution()!.prose!.get(part.id)! }} message={props.message} />
+              </Match>
+              <Match when={part.type === "tool" && part.tool === "finish" && execution()?.report && part.id === execution()?.finishID}>
+                <Show when={execution()?.finishProse?.trim()}>
+                  <box paddingLeft={3} marginTop={1}><text fg={theme.text}>{execution()!.finishProse}</text></box>
+                </Show>
+              </Match>
+              <Match when={part.type === "tool" && part.tool === "finish" && execution() && !execution()?.report}>
+                <ToolPart last={index() === props.parts.length - 1} part={part as ToolPart} message={props.message} suppressReview />
+              </Match>
+              <Match when={part.type === "text" && textReview()?.textPartIDs.includes(part.id)}>
+                <Show when={textReview()?.textPartIDs[0] === part.id && displayedTextReview()}>
+                  {(review) => <ReviewFinish review={review()} part={matchingFinish()?.part} />}
+                </Show>
+              </Match>
+              <Match when={part.id === matchingFinish()?.part.id}>
+                <></>
+              </Match>
+              <Match when={part.id === repeatedFinish()?.id}>
+                <InlineTool icon="✓" pending="Completing task..." complete={true} part={repeatedFinish()!} separate={true}>
+                  Task completed
+                </InlineTool>
+              </Match>
               <Match when={group()?.owner === true}>
                 <ActivityGroup groupID={group()!.groupID} />
               </Match>
@@ -1794,6 +1944,9 @@ export function AssistantMessageRow(props: { message: AssistantMessage; parts: P
           )
         }}
       </For>
+      <Show when={execution()?.owner === props.message.id && execution()?.report}>
+        {(report) => <ReviewFinish review={{ report: report(), analysis: "", raw: execution()?.raw }} />}
+      </Show>
       <Show when={props.parts.some((x) => x.type === "tool" && x.tool === "task")}>
         <box paddingTop={1} paddingLeft={3}>
           <text fg={theme.text}>
@@ -2169,7 +2322,7 @@ function ActivityGroupPartRow(props: { item: ActivityGroupPart }) {
   return <ToolPart last={false} part={props.item.part} message={props.item.message} />
 }
 
-function ToolPart(props: { last: boolean; part: ToolPart; message: AssistantMessage }) {
+function ToolPart(props: { last: boolean; part: ToolPart; message: AssistantMessage; suppressReview?: boolean }) {
   const ctx = use()
   const renderer = createMemo(() => toolRenderer(props.part.tool))
 
@@ -2191,6 +2344,9 @@ function ToolPart(props: { last: boolean; part: ToolPart; message: AssistantMess
     },
     get part() {
       return props.part
+    },
+    get suppressReview() {
+      return props.suppressReview
     },
   }
 
@@ -2331,7 +2487,7 @@ function Invalid(props: ToolProps) {
   )
 }
 
-function Finish(props: ToolProps) {
+function Finish(props: ToolProps & { suppressReview?: boolean }) {
   const ctx = use()
   const { theme } = useTheme()
   const result = createMemo(() => finishResult(props.input, props.output))
@@ -2340,7 +2496,11 @@ function Finish(props: ToolProps) {
   // structurally instead of dumping the raw JSON; only a completed part
   // qualifies, since a running finish can still be declined by the review
   // gate and must not pre-announce its verdict.
-  const review = createMemo(() => (props.part.state.status === "completed" ? parseReviewReport(result()) : undefined))
+  const review = createMemo(() =>
+    !props.suppressReview && props.part.state.status === "completed" && finishBlockView(props.part, props.input)?.tone === "success"
+      ? parseReviewReport(result())
+      : undefined,
+  )
   const [expanded, setExpanded] = createSignal(false)
   const [errorExpanded, setErrorExpanded] = createSignal(false)
   // The block shows the agent's own summary; the tool output also carries
@@ -2584,7 +2744,7 @@ export function reviewFindingLocation(finding: ReviewReport.Finding): string | u
   return file + line
 }
 
-function ReviewFinish(props: { review: { report: ReviewReport.Info; analysis: string }; part: ToolPart }) {
+function ReviewFinish(props: { review: { report: ReviewReport.Info; analysis: string; raw?: string }; part?: ToolPart }) {
   const { theme } = useTheme()
   const ctx = use()
   const [expanded, setExpanded] = createSignal(false)
@@ -2608,10 +2768,9 @@ function ReviewFinish(props: { review: { report: ReviewReport.Info; analysis: st
   const expandable = createMemo(() =>
     analysisCollapsed().overflow || findings().some((finding) => (finding.detail ?? "").trim() !== ""),
   )
-  // The envelope is stripped from the default view; the exact canonical
-  // JSON stays reachable on demand, re-serialized the same way the runtime
-  // delivers it to the parent agent.
-  const rawReport = createMemo(() => capOutputLines(ReviewReport.envelope(report())))
+  // Keep the original receipt reachable when supplied; the legacy fallback
+  // applies only when the delivery has no original raw text.
+  const rawReport = createMemo(() => props.review.raw ?? capOutputLines(ReviewReport.envelope(report())))
   const revision = createMemo(() => (report().revision ? Locale.truncateMiddle(report().revision, 24) : undefined))
 
   const severityColor = (severity: ReviewReport.Finding["severity"]) =>
@@ -2670,15 +2829,32 @@ function ReviewFinish(props: { review: { report: ReviewReport.Info; analysis: st
           </Show>
         </box>
       </BlockTool>
-      <InlineTool
-        icon="⚙"
-        pending="Preparing review report..."
-        complete={true}
-        part={props.part}
-        onClick={() => setRawOpen((prev) => !prev)}
+      <Show
+        when={props.part}
+        fallback={
+          <InlineToolRow
+            icon="⚙"
+            color={theme.textMuted}
+            pending=""
+            complete={true}
+            onMouseUp={() => setRawOpen((prev) => !prev)}
+          >
+            {rawOpen() ? "Click to hide the raw report" : "Raw review report"}
+          </InlineToolRow>
+        }
       >
-        {rawOpen() ? "Click to hide the raw report" : "Raw review report"}
-      </InlineTool>
+        {(part) => (
+          <InlineTool
+            icon="⚙"
+            pending="Preparing review report..."
+            complete={true}
+            part={part()}
+            onClick={() => setRawOpen((prev) => !prev)}
+          >
+            {rawOpen() ? "Click to hide the raw report" : "Raw review report"}
+          </InlineTool>
+        )}
+      </Show>
       <Show when={rawOpen()}>
         <box paddingLeft={5}>
           <text fg={theme.textMuted}>{rawReport()}</text>
@@ -3147,6 +3323,7 @@ function Task(props: ToolProps) {
     if (sessionID && !sync.data.message[sessionID]?.length) void sync.session.sync(sessionID)
   })
 
+  const review = createMemo(() => subagentReview(props.part))
   const sessionID = createMemo(() => stringValue(props.metadata.sessionId))
   const messages = createMemo(() => sync.data.message[sessionID() ?? ""] ?? [])
 
@@ -3219,6 +3396,7 @@ function Task(props: ToolProps) {
   })
 
   return (
+    <>
     <InlineTool
       icon={
         props.part.state.status !== "completed"
@@ -3245,6 +3423,21 @@ function Task(props: ToolProps) {
     >
       {content()}
     </InlineTool>
+    <Show
+      when={review()}
+      fallback={
+        <Show when={props.part.state.status === "completed" && Boolean(props.metadata.review) && props.output}>
+          {(output) => (
+            <box paddingLeft={3} marginTop={1} flexShrink={0}>
+              <text fg={theme.text}>{output()}</text>
+            </box>
+          )}
+        </Show>
+      }
+    >
+      {(value) => <ReviewFinish review={value()} />}
+    </Show>
+    </>
   )
 }
 
