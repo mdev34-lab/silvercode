@@ -23,3 +23,13 @@ script -q -e -c 'stty cols 120 rows 48; bun test/cli/tui/review-history-capture.
 ```
 
 The PNGs are screenshots of these actual terminal streams replayed at 120×48 in xterm.js, with the alternate-screen exit omitted so the last frame stays visible. These streams were freshly recorded from production rendering code at `e3b6dcf`, using the shared reactive execution index in the synthetic component harness; the streams are byte-for-byte identical to the earlier captures. The PNGs were regenerated from those fresh recordings. This is not a full Session-route capture.
+
+## Background launch removal captures
+
+The synthetic `removal/before` and `removal/removed` streams use the live OpenTUI renderer, actual transcript row components, the shared execution index, and the real SDK event/sync contexts in `review-background-removal-capture.tsx`. The fixture mocks the persisted HTTP history. The first frame shows a verified synthetic receipt; the second is recorded after the synthetic launch part is removed from persisted history and a real `message.part.removed` event is delivered. It shows the existing raw fallback, not a verdict. These are component-harness captures, not a complete Session route or a real project.
+
+Recorded at production checkpoint `3e9330c` in a 120×48 pseudo-terminal and replayed in xterm.js with alternate-screen exit omitted:
+
+```sh
+script -q -e -c 'stty cols 120 rows 48; bun test/cli/tui/review-background-removal-capture.tsx removed' /dev/null > removed.ansi
+```
