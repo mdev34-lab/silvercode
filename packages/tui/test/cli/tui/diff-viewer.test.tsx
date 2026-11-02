@@ -33,14 +33,7 @@ test("closing the diff viewer returns to the route it opened from", async () => 
 })
 
 test("diff readiness includes the request after close command registration", async () => {
-  let releaseRequest!: () => void
-  const requestGate = new Promise<void>((resolve) => {
-    releaseRequest = resolve
-  })
-  // Release in the task after the readiness check. The old command-only wait
-  // returned to its assertions before that task; the request-aware wait pumps
-  // another frame. No retry count or delay budget changes (#789).
-  const viewer = await renderDiffViewer([], 20, undefined, requestGate, () => void setTimeout(releaseRequest, 0))
+  const viewer = await renderDiffViewer([], 20, undefined, true)
   try {
     expect(viewer.commands.has("diff.close")).toBe(true)
     expect(viewer.vcsDiffInput()).toEqual({ directory: "/repo/session", mode: "git", context: 12 })
@@ -119,9 +112,14 @@ async function renderDiffViewer(
   vcsDiff: unknown[],
   height = 20,
   initialRoute?: TuiRouteCurrent,
-  requestGate?: Promise<void>,
-  onRequestCheck?: () => void,
+  holdSelectedRequestUntilCommandObserved = false,
 ) {
+  let releaseSelectedRequest: (() => void) | undefined
+  const selectedRequestGate = holdSelectedRequestUntilCommandObserved
+    ? new Promise<void>((resolve) => {
+        releaseSelectedRequest = resolve
+      })
+    : undefined
   const commands = new Map<
     string,
     NonNullable<Parameters<TuiPluginApi["keymap"]["registerLayer"]>[0]["commands"]>[number]
@@ -144,14 +142,14 @@ async function renderDiffViewer(
       client: {
         vcs: {
           diff: async (input: unknown) => {
-            await requestGate
+            await selectedRequestGate
             vcsDiffInput = input
             return { data: vcsDiff }
           },
         },
         session: {
           diff: async (input: unknown) => {
-            await requestGate
+            await selectedRequestGate
             sessionDiffInput = input
             return { data: [] }
           },
@@ -198,15 +196,19 @@ async function renderDiffViewer(
   }
 
   const app = await testRender(() => <Harness />, { width: 80, height })
-  await waitForCommand(
-    app,
-    commands,
-    "diff.close",
-    () =>
-      ("params" in current && current.params && "mode" in current.params && current.params.mode === "last-turn"
-        ? sessionDiffInput
-        : vcsDiffInput) !== undefined,
-    onRequestCheck,
+  const selectedRequestReady = () => {
+    if (current.name !== "diff" || !current.params) return false
+    if (current.params.mode === "last-turn") return sessionDiffInput !== undefined
+    return vcsDiffInput !== undefined
+  }
+  await waitForViewerReadyAndCleanup(app, () =>
+    waitForViewerReady(
+      app,
+      commands,
+      "diff.close",
+      selectedRequestReady,
+      holdSelectedRequestUntilCommandObserved ? () => setTimeout(() => releaseSelectedRequest?.(), 0) : undefined,
+    ),
   )
   return {
     app,
@@ -242,6 +244,44 @@ const session = {
   },
 } satisfies Session
 
+test("diff viewer waits for its selected VCS request after command registration", async () => {
+  const viewer = await renderDiffViewer(
+    [],
+    20,
+    {
+      name: "diff",
+      params: { mode: "branch", sessionID: "session-1", returnRoute: startRoute },
+    },
+    true,
+  )
+  try {
+    expect(viewer.commands.has("diff.close")).toBe(true)
+    expect(viewer.vcsDiffInput()).toEqual({ directory: "/repo/session", mode: "branch", context: 12 })
+    expect(viewer.sessionDiffInput()).toBeUndefined()
+  } finally {
+    viewer.app.renderer.destroy()
+  }
+})
+
+test("last-turn viewer waits for its selected session request after command registration", async () => {
+  const viewer = await renderDiffViewer(
+    [],
+    20,
+    {
+      name: "diff",
+      params: { mode: "last-turn", sessionID: "session-1", messageID: "message-1", returnRoute: startRoute },
+    },
+    true,
+  )
+  try {
+    expect(viewer.commands.has("diff.close")).toBe(true)
+    expect(viewer.sessionDiffInput()).toEqual({ sessionID: "session-1", messageID: "message-1" })
+    expect(viewer.vcsDiffInput()).toBeUndefined()
+  } finally {
+    viewer.app.renderer.destroy()
+  }
+})
+
 test("branch diff source requests branch VCS diff", async () => {
   const viewer = await renderDiffViewer([], 20, {
     name: "diff",
@@ -276,24 +316,83 @@ test("last-turn diff source requests session diff", async () => {
   }
 })
 
-async function waitForCommand(
+async function waitForViewerReady(
   app: Awaited<ReturnType<typeof testRender>>,
   commands: Map<string, unknown>,
   command: string,
-  ready: () => boolean,
-  onCheck?: () => void,
+  selectedRequestReady: () => boolean,
+  onCommandObserved?: () => void,
 ) {
+  let commandObserved = false
   for (let attempt = 0; attempt < 10; attempt++) {
     await app.renderOnce()
-    // Commands and the resource request become observable independently after
-    // KV/theme readiness. Keep the original frame budget, but require both.
-    if (commands.has(command)) {
-      onCheck?.()
-      if (ready()) return
+    if (commands.has(command) && !commandObserved) {
+      commandObserved = true
+      onCommandObserved?.()
     }
+    if (commands.has(command) && selectedRequestReady()) return
     await new Promise((resolve) => setTimeout(resolve, 25))
   }
+  throw new Error(`Timed out waiting for ${command} and its selected diff request`)
 }
+
+async function waitForViewerReadyAndCleanup(app: Awaited<ReturnType<typeof testRender>>, wait: () => Promise<void>) {
+  try {
+    await wait()
+  } catch (error) {
+    app.renderer.destroy()
+    throw error
+  }
+}
+
+test("diff viewer readiness timeout destroys its renderer", async () => {
+  let renderCount = 0
+  let destroyCount = 0
+  const app = {
+    renderOnce: async () => {
+      renderCount++
+    },
+    renderer: {
+      destroy: () => {
+        destroyCount++
+      },
+    },
+  } as unknown as Awaited<ReturnType<typeof testRender>>
+  const error = await waitForViewerReadyAndCleanup(app, () =>
+    waitForViewerReady(app, new Map(), "diff.close", () => false),
+  ).then(
+    () => undefined,
+    (reason: unknown) => reason,
+  )
+
+  expect(error).toEqual(new Error("Timed out waiting for diff.close and its selected diff request"))
+  expect(renderCount).toBe(10)
+  expect(destroyCount).toBe(1)
+})
+
+test("diff viewer render failure destroys its renderer and preserves the error", async () => {
+  let destroyCount = 0
+  const renderError = new Error("renderOnce failed")
+  const app = {
+    renderOnce: async () => {
+      throw renderError
+    },
+    renderer: {
+      destroy: () => {
+        destroyCount++
+      },
+    },
+  } as unknown as Awaited<ReturnType<typeof testRender>>
+  const error = await waitForViewerReadyAndCleanup(app, () =>
+    waitForViewerReady(app, new Map(), "diff.close", () => false),
+  ).then(
+    () => undefined,
+    (reason: unknown) => reason,
+  )
+
+  expect(error).toBe(renderError)
+  expect(destroyCount).toBe(1)
+})
 
 const pluginMeta = {
   id: "diff-viewer",

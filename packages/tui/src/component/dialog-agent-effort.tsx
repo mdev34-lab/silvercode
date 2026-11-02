@@ -30,6 +30,11 @@ const ENTRIES: {
   },
 ]
 
+// The widest level chip (` Thorough `) is 10 columns; a fixed title cell keeps
+// every description starting in the same column, which is what lets a wrapped
+// description hold its alignment instead of running back under the chip.
+const TITLE_COLUMN = 10
+
 export function DialogAgentEffort() {
   const local = useLocal()
   const dialog = useDialog()
@@ -50,6 +55,7 @@ export function DialogAgentEffort() {
           </>
         ),
         description: entry.description,
+        titleColumn: TITLE_COLUMN,
         onSelect: () => {
           dialog.clear()
           local.effort.set(entry.value)
@@ -64,6 +70,9 @@ export function DialogAgentEffort() {
       title="Agent effort"
       current={local.effort.current()}
       flat={true}
+      // Breathing room between the three levels, and a description column that
+      // wraps under itself in narrow terminals (#791).
+      optionSpacing={1}
       footer={
         <text fg={theme.textMuted}>
           {local.effort.scoped() ? "Stored on this session" : "Default for new sessions"}
