@@ -191,12 +191,14 @@ async function renderDiffViewer(
     if (current.params.mode === "last-turn") return sessionDiffInput !== undefined
     return vcsDiffInput !== undefined
   }
-  await waitForViewerReady(
-    app,
-    commands,
-    "diff.close",
-    selectedRequestReady,
-    holdSelectedRequestUntilCommandObserved ? () => setTimeout(() => releaseSelectedRequest?.(), 0) : undefined,
+  await waitForViewerReadyAndCleanup(app, () =>
+    waitForViewerReady(
+      app,
+      commands,
+      "diff.close",
+      selectedRequestReady,
+      holdSelectedRequestUntilCommandObserved ? () => setTimeout(() => releaseSelectedRequest?.(), 0) : undefined,
+    ),
   )
   return {
     app,
@@ -323,6 +325,64 @@ async function waitForViewerReady(
   }
   throw new Error(`Timed out waiting for ${command} and its selected diff request`)
 }
+
+async function waitForViewerReadyAndCleanup(app: Awaited<ReturnType<typeof testRender>>, wait: () => Promise<void>) {
+  try {
+    await wait()
+  } catch (error) {
+    app.renderer.destroy()
+    throw error
+  }
+}
+
+test("diff viewer readiness timeout destroys its renderer", async () => {
+  let renderCount = 0
+  let destroyCount = 0
+  const app = {
+    renderOnce: async () => {
+      renderCount++
+    },
+    renderer: {
+      destroy: () => {
+        destroyCount++
+      },
+    },
+  } as unknown as Awaited<ReturnType<typeof testRender>>
+  const error = await waitForViewerReadyAndCleanup(app, () =>
+    waitForViewerReady(app, new Map(), "diff.close", () => false),
+  ).then(
+    () => undefined,
+    (reason: unknown) => reason,
+  )
+
+  expect(error).toEqual(new Error("Timed out waiting for diff.close and its selected diff request"))
+  expect(renderCount).toBe(10)
+  expect(destroyCount).toBe(1)
+})
+
+test("diff viewer render failure destroys its renderer and preserves the error", async () => {
+  let destroyCount = 0
+  const renderError = new Error("renderOnce failed")
+  const app = {
+    renderOnce: async () => {
+      throw renderError
+    },
+    renderer: {
+      destroy: () => {
+        destroyCount++
+      },
+    },
+  } as unknown as Awaited<ReturnType<typeof testRender>>
+  const error = await waitForViewerReadyAndCleanup(app, () =>
+    waitForViewerReady(app, new Map(), "diff.close", () => false),
+  ).then(
+    () => undefined,
+    (reason: unknown) => reason,
+  )
+
+  expect(error).toBe(renderError)
+  expect(destroyCount).toBe(1)
+})
 
 const pluginMeta = {
   id: "diff-viewer",
