@@ -4,6 +4,8 @@ import { afterEach, describe, expect, test } from "bun:test"
 import { Cause, Effect, Exit, Layer } from "effect"
 import path from "path"
 import { Agent } from "../../src/agent/agent"
+import { EventV2Bridge } from "../../src/event-v2-bridge"
+import { Format } from "../../src/format"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Instruction } from "../../src/session/instruction"
@@ -11,9 +13,12 @@ import { LSP } from "../../src/lsp/lsp"
 import { Ripgrep } from "@opencode-ai/core/ripgrep"
 import { SessionID, MessageID } from "../../src/session/schema"
 import { Truncate } from "@/tool/truncate"
+import { ApplyPatchTool } from "../../src/tool/apply_patch"
+import { EditTool } from "../../src/tool/edit"
 import { GlobTool } from "../../src/tool/glob"
 import { GrepTool } from "../../src/tool/grep"
 import { ReadTool } from "../../src/tool/read"
+import { WriteTool } from "../../src/tool/write"
 import { Workdir } from "../../src/session/workdir"
 import type * as Tool from "../../src/tool/tool"
 import {
@@ -43,6 +48,8 @@ const toolLayer = () =>
   LayerNode.compile(
     LayerNode.group([
       Agent.node,
+      EventV2Bridge.node,
+      Format.node,
       FSUtil.node,
       CrossSpawnSpawner.node,
       Instruction.node,
@@ -90,25 +97,93 @@ const put = Effect.fn("WorkdirTest.put")(function* (file: string, content: strin
   yield* fs.writeWithDirs(file, content)
 })
 
+const get = (file: string) => Effect.promise(() => import("fs/promises").then((fs) => fs.readFile(file, "utf-8")))
+
 const read = Effect.fn("WorkdirTest.read")(function* (dir: string, args: { filePath: string }, ctx: Tool.Context) {
   const init = yield* ReadTool
   const tool = yield* init.init()
   return yield* provideInstance(dir)(tool.execute(args, ctx))
 })
 
-const grep = Effect.fn("WorkdirTest.grep")(function* (dir: string, args: { pattern: string }, ctx: Tool.Context) {
+const grep = Effect.fn("WorkdirTest.grep")(function* (
+  dir: string,
+  args: { pattern: string; path?: string },
+  ctx: Tool.Context,
+) {
   const init = yield* GrepTool
   const tool = yield* init.init()
   return yield* provideInstance(dir)(tool.execute(args, ctx))
 })
 
-const glob = Effect.fn("WorkdirTest.glob")(function* (dir: string, args: { pattern: string }, ctx: Tool.Context) {
+const glob = Effect.fn("WorkdirTest.glob")(function* (
+  dir: string,
+  args: { pattern: string; path?: string },
+  ctx: Tool.Context,
+) {
   const init = yield* GlobTool
   const tool = yield* init.init()
   return yield* provideInstance(dir)(tool.execute(args, ctx))
 })
 
-const settle = <A, E>(effect: Effect.Effect<A, E>) =>
+const edit = Effect.fn("WorkdirTest.edit")(function* (
+  dir: string,
+  args: { filePath: string; oldString: string; newString: string },
+  ctx: Tool.Context,
+) {
+  const init = yield* EditTool
+  const tool = yield* init.init()
+  return yield* provideInstance(dir)(tool.execute(args, ctx))
+})
+
+const write = Effect.fn("WorkdirTest.write")(function* (
+  dir: string,
+  args: { filePath: string; content: string },
+  ctx: Tool.Context,
+) {
+  const init = yield* WriteTool
+  const tool = yield* init.init()
+  return yield* provideInstance(dir)(tool.execute(args, ctx))
+})
+
+const applyPatch = Effect.fn("WorkdirTest.applyPatch")(function* (
+  dir: string,
+  args: { patchText: string },
+  ctx: Tool.Context,
+) {
+  const init = yield* ApplyPatchTool
+  const tool = yield* init.init()
+  return yield* provideInstance(dir)(tool.execute(args, ctx))
+})
+
+const denyExternal = () => {
+  const items: Array<Omit<PermissionV1.Request, "id" | "sessionID" | "tool">> = []
+  return {
+    items,
+    next: {
+      ...base,
+      ask: (req: Omit<PermissionV1.Request, "id" | "sessionID" | "tool">) =>
+        Effect.gen(function* () {
+          items.push(req)
+          if (req.permission === "external_directory") {
+            yield* Effect.die(new Error(`external_directory denied: ${req.patterns.join(",")}`))
+          }
+        }),
+    } satisfies Tool.Context,
+  }
+}
+
+const siblingOutside = (projectDir: string, label: string) =>
+  Effect.acquireRelease(
+    Effect.gen(function* () {
+      const fs = yield* FSUtil.Service
+      const dir = path.join(path.dirname(projectDir), `opencode-ext-${label}-${Math.random().toString(36).slice(2)}`)
+      yield* fs.ensureDir(dir)
+      return dir
+    }),
+    (dir) => Effect.promise(() => import("fs/promises").then((fs) => fs.rm(dir, { recursive: true, force: true }))),
+  )
+
+const settle = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
   Effect.gen(function* () {
     const exit = yield* Effect.exit(effect)
     if (Exit.isFailure(exit)) return { ok: false as const, error: String(Cause.squash(exit.cause)) }
@@ -373,5 +448,268 @@ describe("tool working folder", () => {
 
       expect(items.some((item) => item.permission === "external_directory")).toBe(true)
     }),
+  )
+
+  it.instance(
+    "grep and glob resolve an explicit relative path from the session folder and gate external traversal",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const child = path.join(test.directory, "child")
+        const outer = yield* siblingOutside(test.directory, "search")
+        yield* put(path.join(test.directory, "sub", "root-sub.txt"), "needle in root sub")
+        yield* put(path.join(child, "sub", "child-sub.txt"), "needle in child sub")
+        yield* put(path.join(test.directory, "sibling", "peer.txt"), "needle in peer")
+        yield* put(path.join(outer, "ext-sub", "outside.txt"), "needle outside")
+
+        const internal = asks()
+        const ctx = { ...internal.next, cwd: child }
+        const subGrep = yield* grep(test.directory, { pattern: "needle", path: "sub" }, ctx)
+        const subGlob = yield* glob(test.directory, { pattern: "*.txt", path: "sub" }, ctx)
+        const peerGrep = yield* grep(test.directory, { pattern: "needle", path: "../sibling" }, ctx)
+        const peerGlob = yield* glob(test.directory, { pattern: "*.txt", path: "../sibling" }, ctx)
+
+        expect(subGrep.output).toContain("child-sub.txt")
+        expect(subGrep.output).not.toContain("root-sub.txt")
+        expect(subGlob.output).toContain("child-sub.txt")
+        expect(subGlob.output).not.toContain("root-sub.txt")
+        expect(peerGrep.output).toContain("peer.txt")
+        expect(peerGlob.output).toContain("peer.txt")
+        expect(internal.items.some((item) => item.permission === "external_directory")).toBe(false)
+
+        const relExternal = path.relative(child, path.join(outer, "ext-sub"))
+        expect(path.isAbsolute(relExternal)).toBe(false)
+
+        const denied = denyExternal()
+        const blockedGrep = yield* settle(
+          grep(test.directory, { pattern: "needle", path: relExternal }, { ...denied.next, cwd: child }),
+        )
+        const blockedGlob = yield* settle(
+          glob(test.directory, { pattern: "*.txt", path: relExternal }, { ...denied.next, cwd: child }),
+        )
+        expect(blockedGrep.ok).toBe(false)
+        expect(blockedGrep.error).toContain("external_directory denied")
+        expect(blockedGlob.ok).toBe(false)
+        expect(blockedGlob.error).toContain("external_directory denied")
+
+        const allowed = asks()
+        const extGrep = yield* grep(
+          test.directory,
+          { pattern: "needle", path: relExternal },
+          { ...allowed.next, cwd: child },
+        )
+        const extGlob = yield* glob(
+          test.directory,
+          { pattern: "*.txt", path: relExternal },
+          { ...allowed.next, cwd: child },
+        )
+        expect(extGrep.output).toContain("outside.txt")
+        expect(extGlob.output).toContain("outside.txt")
+        expect(allowed.items.filter((item) => item.permission === "external_directory")).toHaveLength(2)
+      }),
+  )
+
+  it.instance("apply_patch resolves relative add, update, delete, and move paths from the session folder", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const fs = yield* FSUtil.Service
+      const child = path.join(test.directory, "child")
+
+      // Seed identical relative layouts in both the project root and the child folder.
+      yield* put(path.join(test.directory, "modify.txt"), "root line\n")
+      yield* put(path.join(test.directory, "delete.txt"), "keep root\n")
+      yield* put(path.join(test.directory, "old", "move.txt"), "root move\n")
+
+      yield* put(path.join(child, "modify.txt"), "child before\n")
+      yield* put(path.join(child, "delete.txt"), "remove child\n")
+      yield* put(path.join(child, "old", "move.txt"), "move before\n")
+
+      const patchText = [
+        "*** Begin Patch",
+        "*** Add File: nested/added.txt",
+        "+child added",
+        "*** Update File: modify.txt",
+        "@@",
+        "-child before",
+        "+child after",
+        "*** Delete File: delete.txt",
+        "*** Update File: old/move.txt",
+        "*** Move to: renamed/moved.txt",
+        "@@",
+        "-move before",
+        "+move after",
+        "*** End Patch",
+      ].join("\n")
+
+      const { items, next } = asks()
+      yield* applyPatch(test.directory, { patchText }, { ...next, cwd: child })
+
+      expect(yield* get(path.join(child, "nested", "added.txt"))).toBe("child added\n")
+      expect(yield* get(path.join(child, "modify.txt"))).toBe("child after\n")
+      expect(yield* fs.existsSafe(path.join(child, "delete.txt"))).toBe(false)
+      expect(yield* fs.existsSafe(path.join(child, "old", "move.txt"))).toBe(false)
+      expect(yield* get(path.join(child, "renamed", "moved.txt"))).toBe("move after\n")
+
+      // Project-root counterparts stay untouched, and no external approval was needed.
+      expect(yield* fs.existsSafe(path.join(test.directory, "nested", "added.txt"))).toBe(false)
+      expect(yield* get(path.join(test.directory, "modify.txt"))).toBe("root line\n")
+      expect(yield* get(path.join(test.directory, "delete.txt"))).toBe("keep root\n")
+      expect(yield* get(path.join(test.directory, "old", "move.txt"))).toBe("root move\n")
+      expect(yield* fs.existsSafe(path.join(test.directory, "renamed", "moved.txt"))).toBe(false)
+      expect(items.some((item) => item.permission === "external_directory")).toBe(false)
+      expect(items.some((item) => item.permission === "edit")).toBe(true)
+    }),
+  )
+
+  it.instance("apply_patch gates relative and absolute external move destinations and external session folders", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const fs = yield* FSUtil.Service
+      const child = path.join(test.directory, "child")
+      const outer = yield* siblingOutside(test.directory, "patch")
+      yield* put(path.join(child, "source.txt"), "before move\n")
+      yield* put(path.join(child, "abs-source.txt"), "before abs move\n")
+
+      const relDest = path.relative(child, path.join(outer, "dest", "moved.txt"))
+      expect(path.isAbsolute(relDest)).toBe(false)
+
+      const moveToExternal = [
+        "*** Begin Patch",
+        "*** Update File: source.txt",
+        `*** Move to: ${relDest}`,
+        "@@",
+        "-before move",
+        "+after move",
+        "*** End Patch",
+      ].join("\n")
+
+      // Denying external_directory on the destination leaves the internal source untouched.
+      const rejected = denyExternal()
+      const failedMove = yield* settle(
+        applyPatch(test.directory, { patchText: moveToExternal }, { ...rejected.next, cwd: child }),
+      )
+      expect(failedMove.ok).toBe(false)
+      expect(failedMove.error).toContain("external_directory denied")
+      expect(yield* get(path.join(child, "source.txt"))).toBe("before move\n")
+      expect(yield* fs.existsSafe(path.join(outer, "dest", "moved.txt"))).toBe(false)
+
+      // When external_directory is granted, the source inside child moves to the external target.
+      const permitted = asks()
+      yield* applyPatch(test.directory, { patchText: moveToExternal }, { ...permitted.next, cwd: child })
+      expect(yield* fs.existsSafe(path.join(child, "source.txt"))).toBe(false)
+      expect(yield* get(path.join(outer, "dest", "moved.txt"))).toBe("after move\n")
+      const extAsks = permitted.items.filter((item) => item.permission === "external_directory")
+      expect(extAsks).toHaveLength(1)
+      const expectedGlob =
+        process.platform === "win32"
+          ? FSUtil.normalizePathPattern(path.join(outer, "dest", "*"))
+          : path.join(outer, "dest", "*").replaceAll("\\", "/")
+      expect(extAsks[0]?.patterns).toEqual([expectedGlob])
+
+      // An explicit absolute external move destination is gated the same way.
+      const absDest = path.join(outer, "abs-dest", "moved.txt")
+      const absMovePatch = [
+        "*** Begin Patch",
+        "*** Update File: abs-source.txt",
+        `*** Move to: ${absDest}`,
+        "@@",
+        "-before abs move",
+        "+after abs move",
+        "*** End Patch",
+      ].join("\n")
+      const rejectedAbs = denyExternal()
+      const failedAbs = yield* settle(
+        applyPatch(test.directory, { patchText: absMovePatch }, { ...rejectedAbs.next, cwd: child }),
+      )
+      expect(failedAbs.ok).toBe(false)
+      expect(yield* get(path.join(child, "abs-source.txt"))).toBe("before abs move\n")
+      const permittedAbs = asks()
+      yield* applyPatch(test.directory, { patchText: absMovePatch }, { ...permittedAbs.next, cwd: child })
+      expect(yield* fs.existsSafe(path.join(child, "abs-source.txt"))).toBe(false)
+      expect(yield* get(absDest)).toBe("after abs move\n")
+      expect(permittedAbs.items.filter((item) => item.permission === "external_directory")).toHaveLength(1)
+
+      // An external session folder itself still asks external_directory for relative add/update/delete/move.
+      yield* put(path.join(outer, "keep.txt"), "keep v1\n")
+      yield* put(path.join(outer, "drop.txt"), "drop v1\n")
+      const externalPatch = [
+        "*** Begin Patch",
+        "*** Add File: created.txt",
+        "+created outside",
+        "*** Update File: keep.txt",
+        "*** Move to: sub/kept.txt",
+        "@@",
+        "-keep v1",
+        "+keep v2",
+        "*** Delete File: drop.txt",
+        "*** End Patch",
+      ].join("\n")
+
+      const rejectedOuter = denyExternal()
+      const blockedOuter = yield* settle(
+        applyPatch(test.directory, { patchText: externalPatch }, { ...rejectedOuter.next, cwd: outer }),
+      )
+      expect(blockedOuter.ok).toBe(false)
+      expect(yield* fs.existsSafe(path.join(outer, "created.txt"))).toBe(false)
+      expect(yield* get(path.join(outer, "keep.txt"))).toBe("keep v1\n")
+      expect(yield* get(path.join(outer, "drop.txt"))).toBe("drop v1\n")
+
+      const allowedOuter = asks()
+      yield* applyPatch(test.directory, { patchText: externalPatch }, { ...allowedOuter.next, cwd: outer })
+      expect(yield* get(path.join(outer, "created.txt"))).toBe("created outside\n")
+      expect(yield* fs.existsSafe(path.join(outer, "keep.txt"))).toBe(false)
+      expect(yield* get(path.join(outer, "sub", "kept.txt"))).toBe("keep v2\n")
+      expect(yield* fs.existsSafe(path.join(outer, "drop.txt"))).toBe(false)
+      expect(
+        allowedOuter.items.filter((item) => item.permission === "external_directory").length,
+      ).toBeGreaterThanOrEqual(3)
+    }),
+  )
+
+  it.instance(
+    "edit, write, and piped read resolve from the session folder while keeping external_directory checks",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const fs = yield* FSUtil.Service
+        const outer = yield* siblingOutside(test.directory, "rw")
+        yield* put(path.join(test.directory, "piped.txt"), "root piped\n")
+        yield* put(path.join(outer, "piped.txt"), "outer piped\n")
+        yield* put(path.join(outer, "edit.txt"), "before\n")
+
+        const rejected = denyExternal()
+        expect(
+          (yield* settle(
+            write(test.directory, { filePath: "wrote.txt", content: "x\n" }, { ...rejected.next, cwd: outer }),
+          )).ok,
+        ).toBe(false)
+        expect(
+          (yield* settle(
+            edit(
+              test.directory,
+              { filePath: "edit.txt", oldString: "before", newString: "after" },
+              { ...rejected.next, cwd: outer },
+            ),
+          )).ok,
+        ).toBe(false)
+        expect(
+          (yield* settle(read(test.directory, { filePath: "piped.txt | head -n 1" }, { ...rejected.next, cwd: outer })))
+            .ok,
+        ).toBe(false)
+        expect(yield* fs.existsSafe(path.join(outer, "wrote.txt"))).toBe(false)
+        expect(yield* get(path.join(outer, "edit.txt"))).toBe("before\n")
+
+        const allowed = asks()
+        const ctx = { ...allowed.next, cwd: outer }
+        yield* write(test.directory, { filePath: "wrote.txt", content: "written\n" }, ctx)
+        yield* edit(test.directory, { filePath: "edit.txt", oldString: "before", newString: "after" }, ctx)
+        const piped = yield* read(test.directory, { filePath: "piped.txt | head -n 1" }, ctx)
+
+        expect(yield* get(path.join(outer, "wrote.txt"))).toBe("written\n")
+        expect(yield* get(path.join(outer, "edit.txt"))).toBe("after\n")
+        expect(piped.output).toContain("outer piped")
+        expect(piped.output).not.toContain("root piped")
+        expect(allowed.items.filter((item) => item.permission === "external_directory")).toHaveLength(3)
+      }),
   )
 })

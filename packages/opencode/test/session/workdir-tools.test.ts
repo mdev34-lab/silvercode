@@ -2,16 +2,28 @@ import { afterEach, describe, expect } from "bun:test"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { Database } from "@opencode-ai/core/database/database"
-import { Effect, Exit } from "effect"
+import { Effect, Exit, Layer } from "effect"
 import path from "path"
 import { Agent } from "@/agent/agent"
 import { BackgroundJob } from "@/background/job"
+import { Command } from "@/command"
 import { Config } from "@/config/config"
+import { Env } from "@/env"
 import { EventV2Bridge } from "@/event-v2-bridge"
+import { Git } from "@/git"
+import { Image } from "@/image/image"
 import { Question } from "@/question"
 import { Session } from "@/session/session"
+import { SessionCompaction } from "@/session/compaction"
+import { LLM } from "@/session/llm"
+import { MessageV2 } from "@/session/message-v2"
+import { SessionProcessor } from "@/session/processor"
+import { SessionPrompt } from "@/session/prompt"
+import { SessionRevert } from "@/session/revert"
 import { SessionStatus } from "@/session/status"
 import { SessionRunState } from "@/session/run-state"
+import { SessionSummary } from "@/session/summary"
+import { Snapshot } from "@/snapshot"
 import { Todo } from "@/session/todo"
 import { Permission } from "@/permission"
 import { Plugin } from "@/plugin"
@@ -33,21 +45,40 @@ import { Format } from "@/format"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
+import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { MessageID } from "@/session/schema"
 import { InstanceState } from "@/effect/instance-state"
 import { disposeAllInstances, TestInstance, tmpdirScoped } from "../fixture/fixture"
-import { testEffect } from "../lib/effect"
+import { pollWithTimeout, testEffect } from "../lib/effect"
+import { reply, TestLLMServer } from "../lib/llm-server"
 
 afterEach(async () => {
   await disposeAllInstances()
 })
 
+const testLLMServerNode = LayerNode.make({ service: TestLLMServer, layer: TestLLMServer.layer, deps: [] })
+
+const summaryStub = Layer.succeed(
+  SessionSummary.Service,
+  SessionSummary.Service.of({
+    summarize: () => Effect.void,
+    diff: () => Effect.succeed([]),
+    computeDiff: () => Effect.succeed([]),
+  }),
+)
+
 const it = testEffect(
   LayerNode.compile(
     LayerNode.group([
+      SessionPrompt.node,
       Session.node,
       SessionProjector.node,
+      MessageV2.node,
+      Snapshot.node,
+      LLM.node,
+      Env.node,
       Agent.node,
+      Command.node,
       Permission.node,
       Plugin.node,
       Config.node,
@@ -65,14 +96,22 @@ const it = testEffect(
       ToolRegistry.node,
       ToolCatalog.node,
       Skill.node,
+      Git.node,
       Ripgrep.node,
       Format.node,
       Truncate.node,
+      SessionProcessor.node,
+      Image.node,
+      SessionCompaction.node,
+      SessionRevert.node,
+      SessionSummary.node,
       Instruction.node,
       SystemPrompt.node,
       CrossSpawnSpawner.node,
       RuntimeFlags.node,
+      testLLMServerNode,
     ]),
+    [[SessionSummary.node, summaryStub]],
   ),
 )
 
@@ -266,5 +305,197 @@ describe("session working folder reaches tool execution", () => {
         expect(anchor.directory).toBe(test.directory)
       }),
     { config },
+  )
+
+  it.instance(
+    "live SessionPrompt background delegation and resume run child tools in the selected folder while parent stays on the project",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const llm = yield* TestLLMServer
+        const fs = yield* FSUtil.Service
+        const sessions = yield* Session.Service
+        const prompt = yield* SessionPrompt.Service
+        const background = yield* BackgroundJob.Service
+
+        const childDir = path.join(test.directory, "live-child")
+        yield* fs.writeWithDirs(path.join(test.directory, "same.txt"), "project copy\n")
+        yield* fs.writeWithDirs(path.join(test.directory, "sub", "item.txt"), "project needle\n")
+        yield* fs.writeWithDirs(path.join(childDir, "same.txt"), "child copy\n")
+        yield* fs.writeWithDirs(path.join(childDir, "sub", "item.txt"), "child needle\n")
+
+        yield* fs.writeWithDirs(
+          path.join(test.directory, "opencode.json"),
+          JSON.stringify({
+            $schema: "https://opencode.ai/config.json",
+            agent: {
+              work: { finishTool: false },
+              general: { finishTool: false },
+            },
+            provider: {
+              test: {
+                ...config.provider.test,
+                options: { ...config.provider.test.options, baseURL: llm.url },
+              },
+            },
+          }),
+        )
+
+        const bodyText = (body: Record<string, unknown>) => JSON.stringify(body)
+        const isChildSession = (hit: { body: Record<string, unknown> }) =>
+          bodyText(hit.body).includes("Session working folder (Read, Grep, Glob, Edit, Write, ApplyPatch only):")
+        const isResumeChild = (hit: { body: Record<string, unknown> }) =>
+          isChildSession(hit) && bodyText(hit.body).includes("LIVE_RESUME_MARKER")
+        const isInitialChild = (hit: { body: Record<string, unknown> }) =>
+          isChildSession(hit) && !bodyText(hit.body).includes("LIVE_RESUME_MARKER")
+        const isResumeNotification = (hit: { body: Record<string, unknown> }) =>
+          !isChildSession(hit) && bodyText(hit.body).includes("child-resumed-complete")
+        const isParentResume = (hit: { body: Record<string, unknown> }) =>
+          !isChildSession(hit) && bodyText(hit.body).includes("PARENT_RESUME_TURN") && !isResumeNotification(hit)
+        const isBgNotification = (hit: { body: Record<string, unknown> }) =>
+          !isChildSession(hit) &&
+          bodyText(hit.body).includes("child-bg-complete") &&
+          !isParentResume(hit) &&
+          !isResumeNotification(hit)
+        const isParentInitial = (hit: { body: Record<string, unknown> }) =>
+          !isChildSession(hit) &&
+          bodyText(hit.body).includes("LIVE_PARENT_START") &&
+          !isBgNotification(hit) &&
+          !isParentResume(hit) &&
+          !isResumeNotification(hit)
+
+        // Parent turn 1: dispatch background child into `live-child`, then read relative `same.txt` in project root.
+        yield* llm.pushMatch(
+          isParentInitial,
+          reply().tool("task", {
+            description: "delegate live child",
+            prompt: "LIVE_CHILD_MARKER inspect child folder",
+            subagent_type: "general",
+            directory: "live-child",
+            background: true,
+          }),
+          reply().tool("read", { filePath: "same.txt" }),
+          reply().text("parent-dispatched").stop(),
+        )
+
+        // Background child turn 1: read relative `same.txt`, grep explicit relative `sub`, write `child-note.txt`, deliver result.
+        yield* llm.pushMatch(
+          isInitialChild,
+          reply().tool("read", { filePath: "same.txt" }),
+          reply().tool("grep", { pattern: "needle", path: "sub" }),
+          reply().tool("write", { filePath: "child-note.txt", content: "written-in-bg\n" }),
+          reply().text("<silvercode-result>child-bg-complete</silvercode-result>").stop(),
+        )
+
+        // Parent receives synthetic `<task_result>` notification when background child finishes.
+        yield* llm.pushMatch(isBgNotification, reply().text("parent-saw-bg-notification").stop())
+
+        const parent = yield* sessions.create({
+          title: "Live Parent",
+          permission: [{ permission: "*", pattern: "*", action: "allow" }],
+        })
+
+        yield* prompt.prompt({
+          sessionID: parent.id,
+          agent: "work",
+          model: ref,
+          parts: [{ type: "text", text: "LIVE_PARENT_START Research the requested information" }],
+        })
+
+        // Find the spawned background child and wait for both its BackgroundJob and parent `<task_result>` delivery.
+        const kids = yield* sessions.children(parent.id)
+        expect(kids).toHaveLength(1)
+        const child = kids[0]
+        if (!child) throw new Error("expected spawned child session")
+        expect(Workdir.read(child.metadata)).toBe(childDir)
+
+        const waited = yield* background.wait({ id: child.id })
+        expect(waited.info?.status).toBe("completed")
+
+        const notification = yield* pollWithTimeout(
+          Effect.gen(function* () {
+            const msgs = yield* MessageV2.filterCompactedEffect(parent.id)
+            return msgs.find(
+              (m) =>
+                m.info.role === "user" &&
+                m.parts.some((p) => p.type === "text" && p.synthetic === true && p.text.includes("child-bg-complete")),
+            )
+          }),
+          "timed out waiting for live background task notification",
+          "10 seconds",
+        )
+        expect(notification).toBeDefined()
+
+        // Verify the parent's own `read` read `project copy`, while the background child read/wrote in `childDir`.
+        const parentMsgs = yield* MessageV2.filterCompactedEffect(parent.id)
+        const parentReadPart = parentMsgs
+          .flatMap((m) => m.parts)
+          .find(
+            (p): p is SessionV1.ToolPart => p.type === "tool" && p.tool === "read" && p.state.status === "completed",
+          )
+        expect(parentReadPart?.state.status === "completed" ? parentReadPart.state.output : "").toContain(
+          "project copy",
+        )
+
+        const childReadFile = yield* Effect.promise(() =>
+          import("fs/promises").then((fsp) => fsp.readFile(path.join(childDir, "child-note.txt"), "utf-8")),
+        )
+        expect(childReadFile).toBe("written-in-bg\n")
+        expect(yield* fs.existsSafe(path.join(test.directory, "child-note.txt"))).toBe(false)
+
+        // Verify the live HTTP request sent for the child carried the split `<env>` working-folder block.
+        const rawInputs = yield* llm.inputs
+        const childReqBody = rawInputs.find((b) => {
+          const s = JSON.stringify(b)
+          return s.includes("LIVE_CHILD_MARKER") && !s.includes("LIVE_PARENT_START")
+        })
+        const childMessages = Array.isArray(childReqBody?.messages)
+          ? (childReqBody.messages as Array<{ content?: unknown }>)
+              .map((m) => (typeof m.content === "string" ? m.content : JSON.stringify(m.content ?? "")))
+              .join("\n")
+          : ""
+        expect(childMessages).toContain(
+          `Session working folder (Read, Grep, Glob, Edit, Write, ApplyPatch only): ${childDir}`,
+        )
+        expect(childMessages).toContain(`Project directory (default Shell working directory): ${test.directory}`)
+
+        // Resume the completed background child via `task_id` (omitting `directory`): second live turn stays in `childDir`.
+        yield* llm.pushMatch(
+          isParentResume,
+          reply().tool("task", {
+            description: "resume live child",
+            prompt: "LIVE_RESUME_MARKER update child file",
+            subagent_type: "general",
+            task_id: child.id,
+          }),
+          reply().text("parent-triggered-resume").stop(),
+        )
+        yield* llm.pushMatch(
+          isResumeChild,
+          reply().tool("read", { filePath: "child-note.txt" }),
+          reply().tool("edit", { filePath: "same.txt", oldString: "child copy", newString: "child resumed copy" }),
+          reply().text("<silvercode-result>child-resumed-complete</silvercode-result>").stop(),
+        )
+        yield* llm.pushMatch(isResumeNotification, reply().text("parent-saw-resume").stop())
+
+        yield* prompt.prompt({
+          sessionID: parent.id,
+          agent: "work",
+          model: ref,
+          parts: [{ type: "text", text: "PARENT_RESUME_TURN continue child work" }],
+        })
+
+        const waitedResume = yield* background.wait({ id: child.id })
+        expect(waitedResume.info?.status).toBe("completed")
+
+        const childUpdated = yield* Effect.promise(() =>
+          import("fs/promises").then((fsp) => fsp.readFile(path.join(childDir, "same.txt"), "utf-8")),
+        )
+        const projectUnchanged = yield* Effect.promise(() =>
+          import("fs/promises").then((fsp) => fsp.readFile(path.join(test.directory, "same.txt"), "utf-8")),
+        )
+        expect(childUpdated).toBe("child resumed copy\n")
+        expect(projectUnchanged).toBe("project copy\n")
+      }),
   )
 })
