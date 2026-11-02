@@ -121,6 +121,26 @@ const GO_UPSELL_PROVIDERS = new Set(["opencode", "opencode-go"])
 
 export const alwaysSeparate = new WeakSet<BoxRenderable>()
 
+// Rows rendered inside an expanded activity block sit one column closer than
+// the same row at transcript level: the block owns the indent, so every detail
+// line (native tool row, nested reasoning) shares one two-column inner indent.
+const activityDetail = createContext(false)
+
+// A renderable that already draws its own blank row below its content: at
+// transcript level tool panels pad their top and bottom by one row. A block
+// boundary consults this so the shared blank row is drawn once, by whichever
+// side already owns it.
+const selfPadded = new WeakSet<BoxRenderable>()
+
+// A tool panel's own spacing: one row of padding above and below, and one blank
+// row between the rows it stacks. Inside an activity block those rows would be
+// blank rows inside the block, and the block owns all of its spacing, so the
+// detail panel draws none of it. At transcript level the panel keeps its
+// anatomy exactly as before.
+function usePanelSpacing() {
+  return useContext(activityDetail) ? 0 : 1
+}
+
 type RetryAction = Extract<SessionStatus, { type: "retry" }>["action"]
 
 function goUpsellKeys(action: RetryAction) {
@@ -1905,6 +1925,12 @@ const PART_MAPPING = {
 
 const INLINE_TOOL_ICON_WIDTH = 2
 
+// Inner indent of an expanded activity block's detail rows, measured from the
+// block header. Tool panels keep their border on the header column and put
+// their content on this same column, so header, rows and panel content share
+// one indent instead of drifting by tool.
+const ACTIVITY_DETAIL_INDENT = 2
+
 // Default content lines shown in a collapsed bash/write/edit block before "Click to expand".
 const COLLAPSED_TOOL_PREVIEW_LINES = 3
 
@@ -1941,12 +1967,17 @@ function ReasoningPart(props: { last: boolean; part: ReasoningPart; message: Ass
     setExpanded((prev) => !prev)
   }
 
+  const detail = useContext(activityDetail)
+
   return (
     <Show when={content() || opaque()}>
       <box
         ref={(el: BoxRenderable) => alwaysSeparate.add(el)}
-        paddingLeft={3}
-        marginTop={1}
+        paddingLeft={detail ? ACTIVITY_DETAIL_INDENT : 3}
+        // Inside a block a nested reasoning row is one more compact detail row
+        // under the header, so it drops the transcript-level blank row; the
+        // panel above it already pads its own bottom.
+        marginTop={detail ? 0 : 1}
         flexDirection="column"
         flexShrink={0}
       >
@@ -1961,7 +1992,12 @@ function ReasoningPart(props: { last: boolean; part: ReasoningPart; message: Ass
           />
         </box>
         <Show when={!opaque() && open() && summary().body}>
-          <box paddingLeft={inMinimal() ? 2 : 0} marginTop={1}>
+          {/* The body's top margin is the transcript's row between a reasoning
+              header and the text under it. Inside an activity block that row
+              would be a blank row inside the block, so the body starts on the
+              row after the header; the body's own markdown blank lines are
+              content and stay. */}
+          <box paddingLeft={inMinimal() ? 2 : 0} marginTop={detail ? 0 : 1}>
             <code
               filetype="markdown"
               drawUnstyledText={false}
@@ -2125,7 +2161,18 @@ function ActivitySubGroupBlock(props: { groupID: string; subID: string }) {
   }
 
   return (
-    <box>
+    <box
+      ref={(el: BoxRenderable) =>
+        // One blank terminal row between blocks. A block whose last detail row
+        // already ends with its own bottom padding (a tool panel) draws that
+        // row itself, so adding the margin here would double the gap.
+        setPreLayoutSiblingMargin(el, (previous) => {
+          if (!previous) return 0
+          const last = previous.getChildren().at(-1)
+          return last instanceof BoxRenderable && selfPadded.has(last) ? 0 : 1
+        })
+      }
+    >
       <box onMouseOver={() => setHover(true)} onMouseOut={() => setHover(false)} onMouseUp={toggle}>
         <Switch>
           <Match when={summary().working}>
@@ -2156,7 +2203,9 @@ function ActivitySubGroupBlock(props: { groupID: string; subID: string }) {
         </Switch>
       </box>
       <Show when={expanded()}>
-        <For each={parts()}>{(item) => <ActivityGroupPartRow item={item} />}</For>
+        <activityDetail.Provider value={true}>
+          <For each={parts()}>{(item) => <ActivityGroupPartRow item={item} />}</For>
+        </activityDetail.Provider>
       </Show>
     </box>
   )
@@ -2210,6 +2259,7 @@ type ToolProps = {
 }
 function GenericTool(props: ToolProps) {
   const { theme } = useTheme()
+  const spacing = usePanelSpacing()
   const ctx = use()
   const output = createMemo(() => stripAnsi(props.output?.trim() ?? ""))
   const args = createMemo(() => Locale.truncate(input(props.input), Math.max(20, ctx.width - 12)))
@@ -2236,7 +2286,7 @@ function GenericTool(props: ToolProps) {
         part={props.part}
         onClick={collapsed().overflow ? () => setExpanded((prev) => !prev) : undefined}
       >
-        <box gap={1}>
+        <box gap={spacing}>
           <text fg={theme.text}>{limited()}</text>
           <Show when={collapsed().overflow}>
             <text fg={theme.textMuted}>{expanded() ? "Click to collapse" : "Click to expand"}</text>
@@ -2586,6 +2636,7 @@ export function reviewFindingLocation(finding: ReviewReport.Finding): string | u
 
 function ReviewFinish(props: { review: { report: ReviewReport.Info; analysis: string }; part: ToolPart }) {
   const { theme } = useTheme()
+  const spacing = usePanelSpacing()
   const ctx = use()
   const [expanded, setExpanded] = createSignal(false)
   const [rawOpen, setRawOpen] = createSignal(false)
@@ -2624,7 +2675,7 @@ function ReviewFinish(props: { review: { report: ReviewReport.Info; analysis: st
         part={props.part}
         onClick={expandable() ? () => setExpanded((prev) => !prev) : undefined}
       >
-        <box gap={1}>
+        <box gap={spacing}>
           <text fg={theme.text}>
             <span style={{ fg: approved() ? theme.success : theme.error, bold: true }}>
               {approved() ? "✓ Approved" : "✗ Needs fixes"}
@@ -2789,19 +2840,24 @@ export function InlineToolRow(props: {
   onMouseOut?: () => void
   onMouseUp?: () => void
 }) {
+  const detail = useContext(activityDetail)
   return (
     <box
-      paddingLeft={3}
+      paddingLeft={detail ? ACTIVITY_DETAIL_INDENT : 3}
       onMouseOver={props.onMouseOver}
       onMouseOut={props.onMouseOut}
       onMouseUp={props.onMouseUp}
       ref={(el: BoxRenderable) => {
         if (props.separate) alwaysSeparate.add(el)
         setPreLayoutSiblingMargin(el, (previous) => {
-          return props.separate ||
-            (previous instanceof BoxRenderable && (previous.height > 1 || alwaysSeparate.has(previous)))
-            ? 1
-            : 0
+          if (props.separate) return 1
+          if (!(previous instanceof BoxRenderable)) return 0
+          // Inside an expanded activity block the detail rows are one compact
+          // list directly under their header: the block's own margin owns the
+          // spacing between blocks, and a tool panel's own bottom padding owns
+          // the row below it, so a detail row never draws a blank row itself.
+          if (detail) return 0
+          return previous.height > 1 || alwaysSeparate.has(previous) ? 1 : 0
         })
       }}
     >
@@ -2812,8 +2868,13 @@ export function InlineToolRow(props: {
         <Match when={true}>
           <Show
             fallback={
+              // The pending row's `~` stands where a completed row's icon
+              // stands, so the two share a marker column. Inside an activity
+              // block that column is the shared detail indent, which the row's
+              // wrapper already applies, so the text contributes no extra
+              // indent there; at transcript level it keeps its own.
               <text
-                paddingLeft={3}
+                paddingLeft={detail ? 0 : 3}
                 fg={props.color}
                 attributes={props.denied || props.interrupted ? TextAttributes.STRIKETHROUGH : undefined}
               >
@@ -2862,15 +2923,27 @@ function BlockTool(props: {
   const renderer = useRenderer()
   const [hover, setHover] = createSignal(false)
   const error = createMemo(() => (props.part?.state.status === "error" ? props.part.state.error : undefined))
+  // Inside an expanded activity block the panel is one of the block's detail
+  // rows: it draws no padding or gap rows of its own, so the block holds no
+  // blank row inside it, and it keeps its left border on the block header's
+  // column so its content lands on the shared detail column. Only the block's
+  // boundary margin draws a blank row. At transcript level the panel keeps its
+  // padding and gaps, and registers as self-padded so the shared blank row is
+  // drawn once.
+  const detail = useContext(activityDetail)
+  const spacing = usePanelSpacing()
   return (
     <box
-      ref={(el: BoxRenderable) => alwaysSeparate.add(el)}
+      ref={(el: BoxRenderable) => {
+        alwaysSeparate.add(el)
+        if (!detail) selfPadded.add(el)
+      }}
       border={["left"]}
-      paddingTop={1}
-      paddingBottom={1}
-      paddingLeft={2}
-      marginTop={1}
-      gap={1}
+      paddingTop={spacing}
+      paddingBottom={spacing}
+      paddingLeft={detail ? ACTIVITY_DETAIL_INDENT - 1 : 2}
+      marginTop={detail ? 0 : 1}
+      gap={spacing}
       backgroundColor={hover() ? theme.backgroundMenu : theme.backgroundPanel}
       customBorderChars={SplitBorder.customBorderChars}
       borderColor={theme.background}
@@ -2905,6 +2978,7 @@ function BlockTool(props: {
 
 function Shell(props: ToolProps) {
   const { theme } = useTheme()
+  const spacing = usePanelSpacing()
   const pathFormatter = usePathFormatter()
   const ctx = use()
   const isRunning = createMemo(() => props.part.state.status === "running")
@@ -2945,7 +3019,7 @@ function Shell(props: ToolProps) {
           part={props.part}
           onClick={collapsed().overflow ? () => setExpanded((prev) => !prev) : undefined}
         >
-          <box gap={1}>
+          <box gap={spacing}>
             <Show when={isRunning()} fallback={<text fg={theme.text}>$ {stringValue(props.input.command)}</text>}>
               <Spinner color={theme.text}>{stringValue(props.input.command)}</Spinner>
             </Show>
@@ -3033,6 +3107,7 @@ function Glob(props: ToolProps) {
 function Read(props: ToolProps) {
   const { theme } = useTheme()
   const pathFormatter = usePathFormatter()
+  const detail = useContext(activityDetail)
   const isRunning = createMemo(() => props.part.state.status === "running")
   const loaded = createMemo(() => {
     if (props.part.state.status !== "completed") return []
@@ -3054,8 +3129,13 @@ function Read(props: ToolProps) {
       </InlineTool>
       <For each={loaded()}>
         {(filepath) => (
-          <box paddingLeft={3}>
-            <text paddingLeft={3} fg={theme.textMuted}>
+          // At transcript level the row and its loaded files share one column:
+          // the row's own indent, then the row's indent again for the nested
+          // line. Inside an activity block the shared detail indent is that
+          // first indent, so the nested line lands on the same column as the
+          // read row instead of being pushed past it by a second one.
+          <box paddingLeft={detail ? ACTIVITY_DETAIL_INDENT : 3}>
+            <text paddingLeft={detail ? 0 : 3} fg={theme.textMuted}>
               ↳ Loaded {pathFormatter.format(filepath)}
             </text>
           </box>
@@ -3615,6 +3695,7 @@ function TodoWrite(props: ToolProps) {
 
 function Question(props: ToolProps) {
   const { theme } = useTheme()
+  const spacing = usePanelSpacing()
   const questions = createMemo(() => parseQuestions(props.input.questions))
   const answers = createMemo(() => parseQuestionAnswers(props.metadata.answers))
   const count = createMemo(() => questions().length)
@@ -3629,7 +3710,7 @@ function Question(props: ToolProps) {
       <Match when={answers()}>
         <BlockTool title="# Questions" part={props.part}>
           <Show when={questions().length > 0} fallback={<text fg={theme.textMuted}>No questions</text>}>
-            <box gap={1}>
+            <box gap={spacing}>
               <For each={questions()}>
                 {(q, i) => (
                   <box flexDirection="column">
