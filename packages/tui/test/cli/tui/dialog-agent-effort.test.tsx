@@ -490,7 +490,10 @@ function rowFillsOf(spans: Awaited<ReturnType<typeof captureSpans>>) {
 async function selectionPaint(app: Setup, title: string, level: string) {
   let signature: string | undefined
   let same = 0
-  for (let pass = 0; pass < 900; pass++) {
+  // Same pump budget as every other wait in this file (`frameWhere`'s 600
+  // passes, at the same 5 ms spacing): the readiness rule is not allowed to buy
+  // itself more wall clock than the waits it replaces.
+  for (let pass = 0; pass < 600; pass++) {
     await app.renderOnce()
     const spans = await captureSpans(app)
     const fills = rowFillsOf(spans)
