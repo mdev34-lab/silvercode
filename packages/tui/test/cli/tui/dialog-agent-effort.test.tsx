@@ -355,6 +355,23 @@ function markerLine(frame: string) {
   return frame.split("\n").find((line) => line.includes("●")) ?? ""
 }
 
+/**
+ * Waits for the dialog's opening state: the title, the search field and the
+ * stored level already marked.
+ *
+ * The marker is the readiness signal for navigation. Until it paints, the
+ * stored `current` is still arriving; once it does, the effect that selects it
+ * moves the cursor back to it, which reverts an arrow pressed in between. A
+ * dialog that has not marked its level is not ready to be walked.
+ */
+async function dialogReady(app: Setup, level: string) {
+  return frameWhere(
+    app,
+    (f) => f.includes("Search") && markerLine(f).includes(level),
+    `dialog ready (marker on ${level})`,
+  )
+}
+
 function hexOf(color: { r: number; g: number; b: number }) {
   const part = (value: number) => Math.round(value * 255).toString(16).padStart(2, "0")
   return `#${part(color.r)}${part(color.g)}${part(color.b)}`
@@ -447,12 +464,49 @@ function lastPaintedAbove(frame: string, footerRow: number) {
 }
 
 /** The background of the widest span on a row, i.e. the fill the row paints. */
-async function rowFills(app: Setup) {
-  const spans = await captureSpans(app)
+function rowFillsOf(spans: Awaited<ReturnType<typeof captureSpans>>) {
   return spans.lines.map((line) => {
     const widest = line.spans.reduce((acc, span) => (span.width > acc.width ? span : acc), line.spans[0])
     return widest ? hexOf(widest.bg) : undefined
   })
+}
+
+/**
+ * Waits for the cursor's own paint to land, then returns that frame's fills.
+ *
+ * The `●` marker belongs to the stored level (`props.current`), not to the
+ * cursor, so a wait keyed on it is already true when the arrows are pressed and
+ * returns before the selection has been painted. A press only queues the key:
+ * on a loaded runner the dispatch and its repaint can land after the render the
+ * wait pumped, and the read below then sees the previous selection's highlight.
+ *
+ * Readiness is therefore the paint itself: the row that starts `level` must not
+ * carry the panel's own fill, and two further pumped frames must leave every
+ * row's fill and text unchanged. Holding the frame still makes the read below a
+ * single settled state instead of a boundary between two. Only the selection
+ * landing is waited for here; how far the highlight reaches, and whether any
+ * other row picks up the same fill, is asserted afterwards.
+ */
+async function selectionPaint(app: Setup, title: string, level: string) {
+  let signature: string | undefined
+  let same = 0
+  for (let pass = 0; pass < 900; pass++) {
+    await app.renderOnce()
+    const spans = await captureSpans(app)
+    const fills = rowFillsOf(spans)
+    const texts = spans.lines.map((line) => line.spans.map((span) => span.text).join(""))
+    const panel = spans.lines
+      .flatMap((line) => line.spans)
+      .find((span) => span.text.trim() === title && span.bg.a > 0.01)
+    const start = texts.findIndex((text) => text.includes(level))
+    const painted = start >= 0 && panel !== undefined && fills[start] !== hexOf(panel.bg)
+    const current = spans.lines.map((line, index) => `${fills[index]}|${texts[index]}`).join("\n")
+    same = painted && current === signature ? same + 1 : 0
+    signature = current
+    if (same >= 2) return fills
+    await Bun.sleep(5)
+  }
+  throw new Error(`the selection paint for ${level} never settled:\n${await captureFrame(app)}`)
 }
 
 describe("agent effort selector", () => {
@@ -1266,6 +1320,46 @@ describe("agent effort selector", () => {
     }
   })
 
+  test("keeps the level cells intact when the terminal is narrower than the title column", async () => {
+    // The title cell is 10 columns plus the 3-column indent, so a 20-column
+    // terminal leaves no width for the description column. The bounded
+    // behavior is that descriptions stop painting instead of wrapping back
+    // over the level names: every level keeps exactly one row, at one shared
+    // column, and no description text is spliced into a title.
+    const harness = await mountEffort({
+      route: { type: "home" },
+      model: "test-provider/variant-model",
+      children: () => null,
+      width: 20,
+      height: 40,
+    })
+    try {
+      harness.dialog.replace(() => <DialogAgentEffort />)
+      const frame = await frameWhere(
+        harness.app,
+        (f) => f.includes("Search") && f.includes("Thorough") && flatText(f).includes("Default for new"),
+        "20 column dialog",
+      )
+      const lines = frame.split("\n")
+      const columns = ["Fast", "Medium", "Thorough"].map((level) => {
+        // One painted row per level, so no wrapped description lands under a
+        // level name or over the next one.
+        expect(optionBlock(frame, level)).toHaveLength(1)
+        const line = lines.find((candidate) => candidate.includes(level)) ?? ""
+        return line.indexOf(level)
+      })
+      expect(new Set(columns).size).toBe(1)
+      expect(columns[0]).toBeGreaterThan(0)
+      const text = flatText(frame)
+      expect(text).not.toContain("Reliable workhorse")
+      expect(text).not.toContain("Smarter agent")
+      expect(text).not.toContain("meticulous")
+      expect(frame).toContain("●")
+    } finally {
+      await harness.dispose()
+    }
+  })
+
   test("paints the selected row's background across every wrapped line", async () => {
     const harness = await mountEffort({
       route: { type: "home" },
@@ -1276,13 +1370,15 @@ describe("agent effort selector", () => {
     })
     try {
       harness.dialog.replace(() => <DialogAgentEffort />)
+      await dialogReady(harness.app, "Fast")
       await frameWhere(harness.app, (f) => flatText(f).includes("start to finish"), "narrow rows")
       // Walk the cursor to the wrapping level: its highlight must cover the
-      // whole description, not just the title line.
+      // whole description, not just the title line. The marker stays on the
+      // stored level either way, so the wait is on the cursor's paint.
       harness.app.mockInput.pressArrow("down")
       harness.app.mockInput.pressArrow("down")
-      const frame = await frameWhere(harness.app, (f) => markerLine(f).includes("Fast"), "marker stays on the level")
-      const fills = await rowFills(harness.app)
+      const fills = await selectionPaint(harness.app, "Agent effort", "Thorough")
+      const frame = await captureFrame(harness.app)
       const lines = frame.split("\n")
       const start = lines.findIndex((line) => line.includes("Thorough"))
       const block = optionBlock(frame, "Thorough")
@@ -1357,7 +1453,7 @@ describe("agent effort selector", () => {
     })
     try {
       harness.dialog.replace(() => <DialogAgentEffort />)
-      await frameWhere(harness.app, (f) => f.includes("Reliable workhorse"), "first row")
+      await dialogReady(harness.app, "Fast")
       harness.app.mockInput.pressArrow("down")
       harness.app.mockInput.pressArrow("down")
       const frame = await frameWhere(
@@ -1393,7 +1489,7 @@ describe("agent effort selector", () => {
     })
     try {
       harness.dialog.replace(() => <DialogAgentEffort />)
-      await frameWhere(harness.app, (f) => f.includes("Reliable workhorse"), "first row")
+      await dialogReady(harness.app, "Fast")
       harness.app.mockInput.pressArrow("down")
       harness.app.mockInput.pressArrow("down")
       // The scroll reveals the row by its own height: all three wrapped lines
@@ -1490,6 +1586,48 @@ describe("agent effort selector", () => {
       expect((await settledPanel(harness.app, "Control picker")).height).toBe(2 + CHROME - 1)
     } finally {
       await harness.dispose()
+    }
+  })
+
+  test("counts every opt-in spacer row in the panel height", async () => {
+    // `rows()` adds `optionSpacing` for each gap the list paints, so a picker
+    // that opts into a spacing other than the effort menu's 1 still sizes to
+    // the rows it paints instead of to a one-row-per-option guess.
+    for (const spacing of [1, 2]) {
+      const harness = await mountEffort({
+        route: { type: "home" },
+        model: "test-provider/variant-model",
+        children: () => null,
+        width: 120,
+        height: 40,
+      })
+      try {
+        harness.dialog.replace(() => (
+          <DialogSelect
+            options={[
+              { value: "alpha", title: "Alpha", description: "First option" },
+              { value: "bravo", title: "Bravo", description: "Second option" },
+              { value: "charlie", title: "Charlie", description: "Third option" },
+            ]}
+            title="Spaced picker"
+            current="alpha"
+            optionSpacing={spacing}
+          />
+        ))
+        const frame = await frameWhere(
+          harness.app,
+          (f) => f.includes("Spaced picker") && f.includes("Third option"),
+          `spaced picker ${spacing}`,
+        )
+        const lines = frame.split("\n")
+        const rowOf = (needle: string) => lines.findIndex((line) => line.includes(needle))
+        expect(rowOf("Bravo") - rowOf("Alpha")).toBe(spacing + 1)
+        expect(rowOf("Charlie") - rowOf("Bravo")).toBe(spacing + 1)
+        const panel = await settledPanel(harness.app, "Spaced picker")
+        expect(panel.height).toBe(3 + spacing * 2 + CHROME - 1)
+      } finally {
+        await harness.dispose()
+      }
     }
   })
 

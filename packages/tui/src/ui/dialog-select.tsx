@@ -340,6 +340,14 @@ export function DialogSelect<T>(props: DialogSelectProps<T>) {
   }
 
   function moveTo(next: number, center = false, preserve = true) {
+    // The dialog settles on its current option one tick after it opens (or
+    // after the filter is cleared). Any move that reaches here is the user's
+    // own choice, so a settle still queued for that tick must not pull the
+    // cursor back off it.
+    if (filterTimer !== undefined) {
+      clearTimeout(filterTimer)
+      filterTimer = undefined
+    }
     setFocusedAction(undefined)
     setStore("selected", next)
     const option = selected()
