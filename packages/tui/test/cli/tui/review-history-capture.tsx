@@ -28,6 +28,7 @@ import { DialogProvider } from "../../../src/ui/dialog"
 import { LocationProvider } from "../../../src/context/location"
 import { OpencodeKeymapProvider, registerOpencodeKeymap } from "../../../src/keymap"
 import { AssistantMessageRow, SessionContext, CaptureUserMessage } from "../../../src/routes/session"
+import { createExecutionReviewIndex } from "../../../src/routes/session/review-execution"
 import { computeActivityGroups } from "../../../src/util/activity"
 import { waitUntil } from "../../fixture/frame"
 import { ReviewReport } from "@opencode-ai/core/review-report"
@@ -64,6 +65,7 @@ async function mount(options: { entries: { info: Message; parts: Part[] }[] }) {
         })),
       ),
     )
+    const reviewExecution = createMemo(() => createExecutionReviewIndex(storeSync.data.message[SESSION] ?? [], storeSync.data.part))
     const ctxValue = {
       get width() {
         return 120
@@ -80,6 +82,7 @@ async function mount(options: { entries: { info: Message; parts: Part[] }[] }) {
       sync: storeSync,
       tui,
       activity: () => activity(),
+      reviewExecution,
       activityAllExpanded: () => false,
       activityExpanded: () => false,
       toggleActivity: () => {},

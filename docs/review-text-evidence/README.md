@@ -22,4 +22,4 @@ For example, from `packages/tui`:
 script -q -e -c 'stty cols 120 rows 48; bun test/cli/tui/review-history-capture.tsx nudge' /dev/null > nudge.ansi
 ```
 
-The PNGs are screenshots of these actual terminal streams replayed at 120×48 in xterm.js, with the alternate-screen exit omitted so the last frame stays visible. The production rendering code corresponds to `b6fb0d2` plus the exported user-row alias used by this capture fixture.
+The PNGs are screenshots of these actual terminal streams replayed at 120×48 in xterm.js, with the alternate-screen exit omitted so the last frame stays visible. These streams were freshly recorded from production rendering code at `e3b6dcf`, using the shared reactive execution index in the synthetic component harness; the streams are byte-for-byte identical to the earlier captures. The PNGs were regenerated from those fresh recordings. This is not a full Session-route capture.
