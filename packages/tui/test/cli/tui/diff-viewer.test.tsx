@@ -98,7 +98,18 @@ test("brackets navigate diff hunks", async () => {
   }
 })
 
-async function renderDiffViewer(vcsDiff: unknown[], height = 20, initialRoute?: TuiRouteCurrent) {
+async function renderDiffViewer(
+  vcsDiff: unknown[],
+  height = 20,
+  initialRoute?: TuiRouteCurrent,
+  holdSelectedRequestUntilCommandObserved = false,
+) {
+  let releaseSelectedRequest: (() => void) | undefined
+  const selectedRequestGate = holdSelectedRequestUntilCommandObserved
+    ? new Promise<void>((resolve) => {
+        releaseSelectedRequest = resolve
+      })
+    : undefined
   const commands = new Map<
     string,
     NonNullable<Parameters<TuiPluginApi["keymap"]["registerLayer"]>[0]["commands"]>[number]
@@ -121,12 +132,14 @@ async function renderDiffViewer(vcsDiff: unknown[], height = 20, initialRoute?: 
       client: {
         vcs: {
           diff: async (input: unknown) => {
+            await selectedRequestGate
             vcsDiffInput = input
             return { data: vcsDiff }
           },
         },
         session: {
           diff: async (input: unknown) => {
+            await selectedRequestGate
             sessionDiffInput = input
             return { data: [] }
           },
@@ -173,7 +186,18 @@ async function renderDiffViewer(vcsDiff: unknown[], height = 20, initialRoute?: 
   }
 
   const app = await testRender(() => <Harness />, { width: 80, height })
-  await waitForCommand(app, commands, "diff.close")
+  const selectedRequestReady = () => {
+    if (current.name !== "diff" || !current.params) return false
+    if (current.params.mode === "last-turn") return sessionDiffInput !== undefined
+    return vcsDiffInput !== undefined
+  }
+  await waitForViewerReady(
+    app,
+    commands,
+    "diff.close",
+    selectedRequestReady,
+    holdSelectedRequestUntilCommandObserved ? () => setTimeout(() => releaseSelectedRequest?.(), 0) : undefined,
+  )
   return {
     app,
     commands,
@@ -207,6 +231,44 @@ const session = {
     updated: 0,
   },
 } satisfies Session
+
+test("diff viewer waits for its selected VCS request after command registration", async () => {
+  const viewer = await renderDiffViewer(
+    [],
+    20,
+    {
+      name: "diff",
+      params: { mode: "branch", sessionID: "session-1", returnRoute: startRoute },
+    },
+    true,
+  )
+  try {
+    expect(viewer.commands.has("diff.close")).toBe(true)
+    expect(viewer.vcsDiffInput()).toEqual({ directory: "/repo/session", mode: "branch", context: 12 })
+    expect(viewer.sessionDiffInput()).toBeUndefined()
+  } finally {
+    viewer.app.renderer.destroy()
+  }
+})
+
+test("last-turn viewer waits for its selected session request after command registration", async () => {
+  const viewer = await renderDiffViewer(
+    [],
+    20,
+    {
+      name: "diff",
+      params: { mode: "last-turn", sessionID: "session-1", messageID: "message-1", returnRoute: startRoute },
+    },
+    true,
+  )
+  try {
+    expect(viewer.commands.has("diff.close")).toBe(true)
+    expect(viewer.sessionDiffInput()).toEqual({ sessionID: "session-1", messageID: "message-1" })
+    expect(viewer.vcsDiffInput()).toBeUndefined()
+  } finally {
+    viewer.app.renderer.destroy()
+  }
+})
 
 test("branch diff source requests branch VCS diff", async () => {
   const viewer = await renderDiffViewer([], 20, {
@@ -242,16 +304,24 @@ test("last-turn diff source requests session diff", async () => {
   }
 })
 
-async function waitForCommand(
+async function waitForViewerReady(
   app: Awaited<ReturnType<typeof testRender>>,
   commands: Map<string, unknown>,
   command: string,
+  selectedRequestReady: () => boolean,
+  onCommandObserved?: () => void,
 ) {
+  let commandObserved = false
   for (let attempt = 0; attempt < 10; attempt++) {
     await app.renderOnce()
-    if (commands.has(command)) return
+    if (commands.has(command) && !commandObserved) {
+      commandObserved = true
+      onCommandObserved?.()
+    }
+    if (commands.has(command) && selectedRequestReady()) return
     await new Promise((resolve) => setTimeout(resolve, 25))
   }
+  throw new Error(`Timed out waiting for ${command} and its selected diff request`)
 }
 
 const pluginMeta = {
