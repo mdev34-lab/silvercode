@@ -33,3 +33,11 @@ Recorded at production checkpoint `3e9330c` in a 120×48 pseudo-terminal and rep
 ```sh
 script -q -e -c 'stty cols 120 rows 48; bun test/cli/tui/review-background-removal-capture.tsx removed' /dev/null > removed.ansi
 ```
+
+## Accepted spacing and Review together
+
+`merged/activity-review.ansi` was emitted by the live OpenTUI renderer at merged production checkpoint `504e58f` using synthetic data in `review-activity-merge-capture.tsx`. It shows expanded activity details with the accepted spacing and a structured Review in the same transcript. Its PNG is an xterm.js screenshot of that stream with alternate-screen exit omitted. This uses the real transcript row components, not the complete Session route; the combined real-route behavior is covered by the padding and review tests.
+
+```sh
+script -q -e -c 'stty cols 120 rows 48; bun test/cli/tui/review-activity-merge-capture.tsx' /dev/null > activity-review.ansi
+```
