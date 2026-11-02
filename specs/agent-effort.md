@@ -26,6 +26,16 @@ delivered. There are exactly three levels and two switches — no other knobs.
   its unreviewed writes to its parent as `review-pending`. Neither status is
   approval.
 
+## Efficient work at every level
+
+Fast, quick, direct execution matters at every effort level. Depth may vary,
+but effort never justifies inefficient work. Scope searches first, then read
+the needed ranges in batches; include whole files or wider context when needed.
+Make useful independent read, grep, and glob tool calls in parallel; dependent
+calls remain sequential. Avoid redundant exploration fronts and duplicate checks.
+Review evaluates and reports findings and coverage gaps rather than writing tests
+or taking over implementation; existing non-destructive checks remain available.
+
 ## Configuration
 
 The canonical setting is the nested `agent.effort` scalar in `opencode.json`:
