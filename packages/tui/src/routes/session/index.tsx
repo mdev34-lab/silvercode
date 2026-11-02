@@ -1541,12 +1541,24 @@ function UserMessageRow(props: {
   const sdk = useSDK()
   const sync = useSync()
   const [history, setHistory] = createSignal<{ info: Message; parts: Part[] }[]>()
+  const [historyRevision, setHistoryRevision] = createSignal(0)
+  // A removal can affect a launch or duplicate outside this row (or outside
+  // sync's 100-message window). Invalidate immediately and refetch the full
+  // history; the effect cleanup also rejects any older in-flight response.
+  const offHistoryRemoval = sdk.event.on("event", (event) => {
+    const payload = event.payload
+    if ((payload.type !== "message.removed" && payload.type !== "message.part.removed") ||
+        payload.properties.sessionID !== props.message.sessionID) return
+    setHistory(undefined)
+    setHistoryRevision((revision) => revision + 1)
+  })
+  onCleanup(offHistoryRemoval)
   // Sync retains only the newest 100 messages. Read the complete persisted
   // history before treating a launch/receipt pair as unique. While loading or
   // on failure the receipt remains visible on the ordinary fallback path.
   createEffect(on(
-    () => backgroundParts().filter((part) => ReviewReport.TAGS.some((tag) => part.text.includes(`<${tag}`))).map((part) => `${part.id}\n${part.text}`).join("\n"),
-    (key) => {
+    () => ({ key: backgroundParts().filter((part) => ReviewReport.TAGS.some((tag) => part.text.includes(`<${tag}`))).map((part) => `${part.id}\n${part.text}`).join("\n"), revision: historyRevision() }),
+    ({ key }) => {
       setHistory(undefined)
       if (!key) return
       let active = true
