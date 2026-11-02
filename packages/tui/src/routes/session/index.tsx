@@ -2868,8 +2868,13 @@ export function InlineToolRow(props: {
         <Match when={true}>
           <Show
             fallback={
+              // The pending row's `~` stands where a completed row's icon
+              // stands, so the two share a marker column. Inside an activity
+              // block that column is the shared detail indent, which the row's
+              // wrapper already applies, so the text contributes no extra
+              // indent there; at transcript level it keeps its own.
               <text
-                paddingLeft={3}
+                paddingLeft={detail ? 0 : 3}
                 fg={props.color}
                 attributes={props.denied || props.interrupted ? TextAttributes.STRIKETHROUGH : undefined}
               >

@@ -303,6 +303,54 @@ function mountTwoPanels() {
   })
 }
 
+// A call the session has not finished. `state.status === "pending"` keeps the
+// row on InlineToolRow's pending fallback (`~ <pending text>`) instead of the
+// icon + text row that every completed fixture above uses, so these fixtures
+// are the only coverage of that branch.
+function pendingToolPart(id: string, messageID: string, tool: string, input: Record<string, unknown>): ToolPart {
+  return {
+    id,
+    sessionID: SESSION,
+    messageID,
+    type: "tool",
+    callID: id,
+    tool,
+    state: { status: "pending", input, raw: "" },
+  }
+}
+
+const PENDING_READ = "~ Reading file..."
+const PENDING_GREP = "~ Searching content..."
+
+// Two pending calls in one run: the run is an activity block, so each pending
+// row is a detail row under the block header. `standalone` renders a single
+// pending call instead, which is not a run and stays at transcript level.
+function mountPending(size: keyof typeof SIZES, standalone: boolean) {
+  const session = sessionInfo(SESSION, { title: "Fix the App class" })
+  const user = userMessage("msg_00_user", SESSION)
+  const work = assistantMessage("msg_01_work", SESSION, { time: { created: at(1), completed: at(9) } })
+  const closing = assistantMessage("msg_02_closing", SESSION, { time: { created: at(9), completed: at(10) } })
+  const parts: Part[] = standalone
+    ? [pendingToolPart("prt_pending_read", work.id, "read", { filePath: "src/app.py" })]
+    : [
+        pendingToolPart("prt_pending_read", work.id, "read", { filePath: "src/app.py" }),
+        pendingToolPart("prt_pending_grep", work.id, "grep", { pattern: "class App" }),
+      ]
+  const messages: NonNullable<MountOptions["messages"]> = {
+    [SESSION]: [
+      { info: user, parts: [textPart("prt_user", user, "Fix the App class")] },
+      { info: work, parts },
+      { info: closing, parts: [textPart("prt_closing", closing, "After the pending calls.")] },
+    ],
+  }
+  return mountSessionRoute({
+    ...SIZES[size],
+    sessions: [session],
+    messages,
+    kv: standalone ? {} : { activity_groups_expanded: true },
+  })
+}
+
 // A read row that loaded two more files, and an answered question with two
 // groups. Both draw sub-rows and a group gap of their own, so both are places
 // where decorative spacing can leak inside a block.
@@ -914,6 +962,56 @@ describe("activity block spacing", () => {
       attributes: 0,
     })
   })
+
+  // A pending detail row draws `~ <pending text>` instead of icon + text. Its
+  // `~` stands on the marker column a completed row's icon uses, which inside a
+  // block is the shared two-column detail indent — the pending text must not add
+  // a transcript-level indent on top of it.
+  for (const size of ["normal", "narrow"] as const) {
+    test(`${size}: a pending detail row sits on the shared marker column`, async () => {
+      const { app } = await mountPending(size, false)
+      await settle(app)
+      const frame = await settledFrame(app, PENDING_GREP)
+      await capture(app, `activity-padding-pending-${size}`)
+
+      const header = columnOf(frame, "− ⠼ Exploring files...")
+      // The marker column is +2, the same column the completed cases assert for
+      // a detail row's icon: not 5 (wrapper indent plus a second text indent).
+      expect(columnOf(frame, PENDING_READ)).toBe(header + 2)
+      expect(columnOf(frame, PENDING_GREP)).toBe(header + 2)
+      // Header -> first pending row, and row -> row: no blank row either way.
+      expectNoBlankRowBetween(frame, "− ⠼ Exploring files...", "− ⠼ Exploring files...", PENDING_READ)
+      expectNoBlankRowBetween(frame, "− ⠼ Exploring files...", PENDING_READ, PENDING_GREP)
+      // The block boundary below the last pending row is still one blank row.
+      expectOneBlankRowBetween(frame, "− ⠼ Exploring files...", PENDING_GREP, "After the pending calls.")
+      // Pending text, colours and the `~` marker are untouched.
+      expect(await colorOf(app, PENDING_READ)).toEqual({
+        fg: [238, 238, 238, 255],
+        bg: [10, 10, 10, 255],
+        attributes: 0,
+      })
+      expect(frame).toContain("Reading file...")
+      expect(frame).toContain("Searching content...")
+    })
+  }
+
+  // The control: a lone pending call is not a run, so it stays at transcript
+  // level and lines up with the transcript's own text column, at both widths.
+  for (const size of ["normal", "narrow"] as const) {
+    test(`${size}: a standalone pending row stays on the transcript column`, async () => {
+      const { app } = await mountPending(size, true)
+      await settle(app)
+      const frame = await settledFrame(app, "After the pending calls.")
+
+      expect(columnOf(frame, PENDING_READ)).toBe(columnOf(frame, "After the pending calls."))
+      expect(frame).not.toContain("Exploring files...")
+      expect(await colorOf(app, PENDING_READ)).toEqual({
+        fg: [238, 238, 238, 255],
+        bg: [10, 10, 10, 255],
+        attributes: 0,
+      })
+    })
+  }
 
   test("transcript-level tools keep their own spacing", async () => {
     const { app } = await mountOutsideBlock()
