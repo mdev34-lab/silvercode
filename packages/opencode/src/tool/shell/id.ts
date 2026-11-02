@@ -11,9 +11,11 @@ export function toKind(value: string): Kind {
   return isKind(value) ? value : "bash"
 }
 
-// Keep the exposed tool ID and permission key as "bash" for compatibility with
-// existing plugins, users, and saved permissions. Rename with opencode 2.0.
-export const ToolID = "bash"
+// The exposed tool ID and permission key are "shell": the tool runs the host
+// shell (zsh/sh/PowerShell/cmd/...), not necessarily bash (#780). Legacy
+// "bash" permission rules, saved grants, and config keep matching through the
+// alias-aware Wildcard.matchAction used by both permission engines.
+export const ToolID = "shell"
 export type ToolID = typeof ToolID
 
 export * as ShellID from "./id"
