@@ -315,13 +315,19 @@ function expand(pattern: string): string {
 
 export function fromConfig(permission: ConfigPermissionV1.Info) {
   const ruleset: PermissionV1.Rule[] = []
+  // #780: a tools-derived `bash` deny is canonicalised to `shell` in config,
+  // including the wire. Its internal provenance marks the map, so the ruleset
+  // keeps the legacy spelling the rename clamp needs; explicit `shell` rules
+  // carry no marker and keep plain written order.
+  const derivedShellDeny = ConfigPermissionV1.isDerivedShellDeny(permission)
   for (const [key, value] of Object.entries(permission)) {
+    const name = derivedShellDeny && key === "shell" && value === "deny" ? "bash" : key
     if (typeof value === "string") {
-      ruleset.push({ permission: key, action: value, pattern: "*" })
+      ruleset.push({ permission: name, action: value, pattern: "*" })
       continue
     }
     ruleset.push(
-      ...Object.entries(value).map(([pattern, action]) => ({ permission: key, pattern: expand(pattern), action })),
+      ...Object.entries(value).map(([pattern, action]) => ({ permission: name, pattern: expand(pattern), action })),
     )
   }
   return ruleset

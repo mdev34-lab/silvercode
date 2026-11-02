@@ -138,6 +138,52 @@ export function clearDerivedShellRename(derived: Record<string, unknown>, explic
   }
 }
 
+// Internal provenance for the synthetic tools-derived shell record. A legacy
+// `tools: { bash: false }` is canonicalised to `shell` for users, config
+// layers, and the HTTP API; this non-enumerable symbol keeps the fact that the
+// surviving deny came from the legacy spelling, so the ruleset builder can
+// match it against the rename clamp without changing the canonical map.
+// Non-enumerable: invisible to Object.keys, spread, JSON, and schema encode.
+const DERIVED_SHELL_DENY = Symbol.for("@opencode/config-permission/derived-shell-deny")
+
+export function markDerivedShellDeny<T extends object>(permission: T): T {
+  globalThis.Object.defineProperty(permission, DERIVED_SHELL_DENY, {
+    value: true,
+    enumerable: false,
+    configurable: true,
+  })
+  return permission
+}
+
+export function isDerivedShellDeny(permission: unknown): boolean {
+  if (typeof permission !== "object" || permission === null) return false
+  return (permission as Record<PropertyKey, unknown>)[DERIVED_SHELL_DENY] === true
+}
+
+/** Does a permission layer write a real (non-empty) `bash`/`shell` slot? */
+export function writesShellRename(permission: unknown): boolean {
+  if (typeof permission !== "object" || permission === null || globalThis.Array.isArray(permission)) return false
+  const record = permission as Record<string, unknown>
+  return SHELL_RENAME_SPELLINGS.some((key) => isShellRenameWrite(record[key]))
+}
+
+/**
+ * Carry the derived-deny provenance across a permission merge. The layer that
+ * wrote the last real bash/shell slot owns the merged slot, so the merged map
+ * inherits that layer's provenance; a layer that writes nothing leaves the
+ * inherited provenance alone, and an explicit write clears it. The marker is
+ * metadata only: keys, values, and order keep the canonical representation.
+ */
+export function carryDerivedShellDeny<T>(merged: T, target: unknown, source: unknown): T {
+  if (typeof merged !== "object" || merged === null) return merged
+  const owner = writesShellRename(source) ? source : target
+  const inherited = isDerivedShellDeny(owner) && (merged as Record<string, unknown>).shell === "deny"
+  if (inherited) return isDerivedShellDeny(merged) ? merged : markDerivedShellDeny(merged)
+  // Spread copies only enumerable keys, so this drops the marker when an
+  // explicit write replaced the inherited slot.
+  return isDerivedShellDeny(merged) ? ({ ...(merged as Record<string, unknown>) } as T) : merged
+}
+
 export const Info = InputSchema.pipe(
   Schema.decodeTo(InputObject, {
     decode: SchemaGetter.transform(normalizeInput),

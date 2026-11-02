@@ -289,6 +289,110 @@ async function check(map: (dir: string) => string) {
   }
 }
 
+it.instance("legacy top-level tools bash deny survives an unrelated s* allow wildcard", () =>
+  Effect.gen(function* () {
+    const test = yield* TestInstance
+    yield* writeConfigEffect(test.directory, {
+      $schema: "https://opencode.ai/config.json",
+      tools: { bash: false },
+      permission: { "s*": "allow" },
+    })
+
+    const config = yield* Config.use.get()
+    const ruleset = Permission.fromConfig(config.permission ?? {})
+    expect(Permission.evaluate("shell", "echo safe", ruleset).action).toBe("deny")
+  }),
+)
+
+it.instance("legacy agent tools bash deny survives an unrelated s* allow wildcard", () =>
+  Effect.gen(function* () {
+    const test = yield* TestInstance
+    yield* writeConfigEffect(test.directory, {
+      $schema: "https://opencode.ai/config.json",
+      agent: { test: { tools: { bash: false }, permission: { "s*": "allow" } } },
+    })
+
+    const config = yield* Config.use.get()
+    const permission = named(config.agent?.test)?.permission
+    const ruleset = Permission.fromConfig(permission ?? {})
+    expect(Permission.evaluate("shell", "echo safe", ruleset).action).toBe("deny")
+  }),
+)
+
+it.instance("control: explicit top-level shell deny before a later s* allow keeps written order", () =>
+  Effect.gen(function* () {
+    const test = yield* TestInstance
+    yield* writeConfigEffect(test.directory, {
+      $schema: "https://opencode.ai/config.json",
+      permission: { shell: "deny", "s*": "allow" },
+    })
+
+    const config = yield* Config.use.get()
+    const ruleset = Permission.fromConfig(config.permission ?? {})
+    expect(Permission.evaluate("shell", "echo safe", ruleset).action).toBe("allow")
+  }),
+)
+
+it.instance("control: explicit agent shell deny before a later s* allow keeps written order", () =>
+  Effect.gen(function* () {
+    const test = yield* TestInstance
+    yield* writeConfigEffect(test.directory, {
+      $schema: "https://opencode.ai/config.json",
+      agent: { test: { permission: { shell: "deny", "s*": "allow" } } },
+    })
+
+    const config = yield* Config.use.get()
+    const permission = named(config.agent?.test)?.permission
+    const ruleset = Permission.fromConfig(permission ?? {})
+    expect(Permission.evaluate("shell", "echo safe", ruleset).action).toBe("allow")
+  }),
+)
+
+it.instance("control: tools bash deny yields to a later non-recruited * allow", () =>
+  Effect.gen(function* () {
+    const test = yield* TestInstance
+    yield* writeConfigEffect(test.directory, {
+      $schema: "https://opencode.ai/config.json",
+      tools: { bash: false },
+      permission: { "*": "allow" },
+    })
+
+    const config = yield* Config.use.get()
+    const ruleset = Permission.fromConfig(config.permission ?? {})
+    expect(Permission.evaluate("shell", "echo safe", ruleset).action).toBe("allow")
+  }),
+)
+
+it.instance("control: an explicit shell rule replaces the tools-derived shell slot", () =>
+  Effect.gen(function* () {
+    const test = yield* TestInstance
+    yield* writeConfigEffect(test.directory, {
+      $schema: "https://opencode.ai/config.json",
+      tools: { bash: false },
+      permission: { shell: "allow" },
+    })
+
+    const config = yield* Config.use.get()
+    const ruleset = Permission.fromConfig(config.permission ?? {})
+    expect(Permission.evaluate("shell", "echo safe", ruleset).action).toBe("allow")
+  }),
+)
+
+it.instance("control: the rename-recruited s* wildcard still allows unrelated tools", () =>
+  Effect.gen(function* () {
+    const test = yield* TestInstance
+    yield* writeConfigEffect(test.directory, {
+      $schema: "https://opencode.ai/config.json",
+      tools: { bash: false },
+      permission: { "s*": "allow" },
+    })
+
+    const config = yield* Config.use.get()
+    const ruleset = Permission.fromConfig(config.permission ?? {})
+    expect(Permission.evaluate("skill", "anything", ruleset).action).toBe("allow")
+  }),
+)
+
 it.instance("loads config with defaults when no files exist", () =>
   Effect.gen(function* () {
     const config = yield* Config.use.get()
