@@ -215,9 +215,18 @@ const layer = Layer.effect(
       input: AttachmentStoreService.MaterializeInput,
     ) {
       const { attachment } = input
+      const id = attachment.id ?? Identifier.ascending()
+      const mime = finalMime(attachment.uri, undefined, attachment.name)
+      const fallback = () =>
+        FileAttachment.create({
+          id,
+          uri: attachment.uri,
+          mime,
+          name: attachment.name,
+          description: attachment.description,
+          source: attachment.source,
+        })
       return yield* Effect.gen(function* () {
-        const id = attachment.id ?? Identifier.ascending()
-        const mime = finalMime(attachment.uri, undefined, attachment.name)
         let bytes: Uint8Array | undefined
         if (attachment.uri.startsWith("data:")) {
           const parsed = parseDataUri(attachment.uri)
@@ -231,9 +240,9 @@ const layer = Layer.effect(
         } else if (attachment.uri.startsWith("file://")) {
           bytes = yield* readBytes(fs, location, permission, input.sessionID, input.agent, attachment.uri)
         } else {
-          return FileAttachment.create({ ...attachment, id } as FileAttachment)
+          return fallback()
         }
-        if (bytes.length > MAX_BYTES) return FileAttachment.create({ ...attachment, id } as FileAttachment)
+        if (bytes.length > MAX_BYTES) return fallback()
         const file = yield* write(input.sessionID, id, mime, bytes)
         return FileAttachment.create({
           id,
@@ -248,15 +257,8 @@ const layer = Layer.effect(
       }).pipe(
         Effect.catch((error) =>
           Effect.log(`attachment materialization failed: ${String(error)}`).pipe(
-            Effect.andThen(() => Effect.succeed(undefined)),
+            Effect.andThen(() => Effect.succeed(fallback())),
           ),
-        ),
-        Effect.flatMap((result) =>
-          result === undefined
-            ? Effect.succeed(
-                FileAttachment.create({ ...attachment, id: attachment.id ?? Identifier.ascending() } as FileAttachment),
-              )
-            : Effect.succeed(result),
         ),
       )
     })
