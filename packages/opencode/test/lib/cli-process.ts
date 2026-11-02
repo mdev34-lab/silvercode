@@ -271,10 +271,10 @@ export function withCliFixture<A, E>(
           Effect.succeed({
             command: err.command,
             exitCode: err.exitCode ?? -1,
-            stdout: Buffer.alloc(0),
-            stderr: Buffer.from((err.stderr ?? String(err.cause ?? err.message)) + "\n"),
-            stdoutTruncated: false,
-            stderrTruncated: false,
+            stdout: err.partialStdout === undefined ? Buffer.alloc(0) : Buffer.from(err.partialStdout),
+            stderr: Buffer.from(errorStderr(err) + "\n"),
+            stdoutTruncated: err.partialStdoutTruncated ?? false,
+            stderrTruncated: err.partialStderrTruncated ?? false,
           } satisfies AppProcess.RunResult),
         ),
       )
@@ -528,6 +528,17 @@ function parseJsonEvents(stdout: string): Array<Record<string, unknown>> {
 
 function normalizeLines(value: string) {
   return value.replaceAll("\r\n", "\n")
+}
+
+// Builds the stderr text for a failed spawn, keeping the failure reason
+// visible after any partial stderr retained by a timed-out run: `expectExit`
+// dumps the tail of stderr, so the reason goes last and survives that
+// truncation. With no retained partial stderr this is exactly the previous
+// composition.
+function errorStderr(err: AppProcess.AppProcessError): string {
+  const reason = err.stderr ?? String(err.cause ?? err.message)
+  if (err.partialStderr === undefined) return reason
+  return err.partialStderr + (err.partialStderr.endsWith("\n") ? "" : "\n") + reason
 }
 
 // Convenience for the common assertion pattern. Dumps stderr/stdout when

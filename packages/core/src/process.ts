@@ -11,6 +11,16 @@ export class AppProcessError extends Schema.TaggedErrorClass<AppProcessError>()(
   command: Schema.String,
   exitCode: Schema.optional(Schema.Number),
   stderr: Schema.optional(Schema.String),
+  // Output the collectors had already accumulated when a `run` timeout
+  // interrupted collection (separate-stream mode only). Absent when nothing
+  // was collected or the failure is not a timeout. Deliberately separate
+  // from `stderr`, which describes an exited command and feeds `message`:
+  // the getter below never reads these fields, so timeout messages, causes
+  // and exit semantics are unchanged.
+  partialStdout: Schema.optional(Schema.String),
+  partialStderr: Schema.optional(Schema.String),
+  partialStdoutTruncated: Schema.optional(Schema.Boolean),
+  partialStderrTruncated: Schema.optional(Schema.Boolean),
   cause: Schema.optional(Schema.Defect()),
 }) {
   override get message() {
@@ -148,13 +158,40 @@ const POST_EXIT_QUIET = Duration.millis(500)
  * once the process exits, keep draining until the stream has been quiet for
  * `POST_EXIT_QUIET`, then stop even if the stream never closes.
  */
+type CollectedOutput = { chunks: Array<Uint8Array>; bytes: number; truncated: boolean }
+
+const makeCollectedOutput = (): CollectedOutput => ({ chunks: [], bytes: 0, truncated: false })
+
+// Builds the timeout failure, retaining whatever the separate stdout/stderr
+// collectors had accumulated before the interruption settled. Concatenation
+// and utf8 decoding allocate fresh copies, but this only runs once a timeout
+// has already fired. Combine mode retains nothing: its single interleaved
+// buffer is not relabeled as a partial stream.
+const timeoutError = (
+  description: string,
+  stdout: CollectedOutput,
+  stderr: CollectedOutput,
+  combineOutput: boolean | undefined,
+) => {
+  const text = (acc: CollectedOutput) =>
+    acc.bytes > 0 ? { text: Buffer.concat(acc.chunks).toString("utf8"), truncated: acc.truncated } : undefined
+  const out = combineOutput ? undefined : text(stdout)
+  const err = combineOutput ? undefined : text(stderr)
+  return new AppProcessError({
+    command: description,
+    cause: new Error("Timed out"),
+    ...(out ? { partialStdout: out.text, partialStdoutTruncated: out.truncated } : {}),
+    ...(err ? { partialStderr: err.text, partialStderrTruncated: err.truncated } : {}),
+  })
+}
+
 const collectUntilQuiet = (
   stream: Stream.Stream<Uint8Array, PlatformError>,
   maxOutputBytes: number | undefined,
   exit: Effect.Effect<ExitCode, PlatformError>,
+  acc: CollectedOutput,
 ): Effect.Effect<{ buffer: Buffer; truncated: boolean }, PlatformError, Scope.Scope> =>
   Effect.gen(function* () {
-    const acc = { chunks: [] as Uint8Array[], bytes: 0, truncated: false }
     let activity = -1
     const output = yield* Effect.forkScoped(
       Stream.runForEach(stream, (chunk) =>
@@ -197,12 +234,17 @@ const layer = Layer.effect(
 
     const runCommand = (command: ChildProcess.Command, options?: RunOptions) => {
       const description = describeCommand(command)
+      // Accumulators live outside `collect` so the timeout path can read
+      // what was collected after the interruption has settled.
+      const outputAcc = makeCollectedOutput()
+      const stdoutAcc = makeCollectedOutput()
+      const stderrAcc = makeCollectedOutput()
       const collect = Effect.scoped(
         Effect.gen(function* () {
           const handle = yield* spawner.spawn(command)
           if (options?.combineOutput) {
             const [output, exitCode] = yield* Effect.all(
-              [collectUntilQuiet(handle.all, options.maxOutputBytes, handle.exitCode), handle.exitCode],
+              [collectUntilQuiet(handle.all, options.maxOutputBytes, handle.exitCode, outputAcc), handle.exitCode],
               { concurrency: "unbounded" },
             )
             return {
@@ -218,8 +260,8 @@ const layer = Layer.effect(
           }
           const [stdout, stderr, exitCode] = yield* Effect.all(
             [
-              collectUntilQuiet(handle.stdout, options?.maxOutputBytes, handle.exitCode),
-              collectUntilQuiet(handle.stderr, options?.maxErrorBytes, handle.exitCode),
+              collectUntilQuiet(handle.stdout, options?.maxOutputBytes, handle.exitCode, stdoutAcc),
+              collectUntilQuiet(handle.stderr, options?.maxErrorBytes, handle.exitCode, stderrAcc),
               handle.exitCode,
             ],
             { concurrency: "unbounded" },
@@ -237,7 +279,7 @@ const layer = Layer.effect(
       const timed = options?.timeout
         ? Effect.timeoutOrElse(collect, {
             duration: options.timeout,
-            orElse: () => Effect.fail(new AppProcessError({ command: description, cause: new Error("Timed out") })),
+            orElse: () => Effect.fail(timeoutError(description, stdoutAcc, stderrAcc, options?.combineOutput)),
           })
         : collect
       const aborted = options?.signal
