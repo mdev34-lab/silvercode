@@ -303,6 +303,86 @@ function mountTwoPanels() {
   })
 }
 
+// A read row that loaded two more files, and an answered question with two
+// groups. Both draw sub-rows and a group gap of their own, so both are places
+// where decorative spacing can leak inside a block.
+const LOADED_FILES = ["src/app.py", "src/util/state.py"]
+const LOADED_FIRST = `↳ Loaded ${SRC_APP}`
+const LOADED_SECOND = `↳ Loaded src${path.sep}util${path.sep}state.py`
+const QUESTION_LIST = ["Which module owns the initializer?", "Should ready default to true?"]
+const QUESTION_ANSWERS = [["src/app.py"], ["Yes, keep it False"]]
+
+function mountReadLoaded(size: keyof typeof SIZES, insideBlock: boolean) {
+  const session = sessionInfo(SESSION, { title: "Fix the App class" })
+  const user = userMessage("msg_00_user", SESSION)
+  const work = assistantMessage("msg_01_work", SESSION, { time: { created: at(1), completed: at(6) } })
+  const read = toolPart(
+    "prt_read",
+    work.id,
+    "read",
+    { filePath: "src/app.py", limit: 70, offset: 465 },
+    { loaded: LOADED_FILES },
+    at(1),
+    at(2),
+  )
+  const parts: Part[] = insideBlock
+    ? [
+        read,
+        toolPart(
+          "prt_edit",
+          work.id,
+          "edit",
+          { filePath: "src/app.py", oldString: "ready = False", newString: "ready = True" },
+          {},
+          at(2),
+          at(3),
+        ),
+      ]
+    : [read]
+  const messages: NonNullable<MountOptions["messages"]> = {
+    [SESSION]: [
+      { info: user, parts: [textPart("prt_user", user, "Fix the App class")] },
+      { info: work, parts },
+    ],
+  }
+  return mountSessionRoute({
+    ...SIZES[size],
+    sessions: [session],
+    messages,
+    kv: insideBlock ? { activity_groups_expanded: true } : {},
+  })
+}
+
+function mountQuestions(size: keyof typeof SIZES, insideBlock: boolean) {
+  const session = sessionInfo(SESSION, { title: "Fix the App class" })
+  const user = userMessage("msg_00_user", SESSION)
+  const work = assistantMessage("msg_01_work", SESSION, { time: { created: at(1), completed: at(6) } })
+  const question = toolPart(
+    "prt_question",
+    work.id,
+    "question",
+    { questions: QUESTION_LIST.map((question) => ({ question })) },
+    { answers: QUESTION_ANSWERS },
+    at(1),
+    at(2),
+  )
+  const parts: Part[] = insideBlock
+    ? [question, toolPart("prt_read", work.id, "read", { filePath: "src/app.py" }, {}, at(2), at(3))]
+    : [question]
+  const messages: NonNullable<MountOptions["messages"]> = {
+    [SESSION]: [
+      { info: user, parts: [textPart("prt_user", user, "Fix the App class")] },
+      { info: work, parts },
+    ],
+  }
+  return mountSessionRoute({
+    ...SIZES[size],
+    sessions: [session],
+    messages,
+    kv: insideBlock ? { activity_groups_expanded: true } : {},
+  })
+}
+
 // Tools the transcript renders outside any activity block: a single call is not
 // a run, and a non-work call ends the run it lands in. Their rows must keep the
 // spacing the transcript draws for itself.
@@ -735,6 +815,104 @@ describe("activity block spacing", () => {
     // the reasoning header, as hide mode draws it.
     expect(frame).not.toContain("+ Thought: Planning the edit")
     expect(columnOf(frame, THOUGHT_PARA)).toBe(columnOf(frame, `- ${THOUGHT_TITLE}`) + 2)
+  })
+
+  // A read row's loaded files are sub-rows of that detail row. Inside a block
+  // they take the shared detail indent, so they sit on the same column as the
+  // read row instead of stacking a second transcript-level indent past it.
+  for (const size of ["normal", "narrow"] as const) {
+    test(`${size}: loaded files of a read row share the detail column inside a block`, async () => {
+      const { app } = await mountReadLoaded(size, true)
+      await settle(app)
+      const frame = await settledFrame(app, LOADED_SECOND)
+      await capture(app, `activity-padding-loaded-${size}`)
+
+      const header = columnOf(frame, "− Explored 1 file")
+      const read = columnOf(frame, READ_ROW_CELL)
+      expect(read).toBe(header + 2)
+      // Both loaded rows align with the read row they belong to.
+      expect(columnOf(frame, LOADED_FIRST)).toBe(read)
+      expect(columnOf(frame, LOADED_SECOND)).toBe(read)
+      // Nothing decorative between the row and its loaded files.
+      expectNoBlankRowBetween(frame, "− Explored 1 file", READ_ROW_CELL, LOADED_FIRST)
+      expectNoBlankRowBetween(frame, "− Explored 1 file", LOADED_FIRST, LOADED_SECOND)
+      // Order and text survive, and the row keeps its muted colour.
+      const rows = rowsOf(frame, "− Explored 1 file")
+      expect(rowOf(rows, READ_ROW_CELL)).toBeLessThan(rowOf(rows, LOADED_FIRST))
+      expect(rowOf(rows, LOADED_FIRST)).toBeLessThan(rowOf(rows, LOADED_SECOND))
+      expect(await colorOf(app, LOADED_FIRST)).toEqual({
+        fg: [128, 128, 128, 255],
+        bg: [10, 10, 10, 255],
+        attributes: 0,
+      })
+    })
+  }
+
+  // The same read outside a block keeps the transcript's own indent: the loaded
+  // row still lines up with its read row, exactly as before this change.
+  test("normal: a standalone read keeps its loaded files on the row's column", async () => {
+    const { app } = await mountReadLoaded("normal", false)
+    await settle(app)
+    const frame = await settledFrame(app, LOADED_SECOND)
+
+    expect(columnOf(frame, READ_ROW_CELL)).toBe(columnOf(frame, LOADED_FIRST))
+    expect(columnOf(frame, LOADED_FIRST)).toBe(columnOf(frame, LOADED_SECOND))
+    expectNoBlankRowBetween(frame, READ_ROW_CELL, READ_ROW_CELL, LOADED_FIRST)
+    expect(await colorOf(app, LOADED_FIRST)).toEqual({
+      fg: [128, 128, 128, 255],
+      bg: [10, 10, 10, 255],
+      attributes: 0,
+    })
+  })
+
+  // An answered question panel stacks its groups with a blank row at transcript
+  // level. Inside a block that row would be a blank row inside the block, so
+  // the groups follow each other directly.
+  for (const size of ["normal", "narrow"] as const) {
+    test(`${size}: question groups have no decorative blank row inside a block`, async () => {
+      const { app } = await mountQuestions(size, true)
+      await settle(app)
+      const frame = await settledFrame(app, QUESTION_LIST[1]!)
+      await capture(app, `activity-padding-questions-${size}`)
+
+      const rows = rowsOf(frame, "− Worked for")
+      const first = rowOf(rows, QUESTION_LIST[0]!)
+      const answer = rowOf(rows, "src/app.py")
+      const second = rowOf(rows, QUESTION_LIST[1]!)
+      expect(answer).toBeGreaterThan(first)
+      expect(second).toBeGreaterThan(answer)
+      // Question, its answer, then the next question: no row in between.
+      expect({ rows: rows.slice(answer + 1, second) }).toEqual({ rows: [] })
+      // The panel and its first group start on the shared detail column.
+      expect(columnOf(frame, "# Questions")).toBe(columnOf(frame, "− Worked for") + 2)
+      expect(columnOf(frame, QUESTION_LIST[0]!)).toBe(columnOf(frame, "− Worked for") + 2)
+      // Text and colours are untouched: muted question, full-text answer.
+      expect(await colorOf(app, QUESTION_LIST[0]!)).toEqual({
+        fg: [128, 128, 128, 255],
+        bg: [20, 20, 20, 255],
+        attributes: 0,
+      })
+      expect(await colorOf(app, "src/app.py")).toEqual({
+        fg: [238, 238, 238, 255],
+        bg: [20, 20, 20, 255],
+        attributes: 0,
+      })
+    })
+  }
+
+  // The control: outside a block the answered panel keeps its blank row between
+  // groups, so the compaction is activity-only.
+  test("normal: a standalone question panel keeps its group blank row", async () => {
+    const { app } = await mountQuestions("normal", false)
+    await settle(app)
+    const frame = await settledFrame(app, QUESTION_LIST[1]!)
+
+    expectOneBlankRowBetween(frame, "# Questions", "src/app.py", QUESTION_LIST[1]!)
+    expect(await colorOf(app, QUESTION_LIST[1]!)).toEqual({
+      fg: [128, 128, 128, 255],
+      bg: [20, 20, 20, 255],
+      attributes: 0,
+    })
   })
 
   test("transcript-level tools keep their own spacing", async () => {

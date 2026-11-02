@@ -3102,6 +3102,7 @@ function Glob(props: ToolProps) {
 function Read(props: ToolProps) {
   const { theme } = useTheme()
   const pathFormatter = usePathFormatter()
+  const detail = useContext(activityDetail)
   const isRunning = createMemo(() => props.part.state.status === "running")
   const loaded = createMemo(() => {
     if (props.part.state.status !== "completed") return []
@@ -3123,8 +3124,13 @@ function Read(props: ToolProps) {
       </InlineTool>
       <For each={loaded()}>
         {(filepath) => (
-          <box paddingLeft={3}>
-            <text paddingLeft={3} fg={theme.textMuted}>
+          // At transcript level the row and its loaded files share one column:
+          // the row's own indent, then the row's indent again for the nested
+          // line. Inside an activity block the shared detail indent is that
+          // first indent, so the nested line lands on the same column as the
+          // read row instead of being pushed past it by a second one.
+          <box paddingLeft={detail ? ACTIVITY_DETAIL_INDENT : 3}>
+            <text paddingLeft={detail ? 0 : 3} fg={theme.textMuted}>
               ↳ Loaded {pathFormatter.format(filepath)}
             </text>
           </box>
@@ -3684,6 +3690,7 @@ function TodoWrite(props: ToolProps) {
 
 function Question(props: ToolProps) {
   const { theme } = useTheme()
+  const spacing = usePanelSpacing()
   const questions = createMemo(() => parseQuestions(props.input.questions))
   const answers = createMemo(() => parseQuestionAnswers(props.metadata.answers))
   const count = createMemo(() => questions().length)
@@ -3698,7 +3705,7 @@ function Question(props: ToolProps) {
       <Match when={answers()}>
         <BlockTool title="# Questions" part={props.part}>
           <Show when={questions().length > 0} fallback={<text fg={theme.textMuted}>No questions</text>}>
-            <box gap={1}>
+            <box gap={spacing}>
               <For each={questions()}>
                 {(q, i) => (
                   <box flexDirection="column">
