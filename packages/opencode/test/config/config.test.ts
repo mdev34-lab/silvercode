@@ -431,6 +431,74 @@ it.effect("updateGlobal roundtrip orders the rename pair and keeps base pattern 
   ),
 )
 
+for (const spelling of ["shell", "bash"] as const) {
+  it.effect(`updateGlobal JSONC roundtrip keeps an updated ${spelling} deny last without moving other keys`, () =>
+    withGlobalConfig({ name: "opencode.jsonc" }, ({ dir }) =>
+      Effect.gen(function* () {
+        const file = path.join(dir, "opencode.jsonc")
+        yield* FSUtil.use.writeWithDirs(
+          file,
+          `{
+  // Preserve comments and unrelated settings.
+  "$schema": "https://opencode.ai/config.json",
+  "model": "test/model",
+  "permission": {
+    "shell": "ask",
+    "*": "ask",
+    "bash": "allow",
+    "edit": { "*": "allow", "src/**": "deny" }
+  },
+  "agent": {
+    "ordered": {
+      "permission": { "shell": "ask", "bash": "allow", "read": "allow", "edit": { "*": "allow", "src/**": "deny" } }
+    }
+  },
+  "mode": {
+    "ordered": {
+      "permission": { "shell": "ask", "bash": "allow", "read": "allow", "edit": { "*": "allow", "src/**": "deny" } }
+    }
+  }
+}`,
+        )
+
+        yield* Config.use.updateGlobal({
+          permission: { [spelling]: "deny" },
+          agent: { ordered: { permission: { [spelling]: "deny" } } },
+          mode: { ordered: { permission: { [spelling]: "deny" } } },
+        })
+
+        const written = yield* FSUtil.use.readFileString(file)
+        expect(written).toContain("// Preserve comments and unrelated settings.")
+        expect(written).toContain('"model": "test/model"')
+        const parsed = ConfigParse.schema(ConfigV1.Info, ConfigParse.jsonc(written, file), file)
+        const reloaded = yield* Config.use.getGlobal()
+        expect(reloaded.model).toBe("test/model")
+        const agentPermission = named(reloaded.agent?.ordered)?.permission
+        const modePermission = named(reloaded.mode?.ordered)?.permission
+        for (const permission of [parsed.permission, reloaded.permission, agentPermission, modePermission]) {
+          const ruleset = Permission.fromConfig(permission ?? {})
+          expect(Permission.evaluate("shell", "ls", ruleset).action).toBe("deny")
+          expect(Permission.evaluate("edit", "src/index.ts", ruleset).action).toBe("deny")
+          expect(Permission.evaluate("edit", "README.md", ruleset).action).toBe("allow")
+        }
+        const expected = spelling === "shell" ? ["bash", "*", "shell", "edit"] : ["shell", "*", "bash", "edit"]
+        expect(Object.keys(parsed.permission ?? {})).toEqual(expected)
+        expect(Object.keys(reloaded.permission ?? {})).toEqual(expected)
+        expect(parsed.permission?.edit).toEqual({ "*": "allow", "src/**": "deny" })
+        for (const permission of [agentPermission, modePermission]) {
+          expect(Object.keys(permission ?? {})).toEqual([
+            spelling === "shell" ? "bash" : "shell",
+            spelling,
+            "read",
+            "edit",
+          ])
+          expect(permission?.read).toBe("allow")
+        }
+      }),
+    ),
+  )
+}
+
 it.instance("update roundtrip orders the rename pair by last write", () =>
   Effect.gen(function* () {
     const test = yield* TestInstance

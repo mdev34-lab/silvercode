@@ -10,7 +10,7 @@ import fsNode from "fs/promises"
 import { Flag } from "@opencode-ai/core/flag/flag"
 import { Auth } from "../auth"
 import { Env } from "../env"
-import { applyEdits, modify } from "jsonc-parser"
+import { applyEdits, type Edit, findNodeAtLocation, modify, parseTree } from "jsonc-parser"
 import { existsSync } from "fs"
 import { Account } from "@/account/account"
 import { isRecord } from "@/util/record"
@@ -242,6 +242,46 @@ function patchJsonc(input: string, patch: unknown, path: string[] = []): string 
   }
 
   return Object.entries(patch).reduce((result, [key, value]) => patchJsonc(result, value, [...path, key]), input)
+}
+
+// JSONC edits keep existing key positions, so applying the ordered object as a
+// patch is not enough: modify() updates values in place. Swap the rename
+// spellings' property text inside their existing slots, leaving other bytes alone.
+function orderJsoncPermissions(input: string, source: unknown, file: string): string {
+  const parsed = ConfigParse.jsonc(input, file)
+  const ordered = orderConfigPermissions(parsed, source)
+  if (ordered === parsed) return input
+  const root = parseTree(input)
+  if (!root) return input
+  const edits: Edit[] = []
+  const order = (path: string[]) => {
+    const before = path.reduce<unknown>((value, key) => (isRecord(value) ? value[key] : undefined), parsed)
+    const after = path.reduce<unknown>((value, key) => (isRecord(value) ? value[key] : undefined), ordered)
+    if (!isRecord(before) || !isRecord(after) || before === after) return
+    const spellings = (record: Record<string, unknown>) =>
+      Object.keys(record).filter((key) => key === "bash" || key === "shell")
+    const beforeKeys = spellings(before)
+    const afterKeys = spellings(after)
+    for (const [index, key] of beforeKeys.entries()) {
+      const desired = afterKeys[index]
+      if (key === desired) continue
+      const target = findNodeAtLocation(root, [...path, key])?.parent
+      const donor = findNodeAtLocation(root, [...path, desired])?.parent
+      if (!target || !donor) continue
+      edits.push({
+        offset: target.offset,
+        length: target.length,
+        content: input.slice(donor.offset, donor.offset + donor.length),
+      })
+    }
+  }
+  order(["permission"])
+  for (const field of ["agent", "mode"] as const) {
+    const records = isRecord(parsed) ? parsed[field] : undefined
+    if (!isRecord(records)) continue
+    for (const name of Object.keys(records)) order([field, name, "permission"])
+  }
+  return applyEdits(input, edits)
 }
 
 function writable(info: Info) {
@@ -801,7 +841,7 @@ const layer = Layer.effect(
         if (changed) yield* fs.writeFileString(file, serialized).pipe(Effect.orDie)
         next = merged
       } else {
-        const updated = patchJsonc(before, patch)
+        const updated = orderJsoncPermissions(patchJsonc(before, patch), patch, file)
         next = ConfigParse.schema(ConfigV1.Info, ConfigParse.jsonc(updated, file), file)
         changed = updated !== before
         if (changed) yield* fs.writeFileString(file, updated).pipe(Effect.orDie)
