@@ -72,6 +72,30 @@ function foldConfigTools(config: Info): Info {
   return { ...config, tools, agent, mode }
 }
 
+// #780: an empty `bash`/`shell` pattern map writes no rule. Drop it from a
+// layer before merging so it cannot replace a flat deny with `{}` or count as
+// a last write for the rename pair.
+function stripRecordEmptyShellRules<T>(record: T): T {
+  if (!isRecord(record)) return record
+  let out = record
+  for (const [name, entry] of Object.entries(record)) {
+    if (!isRecord(entry)) continue
+    const permission = ConfigPermissionV1.stripEmptyShellRules(entry.permission)
+    if (permission === entry.permission) continue
+    if (out === record) out = { ...record }
+    ;(out as Record<string, unknown>)[name] = { ...entry, permission }
+  }
+  return out
+}
+
+function stripConfigEmptyShellRules(config: Info): Info {
+  const permission = ConfigPermissionV1.stripEmptyShellRules(config.permission)
+  const agent = stripRecordEmptyShellRules(config.agent)
+  const mode = stripRecordEmptyShellRules(config.mode)
+  if (permission === config.permission && agent === config.agent && mode === config.mode) return config
+  return { ...config, permission, agent, mode }
+}
+
 // Permission layering keeps the base mergeDeep contract (an overridden key
 // or pattern keeps its first-written position). The one adjustment is
 // #780's: `bash`/`shell` are two spellings of one permission, so their
@@ -118,12 +142,14 @@ function orderConfigPermissions<T>(merged: T, source: T): T {
 }
 
 function mergeAgentRecords<T extends object>(current: T, next: T): T {
-  return orderRecordPermissions(mergeDeep(foldRecordTools(current), foldRecordTools(next)) as T, next)
+  const source = stripRecordEmptyShellRules(next)
+  return orderRecordPermissions(mergeDeep(foldRecordTools(current), foldRecordTools(source)) as T, source)
 }
 
 function mergeConfig(target: Info, source: Info): Info {
-  const merged = mergeDeep(foldConfigTools(target), foldConfigTools(source)) as Info
-  return orderConfigPermissions(merged, source)
+  const next = stripConfigEmptyShellRules(source)
+  const merged = mergeDeep(foldConfigTools(target), foldConfigTools(next)) as Info
+  return orderConfigPermissions(merged, next)
 }
 
 function mergeConfigConcatArrays(target: Info, source: Info): Info {
@@ -725,7 +751,7 @@ const layer = Layer.effect(
 
         if (Flag.OPENCODE_PERMISSION) {
           try {
-            const envPermission = JSON.parse(Flag.OPENCODE_PERMISSION)
+            const envPermission = ConfigPermissionV1.stripEmptyShellRules(JSON.parse(Flag.OPENCODE_PERMISSION))
             result.permission = mergeDeep(result.permission ?? {}, envPermission)
             if (isRecord(result.permission)) {
               result.permission = ConfigPermissionV1.orderShellRename(
@@ -751,8 +777,11 @@ const layer = Layer.effect(
           }
           // The tools-derived `shell` slot must not park an explicit entry:
           // clear it so the base merge appends explicit entries in order.
-          ConfigPermissionV1.clearDerivedShellRename(perms, result.permission)
-          result.permission = mergeDeep(perms, result.permission ?? {})
+          // An empty explicit pattern map writes no rule and must not replace
+          // the derived deny.
+          const explicit = ConfigPermissionV1.stripEmptyShellRules(result.permission)
+          ConfigPermissionV1.clearDerivedShellRename(perms, explicit)
+          result.permission = mergeDeep(perms, explicit ?? {})
         }
 
         if (!result.username) {
@@ -817,7 +846,7 @@ const layer = Layer.effect(
       const dir = yield* InstanceState.directory
       const file = path.join(dir, "config.json")
       const existing = yield* loadFile(file)
-      const patch = writable(config)
+      const patch = stripConfigEmptyShellRules(writable(config))
       const merged = orderConfigPermissions(mergeDeep(writable(existing), patch), patch)
       yield* fs.writeFileString(file, JSON.stringify(merged, null, 2)).pipe(Effect.orDie)
     })
@@ -829,7 +858,7 @@ const layer = Layer.effect(
     const updateGlobal = Effect.fn("Config.updateGlobal")(function* (config: Info) {
       const file = globalConfigFile()
       const before = (yield* readConfigFile(file)) ?? "{}"
-      const patch = writableGlobal(config)
+      const patch = stripConfigEmptyShellRules(writableGlobal(config))
 
       let next: Info
       let changed: boolean

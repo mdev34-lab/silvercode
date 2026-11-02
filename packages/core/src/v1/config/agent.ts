@@ -88,8 +88,11 @@ const normalize = (agent: Schema.Schema.Type<typeof AgentSchema>): Schema.Schema
   // Base layering: tools-derived entries first, explicit permission assigned
   // over them. The only adjustment is #780's: an explicit `bash`/`shell`
   // entry lands at its own written position instead of the derived slot's.
-  ConfigPermissionV1.clearDerivedShellRename(derived, agent.permission)
-  globalThis.Object.assign(derived, agent.permission)
+  // An empty pattern map writes no rule, so it must not clear or overwrite a
+  // tools-derived deny.
+  const explicit = ConfigPermissionV1.stripEmptyShellRules(agent.permission)
+  ConfigPermissionV1.clearDerivedShellRename(derived, explicit)
+  globalThis.Object.assign(derived, explicit)
   const permission = derived
 
   const steps = agent.steps ?? agent.maxSteps

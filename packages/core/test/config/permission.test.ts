@@ -68,4 +68,30 @@ describe("ConfigPermissionV1.orderShellRename (#780)", () => {
     expect(Object.keys(ordered)).toEqual(["bash", "shell"])
     expect(ordered.shell).toBe(patterns)
   })
+
+  test("an empty rule map is not an actual write and never reorders the rename pair", () => {
+    const merged = { shell: { "*": "allow" }, bash: { "rm *": "deny" } } as const
+    expect(ConfigPermissionV1.orderShellRename(merged, { shell: {} })).toBe(merged)
+    expect(ConfigPermissionV1.orderShellRename(merged, { bash: {} })).toBe(merged)
+    expect(Object.keys(merged)).toEqual(["shell", "bash"])
+  })
+
+  test("clearDerivedShellRename keeps a tools-derived deny when the explicit rule map is empty", () => {
+    const derived: Record<string, unknown> = { shell: "deny", edit: "allow" }
+    ConfigPermissionV1.clearDerivedShellRename(derived, { shell: {}, bash: {} })
+    expect(derived).toEqual({ shell: "deny", edit: "allow" })
+  })
+
+  test("stripEmptyShellRules drops only empty rename pattern maps", () => {
+    const patterns = { "rm *": "deny" } as const
+    const permission = { shell: {}, bash: patterns, edit: "allow", task: {} } as const
+    const stripped = ConfigPermissionV1.stripEmptyShellRules(permission) as Record<string, unknown>
+    expect(stripped).toEqual({ bash: patterns, edit: "allow", task: {} })
+    expect(stripped.bash).toBe(patterns)
+    expect(ConfigPermissionV1.stripEmptyShellRules(permission)).not.toBe(permission)
+    const actual = { shell: "deny", bash: patterns } as const
+    expect(ConfigPermissionV1.stripEmptyShellRules(actual)).toBe(actual)
+    expect(ConfigPermissionV1.stripEmptyShellRules("deny")).toBe("deny")
+    expect(ConfigPermissionV1.stripEmptyShellRules(undefined)).toBe(undefined)
+  })
 })

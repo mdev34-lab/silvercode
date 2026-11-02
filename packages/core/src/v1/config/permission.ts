@@ -48,6 +48,31 @@ const normalizeInput = (input: Schema.Schema.Type<typeof InputSchema>): Schema.S
 // rename. They are one logical permission slot written with either name.
 const SHELL_RENAME_SPELLINGS: readonly string[] = ["bash", "shell"]
 
+// An empty pattern map writes no rule. Treating it as a write can move a broad
+// allow past a deny, or clear a tools-derived deny, without adding any rule.
+function isShellRenameWrite(value: unknown): boolean {
+  if (typeof value === "string") return true
+  if (typeof value !== "object" || value === null || globalThis.Array.isArray(value)) return false
+  return globalThis.Object.keys(value).length > 0
+}
+
+// Drop no-op `bash`/`shell` pattern maps from a layer before it is merged or
+// assigned over another layer. Without this, remeda `mergeDeep` / Object.assign
+// can replace a flat deny with `{}` even though the empty map writes no rule.
+export function stripEmptyShellRules<T>(permission: T): T {
+  if (typeof permission !== "object" || permission === null || globalThis.Array.isArray(permission)) return permission
+  const record = permission as Record<string, unknown>
+  let out = record
+  for (const key of SHELL_RENAME_SPELLINGS) {
+    const value = record[key]
+    if (typeof value !== "object" || value === null || globalThis.Array.isArray(value)) continue
+    if (globalThis.Object.keys(value).length > 0) continue
+    if (out === record) out = { ...record }
+    delete out[key]
+  }
+  return out as T
+}
+
 /**
  * Permission layers merge with the pre-existing deep-merge contract
  * (remeda `mergeDeep` / `Object.assign`): an overridden key or pattern keeps
@@ -72,10 +97,10 @@ export function orderShellRename<T extends object>(merged: T, source: unknown): 
   if (typeof source !== "object" || source === null || globalThis.Array.isArray(source)) return merged
   const record = merged as Record<string, unknown>
   const keys = globalThis.Object.keys(record)
-  const present = keys.filter((key) => SHELL_RENAME_SPELLINGS.includes(key))
+  const present = keys.filter((key) => SHELL_RENAME_SPELLINGS.includes(key) && isShellRenameWrite(record[key]))
   if (present.length < 2) return merged
   const written = globalThis.Object.keys(source as Record<string, unknown>).filter(
-    (key) => SHELL_RENAME_SPELLINGS.includes(key) && (source as Record<string, unknown>)[key] !== undefined,
+    (key) => SHELL_RENAME_SPELLINGS.includes(key) && isShellRenameWrite((source as Record<string, unknown>)[key]),
   )
   if (written.length === 0) return merged
   const desired = [
@@ -109,7 +134,7 @@ export function clearDerivedShellRename(derived: Record<string, unknown>, explic
   if (typeof explicit !== "object" || explicit === null || globalThis.Array.isArray(explicit)) return
   const record = explicit as Record<string, unknown>
   for (const key of SHELL_RENAME_SPELLINGS) {
-    if (record[key] !== undefined) delete derived[key]
+    if (isShellRenameWrite(record[key])) delete derived[key]
   }
 }
 

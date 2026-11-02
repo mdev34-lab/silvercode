@@ -499,6 +499,132 @@ for (const spelling of ["shell", "bash"] as const) {
   )
 }
 
+for (const name of ["opencode.json", "opencode.jsonc"] as const) {
+  it.effect(`updateGlobal ${name} treats an empty shell rule map as no write and keeps the deny last`, () =>
+    withGlobalConfig({ name }, ({ dir }) =>
+      Effect.gen(function* () {
+        const file = path.join(dir, name)
+        const comment = name.endsWith(".jsonc") ? "// keep comment\n  " : ""
+        yield* FSUtil.use.writeWithDirs(
+          file,
+          `{
+  ${comment}"$schema": "https://opencode.ai/config.json",
+  "permission": { "shell": { "*": "allow" }, "bash": { "rm *": "deny" } }
+}`,
+        )
+
+        yield* Config.use.updateGlobal({ permission: { shell: {} } })
+
+        const written = yield* FSUtil.use.readFileString(file)
+        if (comment) expect(written).toContain("// keep comment")
+        const parsed = ConfigParse.schema(ConfigV1.Info, ConfigParse.jsonc(written, file), file)
+        const reloaded = yield* Config.use.getGlobal()
+        for (const permission of [parsed.permission, reloaded.permission]) {
+          expect(Object.keys(permission ?? {})).toEqual(["shell", "bash"])
+          const ruleset = Permission.fromConfig(permission ?? {})
+          expect(Permission.evaluate("shell", "rm -rf x", ruleset).action).toBe("deny")
+          expect(Permission.evaluate("shell", "ls", ruleset).action).toBe("allow")
+        }
+      }),
+    ),
+  )
+
+  it.effect(`updateGlobal ${name} keeps a flat shell deny when the patch rule map is empty`, () =>
+    withGlobalConfig({ name, config: { permission: { shell: "deny" } } }, ({ dir }) =>
+      Effect.gen(function* () {
+        yield* Config.use.updateGlobal({ permission: { shell: {} } })
+
+        const reloaded = yield* Config.use.getGlobal()
+        const ruleset = Permission.fromConfig(reloaded.permission ?? {})
+        expect(Permission.evaluate("shell", "ls", ruleset).action).toBe("deny")
+      }),
+    ),
+  )
+}
+
+it.effect("layered empty shell rule map does not move a broad allow past a legacy deny", () =>
+  withConfigTree(
+    {
+      global: { permission: { shell: { "*": "allow" }, bash: { "rm *": "deny" } } },
+      project: { permission: { shell: {} } },
+    },
+    Effect.gen(function* () {
+      const config = yield* Config.use.get()
+      expect(Object.keys(config.permission ?? {})).toEqual(["shell", "bash"])
+      const ruleset = Permission.fromConfig(config.permission ?? {})
+      expect(Permission.evaluate("shell", "rm -rf x", ruleset).action).toBe("deny")
+      expect(Permission.evaluate("shell", "ls", ruleset).action).toBe("allow")
+    }),
+  ),
+)
+
+for (const field of ["agent", "mode"] as const) {
+  it.effect(`layered empty ${field} shell rule map does not move a broad allow past a legacy deny`, () =>
+    withConfigTree(
+      {
+        global: { [field]: { ordered: { permission: { shell: { "*": "allow" }, bash: { "rm *": "deny" } } } } },
+        project: { [field]: { ordered: { permission: { shell: {} } } } },
+      },
+      Effect.gen(function* () {
+        const config = yield* Config.use.get()
+        const permission = named(config.agent?.ordered)?.permission
+        expect(Object.keys(permission ?? {})).toEqual(["shell", "bash"])
+        const ruleset = Permission.fromConfig(permission ?? {})
+        expect(Permission.evaluate("shell", "rm -rf x", ruleset).action).toBe("deny")
+        expect(Permission.evaluate("shell", "ls", ruleset).action).toBe("allow")
+      }),
+    ),
+  )
+
+  it.instance(`legacy ${field} tools deny survives an empty explicit shell rule map`, () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* writeConfigEffect(test.directory, {
+        $schema: "https://opencode.ai/config.json",
+        [field]: { test: { tools: { bash: false }, permission: { shell: {} } } },
+      })
+
+      const config = yield* Config.use.get()
+      const permission = named(config.agent?.test)?.permission
+      const ruleset = Permission.fromConfig(permission ?? {})
+      expect(Permission.evaluate("shell", "ls", ruleset).action).toBe("deny")
+    }),
+  )
+}
+
+it.instance("legacy top-level tools deny survives an empty explicit shell rule map", () =>
+  Effect.gen(function* () {
+    const test = yield* TestInstance
+    yield* writeConfigEffect(test.directory, {
+      $schema: "https://opencode.ai/config.json",
+      tools: { bash: false },
+      permission: { shell: {} },
+    })
+
+    const config = yield* Config.use.get()
+    const ruleset = Permission.fromConfig(config.permission ?? {})
+    expect(Permission.evaluate("shell", "ls", ruleset).action).toBe("deny")
+  }),
+)
+
+it.instance("update keeps a flat shell deny when the patch rule map is empty", () =>
+  Effect.gen(function* () {
+    const test = yield* TestInstance
+    yield* writeConfigEffect(
+      test.directory,
+      { $schema: "https://opencode.ai/config.json", permission: { shell: "deny" } },
+      "config.json",
+    )
+
+    yield* Config.Service.use((svc) =>
+      svc.update(ConfigParse.schema(ConfigV1.Info, { permission: { shell: {} } }, "test:config")),
+    )
+
+    const written = (yield* FSUtil.use.readJson(path.join(test.directory, "config.json"))) as any
+    expect(Permission.evaluate("shell", "ls", Permission.fromConfig(written.permission)).action).toBe("deny")
+  }),
+)
+
 it.instance("update roundtrip orders the rename pair by last write", () =>
   Effect.gen(function* () {
     const test = yield* TestInstance
@@ -2284,6 +2410,35 @@ describe("OPENCODE_PERMISSION env var", () => {
       }),
     ),
     { config: { permission: { shell: "ask", bash: "allow" } } },
+  )
+
+  it.instance("OPENCODE_PERMISSION empty shell rule map is not a write", () =>
+    withProcessEnv(
+      "OPENCODE_PERMISSION",
+      JSON.stringify({ shell: {} }),
+      Effect.gen(function* () {
+        const config = yield* Config.use.get()
+        expect(Object.keys(config.permission ?? {})).toEqual(["shell", "bash"])
+        const ruleset = Permission.fromConfig(config.permission ?? {})
+        expect(Permission.evaluate("shell", "rm -rf x", ruleset).action).toBe("deny")
+        expect(Permission.evaluate("shell", "ls", ruleset).action).toBe("allow")
+      }),
+    ),
+    { config: { permission: { shell: { "*": "allow" }, bash: { "rm *": "deny" } } } },
+  )
+
+  it.instance("OPENCODE_PERMISSION empty shell rule map keeps a flat deny", () =>
+    withProcessEnv(
+      "OPENCODE_PERMISSION",
+      JSON.stringify({ shell: {} }),
+      Effect.gen(function* () {
+        const config = yield* Config.use.get()
+        expect(Permission.evaluate("shell", "ls", Permission.fromConfig(config.permission ?? {})).action).toBe(
+          "deny",
+        )
+      }),
+    ),
+    { config: { permission: { shell: "deny" } } },
   )
 })
 
