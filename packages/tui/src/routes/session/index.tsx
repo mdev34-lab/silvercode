@@ -66,7 +66,7 @@ import { DialogSessionRename } from "../../component/dialog-session-rename"
 import { Sidebar } from "./sidebar"
 import { SubagentFooter } from "./subagent-footer.tsx"
 import { backgroundReview, reviewPresentationAnalysis, reviewText, subagentReview } from "./review-text"
-import { executionReviewPlan } from "./review-execution"
+import { createExecutionReviewIndex } from "./review-execution"
 import { filetype } from "../../util/filetype"
 import parsers from "../../parsers-config"
 import { errorMessage } from "../../util/error"
@@ -199,6 +199,7 @@ const context = createContext<{
   sync: ReturnType<typeof useSync>
   tui: ReturnType<typeof useTuiConfig>
   activity: () => ActivityGroups
+  reviewExecution?: () => ReturnType<typeof createExecutionReviewIndex>
   activityAllExpanded: () => boolean
   activityExpanded: (groupID: string) => boolean
   toggleActivity: (groupID: string) => void
@@ -250,6 +251,9 @@ export function Session() {
       .toSorted((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
   })
   const messages = createMemo(() => sync.data.message[route.sessionID] ?? [])
+  // The transcript is shared by every assistant row: discover its execution
+  // boundaries once per reactive change, not once per rendered message.
+  const reviewExecution = createMemo(() => createExecutionReviewIndex(messages(), sync.data.part))
   const messagesBeforeRevert = () => {
     const messageID = session()?.revert?.messageID
     if (!messageID) return messages()
@@ -1273,6 +1277,7 @@ export function Session() {
           sync,
           tui: tuiConfig,
           activity,
+          reviewExecution,
           activityAllExpanded,
           activityExpanded,
           toggleActivity,
@@ -1703,7 +1708,10 @@ export function AssistantMessageRow(props: { message: AssistantMessage; parts: P
   const sync = useSync()
   const messages = createMemo(() => sync.data.message[props.message.sessionID] ?? [])
   const model = createMemo(() => Model.name(ctx.providers(), props.message.providerID, props.message.modelID))
-  const execution = createMemo(() => executionReviewPlan(messages(), sync.data.part, props.message))
+  // Standalone row fixtures may omit the session index; the route supplies one
+  // shared instance for all rows.
+  const localReviewExecution = createMemo(() => ctx.reviewExecution ? undefined : createExecutionReviewIndex(messages(), sync.data.part))
+  const execution = createMemo(() => (ctx.reviewExecution ? ctx.reviewExecution() : localReviewExecution())?.get(props.message.id))
   const textReview = createMemo(() => execution() ? undefined : reviewText(props.message, props.parts))
   const matchingFinish = createMemo(() => {
     const text = textReview()
@@ -2748,11 +2756,8 @@ function ReviewFinish(props: { review: { report: ReviewReport.Info; analysis: st
   const expandable = createMemo(() =>
     analysisCollapsed().overflow || findings().some((finding) => (finding.detail ?? "").trim() !== ""),
   )
-  // The envelope is stripped from the default view; the exact canonical
-  // JSON stays reachable on demand, re-serialized the same way the runtime
-  // delivers it to the parent agent.
-  // When a delivery supplies the original receipt, preserve it in full rather
-  // than truncating lines or replacing earlier envelopes with reserialized JSON.
+  // Keep the original receipt reachable when supplied; the legacy fallback
+  // applies only when the delivery has no original raw text.
   const rawReport = createMemo(() => props.review.raw ?? capOutputLines(ReviewReport.envelope(report())))
   const revision = createMemo(() => (report().revision ? Locale.truncateMiddle(report().revision, 24) : undefined))
 

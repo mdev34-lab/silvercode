@@ -64,66 +64,84 @@ function envelopeRanges(source: string): [number, number][] | undefined {
   return ranges
 }
 
-/** Uses the runtime collector for identity, ordering, nudges, and finish boundaries. */
-export function executionReviewPlan(messages: readonly Message[], parts: Readonly<Record<string, readonly Part[] | undefined>>, current: AssistantMessage): Plan | undefined {
-  if (Agent.canonicalID(current.agent) !== "review") return undefined
-  if (!messages.some((message) => message.id === current.id)) return undefined
+/** Shared execution discovery for the entire reactive session transcript. */
+export function createExecutionReviewIndex(messages: readonly Message[], parts: Readonly<Record<string, readonly Part[] | undefined>>) {
+  const plans = new Map<string, Plan | undefined>()
+  const reviewers = messages.filter((message): message is AssistantMessage => message.role === "assistant" && Agent.canonicalID(message.agent) === "review")
+  if (!reviewers.length) return plans
   if (messages.some((message) => !parts[message.id])) {
-    // Hydration has not established execution boundaries yet. Keep each
-    // reviewer row raw until the missing transcript parts are available.
-    return { owner: current.id, members: new Set([current.id]) }
+    for (const row of reviewers) plans.set(row.id, { owner: row.id, members: new Set([row.id]) })
+    return plans
   }
   const entries: Entry[] = messages.map((info) => ({ info, parts: parts[info.id]! })).sort((a, b) => a.info.id.localeCompare(b.info.id))
-  if (!entries.some((entry) => entry.info.role === "user" && entry.info.id === current.parentID)) {
-    // With a missing anchor, the runtime deliberately uses only the current
-    // row. If nearby rows with the same unavailable parent disagree, we cannot
-    // establish whether they are history or one execution; show them raw.
-    const peers = entries.filter((entry) => entry.info.role === "assistant" && entry.info.parentID === current.parentID && Agent.canonicalID(entry.info.agent) === "review")
-    const position = peers.findIndex((entry) => entry.info.id === current.id)
-    let start = position, end = position
-    const finished = (entry: Entry) => entry.parts.some((part) => part.type === "tool" && part.tool === "finish" && part.state.status === "completed")
-    while (start > 0 && !finished(peers[start - 1])) start--
-    while (end + 1 < peers.length && !finished(peers[end])) end++
-    const segment = peers.slice(start, end + 1)
-    if (segment.length > 1) {
-      const reports = new Set<string>()
-      let uncertain = false
-      for (const entry of segment) {
-        if (entry.info.role !== "assistant" || entry.info.time.completed === undefined || entry.info.error) uncertain = true
-        const chunks = entry.parts.flatMap((part) => part.type === "text" && !part.synthetic && !part.ignored ? [part.text] : [])
-        const finish = entry.parts.findLast((part): part is ToolPart => part.type === "tool" && part.tool === "finish" && part.state.status === "completed")
-        if (finish?.state.status === "completed" && typeof finish.state.input.result === "string") chunks.push(finish.state.input.result)
-        const source = chunks.join("\n")
-        if (!ReviewReport.TAGS.some((tag) => source.includes(`<${tag}`))) continue
-        const delivery = ReviewReport.extract(chunks)
-        if (!delivery.ok) uncertain = true
-        else reports.add(JSON.stringify(delivery.report))
+  const byID = new Map<string, Entry>(entries.map((entry) => [entry.info.id, entry]))
+  const userIDs = new Set(entries.filter((entry) => entry.info.role === "user").map((entry) => entry.info.id))
+  const finished = (entry: Entry) => entry.parts.some((part) => part.type === "tool" && part.tool === "finish" && part.state.status === "completed")
+  // Unknown anchors are grouped once by parent and completed-finish boundary.
+  const missingParents = new Map<string, Entry[]>()
+  for (const entry of entries) {
+    if (entry.info.role !== "assistant" || Agent.canonicalID(entry.info.agent) !== "review" || userIDs.has(entry.info.parentID)) continue
+    const peers = missingParents.get(entry.info.parentID) ?? []
+    peers.push(entry)
+    missingParents.set(entry.info.parentID, peers)
+  }
+  for (const peers of missingParents.values()) {
+    let start = 0
+    while (start < peers.length) {
+      let end = start
+      while (end + 1 < peers.length && !finished(peers[end])) end++
+      const segment = peers.slice(start, end + 1)
+      if (segment.length > 1) {
+        const reports = new Set<string>()
+        let uncertain = false
+        for (const entry of segment) {
+          if (entry.info.role !== "assistant" || entry.info.time.completed === undefined || entry.info.error) uncertain = true
+          const chunks = entry.parts.flatMap((part) => part.type === "text" && !part.synthetic && !part.ignored ? [part.text] : [])
+          const finish = entry.parts.findLast((part): part is ToolPart => part.type === "tool" && part.tool === "finish" && part.state.status === "completed")
+          if (finish?.state.status === "completed" && typeof finish.state.input.result === "string") chunks.push(finish.state.input.result)
+          if (!ReviewReport.TAGS.some((tag) => chunks.join("\n").includes(`<${tag}`))) continue
+          const delivery = ReviewReport.extract(chunks)
+          if (!delivery.ok) uncertain = true
+          else reports.add(JSON.stringify(delivery.report))
+        }
+        if (uncertain || reports.size > 1) {
+          const ids = new Set(segment.map((entry) => entry.info.id))
+          for (const entry of segment) plans.set(entry.info.id, { owner: entry.info.id, members: ids })
+        }
       }
-      if (uncertain || reports.size > 1) return { owner: current.id, members: new Set(segment.map((entry) => entry.info.id)) }
+      start = end + 1
     }
   }
-  // Mark assistant messages in a copy, keeping all finish parts intact, so the
-  // actual runtime collector tells us which rows belong to the same execution.
+  // Each runtime collector discovery is performed once for its latest owner;
+  // earlier members are covered by that result rather than rescanning history.
   const marked = entries.map(({ info, parts }) => ({
     info,
     parts: info.role === "assistant" ? [...parts.filter((part) => part.type !== "text"), { type: "text", text: info.id }] : parts,
   })) as unknown as SessionV1.WithParts[]
-  let owner: Entry | undefined
-  let members: string[] = []
-  for (const entry of [...entries].reverse()) {
-    if (entry.info.role !== "assistant" || Agent.canonicalID(entry.info.agent) !== "review") continue
-    const target = marked.find((row) => row.info.id === entry.info.id)!
-    const ids = resultChunks(marked, target)
-    const ownFinish = entry.info.id === current.id && entry.parts.some((part) => part.type === "tool" && part.tool === "finish") &&
-      entry.parts.some((part) => part.type === "text" && !part.ignored && !part.synthetic)
-    const parentID = entry.info.parentID
-    const parentPresent = entries.some((row) => row.info.role === "user" && row.info.id === parentID)
-    if ((ids.length > 1 && parentPresent && ids.includes(current.id)) || (ids.length === 1 && ownFinish)) {
-      owner = entry; members = ids; break
+  const markedByID = new Map<string, SessionV1.WithParts>(marked.map((entry) => [entry.info.id, entry]))
+  const covered = new Set<string>()
+  for (const owner of [...entries].reverse()) {
+    if (owner.info.role !== "assistant" || Agent.canonicalID(owner.info.agent) !== "review" || covered.has(owner.info.id) || plans.has(owner.info.id)) continue
+    const members = resultChunks(marked, markedByID.get(owner.info.id)!)
+    const parentPresent = userIDs.has(owner.info.parentID)
+    const ownFinish = owner.parts.some((part) => part.type === "tool" && part.tool === "finish") &&
+      owner.parts.some((part) => part.type === "text" && !part.ignored && !part.synthetic)
+    if (!((members.length > 1 && parentPresent) || (members.length === 1 && ownFinish))) continue
+    const memberSet = new Set(members)
+    const plan = makeExecutionPlan(entries, owner, members, memberSet)
+    for (const id of members) {
+      const entry = byID.get(id)
+      if (entry?.info.role !== "assistant" || Agent.canonicalID(entry.info.agent) !== "review" || plans.has(id)) continue
+      plans.set(id, plan)
+      covered.add(id)
     }
   }
-  if (!owner || owner.info.role !== "assistant") return undefined
-  const selected = entries.filter((entry) => members.includes(entry.info.id))
+  return plans
+}
+
+function makeExecutionPlan(entries: Entry[], owner: Entry, members: string[], memberSet: Set<string>): Plan | undefined {
+  if (owner.info.role !== "assistant") return undefined
+  const selected = entries.filter((entry) => memberSet.has(entry.info.id))
   const fallback: Plan = { owner: owner.info.id, members: new Set(members) }
   if (selected.length !== members.length || selected.some((entry) => entry.info.role !== "assistant" || Agent.canonicalID(entry.info.agent) !== "review")) return fallback
   const first = selected[0].info as AssistantMessage

@@ -149,3 +149,23 @@ describe("foreground task review provenance", () => {
     expect(subagentReview({ ...part, state: { ...part.state, metadata: { ...part.state.metadata, review: { sessionId: "child", revision: info.revision, report: info, verdict: "pending" } } } })).toBeUndefined()
   })
 })
+
+test("single-message raw expansion retains the original full text, including prior envelopes and long unknown fields", () => {
+  const first = envelope("earlier", "approved")
+  const latest = `<silvercode-review>\n${JSON.stringify({ ...report("latest", "needs-fixes"), extension: `${"x".repeat(2600)}-raw-end` })}\n</silvercode-review>`
+  const chunks = [`Analysis before.\n${first}`, `Analysis between.\n${latest}\nAnalysis after.`]
+  const candidate = reviewText(assistant("review"), chunks.map((chunk, i) => text(chunk, i)))
+  expect(candidate?.report.summary).toBe("latest")
+  expect((candidate as { raw?: string } | undefined)?.raw).toBe(chunks.join("\n"))
+})
+
+test("foreground task raw expansion retains the complete original successful runtime wrapper", () => {
+  const info = report("latest foreground", "needs-fixes")
+  const original = `<silvercode-review>\n${JSON.stringify({ ...info, extension: `${"x".repeat(2600)}-raw-end` })}\n</silvercode-review>`
+  const body = `Before.\n${envelope("earlier", "approved")}\nAfter.\n${original}`
+  const output = `<task id="child" run="child@1" state="completed">\n<summary>Synthetic</summary>\n<task_result>\n${body}\n</task_result>\n<termination reason="success"></termination>\n</task>`
+  const task: ToolPart = { id: "task", sessionID: "parent", messageID: "assistant", type: "tool", tool: "task", callID: "call", state: { status: "completed", title: "Review", input: { subagent_type: "review" }, output, time: { start: 1, end: 2 }, metadata: { sessionId: "child", review: { sessionId: "child", revision: info.revision, report: info }, termination: { reason: "success" } } } }
+  const candidate = subagentReview(task)
+  expect(candidate?.report.summary).toBe("latest foreground")
+  expect((candidate as { raw?: string } | undefined)?.raw).toBe(output)
+})

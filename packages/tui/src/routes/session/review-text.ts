@@ -34,7 +34,7 @@ export function reviewText(message: AssistantMessage, parts: readonly Part[]) {
   if (!delivery.ok) return undefined
   const analysis = reviewPresentationAnalysis(delivery.analysis)
   if (analysis === undefined) return undefined
-  return { report: delivery.report, analysis, textPartIDs: text.map((part) => part.id) }
+  return { report: delivery.report, analysis, raw: joined, textPartIDs: text.map((part) => part.id) }
 }
 
 export function hasQuotedTag(text: string) {
@@ -109,7 +109,7 @@ export function subagentReview(part: ToolPart) {
   if (source.revision !== delivery.report.revision) return undefined
   const analysis = reviewPresentationAnalysis(delivery.analysis)
   if (analysis === undefined) return undefined
-  return { report: delivery.report, analysis }
+  return { report: delivery.report, analysis, raw: output }
 }
 
 /**

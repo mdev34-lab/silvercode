@@ -71,7 +71,7 @@ afterEach(async () => {
   setup = undefined
 })
 
-async function mount(options: { agent: string; completed?: boolean; parts: Part[] }) {
+async function mount(options: { agent: string; completed?: boolean; parts: Part[]; height?: number }) {
   const tmp = await tmpdir()
   const state = path.join(tmp.path, "state")
   await mkdir(state, { recursive: true })
@@ -168,7 +168,7 @@ async function mount(options: { agent: string; completed?: boolean; parts: Part[
         </ExitProvider>
       </TestTuiContexts>
     ),
-    { width: 100, height: 24, kittyKeyboard: true },
+    { width: 100, height: options.height ?? 24, kittyKeyboard: true },
   )
 
   await waitUntil(() => sync !== undefined)
@@ -221,6 +221,41 @@ function completedTool(tool: string, input: Record<string, unknown>, output: str
 }
 
 describe("review assistant text: real transcript fallback", () => {
+  test("raw expansion exposes the original long single-message text and earlier envelope", async () => {
+    const earlier = ReviewReport.envelope({ version: 1, revision: "old", assessment: "approved", summary: "Earlier original envelope", findings: [] })
+    const info = { version: 1 as const, revision: "new", assessment: "needs-fixes" as const, summary: "Latest original envelope", findings: [] }
+    const latest = `<silvercode-review>\n${JSON.stringify({ ...info, extension: `${"x".repeat(2600)}-ORIGINAL_RAW_TAIL` })}\n</silvercode-review>`
+    const mounted = await mount({ agent: "review", completed: true, height: 80, parts: [textPart(`${earlier}\n${latest}`)] })
+    await settleUntilFrame(mounted.app, "Raw review report")
+    const frame = await frameOfSpans(mounted.app)
+    const row = frame.split("\n").findIndex((line) => line.includes("Raw review report"))
+    expect(row).toBeGreaterThanOrEqual(0)
+    await mounted.app.mockMouse.click(5, row)
+    await settleUntilFrame(mounted.app, "ORIGINAL_RAW_TAIL")
+    const expanded = await frameOfSpans(mounted.app)
+    expect(expanded).toContain("Earlier original envelope")
+    expect(expanded).toContain("ORIGINAL_RAW_TAIL")
+  })
+
+  test("raw expansion exposes the complete long foreground task receipt", async () => {
+    const info = { version: 1 as const, revision: "synthetic", assessment: "needs-fixes" as const, summary: "Long child verdict", findings: [] }
+    const report = `<silvercode-review>\n${JSON.stringify({ ...info, extension: `${"x".repeat(2600)}-FOREGROUND_RAW_TAIL` })}\n</silvercode-review>`
+    const output = `<task id="child" state="completed">\n<task_result>\n${report}\n</task_result>\n<termination reason="success"></termination>\n</task>`
+    const task = completedTool("task", { description: "Inspect synthetic changes", subagent_type: "review" }, output,
+      { sessionId: "child", review: { report: info, sessionId: "child", revision: info.revision }, termination: { reason: "success" } })
+    const mounted = await mount({ agent: "work", completed: true, height: 80, parts: [task] })
+    await settleUntilFrame(mounted.app, "Raw review report")
+    const frame = await frameOfSpans(mounted.app)
+    const row = frame.split("\n").findIndex((line) => line.includes("Raw review report"))
+    expect(row).toBeGreaterThanOrEqual(0)
+    await mounted.app.mockMouse.click(5, row)
+    await settleUntilFrame(mounted.app, "FOREGROUND_RAW_TAIL")
+    const expanded = await frameOfSpans(mounted.app)
+    expect(expanded).toContain('<task id="child" state="completed">')
+    expect(expanded).toContain("FOREGROUND_RAW_TAIL")
+    expect(expanded).toContain('<termination reason="success"></termination>')
+  })
+
   test("renders a completed multipart review once with its analysis", async () => {
     const report = ReviewReport.envelope({ version: 1, revision: "synthetic", assessment: "needs-fixes", summary: "Synthetic issue summary", findings: [] })
     const mounted = await mount({ agent: "review", completed: true, parts: [textPart("Synthetic analysis.", "prt_a"), textPart(report, "prt_b")] })
