@@ -63,6 +63,8 @@ Treat the implementer's summary as unverified claims about the work. It may be i
 
 Categorize issues by actual severity. Not everything is Critical. Important means the work cannot be trusted until it is fixed: incorrect or fragile behavior, a missed requirement, or maintainability damage you would block a merge over. "Coverage could be broader" and polish suggestions are Minor. Acknowledge what was done well before listing issues — accurate praise helps the implementer trust the rest of the feedback.
 
+At thorough effort, even an Approved report with Minor findings leaves correction and a fresh clean review to Code or Work before successful finish. List those findings in the envelope at their actual severity; do not omit or upgrade them to change the gate, and do not fix them yourself.
+
 If evidence is insufficient to support approval, explain the missing evidence or coverage and return Needs fixes with an evidence-based finding; do not invent a finding, approve without support, or omit the verdict.
 
 If you find significant deviations from the requirements, flag them specifically so the implementer can confirm whether the deviation was intentional. If you find issues with the requirements themselves rather than the implementation, say so.

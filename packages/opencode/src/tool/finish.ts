@@ -330,7 +330,9 @@ export const FinishTool = Tool.define(
             )
               workflowNotes.push("complex or thorough non-programming work had no successful General delivery")
             if (admission.kind === "programming" && !workflow.implemented)
-              workflowNotes.push("programming work was not delivered through successful Think planning and Code implementation")
+              workflowNotes.push(
+                "programming work was not delivered through successful Think planning and Code implementation",
+              )
             // Blocking findings come from a Review that actually ran: reporting success over them
             // would misstate the delivered work, so that one stays a delivery-integrity refusal.
             if (reviewState.blockingFindings > 0)
@@ -468,11 +470,13 @@ export const FinishTool = Tool.define(
 
           // A missing, stale or unavailable review is not a completion gate: the result is delivered
           // with an explicit UNREVIEWED label and never as approved. Known blocking findings from a
-          // Review that ran, and a review still in progress, keep declining.
+          // Review that ran, and a review still in progress, keep declining. At thorough, known
+          // minor findings also keep declining until corrected and covered by a fresh clean review.
           const softened =
             !outcome.deliver &&
             params.reason !== "subagent_wait" &&
             reviewState.blockingFindings === 0 &&
+            !EffortPolicy.holdsKnownFindings(effort, reviewState) &&
             !reviewState.reviewInProgress
           if (softened)
             workflowNotes.push(
