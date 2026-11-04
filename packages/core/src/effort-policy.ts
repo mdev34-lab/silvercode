@@ -138,6 +138,15 @@ export function deriveValidation(input: {
 }
 
 /**
+ * Thorough alone treats every known finding as unfinished work: at that level a
+ * Minor finding blocks convergence just as a Critical or Important one does.
+ * Fast and medium keep the severity-only reading of `blockingFindings`.
+ */
+export function holdsKnownFindings(effort: AgentEffort.Level, state: ReviewLoopState): boolean {
+  return effort === "thorough" && state.openFindings > 0
+}
+
+/**
  * Decide whether this `finish` call delivers, and with which honest labels.
  *
  * Enforcement lives here, at the finish checkpoint, and depends only on the persisted review
@@ -147,7 +156,8 @@ export function deriveValidation(input: {
  * - `medium`: at least one independent review, then at most two completed attempts. Blocking
  *   findings or stale work force another pass until the cap; after the cap delivery is labelled
  *   budget-exhausted, never approved.
- * - `thorough`: until-clean with no pass cap.
+ * - `thorough`: until-clean with no pass cap; every known finding, including minor,
+ *   must be corrected and followed by a fresh clean review before approval.
  *
  * For medium and thorough (#233): an unavailable reviewer BLOCKS a successful finish. Only a
  * declared failure may deliver with `review-blocked`, and a depth-limited child hands its writes
@@ -176,8 +186,14 @@ export function evaluateFinish(input: FinishInput): FinishOutcome {
     return { deliver: true, termination: "not-required", ...common }
   }
 
+  // Keep the severity-based blocker count intact for fast/medium and persisted metadata.
+  const thoroughFindings = holdsKnownFindings(effort, state)
   const converged =
-    reviewed && !state.workSinceReview && state.lastReviewVerdict === "approved" && state.blockingFindings === 0
+    reviewed &&
+    !state.workSinceReview &&
+    state.lastReviewVerdict === "approved" &&
+    state.blockingFindings === 0 &&
+    !thoroughFindings
   const blocking = state.blockingFindings > 0
 
   const deliverableTermination = ((): Termination => {
@@ -231,14 +247,19 @@ export function evaluateFinish(input: FinishInput): FinishOutcome {
     return { deliver: true, termination: deliverableTermination, ...common }
   }
 
-  // thorough: until-clean, no finite cap.
-  if (!reviewed || blocking || state.lastReviewVerdict !== "approved" || state.workSinceReview) {
+  // thorough: until-clean, no finite cap. Every known finding (Minor included) survives
+  // corrections as open evidence until a fresh report replaces it; fixing alone is not approval.
+  if (!reviewed || blocking || thoroughFindings || state.lastReviewVerdict !== "approved" || state.workSinceReview) {
     if (!reviewerAvailable) return unavailable()
     return decline(
       common,
-      state.workSinceReview && state.lastReviewVerdict === "approved"
-        ? "Work changed after the approved review, so the current tree is no longer covered. Run another synchronous review before finishing."
-        : 'Review required: effort is "thorough", so delivery requires a clean, current independent review from the Review subagent (\`subagent_type: "review"\`, \`background: false\`). Address the outstanding findings and run it again before finishing.',
+      thoroughFindings
+        ? state.workSinceReview
+          ? 'Review required: effort is "thorough" and the last report still lists finding(s), but files have changed since that review. Check each listed finding against the current tree; fix only findings that remain unresolved, then obtain a fresh clean synchronous review of the current tree (`subagent_type: "review"`, `background: false`). Changes since review do not establish that any finding is fixed, and an Approved report that still lists findings is not clean.'
+          : 'Review required: effort is "thorough", so every known finding must be corrected, including minor findings. Fix every outstanding finding, then obtain a fresh clean synchronous review (`subagent_type: "review"`, `background: false`) before finishing; an Approved report that still lists any finding is not enough.'
+        : state.workSinceReview && state.lastReviewVerdict === "approved"
+          ? "Work changed after the approved review, so the current tree is no longer covered. Run another synchronous review before finishing."
+          : 'Review required: effort is "thorough", so delivery requires a clean, current independent review from the Review subagent (`subagent_type: "review"`, `background: false`). Address the outstanding findings and run it again before finishing.',
     )
   }
   return { deliver: true, termination: "approved", ...common }
