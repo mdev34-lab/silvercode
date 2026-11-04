@@ -1,4 +1,6 @@
 import * as pty from "@lydell/node-pty"
+import { windowsConsoleCodePage } from "../shell-encoding"
+import { conptyTextDecoder, normalizeConptyOutput } from "./encoding"
 import type { Opts, Proc } from "./pty"
 
 export type { Disp, Exit, Opts, Proc } from "./pty"
@@ -45,7 +47,7 @@ export function spawn(file: string, args: string[], opts: Opts): Proc {
     process.platform === "win32"
       ? spawnWithConptyFallback((backend) => pty.spawn(file, args, { ...opts, ...backend }))
       : pty.spawn(file, args, opts)
-  return {
+  const session: Proc = {
     pid: proc.pid,
     onData(listener) {
       return proc.onData(listener)
@@ -63,4 +65,9 @@ export function spawn(file: string, args: string[], opts: Opts): Proc {
       proc.kill(signal)
     },
   }
+  // ConPTY hands us UTF-8, but conhost expands byte-oriented output through the
+  // console codepage first (#710). Reverse that where it is provable so `type`
+  // and other raw-byte programs read back correctly.
+  if (process.platform !== "win32") return session
+  return normalizeConptyOutput(session, conptyTextDecoder({ codepage: windowsConsoleCodePage() }))
 }
