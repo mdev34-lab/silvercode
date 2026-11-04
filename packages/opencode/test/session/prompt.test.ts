@@ -8708,7 +8708,7 @@ it.instance(
 // just the returned terminal message.
 
 it.instance(
-  "review HIGH1: a silent note before the first assistant preserves result chunks and continuation",
+  "a silent note before the first assistant preserves result chunks and continuation",
   () =>
     Effect.gen(function* () {
       const { llm } = yield* useServerConfig((url) => ({ ...providerCfg(url), agent: { work: { finishTool: true } } }))
@@ -8754,7 +8754,7 @@ it.instance(
 )
 
 it.instance(
-  "review HIGH2: a queued background completion cannot preempt an unfinished parent tool step",
+  "a queued background completion cannot preempt an unfinished parent tool step",
   () =>
     Effect.gen(function* () {
       const { llm, dir } = yield* useServerConfig((url) => ({
@@ -8847,7 +8847,7 @@ it.instance(
 )
 
 it.instance(
-  "review HIGH3: overflow after a finish nudge settles the original prompt through compaction continuation",
+  "overflow after a finish nudge settles the original prompt through compaction continuation",
   () =>
     Effect.gen(function* () {
       const { llm } = yield* useServerConfig((url) => ({ ...providerCfg(url), agent: { work: { finishTool: true } } }))
@@ -8891,7 +8891,7 @@ it.instance(
 )
 
 it.instance(
-  "review HIGH3: step-0 compaction settles the caller instead of returning the stale seed generation",
+  "step-0 compaction settles the caller instead of returning the stale seed generation",
   () =>
     Effect.gen(function* () {
       const { llm } = yield* useServerConfig((url) => ({ ...providerCfg(url), agent: { work: { finishTool: true } } }))
@@ -8921,7 +8921,7 @@ it.instance(
 )
 
 it.instance(
-  "review MED: resume does not spend a request on a trailing silent marker after a completed finish",
+  "resume does not spend a request on a trailing silent marker after a completed finish",
   () =>
     Effect.gen(function* () {
       const { llm } = yield* useServerConfig((url) => ({ ...providerCfg(url), agent: { work: { finishTool: true } } }))
@@ -8943,7 +8943,7 @@ it.instance(
 )
 
 it.instance(
-  "arena controlled queued overflow lineage diagnostic",
+  "queued overflow preserves prompt lineage",
   () =>
     Effect.gen(function* () {
       const { llm } = yield* useServerConfig((url) => ({ ...providerCfg(url), agent: { work: { finishTool: true } } }))
@@ -9007,15 +9007,6 @@ it.instance(
           .pipe(Effect.map((msgs) => (msgs.some((m) => m.info.id === p2id) ? true : undefined))),
         "queued message not persisted",
       )
-      console.log(
-        "ARENA_BEFORE_RELEASE",
-        JSON.stringify({
-          p1id,
-          p2id,
-          messages: yield* sessions.messages({ sessionID: chat.id }),
-          calls: yield* llm.calls,
-        }),
-      )
       yield* Deferred.succeed(gate, void 0)
       yield* pollWithTimeout(
         sessions
@@ -9035,7 +9026,7 @@ it.instance(
         Effect.tapError(() =>
           Effect.gen(function* () {
             console.log(
-              "ARENA_TIMEOUT_STATE",
+              "prompt test failure",
               JSON.stringify({
                 messages: yield* sessions.messages({ sessionID: chat.id }),
                 calls: yield* llm.calls,
@@ -9051,23 +9042,11 @@ it.instance(
       const continuation = stored.find((m) =>
         m.parts.some((p) => p.type === "text" && p.metadata?.compactionContinuation !== undefined),
       )!
-      console.log(
-        "ARENA_AFTER_COMPACTION",
-        JSON.stringify({
-          p1id,
-          p2id,
-          messages: stored,
-          calls: yield* llm.calls,
-          misses: yield* llm.misses,
-          pending: yield* llm.pending,
-          inputs: yield* llm.inputs,
-        }),
-      )
       const exits = yield* settled([p1, p2], "queued overflow callers never settled").pipe(
         Effect.tapError(() =>
           Effect.gen(function* () {
             console.log(
-              "ARENA_CALLERS_TIMEOUT",
+              "prompt test failure",
               JSON.stringify({
                 messages: yield* sessions.messages({ sessionID: chat.id }),
                 calls: yield* llm.calls,
@@ -9078,17 +9057,6 @@ it.instance(
             )
           }),
         ),
-      )
-      console.log(
-        "ARENA_CALLER_EXITS",
-        JSON.stringify({
-          exits,
-          messages: yield* sessions.messages({ sessionID: chat.id }),
-          calls: yield* llm.calls,
-          misses: yield* llm.misses,
-          pending: yield* llm.pending,
-          inputs: yield* llm.inputs,
-        }),
       )
       const answer1 = assistantExit(exits[0])
       const answer2 = assistantExit(exits[1])
@@ -9124,7 +9092,7 @@ it.instance(
 )
 
 noLLMServer.instance(
-  "review repeated result rejects unfinished own assistant",
+  "repeated result rejects unfinished own assistant",
   () =>
     Effect.gen(function* () {
       const prompt = yield* SessionPrompt.Service
@@ -9164,7 +9132,6 @@ noLLMServer.instance(
         }),
       )
       const result = yield* prompt.loop({ sessionID: chat.id, messageID: p1.id })
-      console.log("REPEATED_GUARD", JSON.stringify({ p1: p1.id, p2: p2.id, stale: stale.id, result, joins }))
       expect(joins).toBe(2)
       expect(result.info.role).toBe("assistant")
       if (result.info.role !== "assistant") throw new Error("expected assistant")
@@ -9178,7 +9145,7 @@ noLLMServer.instance(
 )
 
 it.instance(
-  "review held 413 queued finish nudge downstream control",
+  "held queued finish nudge preserves downstream control",
   () =>
     Effect.gen(function* () {
       const { llm } = yield* useServerConfig((url) => ({ ...providerCfg(url), agent: { work: { finishTool: true } } }))
@@ -9243,15 +9210,6 @@ it.instance(
           .pipe(Effect.map((msgs) => (msgs.some((m) => m.info.id === p2id) ? true : undefined))),
         "queued message not persisted",
       )
-      console.log(
-        "ARENA_BEFORE_RELEASE",
-        JSON.stringify({
-          p1id,
-          p2id,
-          messages: yield* sessions.messages({ sessionID: chat.id }),
-          calls: yield* llm.calls,
-        }),
-      )
       yield* Deferred.succeed(gate, void 0)
       yield* pollWithTimeout(
         sessions
@@ -9271,7 +9229,7 @@ it.instance(
         Effect.tapError(() =>
           Effect.gen(function* () {
             console.log(
-              "ARENA_TIMEOUT_STATE",
+              "prompt test failure",
               JSON.stringify({
                 messages: yield* sessions.messages({ sessionID: chat.id }),
                 calls: yield* llm.calls,
@@ -9287,23 +9245,11 @@ it.instance(
       const continuation = stored.find((m) =>
         m.parts.some((p) => p.type === "text" && p.metadata?.compactionContinuation !== undefined),
       )!
-      console.log(
-        "ARENA_AFTER_COMPACTION",
-        JSON.stringify({
-          p1id,
-          p2id,
-          messages: stored,
-          calls: yield* llm.calls,
-          misses: yield* llm.misses,
-          pending: yield* llm.pending,
-          inputs: yield* llm.inputs,
-        }),
-      )
       const exits = yield* settled([p1, p2], "queued overflow callers never settled").pipe(
         Effect.tapError(() =>
           Effect.gen(function* () {
             console.log(
-              "ARENA_CALLERS_TIMEOUT",
+              "prompt test failure",
               JSON.stringify({
                 messages: yield* sessions.messages({ sessionID: chat.id }),
                 calls: yield* llm.calls,
@@ -9314,17 +9260,6 @@ it.instance(
             )
           }),
         ),
-      )
-      console.log(
-        "ARENA_CALLER_EXITS",
-        JSON.stringify({
-          exits,
-          messages: yield* sessions.messages({ sessionID: chat.id }),
-          calls: yield* llm.calls,
-          misses: yield* llm.misses,
-          pending: yield* llm.pending,
-          inputs: yield* llm.inputs,
-        }),
       )
       const answer1 = assistantExit(exits[0])
       const answer2 = assistantExit(exits[1])
@@ -9477,7 +9412,7 @@ it.instance(
                     Effect.tapError(() =>
                       Effect.gen(function* () {
                         console.log(
-                          "TASK_TIMEOUT",
+                          "prompt test failure",
                           JSON.stringify({
                             calls: yield* llm.calls,
                             misses: yield* llm.misses,
@@ -9491,16 +9426,6 @@ it.instance(
                   )
                   const a1 = assistantExit(exits[0])
                   p2answer = assistantExit(exits[1])
-                  console.log(
-                    "TASK_HELD_RESULT",
-                    JSON.stringify({
-                      input,
-                      exits,
-                      calls: yield* llm.calls,
-                      misses: yield* llm.misses,
-                      pending: yield* llm.pending,
-                    }),
-                  )
                   return a1
                 }),
             },
@@ -9562,17 +9487,6 @@ it.instance(
       const exits = yield* settled([first, second], "cancelled callers never settled")
       const a1 = assistantExit(exits[0])
       const a2 = assistantExit(exits[1])
-      console.log(
-        "CANCEL_OWNERSHIP",
-        JSON.stringify({
-          p1id,
-          p2id,
-          exits,
-          calls: yield* llm.calls,
-          misses: yield* llm.misses,
-          pending: yield* llm.pending,
-        }),
-      )
       expect(yield* llm.calls).toBe(1)
       expect(yield* llm.misses).toEqual([])
       expect(a1.info.role).toBe("assistant")
@@ -9636,10 +9550,6 @@ noLLMServer.instance(
         }),
       )
       const result = yield* prompt.loop({ sessionID: chat.id, messageID: p1.id })
-      console.log(
-        "READ_FAILURE_OWNERSHIP",
-        JSON.stringify({ p1: p1.id, p2: p2.id, other: other.id, result, joins, failedReads }),
-      )
       expect(joins).toBe(1)
       expect(failedReads).toBe(1)
       expect(result.info.role).toBe("assistant")
@@ -9752,7 +9662,7 @@ it.instance(
         Effect.tapError(() =>
           Effect.gen(function* () {
             console.log(
-              "TWICE_TIMEOUT",
+              "prompt test failure",
               JSON.stringify({
                 ids,
                 calls: yield* llm.calls,
@@ -9767,18 +9677,6 @@ it.instance(
       )
       const stored = yield* sessions.messages({ sessionID: chat.id })
       const inputs = yield* llm.inputs
-      console.log(
-        "TWICE_RESULT",
-        JSON.stringify({
-          ids,
-          exits,
-          calls: yield* llm.calls,
-          misses: yield* llm.misses,
-          pending: yield* llm.pending,
-          messages: stored,
-          inputs,
-        }),
-      )
       expect(yield* llm.calls).toBe(7)
       expect(yield* llm.misses).toEqual([])
       expect(yield* llm.pending).toBe(0)
@@ -9884,7 +9782,7 @@ it.instance(
         Effect.tapError(() =>
           Effect.gen(function* () {
             console.log(
-              "MULTI_TIMEOUT",
+              "prompt test failure",
               JSON.stringify({
                 ids,
                 calls: yield* llm.calls,
@@ -9899,18 +9797,6 @@ it.instance(
       )
       const stored = yield* sessions.messages({ sessionID: chat.id })
       const inputs = yield* llm.inputs
-      console.log(
-        "MULTI_RESULT",
-        JSON.stringify({
-          ids,
-          exits,
-          calls: yield* llm.calls,
-          misses: yield* llm.misses,
-          pending: yield* llm.pending,
-          messages: stored,
-          inputs,
-        }),
-      )
       expect(yield* llm.calls).toBe(5)
       expect(yield* llm.misses).toEqual([])
       expect(yield* llm.pending).toBe(0)
@@ -10027,7 +9913,7 @@ it.instance(
         Effect.tapError(() =>
           Effect.gen(function* () {
             console.log(
-              "TWICE_POLICY_TIMEOUT",
+              "prompt test failure",
               JSON.stringify({
                 ids,
                 calls: yield* llm.calls,
@@ -10042,18 +9928,6 @@ it.instance(
       )
       const stored = yield* sessions.messages({ sessionID: chat.id })
       const inputs = yield* llm.inputs
-      console.log(
-        "TWICE_POLICY_RESULT",
-        JSON.stringify({
-          ids,
-          exits,
-          calls: yield* llm.calls,
-          misses: yield* llm.misses,
-          pending: yield* llm.pending,
-          messages: stored,
-          inputs,
-        }),
-      )
       expect(yield* llm.calls).toBe(7)
       expect(yield* llm.misses).toEqual([])
       expect(yield* llm.pending).toBe(0)
@@ -10170,7 +10044,7 @@ it.instance(
         Effect.tapError(() =>
           Effect.gen(function* () {
             console.log(
-              "MULTI_TIMEOUT",
+              "prompt test failure",
               JSON.stringify({
                 ids,
                 calls: yield* llm.calls,
@@ -10185,18 +10059,6 @@ it.instance(
       )
       const stored = yield* sessions.messages({ sessionID: chat.id })
       const inputs = yield* llm.inputs
-      console.log(
-        "MULTI_RESULT",
-        JSON.stringify({
-          ids,
-          exits,
-          calls: yield* llm.calls,
-          misses: yield* llm.misses,
-          pending: yield* llm.pending,
-          messages: stored,
-          inputs,
-        }),
-      )
       expect(yield* llm.calls).toBe(5)
       expect(yield* llm.misses).toEqual([])
       expect(yield* llm.pending).toBe(0)
@@ -10308,7 +10170,7 @@ it.instance(
         Effect.tapError(() =>
           Effect.gen(function* () {
             console.log(
-              "MULTI_TIMEOUT",
+              "prompt test failure",
               JSON.stringify({
                 ids,
                 calls: yield* llm.calls,
@@ -10323,18 +10185,6 @@ it.instance(
       )
       const stored = yield* sessions.messages({ sessionID: chat.id })
       const inputs = yield* llm.inputs
-      console.log(
-        "MULTI_RESULT",
-        JSON.stringify({
-          ids,
-          exits,
-          calls: yield* llm.calls,
-          misses: yield* llm.misses,
-          pending: yield* llm.pending,
-          messages: stored,
-          inputs,
-        }),
-      )
       expect(yield* llm.calls).toBe(5)
       expect(yield* llm.misses).toEqual([])
       expect(yield* llm.pending).toBe(0)
@@ -10418,7 +10268,7 @@ it.instance(
         Effect.tapError(() =>
           Effect.gen(function* () {
             console.log(
-              "FIRST_OVERFLOW_TIMEOUT",
+              "prompt test failure",
               JSON.stringify({
                 ids,
                 calls: yield* llm.calls,
@@ -10433,18 +10283,6 @@ it.instance(
       )
       const stored = yield* sessions.messages({ sessionID: chat.id })
       const inputs = yield* llm.inputs
-      console.log(
-        "FIRST_OVERFLOW_RESULT",
-        JSON.stringify({
-          ids,
-          exits,
-          calls: yield* llm.calls,
-          misses: yield* llm.misses,
-          pending: yield* llm.pending,
-          messages: stored,
-          inputs,
-        }),
-      )
       expect(yield* llm.calls).toBe(4)
       expect(yield* llm.misses).toEqual([])
       expect(yield* llm.pending).toBe(0)
@@ -10560,7 +10398,7 @@ it.instance(
         Effect.tapError(() =>
           Effect.gen(function* () {
             console.log(
-              "FIRST_OVERFLOW_TIMEOUT",
+              "prompt test failure",
               JSON.stringify({
                 ids,
                 calls: yield* llm.calls,
@@ -10575,18 +10413,6 @@ it.instance(
       )
       const stored = yield* sessions.messages({ sessionID: chat.id })
       const inputs = yield* llm.inputs
-      console.log(
-        "FIRST_OVERFLOW_RESULT",
-        JSON.stringify({
-          ids,
-          exits,
-          calls: yield* llm.calls,
-          misses: yield* llm.misses,
-          pending: yield* llm.pending,
-          messages: stored,
-          inputs,
-        }),
-      )
       expect(yield* llm.calls).toBe(5)
       expect(yield* llm.misses).toEqual([])
       expect(yield* llm.pending).toBe(0)
