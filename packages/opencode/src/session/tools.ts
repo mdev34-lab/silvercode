@@ -25,6 +25,7 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { isRecord } from "@/util/record"
 import { RuntimeFlags } from "@/effect/runtime-flags"
+import { Workdir } from "./workdir"
 
 const MCP_RESOURCE_TOOLS = {
   list: "list_mcp_resources",
@@ -70,6 +71,10 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
 
   const context = (args: Record<string, unknown>, options: ToolExecutionOptions): Tool.Context => ({
     sessionID: input.session.id,
+    // The folder this session works in, which is the project directory unless a
+    // delegated child was given one. It resolves paths only; permission checks
+    // keep measuring against the instance through `external-directory`.
+    cwd: Workdir.of(input.session),
     abort: options.abortSignal!,
     messageID: input.processor.message.id,
     callID: options.toolCallId,
