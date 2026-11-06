@@ -1048,17 +1048,14 @@ export function Session() {
         try {
           const sessionData = session()
           if (!sessionData) return
-          const sessionMessages = messages()
-          const transcript = formatTranscript(
-            sessionData,
-            sessionMessages.map((msg) => ({ info: msg, parts: sync.data.part[msg.id] ?? [] })),
-            {
-              thinking: showThinking(),
-              toolDetails: showDetails(),
-              assistantMetadata: showAssistantMetadata(),
-              providers: sync.data.provider,
-            },
-          )
+          // The transcript is the complete history, never just the rendered
+          // window: read it from the session's persisted timeline (#815).
+          const transcript = formatTranscript(sessionData, await sync.session.history(route.sessionID), {
+            thinking: showThinking(),
+            toolDetails: showDetails(),
+            assistantMetadata: showAssistantMetadata(),
+            providers: sync.data.provider,
+          })
           await clipboard.write?.(transcript)
           toast.show({ message: "Session transcript copied to clipboard!", variant: "success" })
         } catch {
@@ -1078,7 +1075,6 @@ export function Session() {
         try {
           const sessionData = session()
           if (!sessionData) return
-          const sessionMessages = messages()
 
           const defaultFilename = `session-${sessionData.id.slice(0, 8)}.md`
 
@@ -1093,16 +1089,14 @@ export function Session() {
 
           if (options === null) return
 
-          const transcript = formatTranscript(
-            sessionData,
-            sessionMessages.map((msg) => ({ info: msg, parts: sync.data.part[msg.id] ?? [] })),
-            {
-              thinking: options.thinking,
-              toolDetails: options.toolDetails,
-              assistantMetadata: options.assistantMetadata,
-              providers: sync.data.provider,
-            },
-          )
+          // Export reads the complete persisted timeline rather than the
+          // rendered window, so an export never truncates the transcript (#815).
+          const transcript = formatTranscript(sessionData, await sync.session.history(route.sessionID), {
+            thinking: options.thinking,
+            toolDetails: options.toolDetails,
+            assistantMetadata: options.assistantMetadata,
+            providers: sync.data.provider,
+          })
 
           if (options.openWithoutSaving) {
             // Just open in editor without saving
@@ -1562,9 +1556,9 @@ function UserMessageRow(props: {
   const sync = useSync()
   const [history, setHistory] = createSignal<{ info: Message; parts: Part[] }[]>()
   const [historyRevision, setHistoryRevision] = createSignal(0)
-  // A removal can affect a launch or duplicate outside this row (or outside
-  // sync's 100-message window). Invalidate immediately and refetch the full
-  // history; the effect cleanup also rejects any older in-flight response.
+  // A removal can affect a launch or duplicate outside this row. Invalidate
+  // immediately and refetch the full history; the effect cleanup also rejects
+  // any older in-flight response.
   const offHistoryRemoval = sdk.event.on("event", (event) => {
     const payload = event.payload
     if ((payload.type !== "message.removed" && payload.type !== "message.part.removed") ||
@@ -1573,9 +1567,9 @@ function UserMessageRow(props: {
     setHistoryRevision((revision) => revision + 1)
   })
   onCleanup(offHistoryRemoval)
-  // Sync retains only the newest 100 messages. Read the complete persisted
-  // history before treating a launch/receipt pair as unique. While loading or
-  // on failure the receipt remains visible on the ordinary fallback path.
+  // Read the complete persisted history before treating a launch/receipt pair
+  // as unique, including rows the live store may not hold. While loading or on
+  // failure the receipt remains visible on the ordinary fallback path.
   createEffect(on(
     () => ({ key: backgroundParts().filter((part) => ReviewReport.TAGS.some((tag) => part.text.includes(`<${tag}`))).map((part) => `${part.id}\n${part.text}`).join("\n"), revision: historyRevision() }),
     ({ key }) => {

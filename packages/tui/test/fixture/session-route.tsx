@@ -24,7 +24,7 @@ import { TestTuiContexts } from "./tui-environment"
 import { createTuiAttention } from "../../src/attention"
 import { TuiConfigProvider, useTuiConfig } from "../../src/config"
 import { ArgsProvider } from "../../src/context/args"
-import { ClipboardProvider } from "../../src/context/clipboard"
+import { ClipboardProvider, type ClipboardService } from "../../src/context/clipboard"
 import { DataProvider } from "../../src/context/data"
 import { EditorContextProvider } from "../../src/context/editor"
 import { EpilogueProvider } from "../../src/context/epilogue"
@@ -39,6 +39,7 @@ import { PromptRefProvider } from "../../src/context/prompt"
 import { RouteProvider, useRoute } from "../../src/context/route"
 import { SDKProvider, useSDK } from "../../src/context/sdk"
 import { SyncProvider, useSync } from "../../src/context/sync"
+import type { TuiPaths } from "../../src/context/runtime"
 import { ThemeProvider, useTheme } from "../../src/context/theme"
 import SidebarContext from "../../src/feature-plugins/sidebar/context"
 import SidebarFooter from "../../src/feature-plugins/sidebar/footer"
@@ -169,6 +170,10 @@ export type MountOptions = {
   // read-only routes. Anything still unaccounted for keeps throwing, so a stray
   // request fails the run instead of passing silently.
   respond?: (request: FetchRequest) => Response | undefined
+  // Transcript export writes into `paths.cwd`; default is the sandbox path.
+  paths?: Partial<TuiPaths>
+  // Captures what copy/export commands hand to the clipboard.
+  clipboard?: ClipboardService
 }
 
 const setups: { app: Setup; dispose: () => Promise<void> }[] = []
@@ -203,7 +208,20 @@ export async function mountSessionRoute(options: MountOptions) {
     const session = options.sessions.find((item) => url.pathname === `/session/${item.id}`)
     if (session) return json(session)
     const messages = options.sessions.find((item) => url.pathname === `/session/${item.id}/message`)
-    if (messages) return json(options.messages?.[messages.id] ?? [])
+    if (messages) {
+      const rows = options.messages?.[messages.id] ?? []
+      // Same page contract as the server: a `limit` answers the newest page in
+      // ascending order and points at older rows through `x-next-cursor`,
+      // while an omitted `limit` is the complete timeline (the endpoint pages
+      // internally). Mounts of long sessions therefore see the real wire
+      // behavior instead of an always-complete fixture.
+      const limit = url.searchParams.get("limit")
+      if (!limit) return json(rows)
+      const before = url.searchParams.get("before")
+      const end = before ? Number(before) : rows.length
+      const start = Math.max(0, end - Number(limit))
+      return json(rows.slice(start, end), start > 0 ? { headers: { "x-next-cursor": String(start) } } : undefined)
+    }
     if (/^\/session\/[^/]+\/(todo|diff)$/.test(url.pathname)) return json([])
     if (url.pathname === "/session") return json(options.sessions)
     if (url.pathname === "/session/status") return json(options.status ?? {})
@@ -280,7 +298,7 @@ export async function mountSessionRoute(options: MountOptions) {
     onCleanup(off)
 
     return (
-      <ClipboardProvider>
+      <ClipboardProvider value={options.clipboard}>
         <OpencodeKeymapProvider keymap={keymap}>
           <ToastProvider>
             <RouteProvider initialRoute={{ type: "session", sessionID: routed.id }}>
@@ -331,7 +349,10 @@ export async function mountSessionRoute(options: MountOptions) {
 
   const app = await testRender(
     () => (
-      <TestTuiContexts directory={directory} paths={{ home: "/tmp", state: tmp.path, worktree: directory }}>
+      <TestTuiContexts
+        directory={directory}
+        paths={{ home: "/tmp", state: tmp.path, worktree: directory, ...options.paths }}
+      >
         <ArgsProvider>
           <KVProvider>
             <Harness />

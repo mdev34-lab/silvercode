@@ -350,25 +350,6 @@ export const {
               draft.splice(result.index, 0, event.properties.info)
             }),
           )
-          const updated = store.message[event.properties.info.sessionID]
-          if (updated.length > 100) {
-            const oldest = updated[0]
-            batch(() => {
-              setStore(
-                "message",
-                event.properties.info.sessionID,
-                produce((draft) => {
-                  draft.shift()
-                }),
-              )
-              setStore(
-                "part",
-                produce((draft) => {
-                  delete draft[oldest.id]
-                }),
-              )
-            })
-          }
           break
         }
         case "message.removed": {
@@ -613,7 +594,10 @@ export const {
           const task = (async () => {
             const [session, messages, todo, diff] = await Promise.all([
               sdk.client.session.get({ sessionID }, { throwOnError: true }),
-              sdk.client.session.messages({ sessionID, limit: 100 }),
+              // Complete persisted history: with `limit` omitted the endpoint
+              // answers the whole timeline (it pages internally), so scrollback
+              // is not capped at a page or at an arbitrary window size (#815).
+              sdk.client.session.messages({ sessionID }),
               sdk.client.session.todo({ sessionID }),
               sdk.client.session.diff({ sessionID }),
             ])
@@ -635,11 +619,12 @@ export const {
                   ),
                 )
                 infos.sort(compareMessage)
-                const removed = infos.slice(0, -100)
-                const visible = infos.slice(-100)
-                const visibleIDs = new Set(visible.map((message) => message.id))
+                const hydrated = new Set(infos.map((info) => info.id))
                 for (const message of messages.data ?? []) {
-                  if (!visibleIDs.has(message.info.id)) {
+                  // A message a live removal took out while hydration was in
+                  // flight must not have its parts resurrected by the stale
+                  // snapshot.
+                  if (tracker.messages.has(message.info.id) && !hydrated.has(message.info.id)) {
                     delete draft.part[message.info.id]
                     continue
                   }
@@ -659,8 +644,7 @@ export const {
                   )
                   draft.part[message.info.id] = parts
                 }
-                for (const message of removed) delete draft.part[message.id]
-                draft.message[sessionID] = visible
+                draft.message[sessionID] = infos
                 draft.session_diff[sessionID] = diff.data ?? []
               }),
             )
@@ -671,6 +655,39 @@ export const {
           })
           syncingSessions.set(sessionID, task)
           return task
+        },
+        // The complete transcript for a session: persisted history plus the
+        // live content the store holds for it. `limit` is deliberately omitted
+        // so the answer is the whole timeline (the endpoint pages internally);
+        // export and copy must never inherit a render-window size (#815).
+        async history(sessionID: string) {
+          const response = await sdk.client.session.messages({ sessionID })
+          const persisted = response.data ?? []
+          const rows = persisted.map((entry) => {
+            const live = store.part[entry.info.id] ?? []
+            const parts = entry.parts.map((part) => {
+              const current = live.find((item) => item.id === part.id)
+              if (!current || current.type !== part.type) return part
+              // A part still streaming when the fetch ran holds text the
+              // persisted row does not: keep the newer of the two.
+              if (part.type === "text" || part.type === "reasoning") return mergePartText(current, part)
+              return current
+            })
+            return {
+              // Prefer what the transcript shows for a message that is still
+              // in flight; the persisted projection is the fallback.
+              info: store.message[sessionID]?.find((info) => info.id === entry.info.id) ?? entry.info,
+              parts: [...parts, ...live.filter((part) => !parts.some((item) => item.id === part.id))],
+            }
+          })
+          // A prompt sent while the fetch was in flight is not projected yet;
+          // it only exists in the live store, and the transcript includes it.
+          return [
+            ...rows,
+            ...(store.message[sessionID] ?? [])
+              .filter((info) => !persisted.some((entry) => entry.info.id === info.id))
+              .map((info) => ({ info, parts: store.part[info.id] ?? [] })),
+          ].sort((a, b) => compareMessage(a.info, b.info))
         },
       },
       bootstrap,
