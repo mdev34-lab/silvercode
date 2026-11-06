@@ -66,6 +66,11 @@ const messageKey = (message: Message) => message.time.created + message.id
 const PAGE_SIZE = 100
 
 type Tracker = { messages: Set<string>; parts: Set<string> }
+// One older page: how many rows it added, and the cursor to the page before it.
+// `added` is progress, not exhaustion — a page can add nothing (its rows are
+// already loaded, or were removed live) while `cursor` still points at older
+// history.
+type OlderPage = { added: number; cursor?: string }
 type MessageWithParts = { info: Message; parts: Part[] }
 
 export const {
@@ -167,7 +172,7 @@ export const {
     // Per session: the `x-next-cursor` of the oldest row loaded so far. Present
     // means older persisted rows exist and can be fetched with `before`.
     const olderCursors = new Map<string, string | undefined>()
-    const loadingOlder = new Map<string, Promise<number>>()
+    const loadingOlder = new Map<string, Promise<OlderPage>>()
     // Every in-flight read of a session's messages registers a tracker here, so
     // live events that land while the request is open can tell the merge which
     // rows and parts moved underneath it (hydration, older pages and transcript
@@ -720,14 +725,16 @@ export const {
           syncingSessions.set(sessionID, task)
           return task
         },
-        // One older page of persisted history, prepended to the store. Returns
-        // how many messages were added; 0 means the start of the timeline is
-        // loaded (or the session has no older rows).
-        async more(sessionID: string) {
+        // One older page of persisted history, prepended to the store. Reports
+        // how many messages it added and the cursor to the page before it, so a
+        // caller can tell progress from exhaustion: an empty `cursor` is the
+        // start of the timeline, while `added === 0` with a cursor means this
+        // page only carried rows the store already had (or rows removed live).
+        async more(sessionID: string): Promise<OlderPage> {
           const pending = loadingOlder.get(sessionID)
           if (pending) return pending
           const cursor = olderCursors.get(sessionID)
-          if (!cursor) return 0
+          if (!cursor) return { added: 0 }
           const tracking = track(sessionID)
           const task = (async () => {
             const page = await sdk.client.session.messages(
@@ -739,8 +746,9 @@ export const {
             const rows = mergePage(sessionID, page.data ?? [], tracking.tracker)
             const known = new Set((store.message[sessionID] ?? []).map((info) => info.id))
             const added = rows.filter((entry) => !known.has(entry.info.id))
-            olderCursors.set(sessionID, page.response.headers.get("x-next-cursor") ?? undefined)
-            if (added.length === 0) return 0
+            const next = page.response.headers.get("x-next-cursor") ?? undefined
+            olderCursors.set(sessionID, next)
+            if (added.length === 0) return { added: 0, cursor: next }
             setStore(
               produce((draft) => {
                 draft.message[sessionID] = [
@@ -750,7 +758,7 @@ export const {
                 for (const entry of added) draft.part[entry.info.id] = entry.parts
               }),
             )
-            return added.length
+            return { added: added.length, cursor: next }
           })().finally(() => {
             loadingOlder.delete(sessionID)
             tracking.release()
@@ -779,15 +787,16 @@ export const {
             )
             const rows = mergePage(sessionID, page.data ?? [], tracking.tracker)
             // A prompt sent while the request was open is not projected yet and
-            // only exists in the store; only the newest page can carry one, and
-            // only rows newer than the page's newest row are missing from it.
+            // only exists in the store. The newest page is missing every row
+            // newer than its newest row; when the server has nothing persisted
+            // at all (a session whose only message is that prompt) it is missing
+            // the whole store.
             const last = newest(rows)
-            const pending =
-              before || !last
-                ? []
-                : (store.message[sessionID] ?? [])
-                    .filter((info) => compareMessage(info, last.info) > 0)
-                    .map((info) => ({ info, parts: store.part[info.id] ?? [] }))
+            const pending = before
+              ? []
+              : (store.message[sessionID] ?? [])
+                  .filter((info) => !last || compareMessage(info, last.info) > 0)
+                  .map((info) => ({ info, parts: store.part[info.id] ?? [] }))
             return {
               rows: [...rows, ...pending].sort((a, b) => compareMessage(a.info, b.info)),
               cursor: page.response.headers.get("x-next-cursor") ?? undefined,

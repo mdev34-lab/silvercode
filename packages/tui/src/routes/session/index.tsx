@@ -441,7 +441,9 @@ export function Session() {
   // mount, the previous page is fetched with the endpoint's `before` cursor
   // when the reader approaches the top, and the viewport is re-anchored on the
   // message it was showing so a prepend never scrolls the transcript.
-  let loadingOlder = false
+  // One older page at a time, but every caller shares that page: a prefetch
+  // that is already running must not report "nothing older" to `session.first`.
+  let olderInFlight: Promise<{ added: number; cursor?: string }> | undefined
   // Chained rAF callbacks outlive an unmount; capture the generation at
   // schedule time and stop at the first stale frame (same guard as the
   // diff-viewer's scroll restore).
@@ -460,23 +462,31 @@ export function Session() {
       scroll.scrollTo(top + Math.max(0, grown))
     })
   }
-  const loadOlder = async (anchor = true) => {
+  type OlderPage = Awaited<ReturnType<typeof sync.session.more>>
+  const loadOlder = (anchor = true): Promise<OlderPage> => {
+    // A read that is already running is shared, not skipped: callers waiting in
+    // `session.first` must still see the page land, and the reader's scroll
+    // must still be anchored when it does.
+    if (olderInFlight) return olderInFlight
     const box = scroll
-    if (loadingOlder || !box || box.isDestroyed || !sync.session.hasOlder(route.sessionID)) return 0
-    loadingOlder = true
+    if (!box || box.isDestroyed || !sync.session.hasOlder(route.sessionID)) return Promise.resolve({ added: 0 })
     const top = box.scrollTop
     const height = box.scrollHeight
-    try {
-      const added = await sync.session.more(route.sessionID)
-      if (added > 0 && anchor) restoreAnchor(top, height)
-      return added
-    } catch {
-      // A failed older page leaves the loaded window as it is; the next scroll
-      // retries. Nothing is dropped from what is already on screen.
-      return 0
-    } finally {
-      loadingOlder = false
-    }
+    const task = (async () => {
+      try {
+        const page = await sync.session.more(route.sessionID)
+        if (page.added > 0 && anchor) restoreAnchor(top, height)
+        return page
+      } catch {
+        // A failed older page leaves the loaded window as it is; the next scroll
+        // retries. Nothing is dropped from what is already on screen.
+        return { added: 0 }
+      } finally {
+        olderInFlight = undefined
+      }
+    })()
+    olderInFlight = task
+    return task
   }
   function watchScroll(r: ScrollBoxRenderable) {
     scroll = r
@@ -983,11 +993,24 @@ export function Session() {
       hidden: true,
       run: () => {
         // "First message" means the oldest persisted message, not the oldest
-        // one the mount window loaded: drain the remaining pages first.
+        // one the mount window loaded: drain every remaining page first. A
+        // prefetch that is already in flight is awaited through `loadOlder`
+        // instead of reading as "nothing older".
         void (async () => {
-          while (sync.session.hasOlder(route.sessionID)) {
-            if ((await loadOlder(false)) === 0) break
+          let cursor: string | undefined
+          for (;;) {
+            if (!sync.session.hasOlder(route.sessionID)) break
+            const page = await loadOlder(false)
+            // A page that adds nothing but moves the cursor is still progress:
+            // its rows were already loaded or were removed live. Only no rows
+            // *and* no cursor movement means the drain cannot get further.
+            if (page.added === 0 && (page.cursor === undefined || page.cursor === cursor)) break
+            cursor = page.cursor
           }
+          // An anchor restore scheduled by the page that was in flight would
+          // land after this scroll and pull the reader off the first message;
+          // an explicit jump to the top wins over pending restores.
+          anchorGeneration++
           if (scroll && !scroll.isDestroyed) scroll.scrollTo(0)
         })()
         dialog.clear()

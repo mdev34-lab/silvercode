@@ -11,6 +11,7 @@ import {
   disposeSessionRoutes,
   mountSessionRoute,
   rows,
+  scrollBox,
   sessionInfo,
   settle,
   textPart,
@@ -77,6 +78,22 @@ async function wheel(
   times: number,
 ) {
   for (let i = 0; i < times; i++) await app.mockMouse.scroll(app.renderer.width - 10, 5, "up")
+  await settle(app)
+}
+
+type Mounted = Awaited<ReturnType<typeof mountSessionRoute>>["app"]
+
+// The transcript's own scroll window. Paging tests below drive it to the top the
+// way a scrollbar drag or a held key does — one call per window, instead of
+// replaying hundreds of wheel steps whose height depends on the layout.
+function scrollBoxOf(app: Mounted) {
+  const box = scrollBox(app)
+  if (!box) throw new Error("session route rendered no scroll box")
+  return box
+}
+
+async function scrollWindowToTop(app: Mounted) {
+  scrollBoxOf(app).scrollTo(0)
   await settle(app)
 }
 
@@ -153,16 +170,196 @@ describe("bounded mount and on-demand older history (#815)", () => {
     })
     await waitFor(app, () => (sync.data.message[SESSION.id]?.length === PAGE ? true : undefined))
 
-    // Walk older pages the way a reader does: one wheel step at a time, with
-    // the fixture answering each `before` page exactly like the server.
-    for (let attempt = 0; attempt < 120 && sync.session.hasOlder(SESSION.id); attempt++) {
-      await wheel(app, 2)
-      await waitFor(app, () => (sync.data.message[SESSION.id]!.length >= PAGE ? true : undefined))
+    // A wheel step really does move the transcript.
+    const box = scrollBoxOf(app)
+    const parked = box.scrollTop
+    await wheel(app, 1)
+    expect(box.scrollTop).toBeLessThan(parked)
+
+    // Scrolling to the top of the window loads exactly one page per step, and
+    // each page has to arrive on the waiting budget this suite uses everywhere
+    // (the default `waitFor`), not on a longer one.
+    for (const expected of [200, 250]) {
+      await scrollWindowToTop(app)
+      await waitFor(app, () =>
+        (sync.data.message[SESSION.id]?.length ?? 0) >= expected
+          ? true
+          : undefined,
+      )
     }
-    await waitFor(app, () => (sync.session.hasOlder(SESSION.id) === false ? true : undefined))
     expect(sync.data.message[SESSION.id]?.length).toBe(250)
     expect(sync.data.message[SESSION.id]?.[0]?.id).toBe("msg_001")
     expect(Object.keys(sync.data.part).length).toBe(250)
+    expect(sync.session.hasOlder(SESSION.id)).toBe(false)
+
+    // And the oldest message is what the reader now sees.
+    await scrollWindowToTop(app)
+    await painted(app, `${MARKER}001`)
+  })
+
+  test("first message drains a page that is already in flight", async () => {
+    const messages = timeline(150)
+    let release!: () => void
+    const older = new Promise<Response>((resolve) => {
+      release = () => resolve(json(messages.slice(0, 50)))
+    })
+    let hydrated = false
+    let held = false
+    const { app, sync, keymap } = await mountSessionRoute({
+      width: 120,
+      height: 40,
+      sessions: [SESSION],
+      messages: { [SESSION.id]: messages },
+      respond: (request) => {
+        if (request.method !== "GET" || request.pathname !== `/session/${SESSION.id}/message`) return undefined
+        if (!hydrated) {
+          hydrated = true
+          return undefined
+        }
+        held = true
+        return older
+      },
+    })
+    await waitFor(app, () => (sync.data.message[SESSION.id]?.length === PAGE ? true : undefined))
+
+    // The reader is at the top, so an older page is already loading.
+    await scrollWindowToTop(app)
+    await waitFor(app, () => (held ? true : undefined))
+    await settle(app)
+
+    // Home must wait for that page and keep going: it may not report "nothing
+    // older" just because another page read is in flight, which used to leave
+    // the reader on the oldest *loaded* message instead of the oldest one.
+    keymap().dispatchCommand("session.first")
+    await settle(app)
+    release()
+
+    await waitFor(app, () => (sync.data.message[SESSION.id]?.length === 150 ? true : undefined))
+    await waitFor(app, () => (sync.session.hasOlder(SESSION.id) === false ? true : undefined))
+    await painted(app, `${MARKER}001`)
+  })
+
+  test("first message keeps draining when a page only repeats rows", async () => {
+    // Stable id cursors: the page after the newest one repeats rows the store
+    // already holds (a duplicate window) while older history still exists.
+    const messages = timeline(250)
+    const { app, sync, keymap, requests } = await mountSessionRoute({
+      width: 120,
+      height: 40,
+      sessions: [SESSION],
+      messages: { [SESSION.id]: messages },
+      respond: (request) => {
+        if (request.method !== "GET" || request.pathname !== `/session/${SESSION.id}/message`) return undefined
+        const before = new URLSearchParams(request.search).get("before")
+        if (!before) return json(messages.slice(150), { headers: { "x-next-cursor": "msg_151" } })
+        if (before === "msg_151") return json(messages.slice(150, 200), { headers: { "x-next-cursor": "msg_101" } })
+        if (before === "msg_101") return json(messages.slice(100, 150), { headers: { "x-next-cursor": "msg_051" } })
+        if (before === "msg_051") return json(messages.slice(50, 100), { headers: { "x-next-cursor": "msg_001" } })
+        return json(messages.slice(0, 50))
+      },
+    })
+    await waitFor(app, () => (sync.data.message[SESSION.id]?.length === PAGE ? true : undefined))
+
+    // The first older page adds nothing but still moves the cursor: that is
+    // progress, not the end of the timeline.
+    keymap().dispatchCommand("session.first")
+    await waitFor(app, () => (sync.data.message[SESSION.id]?.length === 250 ? true : undefined))
+    await waitFor(app, () => (sync.session.hasOlder(SESSION.id) === false ? true : undefined))
+    expect(sync.data.message[SESSION.id]?.[0]?.id).toBe("msg_001")
+    expect(new Set(sync.data.message[SESSION.id]?.map((info) => info.id)).size).toBe(250)
+    await painted(app, `${MARKER}001`)
+  })
+
+  test("paging keeps its place when a persisted row disappears", async () => {
+    const messages = timeline(250)
+    const { app, sync, keymap } = await mountSessionRoute({
+      width: 120,
+      height: 40,
+      sessions: [SESSION],
+      messages: { [SESSION.id]: messages },
+      // The stable id cursor the server returns: an index would move under the
+      // deletion below and page over the wrong boundary.
+      cursor: "id",
+    })
+    await waitFor(app, () => (sync.data.message[SESSION.id]?.length === PAGE ? true : undefined))
+
+    // A row inside the loaded window is deleted between the mount and the walk
+    // older. With an offset cursor the boundary would shift and skip a message.
+    messages.splice(160, 1)
+
+    keymap().dispatchCommand("session.first")
+    await waitFor(app, () => (sync.session.hasOlder(SESSION.id) === false ? true : undefined))
+
+    const ids = sync.data.message[SESSION.id]?.map((info) => info.id) ?? []
+    expect(ids.length).toBe(250)
+    expect(new Set(ids).size).toBe(250)
+    expect(ids[0]).toBe("msg_001")
+    // The deleted row's neighbours are all still there: no page was skipped.
+    expect(ids).toContain("msg_160")
+    expect(ids).toContain("msg_162")
+  })
+
+  test("copy and export keep a prompt the server has not persisted yet", async () => {
+    const cwd = await mkdtemp(path.join(os.tmpdir(), "silvercode-export-live-"))
+    const visual = process.env.VISUAL
+    const editor = process.env.EDITOR
+    delete process.env.VISUAL
+    delete process.env.EDITOR
+    try {
+      // A brand-new session: the persisted timeline is empty, and the only
+      // message is the prompt the reader just sent.
+      const written: string[] = []
+      const { app, events, sync, keymap } = await mountSessionRoute({
+        width: 120,
+        height: 40,
+        sessions: [SESSION],
+        messages: { [SESSION.id]: [] },
+        paths: { cwd },
+        clipboard: { write: async (text) => void written.push(text) },
+      })
+      await settle(app)
+
+      const prompt = userMessage("msg_live_prompt", SESSION.id, { time: { created: BASE + 1_000 } })
+      events.emit({
+        directory,
+        payload: {
+          id: "evt_live_prompt",
+          type: "message.updated",
+          properties: { sessionID: SESSION.id, info: prompt },
+        },
+      })
+      events.emit({
+        directory,
+        payload: {
+          id: "evt_live_prompt_part",
+          type: "message.part.updated",
+          properties: {
+            sessionID: SESSION.id,
+            time: prompt.time.created,
+            part: textPart("prt_live_prompt", prompt, "LIVE-PROMPT-TEXT"),
+          },
+        },
+      })
+      await waitFor(app, () => (sync.data.message[SESSION.id]?.length === 1 ? true : undefined))
+      await painted(app, "LIVE-PROMPT-TEXT")
+
+      keymap().dispatchCommand("session.copy")
+      await waitFor(app, () => (written.length > 0 ? true : undefined))
+      expect(written[0]).toContain("LIVE-PROMPT-TEXT")
+
+      keymap().dispatchCommand("session.export")
+      await waitFor(app, () => (app.captureCharFrame().includes("Export Options") ? true : undefined))
+      await settle(app)
+      app.mockInput.pressEnter()
+
+      const file = path.join(cwd, `session-${SESSION.id.slice(0, 8)}.md`)
+      await waitFor(app, () => (existsSync(file) ? true : undefined), 400, "export never wrote a file")
+      expect(await readFile(file, "utf8")).toContain("LIVE-PROMPT-TEXT")
+    } finally {
+      if (visual !== undefined) process.env.VISUAL = visual
+      if (editor !== undefined) process.env.EDITOR = editor
+      await rm(cwd, { recursive: true, force: true })
+    }
   })
 
   test("an older page prepends without moving what the reader is looking at", async () => {
@@ -190,9 +387,9 @@ describe("bounded mount and on-demand older history (#815)", () => {
     })
     await waitFor(app, () => (sync.data.message[SESSION.id]?.length === PAGE ? true : undefined))
 
-    // Scroll towards the top until the page request fires; its response is
-    // held, so the frame captured here is what the reader must keep seeing.
-    for (let attempt = 0; attempt < 60 && !held; attempt++) await wheel(app, 4)
+    // Scroll to the top so the page request fires; its response is held, so the
+    // frame captured here is what the reader must keep seeing.
+    await scrollWindowToTop(app)
     await waitFor(app, () => (held ? true : undefined))
     await settle(app)
 

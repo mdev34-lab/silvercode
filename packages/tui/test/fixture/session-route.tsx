@@ -2,6 +2,7 @@
 import { createDefaultOpenTuiKeymap } from "@opentui/keymap/opentui"
 import { captureFrame, captureSpans } from "./frame"
 import { testRender, useRenderer } from "@opentui/solid"
+import type { Renderable, ScrollBoxRenderable } from "@opentui/core"
 import { onCleanup } from "solid-js"
 import { mkdir } from "node:fs/promises"
 import path from "node:path"
@@ -174,6 +175,11 @@ export type MountOptions = {
   paths?: Partial<TuiPaths>
   // Captures what copy/export commands hand to the clipboard.
   clipboard?: ClipboardService
+  // How `x-next-cursor` names the next page. `offset` is an index into the
+  // timeline and shifts when rows are deleted; `id` is the oldest row's id, the
+  // stable form the server returns, and the only one that models pagination
+  // while the timeline is being mutated.
+  cursor?: "offset" | "id"
 }
 
 const setups: { app: Setup; dispose: () => Promise<void> }[] = []
@@ -218,6 +224,13 @@ export async function mountSessionRoute(options: MountOptions) {
       const limit = url.searchParams.get("limit")
       if (!limit) return json(rows)
       const before = url.searchParams.get("before")
+      if (options.cursor === "id") {
+        const found = before ? rows.findIndex((row) => row.info.id === before) : rows.length
+        const end = found < 0 ? rows.length : found
+        const start = Math.max(0, end - Number(limit))
+        const next = start > 0 ? rows[start]?.info.id : undefined
+        return json(rows.slice(start, end), next ? { headers: { "x-next-cursor": next } } : undefined)
+      }
       const end = before ? Number(before) : rows.length
       const start = Math.max(0, end - Number(limit))
       return json(rows.slice(start, end), start > 0 ? { headers: { "x-next-cursor": String(start) } } : undefined)
@@ -388,6 +401,23 @@ export async function mountSessionRoute(options: MountOptions) {
     // Route changes a test drives while a command is still awaiting input.
     navigate: (sessionID: string) => navigateRef!({ type: "session", sessionID }),
   }
+}
+
+// The transcript's ScrollBox, found in the mounted tree. Tests drive it to read
+// and move the real scroll window instead of replaying hundreds of wheel events,
+// which made paging tests depend on how many rows one wheel step happens to move.
+export function scrollBox(app: Setup): ScrollBoxRenderable | undefined {
+  const walk = (node: Renderable | undefined): ScrollBoxRenderable | undefined => {
+    if (!node) return undefined
+    const candidate = node as Renderable & Partial<ScrollBoxRenderable>
+    if (typeof candidate.scrollTop === "number" && typeof candidate.scrollTo === "function") return candidate as ScrollBoxRenderable
+    for (const child of node.getChildren?.() ?? []) {
+      const found = walk(child)
+      if (found) return found
+    }
+    return undefined
+  }
+  return walk(app.renderer.root)
 }
 
 // The frame pump lives in its own module so the tests that mount their own app share it.
