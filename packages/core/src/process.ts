@@ -5,6 +5,7 @@ import { ChildProcess } from "effect/unstable/process"
 import { ChildProcessSpawner } from "effect/unstable/process/ChildProcessSpawner"
 import type { ExitCode } from "effect/unstable/process/ChildProcessSpawner"
 import { CrossSpawnSpawner } from "./cross-spawn-spawner"
+import { processPhaseTrace, type ProcessPhaseTrace } from "./process-phase-trace"
 import { makeGlobalNode } from "./effect/app-node"
 
 export class AppProcessError extends Schema.TaggedErrorClass<AppProcessError>()("AppProcessError", {
@@ -152,27 +153,31 @@ const collectUntilQuiet = (
   stream: Stream.Stream<Uint8Array, PlatformError>,
   maxOutputBytes: number | undefined,
   exit: Effect.Effect<ExitCode, PlatformError>,
+  trace?: ProcessPhaseTrace,
 ): Effect.Effect<{ buffer: Buffer; truncated: boolean }, PlatformError, Scope.Scope> =>
   Effect.gen(function* () {
     const acc = { chunks: [] as Uint8Array[], bytes: 0, truncated: false }
     let activity = -1
-    const output = yield* Effect.forkScoped(
-      Stream.runForEach(stream, (chunk) =>
-        Effect.sync(() => {
-          activity++
-          if (maxOutputBytes === undefined) {
-            acc.chunks.push(chunk)
-            acc.bytes += chunk.length
-            return
-          }
-          const remaining = maxOutputBytes - acc.bytes
-          if (remaining > 0) acc.chunks.push(remaining >= chunk.length ? chunk : chunk.slice(0, remaining))
+    trace?.mark("collector-start")
+    const collect = Stream.runForEach(stream, (chunk) =>
+      Effect.sync(() => {
+        activity++
+        if (maxOutputBytes === undefined) {
+          acc.chunks.push(chunk)
           acc.bytes += chunk.length
-          acc.truncated = acc.truncated || acc.bytes > maxOutputBytes
-        }),
-      ),
+          return
+        }
+        const remaining = maxOutputBytes - acc.bytes
+        if (remaining > 0) acc.chunks.push(remaining >= chunk.length ? chunk : chunk.slice(0, remaining))
+        acc.bytes += chunk.length
+        acc.truncated = acc.truncated || acc.bytes > maxOutputBytes
+      }),
+    )
+    const output = yield* Effect.forkScoped(
+      trace ? collect.pipe(Effect.tap(() => Effect.sync(() => trace.mark("collector-eof")))) : collect,
     )
     yield* exit
+    trace?.mark("collector-exit-observed")
     // Prefer the stream closing: a normal command closes its pipe right after
     // exiting, so `Fiber.join(output)` wins the race and we return immediately
     // (no idle delay on the happy path). The quiet window only kicks in when the
@@ -186,7 +191,12 @@ const collectUntilQuiet = (
         last = current
       }
     })
-    yield* Effect.raceFirst(Fiber.join(output), quiet)
+    if (trace) {
+      const winner = yield* Effect.raceFirst(Fiber.join(output).pipe(Effect.as("eof")), quiet.pipe(Effect.as("quiet")))
+      trace.mark(winner === "eof" ? "race-eof" : "race-quiet")
+    } else {
+      yield* Effect.raceFirst(Fiber.join(output), quiet)
+    }
     return { buffer: Buffer.concat(acc.chunks), truncated: acc.truncated }
   })
 
@@ -197,12 +207,15 @@ const layer = Layer.effect(
 
     const runCommand = (command: ChildProcess.Command, options?: RunOptions) => {
       const description = describeCommand(command)
+      const trace = processPhaseTrace(command)
       const collect = Effect.scoped(
         Effect.gen(function* () {
+          trace?.mark("run-before-spawn")
           const handle = yield* spawner.spawn(command)
+          trace?.mark("spawn-return")
           if (options?.combineOutput) {
             const [output, exitCode] = yield* Effect.all(
-              [collectUntilQuiet(handle.all, options.maxOutputBytes, handle.exitCode), handle.exitCode],
+              [collectUntilQuiet(handle.all, options.maxOutputBytes, handle.exitCode, trace), handle.exitCode],
               { concurrency: "unbounded" },
             )
             return {
@@ -218,8 +231,8 @@ const layer = Layer.effect(
           }
           const [stdout, stderr, exitCode] = yield* Effect.all(
             [
-              collectUntilQuiet(handle.stdout, options?.maxOutputBytes, handle.exitCode),
-              collectUntilQuiet(handle.stderr, options?.maxErrorBytes, handle.exitCode),
+              collectUntilQuiet(handle.stdout, options?.maxOutputBytes, handle.exitCode, trace),
+              collectUntilQuiet(handle.stderr, options?.maxErrorBytes, handle.exitCode, trace),
               handle.exitCode,
             ],
             { concurrency: "unbounded" },

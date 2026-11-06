@@ -7,6 +7,7 @@ import { Effect, Exit, Fiber, Stream } from "effect"
 import { ChildProcess } from "effect/unstable/process"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { AppProcess } from "@opencode-ai/core/process"
+import { ProcessPhaseTrace } from "@opencode-ai/core/process-phase-trace"
 import { testEffect } from "../lib/effect"
 
 const it = testEffect(LayerNode.compile(AppProcess.node))
@@ -215,15 +216,27 @@ describe("AppProcess", () => {
       "returns promptly for a normal command without the post-exit idle delay",
       Effect.gen(function* () {
         const svc = yield* AppProcess.Service
+        const trace = new ProcessPhaseTrace()
+        let passed = false
+        onTestFinished(() => {
+          if (!passed) console.error(trace.report())
+          trace.close()
+        })
         const start = Date.now()
-        const result = yield* svc.run(cmd("-e", "process.stdout.write('hi')"), { combineOutput: true })
+        const command = cmd("-e", "process.stdout.write('hi')")
+        trace.bind(command)
+        trace.mark("test-start")
+        const result = yield* svc.run(command, { combineOutput: true })
         const elapsed = Date.now() - start
+        trace.mark("test-return")
         expect(result.exitCode).toBe(0)
         expect(result.output?.toString("utf8")).toBe("hi")
         // A normal command closes its pipe right after exiting, so the 500ms
         // quiet window must never be entered: it returns on stream close, not on
         // the idle timer.
         expect(elapsed).toBeLessThan(400)
+        trace.mark("assertions-passed")
+        passed = true
       }),
     )
 

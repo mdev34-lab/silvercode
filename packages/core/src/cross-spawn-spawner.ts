@@ -25,6 +25,7 @@ import * as NodeChildProcess from "node:child_process"
 import { PassThrough } from "node:stream"
 import launch from "cross-spawn"
 import { makeGlobalNode } from "./effect/app-node"
+import { processPhaseTrace } from "./process-phase-trace"
 import { filesystem, path } from "./effect/app-node-platform"
 
 const toError = (err: unknown): Error => (err instanceof globalThis.Error ? err : new globalThis.Error(String(err)))
@@ -271,7 +272,16 @@ export const make = Effect.gen(function* () {
     >((resume) => {
       const exited = Deferred.makeUnsafe<readonly [code: number | null, signal: NodeJS.Signals | null]>()
       const closed = Deferred.makeUnsafe<readonly [code: number | null, signal: NodeJS.Signals | null]>()
+      const trace = processPhaseTrace(command)
+      trace?.mark("spawn-before-launch")
       const proc = launch(command.command, command.args, opts)
+      trace?.mark("launch-return")
+      if (trace) {
+        proc.stdout?.once("end", () => trace.mark("stdout-eof"))
+        proc.stderr?.once("end", () => trace.mark("stderr-eof"))
+        proc.stdout?.once("close", () => trace.mark("stdout-close"))
+        proc.stderr?.once("close", () => trace.mark("stderr-close"))
+      }
       let exit: readonly [code: number | null, signal: NodeJS.Signals | null] | undefined
       proc.on("error", (err) => {
         resume(Effect.fail(toPlatformError("spawn", err, command)))
@@ -280,14 +290,17 @@ export const make = Effect.gen(function* () {
       // exits. Report the exit promptly, while keeping "close" for kill/escalation
       // and for failed spawns where no exit event is emitted.
       proc.on("exit", (...args) => {
+        trace?.mark("exit-event")
         exit = args
         Deferred.doneUnsafe(exited, Exit.succeed(args))
       })
       proc.on("close", (...args) => {
+        trace?.mark("close-event")
         Deferred.doneUnsafe(closed, Exit.succeed(exit ?? args))
         Deferred.doneUnsafe(exited, Exit.succeed(exit ?? args))
       })
       proc.on("spawn", () => {
+        trace?.mark("spawn-event")
         resume(Effect.succeed([proc, exited, closed]))
       })
       return Effect.sync(() => {
@@ -429,15 +442,19 @@ export const make = Effect.gen(function* () {
               windowsHide: process.platform === "win32",
             }),
             Effect.fnUntraced(function* ([proc, exited, closed]) {
+              const trace = processPhaseTrace(command)
+              trace?.mark("finalizer-start")
+              const finish = (effect: Effect.Effect<void>) =>
+                trace ? effect.pipe(Effect.ensuring(Effect.sync(() => trace.mark("finalizer-end")))) : effect
               const done = yield* Deferred.isDone(exited)
               if (done) {
                 const [code] = yield* Deferred.await(exited)
-                if (process.platform === "win32") return yield* Effect.void
+                if (process.platform === "win32") return yield* finish(Effect.void)
                 if (code !== 0 && Predicate.isNotNull(code))
-                  return yield* Effect.ignore(reap(command, proc, closed, command.options))
-                return yield* Effect.void
+                  return yield* finish(Effect.ignore(reap(command, proc, closed, command.options)))
+                return yield* finish(Effect.void)
               }
-              return yield* Effect.ignore(terminate(command, proc, exited, command.options))
+              return yield* finish(Effect.ignore(terminate(command, proc, exited, command.options)))
             }),
           )
 
