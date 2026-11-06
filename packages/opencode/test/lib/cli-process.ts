@@ -108,6 +108,8 @@ export type RunResult = {
   readonly exitCode: number
   readonly stdout: string
   readonly stderr: string
+  readonly stdoutTruncated?: boolean
+  readonly stderrTruncated?: boolean
   readonly durationMs: number
 }
 
@@ -226,6 +228,7 @@ export type CliFixture = {
 // the surrounding Scope.
 export function withCliFixture<A, E>(
   fn: (input: CliFixture) => Effect.Effect<A, E, Scope.Scope | HttpClient.HttpClient>,
+  options?: { readonly processRun?: AppProcess.Interface["run"] },
 ): Effect.Effect<A, E | unknown, Scope.Scope> {
   return Effect.gen(function* () {
     const llm = yield* TestLLMServer
@@ -266,7 +269,7 @@ export function withCliFixture<A, E>(
       // Catch AppProcessError (timeout OR spawn failure) and synthesize a
       // non-zero result so the test sees it via the usual `expectExit`
       // path rather than as an unhandled Effect failure.
-      const result = yield* appProc.run(command, { timeout: Duration.millis(timeoutMs) }).pipe(
+      const result = yield* (options?.processRun ?? appProc.run)(command, { timeout: Duration.millis(timeoutMs) }).pipe(
         Effect.catchTag("AppProcessError", (err) =>
           Effect.succeed({
             command: err.command,
@@ -282,6 +285,8 @@ export function withCliFixture<A, E>(
         exitCode: result.exitCode,
         stdout: normalizeLines(result.stdout.toString()),
         stderr: normalizeLines(result.stderr.toString()),
+        stdoutTruncated: result.stdoutTruncated,
+        stderrTruncated: result.stderrTruncated,
         durationMs: Date.now() - start,
       }
     })

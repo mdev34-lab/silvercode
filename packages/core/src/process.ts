@@ -11,11 +11,11 @@ export class AppProcessError extends Schema.TaggedErrorClass<AppProcessError>()(
   command: Schema.String,
   exitCode: Schema.optional(Schema.Number),
   stderr: Schema.optional(Schema.String),
-  // Output the collectors had already accumulated when a `run` timeout
-  // interrupted collection (separate-stream mode only). Absent when nothing
-  // was collected or the failure is not a timeout. Deliberately separate
-  // from `stderr`, which describes an exited command and feeds `message`:
-  // the getter below never reads these fields, so timeout messages, causes
+  // UTF-8 text diagnostics decoded from output accumulated when a `run`
+  // timeout fires (separate-stream mode only). They are not byte-faithful:
+  // invalid UTF-8 or a byte cap splitting a character can produce replacement
+  // characters. Absent when nothing was collected or on non-timeout failures.
+  // Separate from `stderr`, which feeds `message`; timeout messages, causes,
   // and exit semantics are unchanged.
   partialStdout: Schema.optional(Schema.String),
   partialStderr: Schema.optional(Schema.String),
@@ -162,11 +162,10 @@ type CollectedOutput = { chunks: Array<Uint8Array>; bytes: number; truncated: bo
 
 const makeCollectedOutput = (): CollectedOutput => ({ chunks: [], bytes: 0, truncated: false })
 
-// Builds the timeout failure, retaining whatever the separate stdout/stderr
-// collectors had accumulated before the interruption settled. Concatenation
-// and utf8 decoding allocate fresh copies, but this only runs once a timeout
-// has already fired. Combine mode retains nothing: its single interleaved
-// buffer is not relabeled as a partial stream.
+// Snapshots separate stdout/stderr when the timeout branch runs, before the
+// losing collection is interrupted; cleanup is awaited before error delivery.
+// Concatenation and UTF-8 decoding allocate fresh copies. Combine mode retains
+// nothing: its single interleaved buffer is not relabeled as a partial stream.
 const timeoutError = (
   description: string,
   stdout: CollectedOutput,
@@ -234,8 +233,8 @@ const layer = Layer.effect(
 
     const runCommand = (command: ChildProcess.Command, options?: RunOptions) => {
       const description = describeCommand(command)
-      // Accumulators live outside `collect` so the timeout path can read
-      // what was collected after the interruption has settled.
+      // Accumulators live outside `collect` so the timeout branch can snapshot
+      // them before interrupting collection and awaiting scoped cleanup.
       const outputAcc = makeCollectedOutput()
       const stdoutAcc = makeCollectedOutput()
       const stderrAcc = makeCollectedOutput()

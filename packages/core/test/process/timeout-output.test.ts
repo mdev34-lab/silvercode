@@ -213,6 +213,38 @@ describe("AppProcess run timeout partial output", () => {
     }),
   )
 
+  it.effect("decodes multibyte UTF-8 and replaces a character split by the byte cap", () =>
+    Effect.gen(function* () {
+      const spawned = yield* Deferred.make<boolean>()
+      const outDone = yield* Deferred.make<boolean>()
+      const errDone = yield* Deferred.make<boolean>()
+      const handle = fakeHandle({
+        stdout: consumed([enc("caf"), new Uint8Array([0xc3]), new Uint8Array([0xa9]), enc(" ☃")], outDone),
+        stderr: consumed([enc("A€B")], errDone),
+        exitCode: Effect.never,
+      })
+      const exit = yield* Effect.gen(function* () {
+        const svc = yield* AppProcess.Service
+        const fiber = yield* Effect.exit(svc.run(cmd, { timeout: "30 seconds", maxErrorBytes: 2 })).pipe(
+          Effect.forkChild,
+        )
+        yield* Deferred.await(spawned)
+        yield* Deferred.await(outDone)
+        yield* Deferred.await(errDone)
+        yield* TestClock.adjust("30 seconds")
+        return yield* Fiber.join(fiber)
+      }).pipe(Effect.provide(fakeLayer(handle, spawned)))
+
+      const error = failure(exit)
+      expectPreservedTimeout(error)
+      expect(error.partialStdout).toBe("café ☃")
+      expect(error.partialStdoutTruncated).toBe(false)
+      expect(error.partialStderr).toBe("A�")
+      expect(error.partialStderrTruncated).toBe(true)
+      expect(Buffer.from(error.partialStderr!, "utf8").equals(Buffer.from([0x41, 0xe2]))).toBe(false)
+    }),
+  )
+
   it.effect("does not retain partial fields for combineOutput timeouts (explicit scope)", () =>
     Effect.gen(function* () {
       const spawned = yield* Deferred.make<boolean>()
