@@ -48,6 +48,7 @@ function bunArgv(args: string[], opts?: SpawnOpts) {
   return [
     "run",
     ...(activeClockScale(opts) ? ["--preload", clockScalePreload] : []),
+    ...(opts?.preload ? ["--preload", opts.preload] : []),
     "--conditions=browser",
     cliEntry,
     ...args,
@@ -121,6 +122,8 @@ export type RunHandle = {
 export type SpawnOpts = {
   readonly timeoutMs?: number
   readonly env?: Record<string, string>
+  // Optional test-only Bun preload for controlled subprocess fixtures.
+  readonly preload?: string
   // Run the spawned CLI child on an accelerated clock: the child observes
   // time `clockScale` times faster than wall time (Date.now + timers scaled
   // together, see clock-scale.preload.ts). Long provider retry waits then
