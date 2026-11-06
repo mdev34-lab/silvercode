@@ -169,7 +169,7 @@ export type MountOptions = {
   // Answers the writes a test drives (abort, prompt submit) before the fixture's
   // read-only routes. Anything still unaccounted for keeps throwing, so a stray
   // request fails the run instead of passing silently.
-  respond?: (request: FetchRequest) => Response | undefined
+  respond?: (request: FetchRequest) => Response | Promise<Response> | undefined
   // Transcript export writes into `paths.cwd`; default is the sandbox path.
   paths?: Partial<TuiPaths>
   // Captures what copy/export commands hand to the clipboard.
@@ -240,6 +240,7 @@ export async function mountSessionRoute(options: MountOptions) {
   const pluginRuntime = createPluginRuntime()
   let keymapRef: OpenTuiKeymap | undefined
   let syncRef: ReturnType<typeof useSync> | undefined
+  let navigateRef: ReturnType<typeof useRoute>["navigate"] | undefined
 
   // Mirrors the plugin host (packages/opencode/src/plugin/tui/runtime.ts): slots
   // only render once the registry exists, and the builtin sidebar plugins own
@@ -255,6 +256,7 @@ export async function mountSessionRoute(options: MountOptions) {
       bindings: tuiConfig.keybinds.get("command.palette.show"),
     }))
     const renderer = useRenderer()
+    navigateRef = useRoute().navigate
     const adapters = createTuiApiAdapters({
       version: "0.0.0-test",
       tuiConfig,
@@ -377,7 +379,15 @@ export async function mountSessionRoute(options: MountOptions) {
   }
   await settle(app)
 
-  return { app, events, sync, requests: calls.requests, keymap: () => keymapRef! }
+  return {
+    app,
+    events,
+    sync,
+    requests: calls.requests,
+    keymap: () => keymapRef!,
+    // Route changes a test drives while a command is still awaiting input.
+    navigate: (sessionID: string) => navigateRef!({ type: "session", sessionID }),
+  }
 }
 
 // The frame pump lives in its own module so the tests that mount their own app share it.

@@ -16,7 +16,7 @@ import {
   userMessage,
 } from "../../fixture/session-route"
 import { waitFor } from "../../fixture/frame"
-import { directory } from "../../fixture/tui-sdk"
+import { directory, json } from "../../fixture/tui-sdk"
 
 afterEach(disposeSessionRoutes)
 
@@ -206,6 +206,184 @@ describe("session history beyond the old 100-message window (#815)", () => {
       const requests_ = messageRequests(requests)
       expect(requests_.length).toBeGreaterThan(0)
       for (const request of requests_) expect(new URLSearchParams(request.search).has("limit")).toBe(false)
+    } finally {
+      if (visual !== undefined) process.env.VISUAL = visual
+      if (editor !== undefined) process.env.EDITOR = editor
+      await rm(cwd, { recursive: true, force: true })
+    }
+  })
+})
+
+describe("transcript request races and failures (#815 review)", () => {
+  function markedMessages(sessionID: string, count: number, prefix: string) {
+    return Array.from({ length: count }, (_, index) => {
+      const mark = String(index + 1).padStart(3, "0")
+      const created = BASE + (index + 1) * 1_000
+      const info =
+        (index + 1) % 2 === 1
+          ? userMessage(`msg_${sessionID}_${mark}`, sessionID, { time: { created } })
+          : assistantMessage(`msg_${sessionID}_${mark}`, sessionID, { time: { created, completed: created + 500 } })
+      return { info, parts: [textPart(`prt_${sessionID}_${mark}`, info, `${prefix}${mark}`)] }
+    })
+  }
+
+  test("removals during the transcript request are not resurrected", async () => {
+    const rows = timeline(4)
+    let release!: () => void
+    const history = new Promise<Response>((resolve) => {
+      release = () => resolve(json(rows))
+    })
+    let hydrated = false
+    let requested = false
+    const written: string[] = []
+    const { app, events, sync, keymap } = await mountSessionRoute({
+      width: 120,
+      height: 40,
+      sessions: [SESSION],
+      messages: { [SESSION.id]: rows },
+      clipboard: { write: async (text) => void written.push(text) },
+      respond: (request) => {
+        if (request.method !== "GET" || request.pathname !== `/session/${SESSION.id}/message`) return undefined
+        if (!hydrated) {
+          hydrated = true
+          return json(rows)
+        }
+        requested = true
+        return history
+      },
+    })
+    await waitFor(app, () => (sync.data.message[SESSION.id]?.length === 4 ? true : undefined))
+
+    keymap().dispatchCommand("session.copy")
+    await waitFor(app, () => (requested ? true : undefined))
+
+    // Both removals land while the transcript request is open, so the persisted
+    // snapshot it returns is older than the removals.
+    events.emit({
+      directory,
+      payload: {
+        id: "evt_removed_message",
+        type: "message.removed",
+        properties: { sessionID: SESSION.id, messageID: "msg_002" },
+      },
+    })
+    events.emit({
+      directory,
+      payload: {
+        id: "evt_removed_part",
+        type: "message.part.removed",
+        properties: { sessionID: SESSION.id, messageID: "msg_004", partID: "prt_004" },
+      },
+    })
+    await waitFor(app, () =>
+      sync.data.message[SESSION.id]?.length === 3 && sync.data.part["msg_004"]?.length === 0 ? true : undefined,
+    )
+
+    release()
+    await waitFor(app, () => (written.length > 0 ? true : undefined))
+
+    const transcript = written[0] ?? ""
+    expect(transcript).toContain(`${MARKER}001`)
+    expect(transcript).toContain(`${MARKER}003`)
+    expect(transcript).not.toContain(`${MARKER}002`)
+    expect(transcript).not.toContain(`${MARKER}004`)
+    expect(occurrences(transcript, MARKER)).toBe(2)
+  })
+
+  for (const [name, failure] of Object.entries({
+    "server error": () => json({ message: "unavailable" }, { status: 500 }),
+    "network error": () => {
+      throw new Error("socket closed")
+    },
+  })) {
+    test(`a history ${name} fails copy and export instead of exporting the cache`, async () => {
+      const cwd = await mkdtemp(path.join(os.tmpdir(), "silvercode-export-fail-"))
+      const visual = process.env.VISUAL
+      const editor = process.env.EDITOR
+      delete process.env.VISUAL
+      delete process.env.EDITOR
+      try {
+        const rows = timeline(4)
+        let hydrated = false
+        const written: string[] = []
+        const { app, keymap } = await mountSessionRoute({
+          width: 120,
+          height: 40,
+          sessions: [SESSION],
+          messages: { [SESSION.id]: rows },
+          paths: { cwd },
+          clipboard: { write: async (text) => void written.push(text) },
+          respond: (request) => {
+            if (request.method !== "GET" || request.pathname !== `/session/${SESSION.id}/message`) return undefined
+            if (!hydrated) {
+              hydrated = true
+              return json(rows)
+            }
+            return failure()
+          },
+        })
+        await settle(app)
+
+        // The cache holds the transcript, so a swallowed failure would still
+        // hand over a "successful" partial export.
+        keymap().dispatchCommand("session.copy")
+        await painted(app, "Failed to copy session transcript")
+        await settle(app)
+        expect(written).toHaveLength(0)
+
+        keymap().dispatchCommand("session.export")
+        await waitFor(app, () => (app.captureCharFrame().includes("Export Options") ? true : undefined))
+        await settle(app)
+        app.mockInput.pressEnter()
+        await painted(app, "Failed to export session")
+        await settle(app)
+        expect(existsSync(path.join(cwd, `session-${SESSION.id.slice(0, 8)}.md`))).toBe(false)
+      } finally {
+        if (visual !== undefined) process.env.VISUAL = visual
+        if (editor !== undefined) process.env.EDITOR = editor
+        await rm(cwd, { recursive: true, force: true })
+      }
+    })
+  }
+
+  test("export keeps the launched session when the route changes while the dialog is open", async () => {
+    const cwd = await mkdtemp(path.join(os.tmpdir(), "silvercode-export-nav-"))
+    const visual = process.env.VISUAL
+    const editor = process.env.EDITOR
+    delete process.env.VISUAL
+    delete process.env.EDITOR
+    try {
+      const other = sessionInfo("ses_zzzz_other", { title: "Other session" })
+      const primaryRows = markedMessages(SESSION.id, 3, "SESSION-A-")
+      const otherRows = markedMessages(other.id, 3, "SESSION-B-")
+      const { app, keymap, navigate } = await mountSessionRoute({
+        width: 120,
+        height: 40,
+        sessions: [SESSION, other],
+        messages: { [SESSION.id]: primaryRows, [other.id]: otherRows },
+        paths: { cwd },
+        clipboard: { write: async () => {} },
+      })
+      await settle(app)
+
+      keymap().dispatchCommand("session.export")
+      await waitFor(app, () => (app.captureCharFrame().includes("Export Options") ? true : undefined))
+      await settle(app)
+
+      // The user moves to another session before confirming the dialog.
+      navigate(other.id)
+      await painted(app, "SESSION-B-001")
+      app.mockInput.pressEnter()
+
+      const file = path.join(cwd, `session-${SESSION.id.slice(0, 8)}.md`)
+      await waitFor(app, () => (existsSync(file) ? true : undefined), 400, "export never wrote a file")
+
+      const transcript = await readFile(file, "utf8")
+      expect(transcript).toContain(`Session ID:** ${SESSION.id}`)
+      expect(transcript).toContain("SESSION-A-001")
+      expect(transcript).toContain("SESSION-A-003")
+      expect(transcript).not.toContain("SESSION-B-")
+      expect(existsSync(path.join(cwd, `session-${other.id.slice(0, 8)}.md`))).toBe(false)
     } finally {
       if (visual !== undefined) process.env.VISUAL = visual
       if (editor !== undefined) process.env.EDITOR = editor

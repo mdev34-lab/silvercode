@@ -155,12 +155,30 @@ export const {
 
     const fullSyncedSessions = new Set<string>()
     const syncingSessions = new Map<string, Promise<void>>()
-    const hydratingSessions = new Map<string, { messages: Set<string>; parts: Set<string> }>()
+    // Every in-flight read of a session's messages registers a tracker here, so
+    // live events that land while the request is open can tell the merge which
+    // rows and parts moved underneath it (hydration and transcript reads share
+    // the same protection).
+    type Tracker = { messages: Set<string>; parts: Set<string> }
+    const trackedRequests = new Map<string, Set<Tracker>>()
+    const track = (sessionID: string) => {
+      const tracker: Tracker = { messages: new Set<string>(), parts: new Set<string>() }
+      const active = trackedRequests.get(sessionID) ?? new Set<Tracker>()
+      active.add(tracker)
+      trackedRequests.set(sessionID, active)
+      return {
+        tracker,
+        release: () => {
+          active.delete(tracker)
+          if (active.size === 0) trackedRequests.delete(sessionID)
+        },
+      }
+    }
     const touchMessage = (sessionID: string, messageID: string) => {
-      hydratingSessions.get(sessionID)?.messages.add(messageID)
+      for (const tracker of trackedRequests.get(sessionID) ?? []) tracker.messages.add(messageID)
     }
     const touchPart = (sessionID: string, partID: string) => {
-      hydratingSessions.get(sessionID)?.parts.add(partID)
+      for (const tracker of trackedRequests.get(sessionID) ?? []) tracker.parts.add(partID)
     }
 
     function sessionListQuery(): { scope?: "project"; path?: string } {
@@ -589,8 +607,8 @@ export const {
           if (fullSyncedSessions.has(sessionID)) return
           const syncing = syncingSessions.get(sessionID)
           if (syncing) return syncing
-          const tracker = { messages: new Set<string>(), parts: new Set<string>() }
-          hydratingSessions.set(sessionID, tracker)
+          const tracking = track(sessionID)
+          const tracker = tracking.tracker
           const task = (async () => {
             const [session, messages, todo, diff] = await Promise.all([
               sdk.client.session.get({ sessionID }, { throwOnError: true }),
@@ -651,7 +669,7 @@ export const {
             fullSyncedSessions.add(sessionID)
           })().finally(() => {
             syncingSessions.delete(sessionID)
-            hydratingSessions.delete(sessionID)
+            tracking.release()
           })
           syncingSessions.set(sessionID, task)
           return task
@@ -661,33 +679,49 @@ export const {
         // so the answer is the whole timeline (the endpoint pages internally);
         // export and copy must never inherit a render-window size (#815).
         async history(sessionID: string) {
-          const response = await sdk.client.session.messages({ sessionID })
-          const persisted = response.data ?? []
-          const rows = persisted.map((entry) => {
-            const live = store.part[entry.info.id] ?? []
-            const parts = entry.parts.map((part) => {
-              const current = live.find((item) => item.id === part.id)
-              if (!current || current.type !== part.type) return part
-              // A part still streaming when the fetch ran holds text the
-              // persisted row does not: keep the newer of the two.
-              if (part.type === "text" || part.type === "reasoning") return mergePartText(current, part)
-              return current
-            })
-            return {
+          const tracking = track(sessionID)
+          const tracker = tracking.tracker
+          try {
+            // `throwOnError` keeps a 500 or a transport failure from arriving
+            // as an empty body: the caller must fail the transcript instead of
+            // exporting whatever the cache happens to hold.
+            const response = await sdk.client.session.messages({ sessionID }, { throwOnError: true })
+            const persisted = response.data ?? []
+            const rows = persisted.flatMap((entry) => {
               // Prefer what the transcript shows for a message that is still
               // in flight; the persisted projection is the fallback.
-              info: store.message[sessionID]?.find((info) => info.id === entry.info.id) ?? entry.info,
-              parts: [...parts, ...live.filter((part) => !parts.some((item) => item.id === part.id))],
-            }
-          })
-          // A prompt sent while the fetch was in flight is not projected yet;
-          // it only exists in the live store, and the transcript includes it.
-          return [
-            ...rows,
-            ...(store.message[sessionID] ?? [])
-              .filter((info) => !persisted.some((entry) => entry.info.id === info.id))
-              .map((info) => ({ info, parts: store.part[info.id] ?? [] })),
-          ].sort((a, b) => compareMessage(a.info, b.info))
+              const liveInfo = store.message[sessionID]?.find((info) => info.id === entry.info.id)
+              // A removal that lands while this request is open must not be
+              // resurrected by the older persisted snapshot.
+              if (tracker.messages.has(entry.info.id) && !liveInfo) return []
+              const live = store.part[entry.info.id] ?? []
+              const parts = entry.parts.flatMap((part) => {
+                const current = live.find((item) => item.id === part.id)
+                if (tracker.parts.has(part.id) && !current) return []
+                if (!current || current.type !== part.type) return [part]
+                // A part still streaming when the fetch ran holds text the
+                // persisted row does not: keep the newer of the two.
+                if (part.type === "text" || part.type === "reasoning") return [mergePartText(current, part)]
+                return [current]
+              })
+              return [
+                {
+                  info: liveInfo ?? entry.info,
+                  parts: [...parts, ...live.filter((part) => !parts.some((item) => item.id === part.id))],
+                },
+              ]
+            })
+            // A prompt sent while the fetch was in flight is not projected yet;
+            // it only exists in the live store, and the transcript includes it.
+            return [
+              ...rows,
+              ...(store.message[sessionID] ?? [])
+                .filter((info) => !persisted.some((entry) => entry.info.id === info.id))
+                .map((info) => ({ info, parts: store.part[info.id] ?? [] })),
+            ].sort((a, b) => compareMessage(a.info, b.info))
+          } finally {
+            tracking.release()
+          }
         },
       },
       bootstrap,

@@ -1050,7 +1050,7 @@ export function Session() {
           if (!sessionData) return
           // The transcript is the complete history, never just the rendered
           // window: read it from the session's persisted timeline (#815).
-          const transcript = formatTranscript(sessionData, await sync.session.history(route.sessionID), {
+          const transcript = formatTranscript(sessionData, await sync.session.history(sessionData.id), {
             thinking: showThinking(),
             toolDetails: showDetails(),
             assistantMetadata: showAssistantMetadata(),
@@ -1075,8 +1075,12 @@ export function Session() {
         try {
           const sessionData = session()
           if (!sessionData) return
+          // Bind the session this command was launched from: the options dialog
+          // awaits the user, and the route can move to another session while it
+          // is open. Metadata and history must both come from the bound session.
+          const sessionID = sessionData.id
 
-          const defaultFilename = `session-${sessionData.id.slice(0, 8)}.md`
+          const defaultFilename = `session-${sessionID.slice(0, 8)}.md`
 
           const options = await DialogExportOptions.show(
             dialog,
@@ -1091,7 +1095,7 @@ export function Session() {
 
           // Export reads the complete persisted timeline rather than the
           // rendered window, so an export never truncates the transcript (#815).
-          const transcript = formatTranscript(sessionData, await sync.session.history(route.sessionID), {
+          const transcript = formatTranscript(sessionData, await sync.session.history(sessionID), {
             thinking: options.thinking,
             toolDetails: options.toolDetails,
             assistantMetadata: options.assistantMetadata,
