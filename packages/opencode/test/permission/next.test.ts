@@ -191,14 +191,14 @@ test("fromConfig - preserves top-level config key order", () => {
   expect(wildcardFirst.map((r) => r.permission)).toEqual(["*", "bash"])
   expect(specificFirst.map((r) => r.permission)).toEqual(["bash", "*"])
 
-  expect(Permission.evaluate("bash", "ls", wildcardFirst).action).toBe("allow")
-  expect(Permission.evaluate("bash", "ls", specificFirst).action).toBe("deny")
+  expect(Permission.evaluate("shell", "ls", wildcardFirst).action).toBe("allow")
+  expect(Permission.evaluate("shell", "ls", specificFirst).action).toBe("deny")
 })
 
 test("fromConfig - wildcard acts as fallback when it appears before specifics", () => {
   const ruleset = Permission.fromConfig({ "*": "ask", bash: "allow" })
   expect(Permission.evaluate("edit", "foo.ts", ruleset).action).toBe("ask")
-  expect(Permission.evaluate("bash", "ls", ruleset).action).toBe("allow")
+  expect(Permission.evaluate("shell", "ls", ruleset).action).toBe("allow")
 })
 
 test("fromConfig - top-level ordering is not sorted by wildcard specificity", () => {
@@ -214,15 +214,116 @@ test("fromConfig - top-level ordering is not sorted by wildcard specificity", ()
 test("fromConfig - sub-pattern insertion order inside a tool key is preserved", () => {
   const ruleset = Permission.fromConfig({ bash: { "*": "deny", "git *": "allow" } })
   expect(ruleset.map((r) => r.pattern)).toEqual(["*", "git *"])
-  expect(Permission.evaluate("bash", "rm foo", ruleset).action).toBe("deny")
-  expect(Permission.evaluate("bash", "git status", ruleset).action).toBe("allow")
+  expect(Permission.evaluate("shell", "rm foo", ruleset).action).toBe("deny")
+  expect(Permission.evaluate("shell", "git status", ruleset).action).toBe("allow")
 })
 
 test("fromConfig - documented fallback-first example", () => {
   const ruleset = Permission.fromConfig({ "*": "ask", bash: "allow", edit: "deny" })
-  expect(Permission.evaluate("bash", "ls", ruleset).action).toBe("allow")
+  expect(Permission.evaluate("shell", "ls", ruleset).action).toBe("allow")
   expect(Permission.evaluate("edit", "foo.ts", ruleset).action).toBe("deny")
   expect(Permission.evaluate("read", "foo.ts", ruleset).action).toBe("ask")
+})
+
+// #780: the shell tool was renamed from "bash" to "shell". Pre-rename user
+// config, saved grants, and agent permission objects spell the action
+// "bash"; those rules must keep matching the canonical "shell" action with
+// full wildcard semantics and findLast precedence. A legacy "deny" must
+// never silently degrade to the default "ask".
+
+test("legacy bash deny still denies the renamed shell tool (no ask broadening)", () => {
+  const ruleset = Permission.fromConfig({ bash: "deny" })
+  expect(Permission.evaluate("shell", "rm foo", ruleset).action).toBe("deny")
+  expect(Permission.disabled(["shell", "read"], ruleset)).toEqual(new Set(["shell"]))
+})
+
+test("legacy bash per-pattern rules still gate shell commands", () => {
+  const ruleset = Permission.fromConfig({ bash: { "*": "ask", "git *": "allow" } })
+  expect(Permission.evaluate("shell", "git status", ruleset).action).toBe("allow")
+  expect(Permission.evaluate("shell", "rm foo", ruleset).action).toBe("ask")
+})
+
+test("legacy bash wildcard permission patterns still match shell (wildcard, not equality)", () => {
+  const ruleset: PermissionV1.Ruleset = [{ permission: "ba*", pattern: "*", action: "deny" }]
+  expect(Permission.evaluate("shell", "ls", ruleset).action).toBe("deny")
+  expect(Permission.disabled(["shell"], ruleset)).toEqual(new Set(["shell"]))
+})
+
+test("legacy doom_loop bash patterns still gate the renamed shell tool", () => {
+  // #780: doom_loop rules key on the tool id. A legacy `bash` pattern must still gate the
+  // tool now published as `shell`, with the same wildcard + findLast semantics.
+  const ruleset: PermissionV1.Ruleset = [{ permission: "doom_loop", pattern: "bash", action: "deny" }]
+  expect(Permission.evaluate("doom_loop", "shell", ruleset).action).toBe("deny")
+  expect(Permission.evaluate("doom_loop", "shell", [{ permission: "doom_loop", pattern: "ba*", action: "deny" }]).action).toBe("deny")
+  expect(Permission.evaluate("doom_loop", "shell", [
+    { permission: "doom_loop", pattern: "bash", action: "deny" },
+    { permission: "doom_loop", pattern: "shell", action: "allow" },
+  ]).action).toBe("allow")
+  expect(Permission.evaluate("doom_loop", "read", ruleset).action).toBe("ask")
+  // Non-doom_loop resources are filenames/patterns, not tool ids: no aliasing there.
+  expect(Permission.evaluate("edit", "shell", [{ permission: "edit", pattern: "bash", action: "deny" }]).action).toBe("ask")
+})
+
+test("a later s* wildcard does not bypass an explicit legacy bash deny", () => {
+  // #780: matching is union + findLast (canonical `s*` does name the tool),
+  // with one compatibility clamp: a wildcard that matches only via the new
+  // name cannot lift a deny that already applied under the legacy name.
+  const ruleset = Permission.fromConfig({ bash: "deny", "s*": "allow" })
+  expect(Permission.evaluate("shell", "ls", ruleset).action).toBe("deny")
+  expect(Permission.evaluate("bash", "ls", ruleset).action).toBe("deny")
+  expect(Permission.disabled(["shell"], ruleset)).toEqual(new Set(["shell"]))
+  // Canonical wildcards otherwise work, including as carve-outs.
+  expect(Permission.evaluate("shell", "ls", Permission.fromConfig({ "s*": "allow" })).action).toBe("allow")
+  expect(Permission.evaluate("shell", "ls", Permission.fromConfig({ "*": "ask", "s*": "allow" })).action).toBe(
+    "allow",
+  )
+  expect(Permission.evaluate("shell", "ls", Permission.fromConfig({ bash: "deny", "s*": "ask" })).action).toBe(
+    "deny",
+  )
+  expect(Permission.disabled(["shell"], Permission.fromConfig({ "s*": "deny" }))).toEqual(new Set(["shell"]))
+  // Explicit re-permits still win by order (last matching literal wins).
+  expect(Permission.evaluate("shell", "ls", Permission.fromConfig({ bash: "deny", shell: "allow" })).action).toBe(
+    "allow",
+  )
+  expect(Permission.evaluate("shell", "ls", Permission.fromConfig({ "s*": "deny", shell: "allow" })).action).toBe(
+    "allow",
+  )
+  // A later legacy wildcard deny still gates the renamed tool.
+  expect(Permission.evaluate("shell", "ls", Permission.fromConfig({ shell: "allow", "ba*": "deny" })).action).toBe(
+    "deny",
+  )
+  // doom_loop resources follow the same rule: s* must not bypass bash deny.
+  expect(
+    Permission.evaluate("doom_loop", "shell", [
+      { permission: "doom_loop", pattern: "bash", action: "deny" },
+      { permission: "doom_loop", pattern: "s*", action: "allow" },
+    ]).action,
+  ).toBe("deny")
+})
+
+test("evaluating under the legacy bash name resolves canonical shell rules", () => {
+  // #780: the two spellings are one action identity in both directions, so a
+  // legacy query name still resolves rules stored under the canonical key.
+  const ruleset: PermissionV1.Ruleset = [
+    { permission: "shell", pattern: "*", action: "allow" },
+    { permission: "shell", pattern: "rm -rf *", action: "deny" },
+  ]
+  expect(Permission.evaluate("bash", "rm -rf *", ruleset).action).toBe("deny")
+  expect(Permission.evaluate("bash", "ls", ruleset).action).toBe("allow")
+  expect(Permission.evaluate("shell", "rm -rf *", ruleset).action).toBe("deny")
+})
+
+test("canonical shell and legacy bash rules resolve by ruleset order (last wins)", () => {
+  const legacyFirst = Permission.fromConfig({ bash: "deny", shell: "allow" })
+  const canonicalFirst = Permission.fromConfig({ shell: "allow", bash: "deny" })
+  expect(Permission.evaluate("shell", "ls", legacyFirst).action).toBe("allow")
+  expect(Permission.evaluate("shell", "ls", canonicalFirst).action).toBe("deny")
+})
+
+test("canonical shell deny hides the shell tool", () => {
+  const ruleset = Permission.fromConfig({ shell: "deny" })
+  expect(Permission.evaluate("shell", "ls", ruleset).action).toBe("deny")
+  expect(Permission.disabled(["shell", "read"], ruleset)).toEqual(new Set(["shell"]))
 })
 
 test("fromConfig - expands exact tilde to home directory", () => {

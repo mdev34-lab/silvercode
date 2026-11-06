@@ -1720,7 +1720,7 @@ it.instance(
       const sessions = yield* Session.Service
       const agents = yield* AgentSvc.Service
       const agent = yield* agents.get("build")
-      expect(Permission.evaluate("doom_loop", "bash", agent.permission).action).toBe("deny")
+      expect(Permission.evaluate("doom_loop", "shell", agent.permission).action).toBe("deny")
       const session = yield* sessions.create({ title: "Doom-loop positive control" })
       yield* prompt.prompt({
         sessionID: session.id,
@@ -1732,7 +1732,7 @@ it.instance(
       const input = { command: "echo SHOULD_NOT_RUN", description: "doom-loop positive control", workdir: dir }
       // One provider response creates one assistant message with three real tool parts.
       // A separate llm.tool() reply for each call would not exercise the per-message guard.
-      yield* llm.push(reply().tool("bash", input).tool("bash", input).tool("bash", input))
+      yield* llm.push(reply().tool("shell", input).tool("shell", input).tool("shell", input))
       const result = yield* prompt.loop({ sessionID: session.id })
       expect(result.info.role).toBe("assistant")
       if (result.info.role !== "assistant") throw new Error("expected an assistant result")
@@ -1744,10 +1744,107 @@ it.instance(
       const messages = yield* sessions.messages({ sessionID: session.id })
       const repeated = messages
         .filter((message) => message.info.role === "assistant")
-        .map((message) => message.parts.filter((part) => part.type === "tool" && part.tool === "bash"))
+        .map((message) => message.parts.filter((part) => part.type === "tool" && part.tool === "shell"))
         .filter((parts) => parts.length === 3)
       expect(repeated).toHaveLength(1)
       expect(repeated[0]?.map((part) => part.type === "tool" && part.state.input)).toEqual([input, input, input])
+    }),
+  20_000,
+)
+
+it.instance(
+  "a hallucinated legacy bash call is repaired as invalid and never executes (#780)",
+  () =>
+    Effect.gen(function* () {
+      const { dir, llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+
+      const session = yield* sessions.create({
+        title: "Legacy bash hallucination",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      yield* prompt.prompt({
+        sessionID: session.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "run the marker command" }],
+      })
+
+      const marker = path.join(dir, "bash-hallucination-ran.txt")
+      // The model calls the pre-rename name `bash`; the catalog only publishes `shell`,
+      // so this must route to the invalid-tool repair with zero execution.
+      yield* llm.tool("bash", { command: `touch ${marker}` })
+      yield* llm.text("done")
+
+      const result = yield* prompt.loop({ sessionID: session.id })
+      expect(result.info.role).toBe("assistant")
+
+      const parts = (yield* sessions.messages({ sessionID: session.id })).flatMap((message) => message.parts)
+      const repaired = parts.find((part) => part.type === "tool" && part.tool === "invalid")
+      expect(repaired?.type).toBe("tool")
+      if (repaired?.type === "tool" && repaired.state.status === "completed") {
+        expect(repaired.state.input).toMatchObject({ tool: "bash" })
+      }
+      expect(parts.some((part) => part.type === "tool" && part.tool === "shell")).toBe(false)
+      expect(yield* Effect.promise(() => Bun.file(marker).exists())).toBe(false)
+    }),
+  20_000,
+)
+
+it.instance(
+  "an archived bash tool part is replayed from stored output, never re-executed (#780)",
+  () =>
+    Effect.gen(function* () {
+      const { dir, llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+
+      const chat = yield* sessions.create({
+        title: "Archived bash part",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      const seeded = yield* seed(chat.id, { finish: "stop" })
+      const marker = path.join(dir, "archived-bash-replayed.txt")
+      // A persisted pre-rename history part: completed, with stored output.
+      yield* sessions.updatePart({
+        id: PartID.ascending(),
+        messageID: seeded.assistant.id,
+        sessionID: chat.id,
+        type: "tool",
+        callID: "archived-bash-call",
+        tool: "bash",
+        state: {
+          status: "completed",
+          input: { command: `touch ${marker}` },
+          output: "stored output from before the rename",
+          title: "done",
+          metadata: {},
+          time: { start: Date.now(), end: Date.now() },
+        },
+      })
+
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "continue please" }],
+      })
+      yield* llm.text("done")
+
+      const result = yield* prompt.loop({ sessionID: chat.id })
+      expect(result.info.role).toBe("assistant")
+
+      // The archived call was not re-executed under the new name, and its
+      // stored output is preserved verbatim.
+      expect(yield* Effect.promise(() => Bun.file(marker).exists())).toBe(false)
+      const parts = (yield* sessions.messages({ sessionID: chat.id })).flatMap((message) => message.parts)
+      expect(parts.some((part) => part.type === "tool" && part.tool === "shell")).toBe(false)
+      const archived = parts.find((part) => part.type === "tool" && part.tool === "bash")
+      expect(archived?.type).toBe("tool")
+      if (archived?.type === "tool" && archived.state.status === "completed") {
+        expect(archived.state.output).toBe("stored output from before the rename")
+      }
     }),
   20_000,
 )
@@ -1790,7 +1887,7 @@ it.instance(
       // Step 2: the model follows the recovery instruction - inspect, write the first
       // chunk, then append the rest with edit. A second `write` would replace the first
       // chunk, so the scripted continuation must not use one.
-      yield* llm.tool("bash", { command: `test -e ${target} && echo exists || echo missing` })
+      yield* llm.tool("shell", { command: `test -e ${target} && echo exists || echo missing` })
       yield* llm.tool("write", { filePath: target, content: first })
       yield* llm.tool("edit", { filePath: target, oldString: "line one\n", newString: "line one\n" + second })
       yield* llm.text("done")
@@ -1872,7 +1969,7 @@ it.instance(
       // Step 2: the model follows the guidance - inspect the existing file, then append
       // each remaining chunk with edit. It never re-writes, so nothing already on disk is
       // replaced by a partial payload.
-      yield* llm.tool("bash", { command: `cat ${target}` })
+      yield* llm.tool("shell", { command: `cat ${target}` })
       yield* llm.tool("edit", {
         filePath: target,
         oldString: "existing line two\n",
@@ -2689,7 +2786,7 @@ it.instance(
         noReply: true,
         parts: [{ type: "text", text: "Write the version to a file and confirm it." }],
       })
-      yield* llm.tool("bash", { command: "printf 1 > version.txt", timeout: 5_000, workdir: path.resolve(dir) })
+      yield* llm.tool("shell", { command: "printf 1 > version.txt", timeout: 5_000, workdir: path.resolve(dir) })
       yield* llm.push(
         reply()
           .text("Wrote version.txt.")
@@ -2898,7 +2995,7 @@ noLLMServer.instance("prompt tools replace previous prompt tool rules", () =>
       sessionID: session.id,
       agent: "work",
       noReply: true,
-      tools: { bash: false },
+      tools: { shell: false },
       parts: [{ type: "text", text: "first" }],
     })
     yield* prompt.prompt({
@@ -2911,7 +3008,7 @@ noLLMServer.instance("prompt tools replace previous prompt tool rules", () =>
 
     const reloaded = yield* sessions.get(session.id)
     expect(reloaded.permission).toEqual([{ permission: "read", pattern: "*", action: "allow" }])
-    expect(Permission.evaluate("bash", "anything", reloaded.permission ?? []).action).toBe("ask")
+    expect(Permission.evaluate("shell", "anything", reloaded.permission ?? []).action).toBe("ask")
   }),
 )
 
@@ -4650,7 +4747,7 @@ unix(
         parts: [{ type: "text", text: "Generate a report using the shell" }],
       })
 
-      yield* llm.tool("bash", {
+      yield* llm.tool("shell", {
         command:
           'i=0; while [ "$i" -lt 4000 ]; do printf "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx %05d\\n" "$i"; i=$((i + 1)); done; printf truncation-ready; sleep 30',
         timeout: 30_000,
@@ -5272,7 +5369,7 @@ it.instance(
         noReply: true,
         parts: [{ type: "text", text: "Generate a report using the shell" }],
       })
-      yield* llm.tool("bash", { command: "sleep 30", timeout: 30_000, workdir: path.resolve(dir) })
+      yield* llm.tool("shell", { command: "sleep 30", timeout: 30_000, workdir: path.resolve(dir) })
       const run = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
       yield* llm.wait(1)
       yield* pollWithTimeout(
@@ -6050,7 +6147,7 @@ it.instance(
       // step-2 stream then dies. Retrying THAT step is safe only because its
       // request carries the executed result - prove the result rides the
       // retry's history and the command never runs twice.
-      yield* llm.tool("bash", { command: `printf 'once\\n' >> ${JSON.stringify(target)}` })
+      yield* llm.tool("shell", { command: `printf 'once\\n' >> ${JSON.stringify(target)}` })
       yield* llm.cut()
       yield* llm.text("recovered after retry")
       yield* user(chat.id, "Research the requested information")
@@ -6086,7 +6183,7 @@ it.instance(
       // resolves. Whether or not the SDK already executed the call, a retry
       // would issue it again: the turn must end as a terminal interruption
       // instead, and the command must never run twice.
-      yield* llm.push(reply().tool("bash", { command: `printf 'replay\\n' >> ${JSON.stringify(target)}` }).cut().item())
+      yield* llm.push(reply().tool("shell", { command: `printf 'replay\\n' >> ${JSON.stringify(target)}` }).cut().item())
       yield* user(chat.id, "hello")
 
       const result = yield* prompt.loop({ sessionID: chat.id })
@@ -6285,7 +6382,7 @@ it.instance("cancel while bash permission is pending cannot run the command on l
     const sessions = yield* Session.Service
     const permissions = yield* Permission.Service
     const chat = yield* sessions.create({ title: "Pinned" })
-    yield* llm.push(reply().tool("bash", { command: "echo SHOULD_NOT_RUN > aborted-command.txt", description: "write marker", workdir: dir }))
+    yield* llm.push(reply().tool("shell", { command: "echo SHOULD_NOT_RUN > aborted-command.txt", description: "write marker", workdir: dir }))
     yield* user(chat.id, "Write a report marker")
     const first = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
     const request = yield* pollWithTimeout(permissions.list().pipe(Effect.map((items) => items.find((r) => r.sessionID === chat.id))), "bash permission did not arrive")

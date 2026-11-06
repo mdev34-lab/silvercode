@@ -1639,7 +1639,7 @@ describe("activity group TUI", () => {
       const group = [...computeActivityGroups(rows).byID.values()][0]!
       const subs = computeActivitySubGroups(group)
       expect(subs.map((sub) => [sub.kind, sub.id])).toEqual([
-        ["bash", `${group.id}:bash:1`],
+        ["shell", `${group.id}:shell:1`],
         ["explore", `${group.id}:explore:1`],
         ["edit", `${group.id}:edit:1`],
         ["explore", `${group.id}:explore:2`],
@@ -1687,17 +1687,17 @@ describe("activity group TUI", () => {
       expect(frame).not.toContain(readRow("src/a.ts"))
       expect(frame).not.toContain("ls")
 
-      // The two Edited blocks are distinct sub-blocks: edit:1, bash:1, edit:2.
+      // The two Edited blocks are distinct sub-blocks: edit:1, shell:1, edit:2.
       const groupRows = (sync.data.message[SESSION] ?? []).map((message) => ({
         message,
         parts: sync.data.part[message.id] ?? [],
       }))
       const group = [...computeActivityGroups(groupRows).byID.values()][0]!
       const subs = computeActivitySubGroups(group)
-      expect(subs.map((sub) => sub.kind)).toEqual(["edit", "bash", "edit"])
+      expect(subs.map((sub) => sub.kind)).toEqual(["edit", "shell", "edit"])
       expect(subs.map((sub) => sub.id)).toEqual([
         `${group.id}:edit:1`,
-        `${group.id}:bash:1`,
+        `${group.id}:shell:1`,
         `${group.id}:edit:2`,
       ])
       expect(new Set(subs.map((sub) => sub.id)).size).toBe(3)

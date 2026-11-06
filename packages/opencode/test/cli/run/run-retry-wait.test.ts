@@ -127,7 +127,7 @@ describe("headless run provider retry delay (#555)", () => {
   cliIt.live("announces each long wait of a multi-step run, not only the first", ({ llm, opencode }) =>
     Effect.gen(function* () {
       yield* llm.error(429, quota, { "retry-after": "11" })
-      yield* llm.push(reply().text("first step").tool("bash", { command: "printf step", description: "First step" }))
+      yield* llm.push(reply().text("first step").tool("shell", { command: "printf step", description: "First step" }))
       yield* llm.error(429, quota, { "retry-after": "11" })
       yield* llm.text("done after two waits")
       const result = yield* opencode.run("two long waits", { timeoutMs: 50_000, extraArgs: ["--dangerously-skip-permissions"], clockScale: 10 })
@@ -427,7 +427,7 @@ describe("headless run provider retry delay (#555)", () => {
           'console.log(JSON.stringify(Object.keys(process.env).filter((k) => k.includes("HEADLESS"))))\n',
         ),
       )
-      yield* llm.tool("bash", {
+      yield* llm.tool("shell", {
         command: "bun check-env.mjs",
         description: "Check child process environment",
       })
