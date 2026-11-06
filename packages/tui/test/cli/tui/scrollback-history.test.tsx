@@ -10,6 +10,7 @@ import {
   assistantMessage,
   disposeSessionRoutes,
   mountSessionRoute,
+  rows,
   sessionInfo,
   settle,
   textPart,
@@ -22,12 +23,17 @@ afterEach(disposeSessionRoutes)
 
 // #815: a session longer than the old 100-message cache lost its oldest
 // messages on hydration and on every live append, and copy/export built the
-// transcript from that same window. These tests mount the real session route
-// against a fixture that pages exactly like the server, so the assertions read
-// painted pixels and real transcript output instead of store internals alone.
+// transcript from that same window. The fix is not a bigger cache: the mount is
+// bounded to the newest page, older pages arrive through the endpoint's
+// `before` cursor, and copy/export read every persisted page themselves. These
+// tests mount the real session route against a fixture that pages exactly like
+// the server, so the assertions read painted pixels and real transcript output
+// instead of store internals alone.
 
 const SESSION = sessionInfo("ses_0815_long", { title: "Long session" })
 const MARKER = "HISTORY-MARK-"
+// The mount page, matching `PAGE_SIZE` in the sync store.
+const PAGE = 100
 
 function timeline(count: number): { info: Message; parts: Part[] }[] {
   return Array.from({ length: count }, (_, index) => {
@@ -49,6 +55,10 @@ function messageRequests(requests: { pathname: string; search: string }[]) {
   return requests.filter((request) => request.pathname === `/session/${SESSION.id}/message`)
 }
 
+function params(request: { search: string }) {
+  return new URLSearchParams(request.search)
+}
+
 async function scrollToTop(
   app: Awaited<ReturnType<typeof mountSessionRoute>>["app"],
   keymap: () => { dispatchCommand(name: string): void },
@@ -61,65 +71,163 @@ async function painted(app: Awaited<ReturnType<typeof mountSessionRoute>>["app"]
   return waitFor(app, () => (app.captureCharFrame().includes(needle) ? true : undefined), 200, `missing ${needle}`)
 }
 
-describe("session history beyond the old 100-message window (#815)", () => {
-  test("hydration loads the whole timeline and reopening keeps it", async () => {
-    const rows = timeline(150)
+// Wheel over the transcript (right of the docked sidebar at the normal size).
+async function wheel(
+  app: Awaited<ReturnType<typeof mountSessionRoute>>["app"],
+  times: number,
+) {
+  for (let i = 0; i < times; i++) await app.mockMouse.scroll(app.renderer.width - 10, 5, "up")
+  await settle(app)
+}
+
+function firstVisibleMarker(list: string[]) {
+  return list.map((row) => row.match(/HISTORY-MARK-\d{3}/)?.[0]).find((mark) => mark !== undefined)
+}
+
+function rowOf(list: string[], needle: string) {
+  return list.findIndex((row) => row.includes(needle))
+}
+
+describe("bounded mount and on-demand older history (#815)", () => {
+  test("the mount loads the newest page only and the oldest arrives on demand", async () => {
+    const messages = timeline(150)
     const first = await mountSessionRoute({
       width: 120,
       height: 40,
       sessions: [SESSION],
-      messages: { [SESSION.id]: rows },
+      messages: { [SESSION.id]: messages },
     })
-    await waitFor(first.app, () => (first.sync.data.message[SESSION.id]?.length === 150 ? true : undefined))
+    await waitFor(first.app, () => (first.sync.data.message[SESSION.id]?.length === PAGE ? true : undefined))
 
     // The newest output is painted and the oldest is not on screen yet, so the
-    // pixel assertion below is about scrollback and not about a lucky viewport.
-    expect(first.app.captureCharFrame()).toContain(`${MARKER}150`)
+    // pixel assertion about scrollback is about loading, not a lucky viewport.
+    await painted(first.app, `${MARKER}150`)
     expect(first.app.captureCharFrame()).not.toContain(`${MARKER}001`)
 
-    // Every hydrated message keeps its parts; the old hydration deleted the
-    // parts of everything outside the newest 100.
-    expect(Object.keys(first.sync.data.part).length).toBe(150)
-    expect(first.sync.data.part["msg_001"]).toHaveLength(1)
+    // Bounded: the mount window is the newest page, with that page's parts and
+    // a cursor to the rest of the timeline.
+    expect(first.sync.data.message[SESSION.id]?.[0]?.id).toBe("msg_051")
+    expect(Object.keys(first.sync.data.part).length).toBe(PAGE)
+    expect(first.sync.data.part["msg_051"]).toHaveLength(1)
+    expect(first.sync.session.hasOlder(SESSION.id)).toBe(true)
+
+    // Bounded by a real page request, not by fetching everything and trimming.
+    const hydration = messageRequests(first.requests)[0]
+    expect(hydration && params(hydration).get("limit")).toBe(String(PAGE))
+    expect(hydration && params(hydration).has("before")).toBe(false)
 
     // Oldest-to-newest navigation reaches the first persisted marker.
     await scrollToTop(first.app, first.keymap)
+    await waitFor(first.app, () => (first.sync.data.message[SESSION.id]?.length === 150 ? true : undefined))
     await painted(first.app, `${MARKER}001`)
-
-    // The hydration request asked for the complete timeline rather than a page.
-    const requests = messageRequests(first.requests)
-    expect(requests.length).toBeGreaterThan(0)
-    for (const request of requests) expect(new URLSearchParams(request.search).has("limit")).toBe(false)
+    expect(first.sync.data.part["msg_001"]).toHaveLength(1)
+    expect(first.sync.session.hasOlder(SESSION.id)).toBe(false)
+    const older = messageRequests(first.requests).filter((request) => params(request).has("before"))
+    expect(older.length).toBeGreaterThan(0)
+    expect(older[0] && params(older[0]).get("limit")).toBe(String(PAGE))
 
     first.app.renderer.destroy()
     await disposeSessionRoutes()
 
-    // Reopening the same session must not hide older history.
+    // Reopening the same session stays bounded and still reaches the oldest.
     const reopened = await mountSessionRoute({
       width: 120,
       height: 40,
       sessions: [SESSION],
-      messages: { [SESSION.id]: rows },
+      messages: { [SESSION.id]: messages },
     })
-    await waitFor(reopened.app, () => (reopened.sync.data.message[SESSION.id]?.length === 150 ? true : undefined))
-    expect(reopened.sync.data.part["msg_001"]).toHaveLength(1)
+    await waitFor(reopened.app, () => (reopened.sync.data.message[SESSION.id]?.length === PAGE ? true : undefined))
+    expect(reopened.sync.data.message[SESSION.id]?.[0]?.id).toBe("msg_051")
     await scrollToTop(reopened.app, reopened.keymap)
+    await waitFor(reopened.app, () => (reopened.sync.data.message[SESSION.id]?.length === 150 ? true : undefined))
     await painted(reopened.app, `${MARKER}001`)
   })
 
+  test("scrolling up through several pages reaches the oldest message", async () => {
+    const messages = timeline(250)
+    const { app, sync } = await mountSessionRoute({
+      width: 120,
+      height: 40,
+      sessions: [SESSION],
+      messages: { [SESSION.id]: messages },
+    })
+    await waitFor(app, () => (sync.data.message[SESSION.id]?.length === PAGE ? true : undefined))
+
+    // Walk older pages the way a reader does: one wheel step at a time, with
+    // the fixture answering each `before` page exactly like the server.
+    for (let attempt = 0; attempt < 120 && sync.session.hasOlder(SESSION.id); attempt++) {
+      await wheel(app, 2)
+      await waitFor(app, () => (sync.data.message[SESSION.id]!.length >= PAGE ? true : undefined))
+    }
+    await waitFor(app, () => (sync.session.hasOlder(SESSION.id) === false ? true : undefined))
+    expect(sync.data.message[SESSION.id]?.length).toBe(250)
+    expect(sync.data.message[SESSION.id]?.[0]?.id).toBe("msg_001")
+    expect(Object.keys(sync.data.part).length).toBe(250)
+  })
+
+  test("an older page prepends without moving what the reader is looking at", async () => {
+    const messages = timeline(150)
+    let release!: () => void
+    const older = new Promise<Response>((resolve) => {
+      release = () => resolve(json(messages.slice(0, 50)))
+    })
+    let hydrated = false
+    let held = false
+    const { app, sync } = await mountSessionRoute({
+      width: 120,
+      height: 40,
+      sessions: [SESSION],
+      messages: { [SESSION.id]: messages },
+      respond: (request) => {
+        if (request.method !== "GET" || request.pathname !== `/session/${SESSION.id}/message`) return undefined
+        if (!hydrated) {
+          hydrated = true
+          return undefined
+        }
+        held = true
+        return older
+      },
+    })
+    await waitFor(app, () => (sync.data.message[SESSION.id]?.length === PAGE ? true : undefined))
+
+    // Scroll towards the top until the page request fires; its response is
+    // held, so the frame captured here is what the reader must keep seeing.
+    for (let attempt = 0; attempt < 60 && !held; attempt++) await wheel(app, 4)
+    await waitFor(app, () => (held ? true : undefined))
+    await settle(app)
+
+    const before = await rows(app)
+    const anchor = firstVisibleMarker(before)
+    expect(anchor).toBeDefined()
+    const anchorRow = rowOf(before, anchor as string)
+    expect(anchorRow).toBeGreaterThanOrEqual(0)
+
+    release()
+    await waitFor(app, () => (sync.data.message[SESSION.id]?.length === 150 ? true : undefined))
+    await settle(app)
+    await settle(app)
+
+    // The prepend did not scroll the reader: same message, same row, and the
+    // older rows sit above the viewport instead of pushing it down.
+    const after = await rows(app)
+    expect(firstVisibleMarker(after)).toBe(anchor as string)
+    expect(rowOf(after, anchor as string)).toBe(anchorRow)
+    expect(firstVisibleMarker(after)).not.toBe(`${MARKER}001`)
+  })
+
   test("live appends no longer evict the oldest message or its parts", async () => {
-    const rows = timeline(120)
+    const messages = timeline(120)
     const { app, sync, events, keymap } = await mountSessionRoute({
       width: 120,
       height: 40,
       sessions: [SESSION],
-      messages: { [SESSION.id]: rows.slice(0, 60) },
+      messages: { [SESSION.id]: messages.slice(0, 60) },
     })
     await waitFor(app, () => (sync.data.message[SESSION.id]?.length === 60 ? true : undefined))
 
     // Grow the session past the removed 100-message ceiling one message at a
     // time, exactly as the live stream does.
-    for (const entry of rows.slice(60)) {
+    for (const entry of messages.slice(60)) {
       events.emit({
         directory,
         payload: {
@@ -152,7 +260,7 @@ describe("session history beyond the old 100-message window (#815)", () => {
 
   test("copy transcript includes the first and last messages with their parts", async () => {
     const written: string[] = []
-    const { app, keymap } = await mountSessionRoute({
+    const { app, keymap, sync } = await mountSessionRoute({
       width: 120,
       height: 40,
       sessions: [SESSION],
@@ -169,9 +277,11 @@ describe("session history beyond the old 100-message window (#815)", () => {
     expect(transcript).toContain(`${MARKER}150`)
     expect(occurrences(transcript, MARKER)).toBe(150)
     expect(transcript).toContain(`Session ID:** ${SESSION.id}`)
+    // The transcript came from the pages, not from the bounded store.
+    expect(sync.data.message[SESSION.id]?.length).toBe(PAGE)
   })
 
-  test("export writes the complete transcript to disk", async () => {
+  test("export writes the complete transcript to disk while the store stays bounded", async () => {
     const cwd = await mkdtemp(path.join(os.tmpdir(), "silvercode-export-"))
     // `openEditor` must stay out of the way: without an editor the export only
     // writes the file, which is exactly what this test reads back.
@@ -180,7 +290,7 @@ describe("session history beyond the old 100-message window (#815)", () => {
     delete process.env.VISUAL
     delete process.env.EDITOR
     try {
-      const { app, keymap, requests } = await mountSessionRoute({
+      const { app, keymap, requests, sync } = await mountSessionRoute({
         width: 120,
         height: 40,
         sessions: [SESSION],
@@ -202,10 +312,15 @@ describe("session history beyond the old 100-message window (#815)", () => {
       expect(transcript).toContain(`${MARKER}001`)
       expect(transcript).toContain(`${MARKER}150`)
       expect(occurrences(transcript, MARKER)).toBe(150)
-      // The export reads the complete persisted timeline, not a cached page.
+      // The export reads every persisted page, newest page first, walking
+      // `before` — it does not depend on what the mount window holds.
       const requests_ = messageRequests(requests)
-      expect(requests_.length).toBeGreaterThan(0)
-      for (const request of requests_) expect(new URLSearchParams(request.search).has("limit")).toBe(false)
+      const paged = requests_.filter((request) => params(request).has("before"))
+      expect(paged.length).toBeGreaterThan(0)
+      for (const request of requests_) {
+        if (params(request).has("before")) expect(params(request).get("limit")).toBe(String(PAGE))
+      }
+      expect(sync.data.message[SESSION.id]?.length).toBe(PAGE)
     } finally {
       if (visual !== undefined) process.env.VISUAL = visual
       if (editor !== undefined) process.env.EDITOR = editor
@@ -228,10 +343,10 @@ describe("transcript request races and failures (#815 review)", () => {
   }
 
   test("removals during the transcript request are not resurrected", async () => {
-    const rows = timeline(4)
+    const messages = timeline(4)
     let release!: () => void
     const history = new Promise<Response>((resolve) => {
-      release = () => resolve(json(rows))
+      release = () => resolve(json(messages))
     })
     let hydrated = false
     let requested = false
@@ -240,13 +355,13 @@ describe("transcript request races and failures (#815 review)", () => {
       width: 120,
       height: 40,
       sessions: [SESSION],
-      messages: { [SESSION.id]: rows },
+      messages: { [SESSION.id]: messages },
       clipboard: { write: async (text) => void written.push(text) },
       respond: (request) => {
         if (request.method !== "GET" || request.pathname !== `/session/${SESSION.id}/message`) return undefined
         if (!hydrated) {
           hydrated = true
-          return json(rows)
+          return json(messages)
         }
         requested = true
         return history
@@ -290,6 +405,167 @@ describe("transcript request races and failures (#815 review)", () => {
     expect(occurrences(transcript, MARKER)).toBe(2)
   })
 
+  test("a part that changes type during the transcript request exports the live part", async () => {
+    // The transcript now walks older pages, so the part that changes type can
+    // live in one of them (message 2 is outside the mount window here). That is
+    // also the realistic shape of the defect: the persisted page carries the
+    // part's older row, the live stream carries a newer part with the same id
+    // but a different type, and only the live one may reach the transcript.
+    const messages = timeline(150)
+    let release!: () => void
+    const older = new Promise<Response>((resolve) => {
+      release = () => resolve(json(messages.slice(0, 50)))
+    })
+    let requests = 0
+    let requested = false
+    const written: string[] = []
+    const { app, events, sync, keymap } = await mountSessionRoute({
+      width: 120,
+      height: 40,
+      sessions: [SESSION],
+      messages: { [SESSION.id]: messages },
+      clipboard: { write: async (text) => void written.push(text) },
+      respond: (request) => {
+        if (request.method !== "GET" || request.pathname !== `/session/${SESSION.id}/message`) return undefined
+        requests++
+        // 1: hydration, 2: the transcript's newest page — both answered by the
+        // fixture. 3: the older page the transcript needs, held open.
+        if (requests < 3) return undefined
+        requested = true
+        return older
+      },
+    })
+    await waitFor(app, () => (sync.data.message[SESSION.id]?.length === PAGE ? true : undefined))
+
+    keymap().dispatchCommand("session.copy")
+    await waitFor(app, () => (requested ? true : undefined))
+
+    // Same part id, different type. The live projection is the newest version
+    // of that part, so the persisted text row must not overwrite it — and the
+    // stale text must not reach the transcript either.
+    events.emit({
+      directory,
+      payload: {
+        id: "evt_type_change",
+        type: "message.part.updated",
+        properties: {
+          sessionID: SESSION.id,
+          time: BASE + 2_000,
+          part: {
+            id: "prt_002",
+            sessionID: SESSION.id,
+            messageID: "msg_002",
+            type: "tool",
+            tool: "live-tool",
+            callID: "call_live",
+            state: {
+              status: "completed",
+              input: { probe: "live" },
+              output: "LIVE-TOOL-OUTPUT",
+              title: "live-tool",
+              metadata: {},
+              time: { start: BASE + 1_000, end: BASE + 2_000 },
+            },
+          },
+        },
+      },
+    })
+    await waitFor(app, () => (sync.data.part["msg_002"]?.[0]?.type === "tool" ? true : undefined))
+
+    release()
+    await waitFor(app, () => (written.length > 0 ? true : undefined))
+
+    const transcript = written[0] ?? ""
+    expect(transcript).toContain("**Tool: live-tool**")
+    expect(transcript).not.toContain(`${MARKER}002`)
+    expect(transcript).toContain(`${MARKER}001`)
+    expect(transcript).toContain(`${MARKER}150`)
+    expect(occurrences(transcript, MARKER)).toBe(149)
+  })
+
+  test("the live part wins over the persisted row with the same id (route change during the request)", async () => {
+    // Same defect, seen from the mounted window: the request is open, the user
+    // navigates away, and the live update for that part (now off-screen) turns
+    // a prose part into a tool call. The transcript must follow the live part.
+    const messages = timeline(4)
+    messages[1] = { info: messages[1]!.info, parts: [textPart("prt_002", messages[1]!.info, "STALE-TEXT")] }
+    const other = sessionInfo("ses_zzzz_other", { title: "Other session" })
+    const otherInfo = userMessage("msg_other", other.id, {})
+    let release!: () => void
+    const history = new Promise<Response>((resolve) => {
+      release = () => resolve(json(messages))
+    })
+    let hydrated = false
+    let requested = false
+    const written: string[] = []
+    const { app, events, keymap, navigate } = await mountSessionRoute({
+      width: 120,
+      height: 40,
+      sessions: [SESSION, other],
+      messages: {
+        [SESSION.id]: messages,
+        [other.id]: [{ info: otherInfo, parts: [textPart("prt_other", otherInfo, "OTHER-SESSION")] }],
+      },
+      clipboard: { write: async (text) => void written.push(text) },
+      respond: (request) => {
+        if (request.method !== "GET" || request.pathname !== `/session/${SESSION.id}/message`) return undefined
+        if (!hydrated) {
+          hydrated = true
+          return undefined
+        }
+        requested = true
+        return history
+      },
+    })
+    await settle(app)
+
+    keymap().dispatchCommand("session.copy")
+    await waitFor(app, () => (requested ? true : undefined))
+
+    // Leave the session so the update cannot repaint the row it changes; the
+    // command already bound this session, so its transcript is unaffected.
+    navigate(other.id)
+    await painted(app, "OTHER-SESSION")
+
+    events.emit({
+      directory,
+      payload: {
+        id: "evt_type_change_nav",
+        type: "message.part.updated",
+        properties: {
+          sessionID: SESSION.id,
+          time: BASE + 2_000,
+          part: {
+            id: "prt_002",
+            sessionID: SESSION.id,
+            messageID: "msg_002",
+            type: "tool",
+            tool: "live-tool",
+            callID: "call_live",
+            state: {
+              status: "completed",
+              input: { probe: "live" },
+              output: "LIVE-TOOL-OUTPUT",
+              title: "live-tool",
+              metadata: {},
+              time: { start: BASE + 1_000, end: BASE + 2_000 },
+            },
+          },
+        },
+      },
+    })
+    await settle(app)
+
+    release()
+    await waitFor(app, () => (written.length > 0 ? true : undefined), 400, "copy never produced a transcript")
+
+    const transcript = written[0] ?? ""
+    expect(transcript).toContain("**Tool: live-tool**")
+    expect(transcript).not.toContain("STALE-TEXT")
+    expect(transcript).toContain(`${MARKER}001`)
+    expect(transcript).toContain(`${MARKER}004`)
+  })
+
   for (const [name, failure] of Object.entries({
     "server error": () => json({ message: "unavailable" }, { status: 500 }),
     "network error": () => {
@@ -303,21 +579,21 @@ describe("transcript request races and failures (#815 review)", () => {
       delete process.env.VISUAL
       delete process.env.EDITOR
       try {
-        const rows = timeline(4)
+        const messages = timeline(4)
         let hydrated = false
         const written: string[] = []
         const { app, keymap } = await mountSessionRoute({
           width: 120,
           height: 40,
           sessions: [SESSION],
-          messages: { [SESSION.id]: rows },
+          messages: { [SESSION.id]: messages },
           paths: { cwd },
           clipboard: { write: async (text) => void written.push(text) },
           respond: (request) => {
             if (request.method !== "GET" || request.pathname !== `/session/${SESSION.id}/message`) return undefined
             if (!hydrated) {
               hydrated = true
-              return json(rows)
+              return json(messages)
             }
             return failure()
           },
@@ -345,6 +621,120 @@ describe("transcript request races and failures (#815 review)", () => {
       }
     })
   }
+
+  test("copy and export can read overlapping pages without interfering", async () => {
+    const cwd = await mkdtemp(path.join(os.tmpdir(), "silvercode-export-overlap-"))
+    const visual = process.env.VISUAL
+    const editor = process.env.EDITOR
+    delete process.env.VISUAL
+    delete process.env.EDITOR
+    try {
+      const messages = timeline(150)
+      const held: { release: () => void }[] = []
+      let hydrated = false
+      const written: string[] = []
+      const { app, keymap } = await mountSessionRoute({
+        width: 120,
+        height: 40,
+        sessions: [SESSION],
+        messages: { [SESSION.id]: messages },
+        paths: { cwd },
+        clipboard: { write: async (text) => void written.push(text) },
+        respond: (request) => {
+          if (request.method !== "GET" || request.pathname !== `/session/${SESSION.id}/message`) return undefined
+          if (!hydrated) {
+            hydrated = true
+            return undefined
+          }
+          // Only the two newest pages are held; the `before` page after them
+          // falls through to the fixture and is answered immediately.
+          if (held.length >= 2) return undefined
+          return new Promise<Response>((resolve) => {
+            held.push({
+              // Each read starts from the newest page, so both resolve the same
+              // persisted rows — exactly the overlap the old single tracker
+              // registry could not describe.
+              release: () => resolve(json(messages.slice(100), { headers: { "x-next-cursor": "100" } })),
+            })
+          })
+        },
+      })
+      await settle(app)
+
+      keymap().dispatchCommand("session.copy")
+      await waitFor(app, () => (held.length === 1 ? true : undefined))
+
+      keymap().dispatchCommand("session.export")
+      await waitFor(app, () => (app.captureCharFrame().includes("Export Options") ? true : undefined))
+      await settle(app)
+      app.mockInput.pressEnter()
+      await waitFor(app, () => (held.length === 2 ? true : undefined))
+
+      // Release the export's page first: each read owns its own tracker and its
+      // own cursor walk, so the order they settle in cannot leak one into the
+      // other.
+      held[1]?.release()
+      await settle(app)
+      held[0]?.release()
+
+      const file = path.join(cwd, `session-${SESSION.id.slice(0, 8)}.md`)
+      await waitFor(app, () => (existsSync(file) ? true : undefined), 400, "export never wrote a file")
+      await waitFor(app, () => (written.length > 0 ? true : undefined))
+
+      const copied = written[0] ?? ""
+      const exported = await readFile(file, "utf8")
+      expect(occurrences(copied, MARKER)).toBe(150)
+      expect(occurrences(exported, MARKER)).toBe(150)
+      expect(copied).toContain(`${MARKER}001`)
+      expect(copied).toContain(`${MARKER}150`)
+      expect(exported).toContain(`${MARKER}001`)
+      expect(exported).toContain(`${MARKER}150`)
+    } finally {
+      if (visual !== undefined) process.env.VISUAL = visual
+      if (editor !== undefined) process.env.EDITOR = editor
+      await rm(cwd, { recursive: true, force: true })
+    }
+  })
+
+  test("releasing a held transcript page after teardown stays safe", async () => {
+    const messages = timeline(150)
+    const held: { release: () => void }[] = []
+    let hydrated = false
+    const written: string[] = []
+    const { app, keymap } = await mountSessionRoute({
+      width: 120,
+      height: 40,
+      sessions: [SESSION],
+      messages: { [SESSION.id]: messages },
+      clipboard: { write: async (text) => void written.push(text) },
+      respond: (request) => {
+        if (request.method !== "GET" || request.pathname !== `/session/${SESSION.id}/message`) return undefined
+        if (!hydrated) {
+          hydrated = true
+          return undefined
+        }
+        if (held.length > 0) return undefined
+        return new Promise<Response>((resolve) => {
+          held.push({
+            release: () => resolve(json(messages.slice(100), { headers: { "x-next-cursor": "100" } })),
+          })
+        })
+      },
+    })
+    await settle(app)
+
+    keymap().dispatchCommand("session.copy")
+    await waitFor(app, () => (held.length === 1 ? true : undefined))
+
+    app.renderer.destroy()
+    await disposeSessionRoutes()
+    held[0]?.release()
+    // The late response must not touch destroyed render state. A transcript the
+    // command had already promised may still land, but never a partial one.
+    await Bun.sleep(200)
+    expect(written.length <= 1).toBe(true)
+    if (written.length === 1) expect(occurrences(written[0] ?? "", MARKER)).toBe(150)
+  })
 
   test("export keeps the launched session when the route changes while the dialog is open", async () => {
     const cwd = await mkdtemp(path.join(os.tmpdir(), "silvercode-export-nav-"))

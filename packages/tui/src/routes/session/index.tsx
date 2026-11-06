@@ -82,7 +82,7 @@ import { DialogExportOptions } from "../../ui/dialog-export-options"
 import * as Model from "../../util/model"
 import { pauseMarker } from "../../util/pause"
 import { elapsed, useClock } from "../../util/clock"
-import { formatTranscript } from "../../util/transcript"
+import { formatTranscriptPaged } from "../../util/transcript"
 import { formatGenerationMetrics } from "../../util/generation-metrics"
 import { sessionEpilogue } from "../../util/presentation"
 import { setPreLayoutSiblingMargin } from "../../util/layout"
@@ -436,6 +436,48 @@ export function Session() {
   // stays put while new output lands under a reader who scrolled up.
   const [scrolledAway, setScrolledAway] = createSignal(false)
   const lastShortcut = useCommandShortcut("session.last")
+  const renderer = useRenderer()
+  // Older history arrives on demand (#815): the store holds the newest page on
+  // mount, the previous page is fetched with the endpoint's `before` cursor
+  // when the reader approaches the top, and the viewport is re-anchored on the
+  // message it was showing so a prepend never scrolls the transcript.
+  let loadingOlder = false
+  // Chained rAF callbacks outlive an unmount; capture the generation at
+  // schedule time and stop at the first stale frame (same guard as the
+  // diff-viewer's scroll restore).
+  let anchorGeneration = 0
+  onCleanup(() => {
+    anchorGeneration++
+  })
+  const restoreAnchor = (top: number, height: number, attempt = 0) => {
+    const generation = anchorGeneration
+    renderer.requestAnimationFrame(() => {
+      if (generation !== anchorGeneration || !scroll || scroll.isDestroyed) return
+      const grown = scroll.scrollHeight - height
+      // The prepended rows may not be laid out yet; retry a frame or two
+      // instead of leaving the reader shifted.
+      if (grown <= 0 && attempt < 3) return restoreAnchor(top, height, attempt + 1)
+      scroll.scrollTo(top + Math.max(0, grown))
+    })
+  }
+  const loadOlder = async (anchor = true) => {
+    const box = scroll
+    if (loadingOlder || !box || box.isDestroyed || !sync.session.hasOlder(route.sessionID)) return 0
+    loadingOlder = true
+    const top = box.scrollTop
+    const height = box.scrollHeight
+    try {
+      const added = await sync.session.more(route.sessionID)
+      if (added > 0 && anchor) restoreAnchor(top, height)
+      return added
+    } catch {
+      // A failed older page leaves the loaded window as it is; the next scroll
+      // retries. Nothing is dropped from what is already on screen.
+      return 0
+    } finally {
+      loadingOlder = false
+    }
+  }
   function watchScroll(r: ScrollBoxRenderable) {
     scroll = r
     const update = () =>
@@ -444,6 +486,9 @@ export function Session() {
         const max = Math.max(0, r.scrollHeight - r.viewport.height)
         // Same threshold the scrollbox uses to re-engage sticky scrolling.
         setScrolledAway(max > 1 && r.scrollTop < max - 1)
+        // Prefetch one viewport ahead of the top so older history is there
+        // before the reader reaches a dead end.
+        if (r.scrollTop <= r.viewport.height) void loadOlder()
       })
     r.verticalScrollBar.on("change", update)
     onCleanup(() => r.verticalScrollBar.off("change", update))
@@ -458,7 +503,6 @@ export function Session() {
   }
   const keymap = useOpencodeKeymap()
   const dialog = useDialog()
-  const renderer = useRenderer()
 
   const offSessionStatus = event.on("session.status", (evt) => {
     if (evt.properties.sessionID !== route.sessionID) return
@@ -938,7 +982,14 @@ export function Session() {
       category: "Session",
       hidden: true,
       run: () => {
-        scroll.scrollTo(0)
+        // "First message" means the oldest persisted message, not the oldest
+        // one the mount window loaded: drain the remaining pages first.
+        void (async () => {
+          while (sync.session.hasOlder(route.sessionID)) {
+            if ((await loadOlder(false)) === 0) break
+          }
+          if (scroll && !scroll.isDestroyed) scroll.scrollTo(0)
+        })()
         dialog.clear()
       },
     },
@@ -1049,13 +1100,18 @@ export function Session() {
           const sessionData = session()
           if (!sessionData) return
           // The transcript is the complete history, never just the rendered
-          // window: read it from the session's persisted timeline (#815).
-          const transcript = formatTranscript(sessionData, await sync.session.history(sessionData.id), {
-            thinking: showThinking(),
-            toolDetails: showDetails(),
-            assistantMetadata: showAssistantMetadata(),
-            providers: sync.data.provider,
-          })
+          // window: read every persisted page instead of the bounded store
+          // (#815).
+          const transcript = await formatTranscriptPaged(
+            sessionData,
+            {
+              thinking: showThinking(),
+              toolDetails: showDetails(),
+              assistantMetadata: showAssistantMetadata(),
+              providers: sync.data.provider,
+            },
+            (before) => sync.session.historyPage(sessionData.id, before),
+          )
           await clipboard.write?.(transcript)
           toast.show({ message: "Session transcript copied to clipboard!", variant: "success" })
         } catch {
@@ -1093,14 +1149,19 @@ export function Session() {
 
           if (options === null) return
 
-          // Export reads the complete persisted timeline rather than the
-          // rendered window, so an export never truncates the transcript (#815).
-          const transcript = formatTranscript(sessionData, await sync.session.history(sessionID), {
-            thinking: options.thinking,
-            toolDetails: options.toolDetails,
-            assistantMetadata: options.assistantMetadata,
-            providers: sync.data.provider,
-          })
+          // Export reads every persisted page rather than the bounded store (or
+          // the session's mount window), so an export never truncates the
+          // transcript (#815).
+          const transcript = await formatTranscriptPaged(
+            sessionData,
+            {
+              thinking: options.thinking,
+              toolDetails: options.toolDetails,
+              assistantMetadata: options.assistantMetadata,
+              providers: sync.data.provider,
+            },
+            (before) => sync.session.historyPage(sessionID, before),
+          )
 
           if (options.openWithoutSaving) {
             // Just open in editor without saving
