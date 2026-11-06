@@ -1,6 +1,6 @@
 import { describe, expect, onTestFinished } from "bun:test"
 import fs from "fs/promises"
-import { realpathSync } from "node:fs"
+import { existsSync, readFileSync, realpathSync } from "node:fs"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import { Effect, Exit, Fiber, Stream } from "effect"
@@ -228,23 +228,101 @@ describe("AppProcess", () => {
     )
 
     if (process.platform !== "win32") {
+      // Extends the #672 timeout diagnostic for both cleanup tests. Keep the
+      // passing path to timestamps and in-memory bookkeeping only.
+      const diagnosticDirectory = (prefix: string) =>
+        Effect.promise(async () => {
+          const directory = await fs.mkdtemp(path.join(tmpdir(), prefix))
+          const ready = path.join(directory, "ready")
+          const settled = path.join(directory, "settled")
+          const started = Date.now()
+          let stage = "spawn"
+          let stageStarted = started
+          let pid = "unknown"
+          let readyObserved = false
+          let settledObserved = false
+          let completed = false
+          let failedStage: string | undefined
+          const events: string[] = []
+          const mark = (next: string) => {
+            const now = Date.now()
+            events.push(
+              `${stage}: +${stageStarted - started}ms to +${now - started}ms (${now - stageStarted}ms); ready=${readyObserved ? "previously observed" : "unknown"} settled=${settledObserved ? "previously observed" : "unknown"}; exitCode/signal=unavailable`,
+            )
+            stage = next
+            stageStarted = now
+          }
+          onTestFinished(() => {
+            if (completed) return
+            const now = Date.now()
+            let state = "unavailable"
+            if (/^\d+$/.test(pid) && process.platform === "linux") {
+              try {
+                const stat = readFileSync(`/proc/${pid}/stat`, "utf8")
+                state = stat.slice(stat.lastIndexOf(")") + 2).split(" ")[0] ?? "unavailable"
+              } catch {
+                state = "not observable in /proc"
+              }
+            }
+            console.error(
+              `[process-cleanup] started=${new Date(started).toISOString()}\n${events.join("\n")}\n${stage}: +${stageStarted - started}ms to +${now - started}ms (${now - stageStarted}ms, incomplete or failed)${failedStage ? `; use failed at ${failedStage}` : ""}; pid=${pid} processState=${state} exitCode/signal=unavailable ready=${existsSync(ready)} settled=${existsSync(settled)} (test-finished snapshot; timeout cleanup may already have changed child and files)`,
+            )
+          })
+          return {
+            directory,
+            ready,
+            settled,
+            mark,
+            setPid: (value: string) => {
+              pid = value
+              readyObserved = true
+            },
+            observeSettled: () => {
+              settledObserved = true
+            },
+            beginCleanup: (success: boolean) => {
+              if (!success) failedStage = stage
+              mark("directory cleanup (fs.rm)")
+            },
+            finishCleanup: (success: boolean) => {
+              mark("finished")
+              completed = success
+            },
+          }
+        })
+
       it.live(
         "timeout cleans up the scoped child process",
         Effect.acquireUseRelease(
-          Effect.promise(() => fs.mkdtemp(path.join(tmpdir(), "opencode-process-timeout-"))),
-          (directory) => {
-            const ready = path.join(directory, "ready")
-            const settled = path.join(directory, "settled")
+          diagnosticDirectory("opencode-process-timeout-"),
+          ({ ready, settled, mark, setPid, observeSettled }) => {
             const script = `const fs=require('fs');fs.writeFileSync(${JSON.stringify(ready)},String(process.pid));process.on('SIGTERM',()=>{fs.writeFileSync(${JSON.stringify(settled)},'settled');process.exit(0)});setInterval(()=>{},60000)`
             return Effect.gen(function* () {
               const svc = yield* AppProcess.Service
+              mark("run with timeout")
               const exit = yield* Effect.exit(svc.run(cmd("-e", script), { timeout: "250 millis" }))
+              mark("timeout result assertion")
               expect(Exit.isFailure(exit)).toBe(true)
-              expect(yield* waitForFile(ready)).toMatch(/^\d+$/)
-              expect(yield* waitForFile(settled)).toBe("settled")
+              mark("readiness wait")
+              const pid = yield* waitForFile(ready)
+              setPid(pid)
+              mark("readiness assertion")
+              expect(pid).toMatch(/^\d+$/)
+              mark("settled wait")
+              const result = yield* waitForFile(settled)
+              observeSettled()
+              mark("settled assertion")
+              expect(result).toBe("settled")
+              mark("use complete")
             })
           },
-          (directory) => Effect.promise(() => fs.rm(directory, { recursive: true, force: true })),
+          ({ directory, beginCleanup, finishCleanup }, exit) =>
+            Effect.promise(async () => {
+              const success = Exit.isSuccess(exit)
+              beginCleanup(success)
+              await fs.rm(directory, { recursive: true, force: true })
+              finishCleanup(success)
+            }),
         ),
         5_000,
       )
@@ -252,36 +330,34 @@ describe("AppProcess", () => {
       it.live(
         "fiber interruption cleans up the scoped child process after readiness",
         Effect.acquireUseRelease(
-          Effect.promise(() => fs.mkdtemp(path.join(tmpdir(), "opencode-process-interrupt-"))),
-          (directory) => {
-            const ready = path.join(directory, "ready")
-            const settled = path.join(directory, "settled")
+          diagnosticDirectory("opencode-process-interrupt-"),
+          ({ ready, settled, mark, setPid, observeSettled }) => {
             const script = `const fs=require('fs');fs.writeFileSync(${JSON.stringify(ready)},String(process.pid));process.on('SIGTERM',()=>{fs.writeFileSync(${JSON.stringify(settled)},'settled');process.exit(0)});setInterval(()=>{},60000)`
             return Effect.gen(function* () {
-              // Both waits below are unbounded, so a host timeout looks the same whichever one stalls.
-              // Record the stage and print it only when the test did not finish, so a pass stays silent.
-              const started = Date.now()
-              let stage = "starting the child"
-              let pid = "unknown"
-              onTestFinished(() => {
-                if (stage === "done") return
-                console.error(
-                  `[process-interrupt] stopped while ${stage} (child pid ${pid}, ${Date.now() - started}ms after start)`,
-                )
-              })
               const svc = yield* AppProcess.Service
               const fiber = yield* svc.run(cmd("-e", script)).pipe(Effect.forkChild)
-              stage = "waiting for the ready file"
-              pid = yield* waitForFile(ready)
+              mark("readiness wait")
+              const pid = yield* waitForFile(ready)
+              setPid(pid)
+              mark("readiness assertion")
               expect(pid).toMatch(/^\d+$/)
-              stage = "interrupting and joining the run fiber"
+              mark("interrupt")
               yield* Fiber.interrupt(fiber)
-              stage = "waiting for the settled file"
-              expect(yield* waitForFile(settled)).toBe("settled")
-              stage = "done"
+              mark("settled wait")
+              const result = yield* waitForFile(settled)
+              observeSettled()
+              mark("settled assertion")
+              expect(result).toBe("settled")
+              mark("use complete")
             })
           },
-          (directory) => Effect.promise(() => fs.rm(directory, { recursive: true, force: true })),
+          ({ directory, beginCleanup, finishCleanup }, exit) =>
+            Effect.promise(async () => {
+              const success = Exit.isSuccess(exit)
+              beginCleanup(success)
+              await fs.rm(directory, { recursive: true, force: true })
+              finishCleanup(success)
+            }),
         ),
         5_000,
       )
