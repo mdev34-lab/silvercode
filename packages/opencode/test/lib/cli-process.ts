@@ -48,6 +48,7 @@ function bunArgv(args: string[], opts?: SpawnOpts) {
   return [
     "run",
     ...(activeClockScale(opts) ? ["--preload", clockScalePreload] : []),
+    ...(opts?.preload ? ["--preload", opts.preload] : []),
     "--conditions=browser",
     cliEntry,
     ...args,
@@ -108,6 +109,8 @@ export type RunResult = {
   readonly exitCode: number
   readonly stdout: string
   readonly stderr: string
+  readonly stdoutTruncated?: boolean
+  readonly stderrTruncated?: boolean
   readonly durationMs: number
 }
 
@@ -119,6 +122,8 @@ export type RunHandle = {
 export type SpawnOpts = {
   readonly timeoutMs?: number
   readonly env?: Record<string, string>
+  // Optional test-only Bun preload for controlled subprocess fixtures.
+  readonly preload?: string
   // Run the spawned CLI child on an accelerated clock: the child observes
   // time `clockScale` times faster than wall time (Date.now + timers scaled
   // together, see clock-scale.preload.ts). Long provider retry waits then
@@ -226,6 +231,7 @@ export type CliFixture = {
 // the surrounding Scope.
 export function withCliFixture<A, E>(
   fn: (input: CliFixture) => Effect.Effect<A, E, Scope.Scope | HttpClient.HttpClient>,
+  options?: { readonly processRun?: AppProcess.Interface["run"] },
 ): Effect.Effect<A, E | unknown, Scope.Scope> {
   return Effect.gen(function* () {
     const llm = yield* TestLLMServer
@@ -266,15 +272,15 @@ export function withCliFixture<A, E>(
       // Catch AppProcessError (timeout OR spawn failure) and synthesize a
       // non-zero result so the test sees it via the usual `expectExit`
       // path rather than as an unhandled Effect failure.
-      const result = yield* appProc.run(command, { timeout: Duration.millis(timeoutMs) }).pipe(
+      const result = yield* (options?.processRun ?? appProc.run)(command, { timeout: Duration.millis(timeoutMs) }).pipe(
         Effect.catchTag("AppProcessError", (err) =>
           Effect.succeed({
             command: err.command,
             exitCode: err.exitCode ?? -1,
-            stdout: Buffer.alloc(0),
-            stderr: Buffer.from((err.stderr ?? String(err.cause ?? err.message)) + "\n"),
-            stdoutTruncated: false,
-            stderrTruncated: false,
+            stdout: err.partialStdout === undefined ? Buffer.alloc(0) : Buffer.from(err.partialStdout),
+            stderr: Buffer.from(errorStderr(err) + "\n"),
+            stdoutTruncated: err.partialStdoutTruncated ?? false,
+            stderrTruncated: err.partialStderrTruncated ?? false,
           } satisfies AppProcess.RunResult),
         ),
       )
@@ -282,6 +288,8 @@ export function withCliFixture<A, E>(
         exitCode: result.exitCode,
         stdout: normalizeLines(result.stdout.toString()),
         stderr: normalizeLines(result.stderr.toString()),
+        stdoutTruncated: result.stdoutTruncated,
+        stderrTruncated: result.stderrTruncated,
         durationMs: Date.now() - start,
       }
     })
@@ -528,6 +536,17 @@ function parseJsonEvents(stdout: string): Array<Record<string, unknown>> {
 
 function normalizeLines(value: string) {
   return value.replaceAll("\r\n", "\n")
+}
+
+// Builds the stderr text for a failed spawn, keeping the failure reason
+// visible after any partial stderr retained by a timed-out run: `expectExit`
+// dumps the tail of stderr, so the reason goes last and survives that
+// truncation. With no retained partial stderr this is exactly the previous
+// composition.
+function errorStderr(err: AppProcess.AppProcessError): string {
+  const reason = err.stderr ?? String(err.cause ?? err.message)
+  if (err.partialStderr === undefined) return reason
+  return err.partialStderr + (err.partialStderr.endsWith("\n") ? "" : "\n") + reason
 }
 
 // Convenience for the common assertion pattern. Dumps stderr/stdout when
