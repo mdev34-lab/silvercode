@@ -62,12 +62,20 @@ async function mountReceipt(options: { runMismatch?: boolean; duplicateReceipt?:
     ? [{ info: hidden, parts: [{ ...launchPart, id: "hidden_duplicate", messageID: hidden.id }] }, ...filler, ...visible]
     : visible
   let historyFetches = 0
+  // The route hydrates a session on mount and asks for the complete timeline.
+  // Answer that one with the live window so this fixture keeps modelling a
+  // store that lacks older rows; everything after it is the review's own
+  // full-history read, which is what these cases exercise.
+  let hydrated = false
   const { app, events, requests, sync } = await mountSessionRoute({ width: 120, height: 45, sessions: [sessionInfo(id), sessionInfo(child, { parentID: id, agent: options.childAgent ?? "review" })], messages: {
     [id]: visible,
     [child]: [{ info: childMessage, parts: [] }],
   }, respond: (request) => {
     if (request.method !== "GET" || request.pathname !== `/session/${id}/message`) return undefined
-    if (new URLSearchParams(request.search).has("limit")) return options.outsideWindow ? json(persisted.slice(-100)) : undefined
+    if (!hydrated) {
+      hydrated = true
+      return json(visible)
+    }
     if (options.fetchFailure) return json({ message: "history unavailable" }, { status: 500 })
     historyFetches++
     return options.historyResponse?.(persisted, historyFetches) ?? json(persisted)

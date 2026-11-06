@@ -59,6 +59,20 @@ function compareMessage(a: Message, b: Message) {
 
 const messageKey = (message: Message) => message.time.created + message.id
 
+// Bounded mount (#815 review): the transcript opens with the newest page and
+// older pages arrive on demand through the endpoint's `before` cursor. This is
+// the mount/render budget, not a display cap — every persisted message stays
+// reachable and the transcript reads pages directly instead of the store.
+const PAGE_SIZE = 100
+
+type Tracker = { messages: Set<string>; parts: Set<string> }
+// One older page: how many rows it added, and the cursor to the page before it.
+// `added` is progress, not exhaustion — a page can add nothing (its rows are
+// already loaded, or were removed live) while `cursor` still points at older
+// history.
+type OlderPage = { added: number; cursor?: string }
+type MessageWithParts = { info: Message; parts: Part[] }
+
 export const {
   context: SyncContext,
   use: useSync,
@@ -155,13 +169,68 @@ export const {
 
     const fullSyncedSessions = new Set<string>()
     const syncingSessions = new Map<string, Promise<void>>()
-    const hydratingSessions = new Map<string, { messages: Set<string>; parts: Set<string> }>()
+    // Per session: why the last mount read failed. `sync()` stays quiet on a
+    // messages failure (#26560), so this is how the route tells the user the
+    // timeline is empty for a reason; cleared by the read that succeeds.
+    const syncFailures = new Map<string, unknown>()
+    // Per session: the `x-next-cursor` of the oldest row loaded so far. Present
+    // means older persisted rows exist and can be fetched with `before`.
+    const olderCursors = new Map<string, string | undefined>()
+    const loadingOlder = new Map<string, Promise<OlderPage>>()
+    // Every in-flight read of a session's messages registers a tracker here, so
+    // live events that land while the request is open can tell the merge which
+    // rows and parts moved underneath it (hydration, older pages and transcript
+    // reads share the same protection).
+    const trackedRequests = new Map<string, Set<Tracker>>()
+    const track = (sessionID: string) => {
+      const tracker: Tracker = { messages: new Set<string>(), parts: new Set<string>() }
+      const active = trackedRequests.get(sessionID) ?? new Set<Tracker>()
+      active.add(tracker)
+      trackedRequests.set(sessionID, active)
+      return {
+        tracker,
+        release: () => {
+          active.delete(tracker)
+          if (active.size === 0) trackedRequests.delete(sessionID)
+        },
+      }
+    }
     const touchMessage = (sessionID: string, messageID: string) => {
-      hydratingSessions.get(sessionID)?.messages.add(messageID)
+      for (const tracker of trackedRequests.get(sessionID) ?? []) tracker.messages.add(messageID)
     }
     const touchPart = (sessionID: string, partID: string) => {
-      hydratingSessions.get(sessionID)?.parts.add(partID)
+      for (const tracker of trackedRequests.get(sessionID) ?? []) tracker.parts.add(partID)
     }
+    // Merges one persisted page with what the store already holds, for reads
+    // that run while live events can still land:
+    // - a message or part removed while the request was open stays removed;
+    // - a part the live stream touched wins as-is, including a type change,
+    //   because the live projection is the newest version of that part;
+    // - a persisted text/reasoning part only fills content the live copy does
+    //   not have yet (streamed text is never rolled back).
+    const mergePage = (sessionID: string, persisted: MessageWithParts[], tracker: Tracker) => {
+      const current = store.message[sessionID] ?? []
+      return persisted.flatMap((entry) => {
+        const liveInfo = current.find((info) => info.id === entry.info.id)
+        if (tracker.messages.has(entry.info.id) && !liveInfo) return []
+        const live = store.part[entry.info.id] ?? []
+        const parts = entry.parts.flatMap((part) => {
+          const livePart = live.find((item) => item.id === part.id)
+          if (tracker.parts.has(part.id)) return livePart ? [livePart] : []
+          if (!livePart || livePart.type !== part.type) return [part]
+          if (part.type === "text" || part.type === "reasoning") return [mergePartText(livePart, part)]
+          return [livePart]
+        })
+        return [
+          {
+            info: liveInfo ?? entry.info,
+            parts: [...parts, ...live.filter((part) => !parts.some((item) => item.id === part.id))],
+          },
+        ]
+      })
+    }
+    const newest = (rows: MessageWithParts[]) =>
+      rows.reduce<MessageWithParts | undefined>((last, row) => (!last || compareMessage(row.info, last.info) > 0 ? row : last), undefined)
 
     function sessionListQuery(): { scope?: "project"; path?: string } {
       if (!kv.get("session_directory_filter_enabled", true)) return { scope: "project" }
@@ -350,25 +419,6 @@ export const {
               draft.splice(result.index, 0, event.properties.info)
             }),
           )
-          const updated = store.message[event.properties.info.sessionID]
-          if (updated.length > 100) {
-            const oldest = updated[0]
-            batch(() => {
-              setStore(
-                "message",
-                event.properties.info.sessionID,
-                produce((draft) => {
-                  draft.shift()
-                }),
-              )
-              setStore(
-                "part",
-                produce((draft) => {
-                  delete draft[oldest.id]
-                }),
-              )
-            })
-          }
           break
         }
         case "message.removed": {
@@ -608,15 +658,37 @@ export const {
           if (fullSyncedSessions.has(sessionID)) return
           const syncing = syncingSessions.get(sessionID)
           if (syncing) return syncing
-          const tracker = { messages: new Set<string>(), parts: new Set<string>() }
-          hydratingSessions.set(sessionID, tracker)
+          const tracking = track(sessionID)
+          const tracker = tracking.tracker
           const task = (async () => {
-            const [session, messages, todo, diff] = await Promise.all([
+            const [session, todo, diff] = await Promise.all([
               sdk.client.session.get({ sessionID }, { throwOnError: true }),
-              sdk.client.session.messages({ sessionID, limit: 100 }),
               sdk.client.session.todo({ sessionID }),
               sdk.client.session.diff({ sessionID }),
             ])
+            // Bounded mount: the newest page only. `x-next-cursor` on the
+            // response says whether older rows exist, and is what `more()`
+            // passes back as `before` — the timeline is never truncated, it is
+            // paginated (#815).
+            //
+            // A failed read must not look like "this session has no history":
+            // sync stays quiet for #26560, but the session is left unsynced so
+            // the next `sync()` retries instead of marking an empty timeline as
+            // complete, and the failure is kept for the route to report
+            // (`syncError`).
+            let failure: unknown
+            const messages = await sdk.client.session
+              .messages({ sessionID, limit: PAGE_SIZE }, { throwOnError: true })
+              .catch((error: unknown) => {
+                failure = error ?? new Error("messages request failed")
+                return undefined
+              })
+            if (!messages) {
+              syncFailures.set(sessionID, failure)
+              return
+            }
+            syncFailures.delete(sessionID)
+            olderCursors.set(sessionID, messages.response.headers.get("x-next-cursor") ?? undefined)
             setStore(
               produce((draft) => {
                 const match = search(draft.session, sessionID, (s) => s.id)
@@ -635,11 +707,12 @@ export const {
                   ),
                 )
                 infos.sort(compareMessage)
-                const removed = infos.slice(0, -100)
-                const visible = infos.slice(-100)
-                const visibleIDs = new Set(visible.map((message) => message.id))
+                const hydrated = new Set(infos.map((info) => info.id))
                 for (const message of messages.data ?? []) {
-                  if (!visibleIDs.has(message.info.id)) {
+                  // A message a live removal took out while hydration was in
+                  // flight must not have its parts resurrected by the stale
+                  // snapshot.
+                  if (tracker.messages.has(message.info.id) && !hydrated.has(message.info.id)) {
                     delete draft.part[message.info.id]
                     continue
                   }
@@ -659,18 +732,103 @@ export const {
                   )
                   draft.part[message.info.id] = parts
                 }
-                for (const message of removed) delete draft.part[message.id]
-                draft.message[sessionID] = visible
+                draft.message[sessionID] = infos
                 draft.session_diff[sessionID] = diff.data ?? []
               }),
             )
             fullSyncedSessions.add(sessionID)
           })().finally(() => {
             syncingSessions.delete(sessionID)
-            hydratingSessions.delete(sessionID)
+            tracking.release()
           })
           syncingSessions.set(sessionID, task)
           return task
+        },
+        // One older page of persisted history, prepended to the store. Reports
+        // how many messages it added and the cursor to the page before it, so a
+        // caller can tell progress from exhaustion: an empty `cursor` is the
+        // start of the timeline, while `added === 0` with a cursor means this
+        // page only carried rows the store already had (or rows removed live).
+        async more(sessionID: string): Promise<OlderPage> {
+          const pending = loadingOlder.get(sessionID)
+          if (pending) return pending
+          const cursor = olderCursors.get(sessionID)
+          if (!cursor) return { added: 0 }
+          const tracking = track(sessionID)
+          const task = (async () => {
+            const page = await sdk.client.session.messages(
+              { sessionID, limit: PAGE_SIZE, before: cursor },
+              { throwOnError: true },
+            )
+            // The oldest loaded timestamp can move while this request is open
+            // (live appends, removals); merge against the store as it is now.
+            const rows = mergePage(sessionID, page.data ?? [], tracking.tracker)
+            const known = new Set((store.message[sessionID] ?? []).map((info) => info.id))
+            const added = rows.filter((entry) => !known.has(entry.info.id))
+            const next = page.response.headers.get("x-next-cursor") ?? undefined
+            olderCursors.set(sessionID, next)
+            if (added.length === 0) return { added: 0, cursor: next }
+            setStore(
+              produce((draft) => {
+                draft.message[sessionID] = [
+                  ...added.map((entry) => entry.info),
+                  ...(draft.message[sessionID] ?? []),
+                ].sort(compareMessage)
+                for (const entry of added) draft.part[entry.info.id] = entry.parts
+              }),
+            )
+            return { added: added.length, cursor: next }
+          })().finally(() => {
+            loadingOlder.delete(sessionID)
+            tracking.release()
+          })
+          loadingOlder.set(sessionID, task)
+          return task
+        },
+        // The error of the last `sync()` whose messages read failed, until a
+        // later read succeeds. `undefined` when the session's mount read is
+        // fine (or never ran).
+        syncError(sessionID: string): unknown {
+          return syncFailures.get(sessionID)
+        },
+        // Whether the server said older persisted rows exist beyond what the
+        // store holds right now.
+        hasOlder(sessionID: string) {
+          return olderCursors.get(sessionID) !== undefined
+        },
+        // One page of the complete persisted timeline, newest page first, with
+        // `before` walking older. Copy and export assemble the transcript from
+        // these pages, so they read every persisted message without loading it
+        // into the render store and never inherit the mount window (#815).
+        async historyPage(sessionID: string, before?: string) {
+          const tracking = track(sessionID)
+          try {
+            // `throwOnError` keeps a 500 or a transport failure from arriving
+            // as an empty body: the caller must fail the transcript instead of
+            // exporting whatever the cache happens to hold.
+            const page = await sdk.client.session.messages(
+              { sessionID, limit: PAGE_SIZE, ...(before ? { before } : {}) },
+              { throwOnError: true },
+            )
+            const rows = mergePage(sessionID, page.data ?? [], tracking.tracker)
+            // A prompt sent while the request was open is not projected yet and
+            // only exists in the store. The newest page is missing every row
+            // newer than its newest row; when the server has nothing persisted
+            // at all (a session whose only message is that prompt) it is missing
+            // the whole store.
+            const last = newest(rows)
+            const pending = before
+              ? []
+              : (store.message[sessionID] ?? [])
+                  .filter((info) => !last || compareMessage(info, last.info) > 0)
+                  .map((info) => ({ info, parts: store.part[info.id] ?? [] }))
+            return {
+              rows: [...rows, ...pending].sort((a, b) => compareMessage(a.info, b.info)),
+              cursor: page.response.headers.get("x-next-cursor") ?? undefined,
+            }
+          } finally {
+            tracking.release()
+          }
         },
       },
       bootstrap,
