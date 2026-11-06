@@ -169,6 +169,10 @@ export const {
 
     const fullSyncedSessions = new Set<string>()
     const syncingSessions = new Map<string, Promise<void>>()
+    // Per session: why the last mount read failed. `sync()` stays quiet on a
+    // messages failure (#26560), so this is how the route tells the user the
+    // timeline is empty for a reason; cleared by the read that succeeds.
+    const syncFailures = new Map<string, unknown>()
     // Per session: the `x-next-cursor` of the oldest row loaded so far. Present
     // means older persisted rows exist and can be fetched with `before`.
     const olderCursors = new Map<string, string | undefined>()
@@ -670,12 +674,20 @@ export const {
             // A failed read must not look like "this session has no history":
             // sync stays quiet for #26560, but the session is left unsynced so
             // the next `sync()` retries instead of marking an empty timeline as
-            // complete (the same outcome the pre-#815 hydration had, carried
-            // over to the paged read).
+            // complete, and the failure is kept for the route to report
+            // (`syncError`).
+            let failure: unknown
             const messages = await sdk.client.session
               .messages({ sessionID, limit: PAGE_SIZE }, { throwOnError: true })
-              .catch(() => undefined)
-            if (!messages) return
+              .catch((error: unknown) => {
+                failure = error ?? new Error("messages request failed")
+                return undefined
+              })
+            if (!messages) {
+              syncFailures.set(sessionID, failure)
+              return
+            }
+            syncFailures.delete(sessionID)
             olderCursors.set(sessionID, messages.response.headers.get("x-next-cursor") ?? undefined)
             setStore(
               produce((draft) => {
@@ -772,6 +784,12 @@ export const {
           })
           loadingOlder.set(sessionID, task)
           return task
+        },
+        // The error of the last `sync()` whose messages read failed, until a
+        // later read succeeds. `undefined` when the session's mount read is
+        // fine (or never ran).
+        syncError(sessionID: string): unknown {
+          return syncFailures.get(sessionID)
         },
         // Whether the server said older persisted rows exist beyond what the
         // store holds right now.

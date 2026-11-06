@@ -396,7 +396,19 @@ export function Session() {
       }
       editor.reconnect(result.data.directory)
       await sync.session.sync(sessionID)
-      if (route.sessionID === sessionID && scroll) scroll.scrollBy(100_000)
+      if (route.sessionID !== sessionID) return
+      // The mount read failed quietly (`sync()` resolves on a messages error,
+      // #26560). Say so instead of leaving an empty timeline without a reason;
+      // nothing was marked complete, so the next visit retries the read (#815).
+      const failure = sync.session.syncError(sessionID)
+      if (failure !== undefined) {
+        toast.show({
+          message: `Failed to load messages: ${errorMessage(failure)}`,
+          variant: "error",
+          duration: 5000,
+        })
+      }
+      if (scroll) scroll.scrollBy(100_000)
     })().catch((error) => {
       if (route.sessionID !== sessionID) return
       toast.show({

@@ -386,6 +386,71 @@ describe("bounded mount and on-demand older history (#815)", () => {
     await painted(app, `${MARKER}001`)
   })
 
+  for (const [name, fail] of Object.entries({
+    "server error": () => json({ message: "unavailable" }, { status: 500 }),
+    "network error": (): Response => {
+      throw new Error("socket closed")
+    },
+  })) {
+    test(`a ${name} on the mount read is reported and the next visit loads the history`, async () => {
+      // The mounted route, not the store alone: the user who opens a session
+      // whose read failed must see why the timeline is empty, and coming back
+      // to the session must load it (the read is retried because nothing was
+      // marked complete) without a stale error.
+      const messages = timeline(150)
+      const other = sessionInfo("ses_zzzz_other", { title: "Other session" })
+      const otherInfo = userMessage("msg_other", other.id, {})
+      let broken = true
+      let reads = 0
+      const { app, sync, keymap, navigate } = await mountSessionRoute({
+        width: 120,
+        height: 40,
+        sessions: [SESSION, other],
+        messages: {
+          [SESSION.id]: messages,
+          [other.id]: [{ info: otherInfo, parts: [textPart("prt_other", otherInfo, "OTHER-SESSION")] }],
+        },
+        respond: (request) => {
+          if (request.method !== "GET" || request.pathname !== `/session/${SESSION.id}/message`) return undefined
+          reads++
+          if (!broken) return undefined
+          return fail()
+        },
+      })
+
+      // Visible failure on the route, with an empty timeline that is not
+      // recorded as this session's complete history.
+      await painted(app, "Failed to load messages")
+      await settle(app)
+      expect(reads).toBe(1)
+      expect(sync.data.message[SESSION.id]?.length ?? 0).toBe(0)
+      expect(sync.session.hasOlder(SESSION.id)).toBe(false)
+      expect(app.captureCharFrame()).not.toContain(MARKER)
+
+      // Existing recovery path: leave and come back. The route re-syncs the
+      // session, the read is retried, and the newest page paints.
+      broken = false
+      navigate(other.id)
+      await painted(app, "OTHER-SESSION")
+      navigate(SESSION.id)
+      await waitFor(app, () => (sync.data.message[SESSION.id]?.length === PAGE ? true : undefined))
+      await painted(app, `${MARKER}150`)
+      expect(reads).toBe(2)
+      expect(sync.session.hasOlder(SESSION.id)).toBe(true)
+      // The successful read cleared the failure and the revisit reported no
+      // new one; the first visit's toast only ages out on its own timer, so
+      // the frame holds at most that one.
+      expect(sync.session.syncError(SESSION.id)).toBeUndefined()
+      expect(occurrences(app.captureCharFrame(), "Failed to load messages")).toBeLessThanOrEqual(1)
+
+      // And the recovered session still reaches its real oldest message.
+      keymap().dispatchCommand("session.first")
+      await waitFor(app, () => (sync.session.hasOlder(SESSION.id) === false ? true : undefined))
+      expect(sync.data.message[SESSION.id]?.length).toBe(150)
+      await painted(app, `${MARKER}001`)
+    })
+  }
+
   test("wheel scrolling into the top loads the next page", async () => {
     // A wheel-only walk of a 100-message window does not fit this suite's
     // default per-test budget (measured: over five seconds of wheel steps), so
