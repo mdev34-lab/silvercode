@@ -272,31 +272,150 @@ describe("bounded mount and on-demand older history (#815)", () => {
 
   test("paging keeps its place when a persisted row disappears", async () => {
     const messages = timeline(250)
+    const { app, sync, keymap, pages } = await mountSessionRoute({
+      width: 120,
+      height: 40,
+      sessions: [SESSION],
+      messages: { [SESSION.id]: messages },
+      // The stable id cursor the server returns. The offset cursor below moves
+      // when the timeline loses a row and re-delivers one the reader has.
+      cursor: "id",
+    })
+    await waitFor(app, () => (sync.data.message[SESSION.id]?.length === PAGE ? true : undefined))
+
+    // A row *older than the page boundary* disappears before the older pages
+    // are read. An offset cursor (the reader's position counted in rows) then
+    // slides: the next page starts one row too late and repeats a message.
+    messages.splice(9, 1)
+
+    keymap().dispatchCommand("session.first")
+    await waitFor(app, () => (sync.session.hasOlder(SESSION.id) === false ? true : undefined))
+
+    // No page may serve a message twice...
+    const served = pages.flatMap((page) => page.ids)
+    expect(served.length).toBeGreaterThan(PAGE)
+    expect(new Set(served).size).toBe(served.length)
+
+    // ...and every persisted row is still reachable, oldest first.
+    const ids = sync.data.message[SESSION.id]?.map((info) => info.id) ?? []
+    expect(ids.length).toBe(249)
+    expect(new Set(ids).size).toBe(249)
+    expect(ids[0]).toBe("msg_001")
+    expect(ids).not.toContain("msg_010")
+    expect(ids).toContain("msg_009")
+    expect(ids).toContain("msg_011")
+    expect(ids).toContain("msg_052")
+  })
+
+  for (const [name, fail] of Object.entries({
+    "server error": () => json({ message: "unavailable" }, { status: 500 }),
+    "network error": (): Response => {
+      throw new Error("socket closed")
+    },
+  })) {
+    test(`first message reports a ${name} on an older page and retries to the oldest`, async () => {
+      const messages = timeline(150)
+      let hydrated = false
+      let broken = true
+      const { app, sync, keymap } = await mountSessionRoute({
+        width: 120,
+        height: 40,
+        sessions: [SESSION],
+        messages: { [SESSION.id]: messages },
+        respond: (request) => {
+          if (request.method !== "GET" || request.pathname !== `/session/${SESSION.id}/message`) return undefined
+          if (!hydrated) {
+            hydrated = true
+            return undefined
+          }
+          if (!broken) return undefined
+          return fail()
+        },
+      })
+      await waitFor(app, () => (sync.data.message[SESSION.id]?.length === PAGE ? true : undefined))
+
+      keymap().dispatchCommand("session.first")
+
+      // The failure is reported, and the reader is not dropped at the oldest
+      // *loaded* message as if it were the first one.
+      await painted(app, "Failed to load older messages")
+      await settle(app)
+      expect(sync.data.message[SESSION.id]?.length).toBe(PAGE)
+      expect(sync.session.hasOlder(SESSION.id)).toBe(true)
+      expect(app.captureCharFrame()).not.toContain(`${MARKER}001`)
+
+      // The cursor was not consumed by the failure, so the next attempt retries
+      // the same page and reaches the real oldest message.
+      broken = false
+      keymap().dispatchCommand("session.first")
+      await waitFor(app, () => (sync.data.message[SESSION.id]?.length === 150 ? true : undefined))
+      await waitFor(app, () => (sync.session.hasOlder(SESSION.id) === false ? true : undefined))
+      await painted(app, `${MARKER}001`)
+    })
+  }
+
+  test("a failed hydration is retried instead of looking like an empty session", async () => {
+    const messages = timeline(150)
+    let broken = true
     const { app, sync, keymap } = await mountSessionRoute({
       width: 120,
       height: 40,
       sessions: [SESSION],
       messages: { [SESSION.id]: messages },
-      // The stable id cursor the server returns: an index would move under the
-      // deletion below and page over the wrong boundary.
-      cursor: "id",
+      respond: (request) => {
+        if (request.method !== "GET" || request.pathname !== `/session/${SESSION.id}/message`) return undefined
+        if (!broken) return undefined
+        return json({ message: "unavailable" }, { status: 500 })
+      },
     })
-    await waitFor(app, () => (sync.data.message[SESSION.id]?.length === PAGE ? true : undefined))
+    await settle(app)
 
-    // A row inside the loaded window is deleted between the mount and the walk
-    // older. With an offset cursor the boundary would shift and skip a message.
-    messages.splice(160, 1)
+    // The mount's read failed: sync must stay quiet (#26560) and must not record
+    // an empty timeline as this session's complete history.
+    expect(sync.data.message[SESSION.id]?.length ?? 0).toBe(0)
+    expect(sync.session.hasOlder(SESSION.id)).toBe(false)
+
+    broken = false
+    await sync.session.sync(SESSION.id)
+    await waitFor(app, () => (sync.data.message[SESSION.id]?.length === PAGE ? true : undefined))
+    expect(sync.session.hasOlder(SESSION.id)).toBe(true)
 
     keymap().dispatchCommand("session.first")
     await waitFor(app, () => (sync.session.hasOlder(SESSION.id) === false ? true : undefined))
+    expect(sync.data.message[SESSION.id]?.length).toBe(150)
+    await painted(app, `${MARKER}001`)
+  })
 
-    const ids = sync.data.message[SESSION.id]?.map((info) => info.id) ?? []
-    expect(ids.length).toBe(250)
-    expect(new Set(ids).size).toBe(250)
-    expect(ids[0]).toBe("msg_001")
-    // The deleted row's neighbours are all still there: no page was skipped.
-    expect(ids).toContain("msg_160")
-    expect(ids).toContain("msg_162")
+  test("wheel scrolling into the top loads the next page", async () => {
+    // A wheel-only walk of a 100-message window does not fit this suite's
+    // default per-test budget (measured: over five seconds of wheel steps), so
+    // the multi-page test walks with the scroll window and this one keeps the
+    // wheel path honest: the wheel moves the transcript and, crossing into the
+    // prefetch zone, is what loads the page.
+    const messages = timeline(150)
+    const { app, sync } = await mountSessionRoute({
+      width: 120,
+      height: 40,
+      sessions: [SESSION],
+      messages: { [SESSION.id]: messages },
+    })
+    await waitFor(app, () => (sync.data.message[SESSION.id]?.length === PAGE ? true : undefined))
+
+    const box = scrollBoxOf(app)
+    const parked = box.scrollTop
+    await wheel(app, 1)
+    expect(box.scrollTop).toBeLessThan(parked)
+
+    // Park just outside the one-viewport prefetch zone, then let the wheel
+    // cross into it.
+    box.scrollTo(box.viewport.height + 4)
+    await settle(app)
+    expect(sync.data.message[SESSION.id]?.length).toBe(PAGE)
+
+    await wheel(app, 3)
+    await waitFor(app, () => (sync.data.message[SESSION.id]?.length === 150 ? true : undefined))
+    expect(sync.session.hasOlder(SESSION.id)).toBe(false)
+    expect(sync.data.message[SESSION.id]?.[0]?.id).toBe("msg_001")
   })
 
   test("copy and export keep a prompt the server has not persisted yet", async () => {

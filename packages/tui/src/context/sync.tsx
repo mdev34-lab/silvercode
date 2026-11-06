@@ -657,19 +657,26 @@ export const {
           const tracking = track(sessionID)
           const tracker = tracking.tracker
           const task = (async () => {
-            const [session, messages, todo, diff] = await Promise.all([
+            const [session, todo, diff] = await Promise.all([
               sdk.client.session.get({ sessionID }, { throwOnError: true }),
-              // Bounded mount: the newest page only. `x-next-cursor` on the
-              // response says whether older rows exist, and is what `more()`
-              // passes back as `before` — the timeline is never truncated, it is
-              // paginated (#815).
-              sdk.client.session.messages({ sessionID, limit: PAGE_SIZE }),
               sdk.client.session.todo({ sessionID }),
               sdk.client.session.diff({ sessionID }),
             ])
-            // A failed hydration leaves `response` undefined; it also means
-            // there is no cursor to walk (the #26560 path: sync must not crash).
-            olderCursors.set(sessionID, messages.response?.headers.get("x-next-cursor") ?? undefined)
+            // Bounded mount: the newest page only. `x-next-cursor` on the
+            // response says whether older rows exist, and is what `more()`
+            // passes back as `before` — the timeline is never truncated, it is
+            // paginated (#815).
+            //
+            // A failed read must not look like "this session has no history":
+            // sync stays quiet for #26560, but the session is left unsynced so
+            // the next `sync()` retries instead of marking an empty timeline as
+            // complete (the same outcome the pre-#815 hydration had, carried
+            // over to the paged read).
+            const messages = await sdk.client.session
+              .messages({ sessionID, limit: PAGE_SIZE }, { throwOnError: true })
+              .catch(() => undefined)
+            if (!messages) return
+            olderCursors.set(sessionID, messages.response.headers.get("x-next-cursor") ?? undefined)
             setStore(
               produce((draft) => {
                 const match = search(draft.session, sessionID, (s) => s.id)

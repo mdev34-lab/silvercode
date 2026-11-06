@@ -193,6 +193,10 @@ export async function disposeSessionRoutes() {
 
 export async function mountSessionRoute(options: MountOptions) {
   const tmp = await tmpdir()
+  // Every paged read this mount served, oldest row last. Tests use it to assert
+  // that no page re-delivers a message the reader already has, which is what a
+  // stable cursor buys and an offset cursor loses under deletion.
+  const pages: { before: string | null; ids: string[] }[] = []
   await Bun.write(`${tmp.path}/kv.json`, JSON.stringify(options.kv ?? {}))
 
   const routed = options.sessions[0]
@@ -229,11 +233,15 @@ export async function mountSessionRoute(options: MountOptions) {
         const end = found < 0 ? rows.length : found
         const start = Math.max(0, end - Number(limit))
         const next = start > 0 ? rows[start]?.info.id : undefined
-        return json(rows.slice(start, end), next ? { headers: { "x-next-cursor": next } } : undefined)
+        const page = rows.slice(start, end)
+        pages.push({ before, ids: page.map((row) => row.info.id) })
+        return json(page, next ? { headers: { "x-next-cursor": next } } : undefined)
       }
       const end = before ? Number(before) : rows.length
       const start = Math.max(0, end - Number(limit))
-      return json(rows.slice(start, end), start > 0 ? { headers: { "x-next-cursor": String(start) } } : undefined)
+      const page = rows.slice(start, end)
+      pages.push({ before, ids: page.map((row) => row.info.id) })
+      return json(page, start > 0 ? { headers: { "x-next-cursor": String(start) } } : undefined)
     }
     if (/^\/session\/[^/]+\/(todo|diff)$/.test(url.pathname)) return json([])
     if (url.pathname === "/session") return json(options.sessions)
@@ -397,6 +405,7 @@ export async function mountSessionRoute(options: MountOptions) {
     events,
     sync,
     requests: calls.requests,
+    pages,
     keymap: () => keymapRef!,
     // Route changes a test drives while a command is still awaiting input.
     navigate: (sessionID: string) => navigateRef!({ type: "session", sessionID }),

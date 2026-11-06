@@ -463,6 +463,16 @@ export function Session() {
     })
   }
   type OlderPage = Awaited<ReturnType<typeof sync.session.more>>
+  // A failed page must not read as "the timeline ended here": the cursor stays
+  // where it was (the store only advances it on a successful page), so the next
+  // attempt retries the same page. The failure is reported to the reader instead
+  // of being turned into an empty result.
+  let olderFailureShown = false
+  const reportOlderFailure = () => {
+    if (olderFailureShown) return
+    olderFailureShown = true
+    toast.show({ message: "Failed to load older messages", variant: "error" })
+  }
   const loadOlder = (anchor = true): Promise<OlderPage> => {
     // A read that is already running is shared, not skipped: callers waiting in
     // `session.first` must still see the page land, and the reader's scroll
@@ -476,11 +486,13 @@ export function Session() {
       try {
         const page = await sync.session.more(route.sessionID)
         if (page.added > 0 && anchor) restoreAnchor(top, height)
+        olderFailureShown = false
         return page
-      } catch {
-        // A failed older page leaves the loaded window as it is; the next scroll
-        // retries. Nothing is dropped from what is already on screen.
-        return { added: 0 }
+      } catch (error) {
+        // The loaded window is left as it is (nothing on screen is dropped) and
+        // the failure reaches the caller.
+        reportOlderFailure()
+        throw error
       } finally {
         olderInFlight = undefined
       }
@@ -498,7 +510,7 @@ export function Session() {
         setScrolledAway(max > 1 && r.scrollTop < max - 1)
         // Prefetch one viewport ahead of the top so older history is there
         // before the reader reaches a dead end.
-        if (r.scrollTop <= r.viewport.height) void loadOlder()
+        if (r.scrollTop <= r.viewport.height) void loadOlder().catch(() => undefined)
       })
     r.verticalScrollBar.on("change", update)
     onCleanup(() => r.verticalScrollBar.off("change", update))
@@ -998,14 +1010,22 @@ export function Session() {
         // instead of reading as "nothing older".
         void (async () => {
           let cursor: string | undefined
-          for (;;) {
-            if (!sync.session.hasOlder(route.sessionID)) break
-            const page = await loadOlder(false)
-            // A page that adds nothing but moves the cursor is still progress:
-            // its rows were already loaded or were removed live. Only no rows
-            // *and* no cursor movement means the drain cannot get further.
-            if (page.added === 0 && (page.cursor === undefined || page.cursor === cursor)) break
-            cursor = page.cursor
+          try {
+            for (;;) {
+              if (!sync.session.hasOlder(route.sessionID)) break
+              const page = await loadOlder(false)
+              // A page that adds nothing but moves the cursor is still progress:
+              // its rows were already loaded or were removed live. Only no rows
+              // *and* no cursor movement means the drain cannot get further.
+              if (page.added === 0 && (page.cursor === undefined || page.cursor === cursor)) break
+              cursor = page.cursor
+            }
+          } catch {
+            // Older history is still out there and unreachable right now. Leave
+            // the reader where they are rather than jumping to the oldest
+            // *loaded* message as if it were the first one; the retry is another
+            // Home (or a scroll), and the cursor was never advanced past it.
+            return
           }
           // An anchor restore scheduled by the page that was in flight would
           // land after this scroll and pull the reader off the first message;
