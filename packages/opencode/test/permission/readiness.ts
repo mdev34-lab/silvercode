@@ -261,4 +261,4 @@ export const permissionReadiness = {
   makeCohort,
   releaseCohort,
   cohortSize,
-                                                }
+}
