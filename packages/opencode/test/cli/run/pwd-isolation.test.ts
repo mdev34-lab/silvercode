@@ -60,7 +60,16 @@ if (!INNER) {
 
       let child: ReturnType<typeof Bun.spawn> | undefined
       try {
-        child = Bun.spawn(
+        // Capture in a const so Bun.spawn's `const Out`/`const Err` type
+        // params narrow to the "pipe" literal — spawned.stdout/stderr are
+        // then ReadableStream<Uint8Array> (not the
+        // number|ReadableStream|undefined union of the general ReturnType,
+        // which made `new Response(child.stdout)` fail TS2345). child
+        // (general type) is retained for the finally cleanup only; spawned
+        // (narrowed) feeds the real piped streams to Response. No cast: if
+        // the options were not "pipe", tsc would reject the Response call,
+        // surfacing the wrong configuration instead of hiding it.
+        const spawned = Bun.spawn(
           [process.execPath, "test", import.meta.path],
           {
             env: { ...process.env, REGRESSION_INNER: "1", PWD: ambientDir },
@@ -69,10 +78,11 @@ if (!INNER) {
             stderr: "pipe",
           },
         )
+        child = spawned
         const [stdout, stderr, exitCode] = await Promise.all([
-          new Response(child.stdout).text(),
-          new Response(child.stderr).text(),
-          child.exited,
+          new Response(spawned.stdout).text(),
+          new Response(spawned.stderr).text(),
+          spawned.exited,
         ])
 
         // Parse inner diagnostic (printed by inner test before assertions)
@@ -201,16 +211,44 @@ if (!INNER) {
       )
       console.log("INNER_DIAGNOSTIC_END")
 
+      // Canonicalize via real filesystem identity (fs.realpathSync.native).
+      // On Windows, os.tmpdir()/TEMP may yield an 8.3 short name (e.g.
+      // C:\Users\RUNNER~1\AppData\Local\Temp\oc-cli-XXX) while the CLI child
+      // resolves the long name (e.g. C:\Users\runneradmin\... for the SAME
+      // directory). realpathSync.native resolves both to one canonical path
+      // (GetFinalPathNameByHandle on Windows, realpath(2) on POSIX), so a
+      // string mismatch that is the SAME directory does not falsely fail,
+      // while a TRULY different directory stays different. No lowercasing,
+      // string-substitution, equality removal, or platform skip. The
+      // diagnostic JSON above keeps RAW values (so the 8.3/long pair is
+      // visible for debugging); only the assertions below use canonical
+      // identity. If a path does not exist (would indicate a real config
+      // error), fall back to the raw string so the assertion still runs and
+      // surfaces the diff rather than hiding it.
+      const canonical = (p: string | undefined): string | undefined => {
+        if (p === undefined) return undefined
+        try {
+          return fs.realpathSync.native(p)
+        } catch {
+          return p
+        }
+      }
+      const canonicalHome = canonical(home)
+      const canonicalSessionDir = canonical(sessionDir)
+      const canonicalAmbientPwd = canonical(ambientPwd)
+      const canonicalAllDirs = allDirs.map(canonical)
+      const canonicalAllCwds = allCwds.map(canonical)
+
       expect(childResult.exitCode).toBe(0)
       expect(childResult.stdout).toBe("hello from the test llm\n")
       expect(sessionDir).toBeDefined()
-      expect(sessionDir).toBe(home)
-      expect(sessionDir).not.toBe(ambientPwd)
-      for (const d of allDirs) {
-        expect(d).not.toBe(ambientPwd)
+      expect(canonicalSessionDir).toBe(canonicalHome)
+      expect(canonicalSessionDir).not.toBe(canonicalAmbientPwd)
+      for (const d of canonicalAllDirs) {
+        expect(d).not.toBe(canonicalAmbientPwd)
       }
-      for (const c of allCwds) {
-        expect(c).not.toBe(ambientPwd)
+      for (const c of canonicalAllCwds) {
+        expect(c).not.toBe(canonicalAmbientPwd)
       }
     },
     20_000,

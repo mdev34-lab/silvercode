@@ -1,6 +1,8 @@
 import { describe, expect } from "bun:test"
 import { Duration, Effect, Option } from "effect"
 import { writeFile } from "node:fs/promises"
+import { mkdtempSync, rmSync } from "node:fs"
+import os from "node:os"
 import path from "node:path"
 import { cliIt } from "../../lib/cli-process"
 import { reply } from "../../lib/llm-server"
@@ -47,7 +49,33 @@ const SECRET = "APP_MODE=demo_child_perm_marker"
 describe("headless run child permission requests", () => {
   const exec = (extraArgs: string[]) => ({ llm, home, opencode }: any): Effect.Effect<Outcome, unknown, any> =>
     Effect.gen(function* () {
-      const envFile = path.join(home, ".env")
+      // envFile must be EXTERNAL to the session directory (home) so the read
+      // tool raises the external_directory permission (via
+      // assertExternalDirectoryEffect in tool/read.ts) BEFORE the read
+      // permission. Previously envFile was path.join(home, ".env"), which was
+      // external only because the ambient PWD leaked into the child and
+      // session.directory != home. With PWD isolation fixed (cli-process.ts
+      // aligns PWD with cwd), session.directory == home, so home/.env became
+      // INTERNAL and the read raised only the `read` permission (still
+      // auto-rejected, but not as external_directory), breaking the intended
+      // external_directory coverage. Place .env in a dedicated owned sibling
+      // tmpdir OUTSIDE home so the external scenario is genuine and does not
+      // depend on the PWD bug. The .env filename is preserved.
+      //
+      // Acquisition + finalizer registration use Effect.acquireRelease so the
+      // mkdtempSync (acquire) and the release registration are atomic and
+      // uninterruptible (acquireRelease default: non-interruptible acquire) —
+      // there is no window where interruption between a direct mkdtempSync and
+      // a later addFinalizer could leak the sibling dir. The release is a
+      // plain Effect.sync(rmSync) with NO catchall: if rmSync throws, the
+      // error propagates as a Die defect (visible failure), not silently
+      // swallowed. rmSync uses recursive+force so ENOENT (already-gone) is
+      // treated as benign, but real errors (EACCES/EBUSY/etc.) surface.
+      const externalDir = yield* Effect.acquireRelease(
+        Effect.sync(() => mkdtempSync(path.join(os.tmpdir(), "oc-perm-ext-"))),
+        (dir) => Effect.sync(() => rmSync(dir, { recursive: true, force: true })),
+      )
+      const envFile = path.join(externalDir, ".env")
       yield* Effect.promise(() => writeFile(envFile, SECRET + "\n"))
       yield* flow(llm, envFile)
       const config = JSON.stringify({
