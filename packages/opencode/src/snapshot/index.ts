@@ -11,6 +11,18 @@ import { Config } from "@/config/config"
 import { Global } from "@opencode-ai/core/global"
 import { Info } from "@opencode-ai/schema/file-diff"
 
+// DIAGNOSTIC (DO NOT MERGE): inert unless explicitly opted in.
+// Bounded by test/snapshot/snapshot.test.ts beforeAll/afterAll save+restore.
+// Read only inside track(); never emitted in production unless flipped on.
+let __diagnosticTrackPhases = false
+export const __diagnostic = {
+  setTrackPhases(next: boolean): boolean {
+    const prev = __diagnosticTrackPhases
+    __diagnosticTrackPhases = next
+    return prev
+  },
+}
+
 export const Patch = Schema.Struct({
   hash: Schema.String,
   files: Schema.mutable(Schema.Array(Schema.String)),
@@ -319,12 +331,23 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | AppProcess.Service | C
           return yield* locked(
             Effect.gen(function* () {
               if (!(yield* enabled())) return
+              // DIAGNOSTIC (DO NOT MERGE): inert unless opted in via __diagnostic.setTrackPhases(true).
+              // total = wall-clock from after-enabled-check to before-final-logInfo;
+              // excludes enabled check, semaphore wait, final logInfo emit, and this diagnostic emit.
+              const diag = __diagnosticTrackPhases
+              const t0 = diag ? performance.now() : 0
+              let bInit = t0
+              let bConfig = t0
+              let bSeed = t0
+              let bAdd = t0
+              let bWriteTree = t0
               const existed = yield* exists(state.gitdir)
               yield* fs.ensureDir(state.gitdir).pipe(Effect.orDie)
               if (!existed) {
                 yield* git(["init"], {
                   env: { GIT_DIR: state.gitdir, GIT_WORK_TREE: state.worktree },
                 })
+                if (diag) bInit = performance.now()
                 yield* git(["--git-dir", state.gitdir, "config", "core.autocrlf", "false"])
                 yield* git(["--git-dir", state.gitdir, "config", "core.longpaths", "true"])
                 yield* git(["--git-dir", state.gitdir, "config", "core.symlinks", "true"])
@@ -334,12 +357,38 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | AppProcess.Service | C
                 yield* git(["--git-dir", state.gitdir, "config", "index.version", "4"])
                 yield* git(["--git-dir", state.gitdir, "config", "index.threads", "true"])
                 yield* git(["--git-dir", state.gitdir, "config", "core.untrackedCache", "true"])
+                if (diag) bConfig = performance.now()
                 yield* seed()
+                if (diag) bSeed = performance.now()
                 yield* Effect.logInfo("initialized")
+              } else if (diag) {
+                bInit = performance.now()
+                bConfig = bInit
+                bSeed = bInit
               }
               yield* add()
+              if (diag) bAdd = performance.now()
               const result = yield* git(args(["write-tree"]), { cwd: state.directory })
+              if (diag) bWriteTree = performance.now()
               const hash = result.text.trim()
+              if (diag) {
+                try {
+                  const tEnd = performance.now()
+                  console.error(
+                    JSON.stringify({
+                      diag: "snapshot.track",
+                      init: Number((bInit - t0).toFixed(3)),
+                      configBlock: Number((bConfig - bInit).toFixed(3)),
+                      seed: Number((bSeed - bConfig).toFixed(3)),
+                      add: Number((bAdd - bSeed).toFixed(3)),
+                      writeTree: Number((bWriteTree - bAdd).toFixed(3)),
+                      total: Number((tEnd - t0).toFixed(3)),
+                    }),
+                  )
+                } catch {
+                  // Drop telemetry errors; never block tracking log/return below.
+                }
+              }
               yield* Effect.logInfo("tracking", { hash, cwd: state.directory, git: state.gitdir })
               return hash
             }),
