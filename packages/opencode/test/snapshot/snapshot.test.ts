@@ -1,4 +1,4 @@
-import { afterEach, expect } from "bun:test"
+import { afterAll, afterEach, beforeAll, expect } from "bun:test"
 import { $ } from "bun"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
@@ -32,6 +32,17 @@ const MIXED_BATCH_GROUP_COUNT = Math.ceil(OVER_BATCH_COUNT / 4)
 
 afterEach(async () => {
   await disposeAllInstances()
+})
+
+// DIAGNOSTIC (DO NOT MERGE): activate snapshot.track phase telemetry only for
+// this suite; save the prior flag and restore it after the suite so the module
+// default (false) is preserved across the Bun test process's module graph.
+let __priorDiagnosticTrackPhases = false
+beforeAll(() => {
+  __priorDiagnosticTrackPhases = Snapshot.__diagnostic.setTrackPhases(true)
+})
+afterAll(() => {
+  Snapshot.__diagnostic.setTrackPhases(__priorDiagnosticTrackPhases)
 })
 
 const exec = (cwd: string, command: string[]) =>
