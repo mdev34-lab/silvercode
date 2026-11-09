@@ -257,7 +257,8 @@ export function withCliFixture<A, E>(
       // ignore; ChildProcess.make defaults to pipe, so we set it explicitly.
       const command = ChildProcess.make("bun", bunArgv(args, opts), {
         cwd: home,
-        env: { ...env, ...clockScaleEnv(opts), ...opts?.env },
+        // PWD aligned with cwd; opts.env.PWD wins (last spread).
+        env: { ...env, PWD: home, ...clockScaleEnv(opts), ...opts?.env },
         extendEnv: true,
         stdin: "ignore",
       })
@@ -331,7 +332,8 @@ export function withCliFixture<A, E>(
         Effect.sync(() =>
           Bun.spawn(["bun", ...bunArgv(runArgs(message, opts), options)], {
             cwd: home,
-            env: { ...process.env, ...env, ...clockScaleEnv(options), ...options?.env },
+            // PWD aligned with cwd; opts.env.PWD wins (last spread).
+            env: { ...process.env, ...env, PWD: home, ...clockScaleEnv(options), ...options?.env },
             stdin: "ignore",
             stdout: "pipe",
             stderr: "pipe",
@@ -372,7 +374,8 @@ export function withCliFixture<A, E>(
         Effect.sync(() =>
           Bun.spawn(["bun", ...bunArgv(argv, opts)], {
             cwd: home,
-            env: { ...process.env, ...env, ...clockScaleEnv(opts), ...opts?.env },
+            // PWD aligned with cwd; opts.env.PWD wins (last spread).
+            env: { ...process.env, ...env, PWD: home, ...clockScaleEnv(opts), ...opts?.env },
             stdout: "pipe",
             stderr: "pipe",
           }),
@@ -443,7 +446,8 @@ export function withCliFixture<A, E>(
         Effect.sync(() =>
           Bun.spawn(["bun", ...bunArgv(argv, opts)], {
             cwd: opts?.cwd ?? home,
-            env: { ...process.env, ...env, ...clockScaleEnv(opts), ...opts?.env },
+            // PWD resolved absolute (matches Bun.spawn cwd resolution); opts.env.PWD wins.
+            env: { ...process.env, ...env, PWD: path.resolve(opts?.cwd ?? home), ...clockScaleEnv(opts), ...opts?.env },
             stdin: "pipe",
             stdout: "pipe",
             stderr: "pipe",
