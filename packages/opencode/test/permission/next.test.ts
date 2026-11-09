@@ -12,6 +12,7 @@ import { InstanceStore } from "../../src/project/instance-store"
 import { TestInstance, tmpdirScoped } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
 import { MessageID, SessionID } from "../../src/session/schema"
+import { permissionReadiness } from "./readiness"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 
@@ -84,22 +85,16 @@ const rejectAll = (message?: string) =>
     }
   })
 
-const waitForPending = (count: number) =>
-  Effect.gen(function* () {
-    const permission = yield* Permission.Service
-    return yield* Effect.gen(function* () {
-      while (true) {
-        const list = yield* permission.list()
-        if (list.length === count) return list
-        yield* Effect.sleep("10 millis")
-      }
-    }).pipe(
-      Effect.timeoutOrElse({
-        duration: "1 second",
-        orElse: () => Effect.fail(new Error(`timed out waiting for ${count} pending permission request(s)`)),
-      }),
-    )
-  })
+// The guard is the same one second; the wait now observes the publication instead of
+// re-reading the list on a timer, so a late tick cannot spend the guard. An optional
+// `cohort` wires explicit ownership: a wait scoped to a cohort owns the asks registered into
+// it (including ones pre-started before the wait) and fail-fasts on their outcome, while an
+// unrelated prior ask in a different cohort cannot fail it.
+const waitForPending = (
+  count: number,
+  cohort?: Parameters<typeof permissionReadiness.waitForPending>[1],
+  options?: Parameters<typeof permissionReadiness.waitForPending>[2],
+) => permissionReadiness.waitForPending(count, cohort, options)
 
 const fail = <A, E, R>(self: Effect.Effect<A, E, R>) =>
   Effect.gen(function* () {
@@ -108,10 +103,16 @@ const fail = <A, E, R>(self: Effect.Effect<A, E, R>) =>
     throw new Error("expected permission effect to fail")
   })
 
-const ask = (input: Parameters<Permission.Interface["ask"]>[0]) =>
+// Tracked so a wait scoped to the same cohort can fail with the ask's own outcome instead
+// of waiting for a request that ask already settled without publishing. With no cohort the
+// ask is not owned by any wait's fail-fast (it still registers pending via permission.ask).
+const ask = (
+  input: Parameters<Permission.Interface["ask"]>[0],
+  cohort?: Parameters<typeof permissionReadiness.trackAsk>[1],
+) =>
   Effect.gen(function* () {
     const permission = yield* Permission.Service
-    return yield* permission.ask(input)
+    return yield* permissionReadiness.trackAsk(permission.ask(input), cohort)
   })
 
 const reply = (input: Parameters<Permission.Interface["reply"]>[0]) =>
@@ -1431,4 +1432,244 @@ baseIt.live("readiness - preload keeps delayed config startup outside the pendin
       }),
     )
   }),
+)
+
+// Readiness regressions (#732, #654, #579).
+//
+// The barrier's *failure* contract at the unchanged one-second guard: a wait that is only a
+// duration cannot tell an unregistered request from a fixture that already settled it; it
+// spends the guard and reports "timed out", hiding the ask's real outcome behind a scheduling
+// complaint. What the waits below add is that a request that can no longer arrive is reported
+// immediately, with the outcome the product produced.
+//
+// Ownership is explicit via a `cohort`: a wait scoped to a cohort owns the asks registered
+// into it (including ones pre-started before the wait — the original ask-then-wait contract),
+// and an unrelated prior ask in a different cohort cannot fail it. A cohort's settled entries
+// are released when the LAST owning wait completes (refCount), so concurrent owners cannot
+// hide the shared ask's outcome from each other.
+
+// Original ask-then-wait contract (restored order): fork an intended ask, await it (settled),
+// then wait scoped to the SAME cohort and fail-fast with the ask's own outcome. This is the
+// "intended B pre-started before the wait" case — the cohort ownership is what lets the wait
+// distinguish this ask (intended, in its cohort) from an unrelated prior ask (in another
+// cohort). RED without cohort ownership: the wait cannot see the pre-settled ask and would
+// time out; GREEN with the cohort: fail-fast with the outcome well under the guard.
+baseIt.instance(
+  "readiness - an ask settled by an allow rule is reported, not waited out",
+  () =>
+    Effect.gen(function* () {
+      const cohort = yield* permissionReadiness.makeCohort()
+      const started = Date.now()
+      const fiber = yield* ask({
+        id: PermissionV1.ID.make("per_readiness_allowed"),
+        sessionID: SessionID.make("session_readiness_allowed"),
+        permission: "bash",
+        patterns: ["ls"],
+        metadata: {},
+        always: [],
+        ruleset: [{ permission: "bash", pattern: "ls", action: "allow" }],
+      }, cohort).pipe(Effect.forkScoped)
+      yield* Fiber.await(fiber)
+      const exit = yield* waitForPending(1, cohort).pipe(Effect.exit)
+      if (Exit.isSuccess(exit)) throw new Error("expected the wait to fail: no request was ever registered")
+      const message = String(Cause.squash(exit.cause))
+      expect(message).toContain("every ask in this directory already settled")
+      expect(message).toContain("it completed without registering a request")
+      expect(Date.now() - started).toBeLessThan(1000)
+    }),
+  { git: true },
+)
+
+baseIt.instance(
+  "readiness - an ask denied by rules is reported, not waited out",
+  () =>
+    Effect.gen(function* () {
+      const cohort = yield* permissionReadiness.makeCohort()
+      const started = Date.now()
+      const askExit = yield* ask({
+        id: PermissionV1.ID.make("per_readiness_denied"),
+        sessionID: SessionID.make("session_readiness_denied"),
+        permission: "bash",
+        patterns: ["ls"],
+        metadata: {},
+        always: [],
+        ruleset: [{ permission: "bash", pattern: "ls", action: "deny" }],
+      }, cohort).pipe(Effect.exit)
+      if (Exit.isSuccess(askExit)) throw new Error("expected the deny rule to fail the ask")
+      expect(Cause.squash(askExit.cause)).toBeInstanceOf(PermissionV1.DeniedError)
+      const waiting = yield* waitForPending(1, cohort).pipe(Effect.exit)
+      if (Exit.isSuccess(waiting)) throw new Error("expected the wait to fail: no request was ever registered")
+      const message = String(Cause.squash(waiting.cause))
+      expect(message).toContain("timed out waiting for 1 pending permission request(s)")
+      expect(message).toContain("every ask in this directory already settled")
+      expect(Date.now() - started).toBeLessThan(1000)
+    }),
+  { git: true },
+)
+
+// Settle-after-park wake (deterministic `parked` handshake, no sleep): the wait parks, then
+// an ask registered into its cohort during the wait settles without publishing Asked, and the
+// wake fan-out fail-fasts the wait with the outcome. RED with the wake disabled (same
+// handshake): the wait burns the one-second guard and reports the timeout, not the outcome.
+baseIt.instance(
+  "readiness - an ask that settles while the wait is parked wakes it before the guard",
+  () =>
+    Effect.gen(function* () {
+      const cohort = yield* permissionReadiness.makeCohort()
+      const started = Date.now()
+      const parked = yield* Deferred.make<void, never>()
+      const waiting = yield* waitForPending(1, cohort, { parked }).pipe(Effect.forkScoped)
+      yield* Deferred.await(parked)
+      yield* ask({
+        id: PermissionV1.ID.make("per_readiness_parked_wake"),
+        sessionID: SessionID.make("session_readiness_parked_wake"),
+        permission: "bash",
+        patterns: ["ls"],
+        metadata: {},
+        always: [],
+        ruleset: [{ permission: "bash", pattern: "ls", action: "allow" }],
+      }, cohort)
+      const exit = yield* Fiber.await(waiting)
+      if (Exit.isSuccess(exit)) throw new Error("expected the wait to fail: no request was ever registered")
+      const message = String(Cause.squash(exit.cause))
+      expect(message).toContain("every ask in this directory already settled")
+      expect(Date.now() - started).toBeLessThan(900)
+    }),
+  { git: true },
+)
+
+// Cohort-ownership proof 1 (unrelated old A vs intended B): a prior cohort A (same
+// service+directory) is released explicitly (record/fullExit gone within the service), and a
+// later wait B in a DIFFERENT cohort started BEFORE B's own ask registers succeeds after B'
+// registers a pending request. A is in cA (released), B' is in cB; B's wait (cB) cannot see A
+// and does not fail on it. This is the real same-service A-then-B path: explicit ownership
+// distinguishes unrelated old A from intended B.
+baseIt.instance(
+  "readiness - a prior cohort is released and a later wait in a different cohort succeeds after its own ask registers",
+  () =>
+    Effect.gen(function* () {
+      const cohortA = yield* permissionReadiness.makeCohort()
+      yield* ask({
+        id: PermissionV1.ID.make("per_cohort_prior_a"),
+        sessionID: SessionID.make("session_cohort_prior_a"),
+        permission: "bash",
+        patterns: ["ls"],
+        metadata: {},
+        always: [],
+        ruleset: [{ permission: "bash", pattern: "ls", action: "allow" }],
+      }, cohortA)
+      // A settled; release its cohort explicitly (abandoned, no wait owns it). Record gone
+      // within the service, not at service GC.
+      yield* permissionReadiness.releaseCohort(cohortA)
+      expect(yield* permissionReadiness.cohortSize(cohortA)).toBe(0)
+
+      const cohortB = yield* permissionReadiness.makeCohort()
+      const parked = yield* Deferred.make<void, never>()
+      const waiting = yield* waitForPending(1, cohortB, { parked }).pipe(Effect.forkScoped)
+      yield* Deferred.await(parked)
+      yield* ask({
+        id: PermissionV1.ID.make("per_cohort_b_prime"),
+        sessionID: SessionID.make("session_cohort_b_prime"),
+        permission: "bash",
+        patterns: ["ls"],
+        metadata: {},
+        always: [],
+        ruleset: [],
+      }, cohortB).pipe(Effect.forkScoped)
+      const result = yield* Fiber.await(waiting)
+      if (Exit.isFailure(result)) {
+        throw new Error("expected B to succeed after B' registered, got: " + String(Cause.squash(result.cause)))
+      }
+      expect(result.value).toHaveLength(1)
+    }),
+  { git: true },
+)
+
+// Cohort-ownership proof 2 (own outcome, not a prior cohort's): A (allow) settles in cA; B's
+// wait (cB) parks; B' (deny) settles inside cB. The wait fail-fasts with B's deny outcome,
+// and A's allow outcome ("it completed without registering a request") does NOT appear —
+// proving A is excluded from B's cohort and B's own outcome is what is reported.
+baseIt.instance(
+  "readiness - a wait reports its own cohort ask's outcome, not a prior cohort's",
+  () =>
+    Effect.gen(function* () {
+      const cohortA = yield* permissionReadiness.makeCohort()
+      yield* ask({
+        id: PermissionV1.ID.make("per_cohort_own_a"),
+        sessionID: SessionID.make("session_cohort_own_a"),
+        permission: "bash",
+        patterns: ["ls"],
+        metadata: {},
+        always: [],
+        ruleset: [{ permission: "bash", pattern: "ls", action: "allow" }],
+      }, cohortA)
+      const cohortB = yield* permissionReadiness.makeCohort()
+      const started = Date.now()
+      const parked = yield* Deferred.make<void, never>()
+      const waiting = yield* waitForPending(1, cohortB, { parked }).pipe(Effect.forkScoped)
+      yield* Deferred.await(parked)
+      const bExit = yield* ask({
+        id: PermissionV1.ID.make("per_cohort_own_b"),
+        sessionID: SessionID.make("session_cohort_own_b"),
+        permission: "bash",
+        patterns: ["ls"],
+        metadata: {},
+        always: [],
+        ruleset: [{ permission: "bash", pattern: "ls", action: "deny" }],
+      }, cohortB).pipe(Effect.exit)
+      if (Exit.isSuccess(bExit)) throw new Error("expected B' to be denied")
+      expect(Cause.squash(bExit.cause)).toBeInstanceOf(PermissionV1.DeniedError)
+      const exit = yield* Fiber.await(waiting)
+      if (Exit.isSuccess(exit)) throw new Error("expected the wait to fail: B' was denied")
+      const message = String(Cause.squash(exit.cause))
+      expect(message).toContain("every ask in this directory already settled")
+      expect(message).not.toContain("it completed without registering a request")
+      expect(Date.now() - started).toBeLessThan(900)
+    }),
+  { git: true },
+)
+
+// Concurrent W1/W2 both owning the SAME cohort (blocker 2): B settles in the cohort and wakes
+// both; each must fail-fast with B's own outcome. W1 finishing first MUST NOT release B's
+// record while W2 still needs it — release happens only after the LAST owner (refCount). RED
+// without ref-counted release (cleanup splices the cohort's settled entries on every
+// completion): W2 cannot see B and times out. GREEN with ref-counted release: both report
+// B's outcome.
+baseIt.instance(
+  "readiness - concurrent waits owning one cohort both get the outcome (release after last owner)",
+  () =>
+    Effect.gen(function* () {
+      const cohort = yield* permissionReadiness.makeCohort()
+      const parked1 = yield* Deferred.make<void, never>()
+      const parked2 = yield* Deferred.make<void, never>()
+      const w1 = yield* waitForPending(1, cohort, { parked: parked1 }).pipe(Effect.forkScoped)
+      const w2 = yield* waitForPending(1, cohort, { parked: parked2 }).pipe(Effect.forkScoped)
+      yield* Deferred.await(parked1)
+      yield* Deferred.await(parked2)
+      // Both parked, both own the cohort (refCount = 2).
+      yield* ask({
+        id: PermissionV1.ID.make("per_cohort_concurrent_b"),
+        sessionID: SessionID.make("session_cohort_concurrent_b"),
+        permission: "bash",
+        patterns: ["ls"],
+        metadata: {},
+        always: [],
+        ruleset: [{ permission: "bash", pattern: "ls", action: "allow" }],
+      }, cohort)
+      const e1 = yield* Fiber.await(w1)
+      const e2 = yield* Fiber.await(w2)
+      if (Exit.isSuccess(e1)) throw new Error("expected w1 to fail: B settled without pending")
+      if (Exit.isSuccess(e2)) throw new Error("expected w2 to fail: B settled without pending")
+      const m1 = String(Cause.squash(e1.cause))
+      const m2 = String(Cause.squash(e2.cause))
+      // Both report B's outcome (the "every ask ... already settled" settle message), NOT the
+      // bare guard timeout. The settle message is "timed out waiting for 1 pending ...: saw 0,
+      // every ask in this directory already settled (...)"; the bare guard timeout is exactly
+      // "timed out waiting for 1 pending permission request(s)" with no ": saw ... every ask"
+      // suffix. RED without ref-counted release: whichever finishes first splices B and the
+      // other gets the bare guard timeout (no "every ask settled").
+      expect(m1).toContain("every ask in this directory already settled")
+      expect(m2).toContain("every ask in this directory already settled")
+    }),
+  { git: true },
 )
