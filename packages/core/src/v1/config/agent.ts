@@ -75,16 +75,25 @@ const normalize = (agent: Schema.Schema.Type<typeof AgentSchema>): Schema.Schema
     if (!KNOWN_KEYS.has(key)) options[key] = value
   }
 
-  const permission: ConfigPermissionV1.Info = {}
+  const derived: ConfigPermissionV1.Info = {}
   for (const [tool, enabled] of Object.entries(agent.tools ?? {})) {
     const action = enabled ? "allow" : "deny"
     if (tool === "write" || tool === "edit" || tool === "patch") {
-      permission.edit = action
+      derived.edit = action
       continue
     }
-    permission[tool] = action
+    // #780: `tools: { bash: ... }` is the pre-rename spelling of the shell tool.
+    derived[tool === "bash" ? "shell" : tool] = action
   }
-  globalThis.Object.assign(permission, agent.permission)
+  // Base layering: tools-derived entries first, explicit permission assigned
+  // over them. The only adjustment is #780's: an explicit `bash`/`shell`
+  // entry lands at its own written position instead of the derived slot's.
+  // An empty pattern map writes no rule, so it must not clear or overwrite a
+  // tools-derived deny.
+  const explicit = ConfigPermissionV1.stripEmptyShellRules(agent.permission)
+  ConfigPermissionV1.clearDerivedShellRename(derived, explicit)
+  globalThis.Object.assign(derived, explicit)
+  const permission = derived
 
   const steps = agent.steps ?? agent.maxSteps
   return { ...agent, options, permission, ...(steps !== undefined ? { steps } : {}) }

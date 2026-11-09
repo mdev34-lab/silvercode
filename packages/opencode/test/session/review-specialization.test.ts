@@ -497,16 +497,16 @@ it.instance(
         // not the other fails here.
         expect(reviewer?.permission).toEqual(generic?.permission)
 
-        // Bash is the whole point of #165: a reviewer that cannot execute
+        // Shell is the whole point of #165: a reviewer that cannot execute
         // cannot reproduce, typecheck, or run the tests it is asked to judge.
-        expect(Permission.evaluate("bash", "*", reviewer!.permission).action).toBe("allow")
+        expect(Permission.evaluate("shell", "*", reviewer!.permission).action).toBe("allow")
         expect(Permission.evaluate("edit", "*", reviewer!.permission).action).toBe("deny")
         expect(Permission.evaluate("task", "general", reviewer!.permission).action).toBe("deny")
 
         const ids = (yield* registry.tools({ providerID: ref.providerID, modelID: ref.modelID, agent: reviewer! })).map(
           (tool) => tool.id,
         )
-        expect(ids).toContain("bash")
+        expect(ids).toContain("shell")
         expect(ids).toContain("finish")
         expect(ids).not.toContain("edit")
         expect(ids).not.toContain("write")
@@ -531,7 +531,7 @@ for (const parent of ["work", "code", "custom", "plan"]) {
         // The reviewer that actually ran is the one the child session records,
         // and it ran with the plan-equivalent toolset #165 gave `review`.
         expect(reviewerRequests.length).toBeGreaterThan(0)
-        expect(toolNames(reviewerRequests[0] as { body: unknown })).toContain("bash")
+        expect(toolNames(reviewerRequests[0] as { body: unknown })).toContain("shell")
         expect(toolNames(reviewerRequests[0] as { body: unknown })).toContain("finish")
 
         // The verdict came back as the canonical envelope rather than as prose.

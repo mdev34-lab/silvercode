@@ -138,10 +138,10 @@ it.live("tool execution produces non-empty session diff (snapshot race)", () =>
 
       // Use bash tool (always registered) to create a file
       const command = `echo 'snapshot race test content' > ${path.join(dir, "race-test.txt")}`
-      yield* llm.toolMatch((hit) => JSON.stringify(hit.body).includes("create the file"), "bash", {
+      yield* llm.toolMatch((hit) => JSON.stringify(hit.body).includes("create the file"), "shell", {
         command,
       })
-      yield* llm.textMatch((hit) => JSON.stringify(hit.body).includes("bash"), "done")
+      yield* llm.textMatch((hit) => JSON.stringify(hit.body).includes("shell"), "done")
 
       // Seed user message
       yield* prompt.prompt({
@@ -172,7 +172,7 @@ it.live("tool execution produces non-empty session diff (snapshot race)", () =>
       )
       const tool = allMsgs
         .flatMap((m) => m.parts)
-        .find((p): p is SessionV1.ToolPart => p.type === "tool" && p.tool === "bash")
+        .find((p): p is SessionV1.ToolPart => p.type === "tool" && p.tool === "shell")
       expect(tool?.state.status).toBe("completed")
       if (!user) throw new Error("Expected user message")
 

@@ -608,7 +608,7 @@ it.instance(
       const reviewTools = toolNames(reviewHits[0])
       expect(reviewTools).toContain("finish")
       expect(reviewTools).toContain("read")
-      expect(reviewTools).toContain("bash")
+      expect(reviewTools).toContain("shell")
       expect(reviewTools).toContain("task")
 
       // The script's delegation branch fired: a synchronous review-agent

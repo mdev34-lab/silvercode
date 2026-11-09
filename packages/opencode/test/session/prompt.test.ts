@@ -1708,6 +1708,303 @@ withMcpTools.instance(
   20_000,
 )
 
+it.instance(
+  "three identical calls in one assistant message reach the denied doom-loop permission",
+  () =>
+    Effect.gen(function* () {
+      const { dir, llm } = yield* useServerConfig((url) => ({
+        ...providerCfg(url),
+        permission: { "*": "allow", doom_loop: "deny" },
+      }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const agents = yield* AgentSvc.Service
+      const agent = yield* agents.get("build")
+      expect(Permission.evaluate("doom_loop", "shell", agent.permission).action).toBe("deny")
+      const session = yield* sessions.create({ title: "Doom-loop positive control" })
+      yield* prompt.prompt({
+        sessionID: session.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "run the same harmless command three times" }],
+      })
+
+      const input = { command: "echo SHOULD_NOT_RUN", description: "doom-loop positive control", workdir: dir }
+      // One provider response creates one assistant message with three real tool parts.
+      // A separate llm.tool() reply for each call would not exercise the per-message guard.
+      yield* llm.push(reply().tool("shell", input).tool("shell", input).tool("shell", input))
+      const result = yield* prompt.loop({ sessionID: session.id })
+      expect(result.info.role).toBe("assistant")
+      if (result.info.role !== "assistant") throw new Error("expected an assistant result")
+      // The guard's denied ask interrupts this model step after tool calls were issued.
+      // That is the observable runtime signal (as opposed to an inferred structural window).
+      expect(result.info.error).toBeDefined()
+      expect(JSON.stringify(result.info.error)).toContain("ProviderStreamInterruptedAfterToolCallError")
+
+      const messages = yield* sessions.messages({ sessionID: session.id })
+      const repeated = messages
+        .filter((message) => message.info.role === "assistant")
+        .map((message) => message.parts.filter((part) => part.type === "tool" && part.tool === "shell"))
+        .filter((parts) => parts.length === 3)
+      expect(repeated).toHaveLength(1)
+      expect(repeated[0]?.map((part) => part.type === "tool" && part.state.input)).toEqual([input, input, input])
+    }),
+  20_000,
+)
+
+it.instance(
+  "a hallucinated legacy bash call is repaired as invalid and never executes (#780)",
+  () =>
+    Effect.gen(function* () {
+      const { dir, llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+
+      const session = yield* sessions.create({
+        title: "Legacy bash hallucination",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      yield* prompt.prompt({
+        sessionID: session.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "run the marker command" }],
+      })
+
+      const marker = path.join(dir, "bash-hallucination-ran.txt")
+      // The model calls the pre-rename name `bash`; the catalog only publishes `shell`,
+      // so this must route to the invalid-tool repair with zero execution.
+      yield* llm.tool("bash", { command: `touch ${marker}` })
+      yield* llm.text("done")
+
+      const result = yield* prompt.loop({ sessionID: session.id })
+      expect(result.info.role).toBe("assistant")
+
+      const parts = (yield* sessions.messages({ sessionID: session.id })).flatMap((message) => message.parts)
+      const repaired = parts.find((part) => part.type === "tool" && part.tool === "invalid")
+      expect(repaired?.type).toBe("tool")
+      if (repaired?.type === "tool" && repaired.state.status === "completed") {
+        expect(repaired.state.input).toMatchObject({ tool: "bash" })
+      }
+      expect(parts.some((part) => part.type === "tool" && part.tool === "shell")).toBe(false)
+      expect(yield* Effect.promise(() => Bun.file(marker).exists())).toBe(false)
+    }),
+  20_000,
+)
+
+it.instance(
+  "an archived bash tool part is replayed from stored output, never re-executed (#780)",
+  () =>
+    Effect.gen(function* () {
+      const { dir, llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+
+      const chat = yield* sessions.create({
+        title: "Archived bash part",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      const seeded = yield* seed(chat.id, { finish: "stop" })
+      const marker = path.join(dir, "archived-bash-replayed.txt")
+      // A persisted pre-rename history part: completed, with stored output.
+      yield* sessions.updatePart({
+        id: PartID.ascending(),
+        messageID: seeded.assistant.id,
+        sessionID: chat.id,
+        type: "tool",
+        callID: "archived-bash-call",
+        tool: "bash",
+        state: {
+          status: "completed",
+          input: { command: `touch ${marker}` },
+          output: "stored output from before the rename",
+          title: "done",
+          metadata: {},
+          time: { start: Date.now(), end: Date.now() },
+        },
+      })
+
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "continue please" }],
+      })
+      yield* llm.text("done")
+
+      const result = yield* prompt.loop({ sessionID: chat.id })
+      expect(result.info.role).toBe("assistant")
+
+      // The archived call was not re-executed under the new name, and its
+      // stored output is preserved verbatim.
+      expect(yield* Effect.promise(() => Bun.file(marker).exists())).toBe(false)
+      const parts = (yield* sessions.messages({ sessionID: chat.id })).flatMap((message) => message.parts)
+      expect(parts.some((part) => part.type === "tool" && part.tool === "shell")).toBe(false)
+      const archived = parts.find((part) => part.type === "tool" && part.tool === "bash")
+      expect(archived?.type).toBe("tool")
+      if (archived?.type === "tool" && archived.state.status === "completed") {
+        expect(archived.state.output).toBe("stored output from before the rename")
+      }
+    }),
+  20_000,
+)
+
+it.instance(
+  "a truncated write retry completes without a doom-loop ask under deny policy",
+  () =>
+    Effect.gen(function* () {
+      // Keep `doom_loop` denied so any guard request halts this turn; the successful result
+      // below is the runtime no-ask assertion.
+      const { dir, llm } = yield* useServerConfig((url) => ({
+        ...providerCfg(url),
+        permission: { "*": "allow", doom_loop: "deny" },
+      }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+
+      const session = yield* sessions.create({
+        title: "Truncated write",
+        permission: [
+          { permission: "*", pattern: "*", action: "allow" },
+          { permission: "doom_loop", pattern: "*", action: "deny" },
+        ],
+      })
+      yield* prompt.prompt({
+        sessionID: session.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "write the report" }],
+      })
+
+      const target = path.join(dir, "report.md")
+      const first = "# Report\n\nline one\n"
+      const second = "line two\n"
+      const full = first + second
+
+      // Step 1: a write call whose arguments are cut off inside `content` - the path
+      // arrived complete, the body never did.
+      yield* llm.toolRaw("write", `{"filePath":${JSON.stringify(target)},"content":"# Report\\n\\nline one\\nline two`)
+      // Step 2: the model follows the recovery instruction - inspect, write the first
+      // chunk, then append the rest with edit. A second `write` would replace the first
+      // chunk, so the scripted continuation must not use one.
+      yield* llm.tool("shell", { command: `test -e ${target} && echo exists || echo missing` })
+      yield* llm.tool("write", { filePath: target, content: first })
+      yield* llm.tool("edit", { filePath: target, oldString: "line one\n", newString: "line one\n" + second })
+      yield* llm.text("done")
+
+      const result = yield* prompt.loop({ sessionID: session.id })
+      expect(result.info.role).toBe("assistant")
+      if (result.info.role !== "assistant") throw new Error("expected an assistant result")
+      expect(result.info.error).toBeUndefined()
+
+      const parts = (yield* sessions.messages({ sessionID: session.id })).flatMap((message) => message.parts)
+      const executions = parts.filter(
+        (part): part is SessionV1.ToolPart => part.type === "tool" && part.state.status !== "pending",
+      )
+      const executionsOf = (name: string) => executions.filter((part) => part.tool === name)
+      const repaired = parts.find((part) => part.type === "tool" && part.tool === "invalid")
+      expect(repaired?.type).toBe("tool")
+      if (repaired?.type !== "tool" || repaired.state.status !== "completed") throw new Error("expected a completed repair")
+      expect(repaired.state.input).toMatchObject({ tool: "write" })
+      expect(repaired.state.output).toContain(target)
+      expect(repaired.state.output).toContain("did not execute")
+      expect(repaired.state.output).toContain("wrote nothing")
+      expect(repaired.state.output).toContain("first chunk")
+      expect(repaired.state.output).toContain("append")
+      expect(repaired.state.output).toContain("edit calls")
+      expect(repaired.state.output).toContain("write replaces the entire file")
+      // the fragment's unfinished body is never presented as recovered content: the
+      // only echo of the raw text is the provider/parser error inside the parenthetical
+      const recovered = repaired.state.output.slice(repaired.state.output.indexOf("Recovered from the partial arguments:"))
+      expect(recovered).not.toContain("line two")
+      expect(recovered).not.toContain("Report")
+
+      // the guided retry actually executed, in the shape the guidance asks for: `write`
+      // for the first chunk, then an `edit` append - never a second full `write`
+      const writes = executionsOf("write")
+      expect(writes).toHaveLength(1)
+      expect(writes[0]?.state.status === "completed" && writes[0].state.input).toMatchObject({ content: first })
+      expect(executionsOf("edit")).toHaveLength(1)
+      expect(yield* Effect.promise(() => readFile(target, "utf8"))).toBe(full)
+
+      // The deny rule is live for the entire recovery. Completion with no assistant error
+      // is runtime evidence that the single truncated write and guided retry did not ask.
+      expect(parts.some((part) => part.type === "text" && part.text === "done")).toBe(true)
+    }),
+  20_000,
+)
+
+it.instance(
+  "a truncated write for an existing file keeps what earlier calls wrote",
+  () =>
+    Effect.gen(function* () {
+      const { dir, llm } = yield* useServerConfig((url) => ({
+        ...providerCfg(url),
+        permission: { "*": "allow", doom_loop: "deny" },
+      }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+
+      const target = path.join(dir, "notes.md")
+      const existing = "# Notes\n\nexisting line one\nexisting line two\n"
+      const chunkOne = "appended chunk one\n"
+      const chunkTwo = "appended chunk two\n"
+      // An earlier call in this session already produced this content; the guidance must
+      // not assume the path is empty just because this call wrote nothing.
+      const session = yield* sessions.create({
+        title: "Truncated write over existing file",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      yield* prompt.prompt({
+        sessionID: session.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "extend the notes" }],
+      })
+
+      // Earlier bytes are created by a real tool call in this same session.
+      yield* llm.tool("write", { filePath: target, content: existing })
+      // Step 1: the next write call is cut off inside `content`.
+      yield* llm.toolRaw("write", `{"filePath":${JSON.stringify(target)},"content":"# Notes\\n\\nreplacement`)
+      // Step 2: the model follows the guidance - inspect the existing file, then append
+      // each remaining chunk with edit. It never re-writes, so nothing already on disk is
+      // replaced by a partial payload.
+      yield* llm.tool("shell", { command: `cat ${target}` })
+      yield* llm.tool("edit", {
+        filePath: target,
+        oldString: "existing line two\n",
+        newString: "existing line two\n" + chunkOne,
+      })
+      yield* llm.tool("edit", { filePath: target, oldString: chunkOne, newString: chunkOne + chunkTwo })
+      yield* llm.text("done")
+
+      const result = yield* prompt.loop({ sessionID: session.id })
+      expect(result.info.role).toBe("assistant")
+      if (result.info.role !== "assistant") throw new Error("expected an assistant result")
+      expect(result.info.error).toBeUndefined()
+
+      const parts = (yield* sessions.messages({ sessionID: session.id })).flatMap((message) => message.parts)
+      const executions = parts.filter(
+        (part): part is SessionV1.ToolPart => part.type === "tool" && part.state.status !== "pending",
+      )
+      const repaired = executions.find((part) => part.tool === "invalid")
+      if (repaired?.state.status !== "completed") throw new Error("expected a completed repair")
+      // the guidance names the existing-file branch instead of instructing a fresh write
+      expect(repaired.state.output).toContain("do not start over with write")
+      expect(repaired.state.output).toContain("would discard what is already there")
+
+      // The only executed write is the earlier content; this failed write did not replace it.
+      const writes = executions.filter((part) => part.tool === "write")
+      expect(writes).toHaveLength(1)
+      expect(writes[0]?.state.status === "completed" && writes[0].state.input).toMatchObject({ content: existing })
+      expect(executions.filter((part) => part.tool === "edit")).toHaveLength(2)
+
+      // every byte that was already there survives, and both chunks landed after it
+      expect(yield* Effect.promise(() => readFile(target, "utf8"))).toBe(existing + chunkOne + chunkTwo)
+    }),
+  20_000,
+)
+
 withMcpTools.instance(
   "an MCP tool discovered by tool_search is callable on the next step",
   () =>
@@ -2489,7 +2786,7 @@ it.instance(
         noReply: true,
         parts: [{ type: "text", text: "Write the version to a file and confirm it." }],
       })
-      yield* llm.tool("bash", { command: "printf 1 > version.txt", timeout: 5_000, workdir: path.resolve(dir) })
+      yield* llm.tool("shell", { command: "printf 1 > version.txt", timeout: 5_000, workdir: path.resolve(dir) })
       yield* llm.push(
         reply()
           .text("Wrote version.txt.")
@@ -2698,7 +2995,7 @@ noLLMServer.instance("prompt tools replace previous prompt tool rules", () =>
       sessionID: session.id,
       agent: "work",
       noReply: true,
-      tools: { bash: false },
+      tools: { shell: false },
       parts: [{ type: "text", text: "first" }],
     })
     yield* prompt.prompt({
@@ -2711,7 +3008,7 @@ noLLMServer.instance("prompt tools replace previous prompt tool rules", () =>
 
     const reloaded = yield* sessions.get(session.id)
     expect(reloaded.permission).toEqual([{ permission: "read", pattern: "*", action: "allow" }])
-    expect(Permission.evaluate("bash", "anything", reloaded.permission ?? []).action).toBe("ask")
+    expect(Permission.evaluate("shell", "anything", reloaded.permission ?? []).action).toBe("ask")
   }),
 )
 
@@ -4450,7 +4747,7 @@ unix(
         parts: [{ type: "text", text: "Generate a report using the shell" }],
       })
 
-      yield* llm.tool("bash", {
+      yield* llm.tool("shell", {
         command:
           'i=0; while [ "$i" -lt 4000 ]; do printf "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx %05d\\n" "$i"; i=$((i + 1)); done; printf truncation-ready; sleep 30',
         timeout: 30_000,
@@ -5072,7 +5369,7 @@ it.instance(
         noReply: true,
         parts: [{ type: "text", text: "Generate a report using the shell" }],
       })
-      yield* llm.tool("bash", { command: "sleep 30", timeout: 30_000, workdir: path.resolve(dir) })
+      yield* llm.tool("shell", { command: "sleep 30", timeout: 30_000, workdir: path.resolve(dir) })
       const run = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
       yield* llm.wait(1)
       yield* pollWithTimeout(
@@ -5850,7 +6147,7 @@ it.instance(
       // step-2 stream then dies. Retrying THAT step is safe only because its
       // request carries the executed result - prove the result rides the
       // retry's history and the command never runs twice.
-      yield* llm.tool("bash", { command: `printf 'once\\n' >> ${JSON.stringify(target)}` })
+      yield* llm.tool("shell", { command: `printf 'once\\n' >> ${JSON.stringify(target)}` })
       yield* llm.cut()
       yield* llm.text("recovered after retry")
       yield* user(chat.id, "Research the requested information")
@@ -5886,7 +6183,7 @@ it.instance(
       // resolves. Whether or not the SDK already executed the call, a retry
       // would issue it again: the turn must end as a terminal interruption
       // instead, and the command must never run twice.
-      yield* llm.push(reply().tool("bash", { command: `printf 'replay\\n' >> ${JSON.stringify(target)}` }).cut().item())
+      yield* llm.push(reply().tool("shell", { command: `printf 'replay\\n' >> ${JSON.stringify(target)}` }).cut().item())
       yield* user(chat.id, "hello")
 
       const result = yield* prompt.loop({ sessionID: chat.id })
@@ -6085,7 +6382,7 @@ it.instance("cancel while bash permission is pending cannot run the command on l
     const sessions = yield* Session.Service
     const permissions = yield* Permission.Service
     const chat = yield* sessions.create({ title: "Pinned" })
-    yield* llm.push(reply().tool("bash", { command: "echo SHOULD_NOT_RUN > aborted-command.txt", description: "write marker", workdir: dir }))
+    yield* llm.push(reply().tool("shell", { command: "echo SHOULD_NOT_RUN > aborted-command.txt", description: "write marker", workdir: dir }))
     yield* user(chat.id, "Write a report marker")
     const first = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
     const request = yield* pollWithTimeout(permissions.list().pipe(Effect.map((items) => items.find((r) => r.sessionID === chat.id))), "bash permission did not arrive")
