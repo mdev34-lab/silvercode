@@ -55,6 +55,7 @@ import { decodeDataUrl } from "@/util/data-url"
 import { Process } from "@/util/process"
 import { Cause, DateTime, Effect, Exit, Fiber, Latch, Layer, Option, Scope, Context, Schema, Types } from "effect"
 import { InstanceState } from "@/effect/instance-state"
+import { NotFoundError } from "@/storage/storage"
 import { TaskTool, type TaskPromptOps } from "@/tool/task"
 import { FinishTool, readTermination } from "@/tool/finish"
 import PROMPT_REVIEW_LOOP from "./prompt/review-loop.txt"
@@ -1742,9 +1743,18 @@ const layer = Layer.effect(
               .pipe(Effect.catchCause(() => Effect.succeed(false)))
             // Resolve the effective effort exactly like finish does:
             // session-persisted selection, then configuration, then medium.
+            // The selection is read from the persisted session row for every
+            // step, never from the run's opening snapshot: a level changed in
+            // the same session applies to the next step built after it (the
+            // request already in flight keeps the prompt it was sent with), and
+            // finish reads that same row at its own execution point. A row that
+            // disappears mid-run falls back to the snapshot instead of dying.
             const effortConfig = yield* config.get()
             const configEffort = typeof effortConfig.agent?.effort === "string" ? effortConfig.agent.effort : undefined
-            const effort = AgentEffort.resolve(readAgentEffort(session.metadata), AgentEffort.resolve(configEffort))
+            const effortSession = yield* sessions
+              .get(sessionID)
+              .pipe(Effect.catchIf(NotFoundError.isInstance, () => Effect.succeed(session)))
+            const effort = AgentEffort.resolve(readAgentEffort(effortSession.metadata), AgentEffort.resolve(configEffort))
             // Compaction can drop the write markers from the visible history, so a
             // compacted session keeps the policy on: it was long enough to compact.
             const sessionWroteFiles = msgs.some(
