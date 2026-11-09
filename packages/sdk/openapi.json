@@ -20745,6 +20745,9 @@
               "list": {
                 "$ref": "#/components/schemas/PermissionRuleConfig"
               },
+              "shell": {
+                "$ref": "#/components/schemas/PermissionRuleConfig"
+              },
               "bash": {
                 "$ref": "#/components/schemas/PermissionRuleConfig"
               },

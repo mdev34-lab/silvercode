@@ -55,6 +55,7 @@ import { decodeDataUrl } from "@/util/data-url"
 import { Process } from "@/util/process"
 import { Cause, DateTime, Effect, Exit, Fiber, Latch, Layer, Option, Scope, Context, Schema, Types } from "effect"
 import { InstanceState } from "@/effect/instance-state"
+import { NotFoundError } from "@/storage/storage"
 import { TaskTool, type TaskPromptOps } from "@/tool/task"
 import { FinishTool, readTermination } from "@/tool/finish"
 import PROMPT_REVIEW_LOOP from "./prompt/review-loop.txt"
@@ -125,7 +126,7 @@ const EFFORT_PROCESS: Record<AgentEffort.Level, string> = {
   ].join("\n\n"),
   thorough: [
     "## Agent effort: thorough (review passes: until clean, validation gate: full)",
-    "Aim for a clean, current independent review: fix blocking findings and re-review; any write after an approval needs a fresh pass. No pass cap. Without one (or if the reviewer cannot run), finish delivers the result labelled UNREVIEWED, never approved; known blocking findings hold finish back until fixed. Declare full validation evidence (tests, typecheck, parity as applicable) on finish.",
+    "A clean, current independent review is required for approval: fix every known finding, including minor findings, then obtain a fresh clean review; any write after an approval needs a fresh pass. No pass cap. An Approved report with open minor findings does not permit successful finish. A missing or stale review with no known findings still delivers labelled UNREVIEWED, never approved. Declare full validation evidence (tests, typecheck, parity as applicable) on finish.",
   ].join("\n\n"),
 }
 
@@ -1744,9 +1745,18 @@ const layer = Layer.effect(
               .pipe(Effect.catchCause(() => Effect.succeed(false)))
             // Resolve the effective effort exactly like finish does:
             // session-persisted selection, then configuration, then medium.
+            // The selection is read from the persisted session row for every
+            // step, never from the run's opening snapshot: a level changed in
+            // the same session applies to the next step built after it (the
+            // request already in flight keeps the prompt it was sent with), and
+            // finish reads that same row at its own execution point. A row that
+            // disappears mid-run falls back to the snapshot instead of dying.
             const effortConfig = yield* config.get()
             const configEffort = typeof effortConfig.agent?.effort === "string" ? effortConfig.agent.effort : undefined
-            const effort = AgentEffort.resolve(readAgentEffort(session.metadata), AgentEffort.resolve(configEffort))
+            const effortSession = yield* sessions
+              .get(sessionID)
+              .pipe(Effect.catchIf(NotFoundError.isInstance, () => Effect.succeed(session)))
+            const effort = AgentEffort.resolve(readAgentEffort(effortSession.metadata), AgentEffort.resolve(configEffort))
             // Compaction can drop the write markers from the visible history, so a
             // compacted session keeps the policy on: it was long enough to compact.
             const sessionWroteFiles = msgs.some(

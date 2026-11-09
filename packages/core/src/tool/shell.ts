@@ -1,4 +1,4 @@
-export * as BashTool from "./bash"
+export * as ShellTool from "./shell"
 
 import path from "path"
 import { ToolFailure } from "@opencode-ai/llm"
@@ -17,7 +17,7 @@ import { NarrationDetector } from "./narration"
 import { Tool } from "./tool"
 import { Tools } from "./tools"
 
-export const name = "bash"
+export const name = "shell"
 export const DEFAULT_TIMEOUT_MS = 2 * 60 * 1_000
 export const MAX_TIMEOUT_MS = 10 * 60 * 1_000
 export const MAX_CAPTURE_BYTES = 1024 * 1024
@@ -80,7 +80,7 @@ const isTimeout = (error: AppProcess.AppProcessError) =>
 
 const shellTokens = (command: string) => command.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g) ?? []
 const unquote = (value: string) => value.replace(/^(['"])(.*)\1$/, "$2")
-const externalCommandDirectories = Effect.fn("BashTool.externalCommandDirectories")(function* (
+const externalCommandDirectories = Effect.fn("ShellTool.externalCommandDirectories")(function* (
   fs: FSUtil.Interface,
   command: string,
   cwd: string,
@@ -147,7 +147,7 @@ const layer = Layer.effectDiscard(
                 })
               const warnings = (yield* externalCommandDirectories(fs, input.command, target.canonical)).map(
                 (directory) =>
-                  `Command argument references external directory ${path.join(directory, "*").replaceAll("\\", "/")}. Bash runs with host-user filesystem, process, and network authority; this scan is advisory only.`,
+                  `Command argument references external directory ${path.join(directory, "*").replaceAll("\\", "/")}. The shell tool runs with host-user filesystem, process, and network authority; this scan is advisory only.`,
               )
               yield* permission.assert({
                 action: name,
@@ -216,7 +216,7 @@ const layer = Layer.effectDiscard(
 )
 
 export const node = makeLocationNode({
-  name: "tool/bash",
+  name: "tool/shell",
   layer,
   deps: [ToolRegistry.node, LocationMutation.node, FSUtil.node, AppProcess.node, Config.node, PermissionV2.node],
 })

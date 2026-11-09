@@ -11,12 +11,13 @@
 // raised from a test process, so the Windows case runs through a fixture that
 // pins process.platform and asserts the launcher's policy: the child must not
 // observe a forwarded SIGINT.
-import { expect, test } from "bun:test"
+import { afterEach, expect, test } from "bun:test"
 import path from "node:path"
 
 const launcher = path.join(import.meta.dir, "../../bin/silvercode")
 const win32Launcher = path.join(import.meta.dir, "../fixture/win32-launcher.cjs")
 const child = path.join(import.meta.dir, "../fixture/launcher-child.js")
+const signalChild = path.join(import.meta.dir, "../fixture/launcher-signal-child.js")
 
 type Result = {
   stdout: string
@@ -25,18 +26,53 @@ type Result = {
   signalCode: string | null
 }
 
-async function launch(entry: string): Promise<Result> {
-  const proc = Bun.spawn({
-    cmd: [process.execPath, entry, child],
-    env: { ...process.env, OPENCODE_BIN_PATH: process.execPath },
-    stdin: "ignore",
-    stdout: "pipe",
-    stderr: "pipe",
-  })
+let activePosix: Bun.PipedSubprocess | undefined
+let posixPending: Promise<void> | undefined
+let posixCancelled = false
+
+afterEach(async () => {
+  if (activePosix && activePosix.exitCode === null) {
+    posixCancelled = true
+    activePosix.stdin.end()
+    activePosix.kill("SIGTERM")
+    await activePosix.exited
+    if (posixPending) await posixPending
+  }
+  activePosix = undefined
+  posixPending = undefined
+})
+
+async function launch(entry: string, handshake = false): Promise<Result> {
+  const spawned:
+    | { handshake: true; proc: Bun.PipedSubprocess }
+    | { handshake: false; proc: Bun.Subprocess<"ignore", "pipe", "pipe"> } = handshake
+    ? {
+        handshake: true,
+        proc: Bun.spawn({
+          cmd: [process.execPath, entry, signalChild],
+          env: { ...process.env, OPENCODE_BIN_PATH: process.execPath },
+          stdin: "pipe",
+          stdout: "pipe",
+          stderr: "pipe",
+        }),
+      }
+    : {
+        handshake: false,
+        proc: Bun.spawn({
+          cmd: [process.execPath, entry, child],
+          env: { ...process.env, OPENCODE_BIN_PATH: process.execPath },
+          stdin: "ignore",
+          stdout: "pipe",
+          stderr: "pipe",
+        }),
+      }
+  const proc = spawned.proc
+  if (spawned.handshake) activePosix = spawned.proc
 
   const decoder = new TextDecoder()
   let stdout = ""
   let signalled = false
+  let released = false
   const pump = (async () => {
     const reader = proc.stdout.getReader()
     for (;;) {
@@ -48,6 +84,11 @@ async function launch(entry: string): Promise<Result> {
       if (!signalled && stdout.includes("child:ready")) {
         signalled = true
         proc.kill("SIGINT")
+      }
+      if (spawned.handshake && !released && stdout.includes("child:sigint")) {
+        released = true
+        spawned.proc.stdin.write("release\n")
+        spawned.proc.stdin.end()
       }
     }
   })()
@@ -64,13 +105,18 @@ async function launch(entry: string): Promise<Result> {
 // covered by the platform-pinned fixture instead.
 const noSignalDelivery = process.platform === "win32"
 
-test.skipIf(noSignalDelivery)("forwards SIGINT to the child on POSIX hosts", async () => {
-  const result = await launch(launcher)
+test.skipIf(noSignalDelivery)("forwards SIGINT to the child on POSIX hosts", () => {
+  posixCancelled = false
+  posixPending = (async () => {
+    const result = await launch(launcher, true)
+    if (posixCancelled) return
 
-  expect(result.stderr).toBe("")
-  expect(result.stdout).toContain("child:sigint")
-  expect(result.stdout).toContain("child:done")
-  expect(result.exitCode).toBe(7)
+    expect(result.stderr).toBe("")
+    expect(result.stdout).toContain("child:sigint")
+    expect(result.stdout).toContain("child:done")
+    expect(result.exitCode).toBe(7)
+  })()
+  return posixPending
 })
 
 test.skipIf(noSignalDelivery)("does not force-kill the child on win32 (#441)", async () => {

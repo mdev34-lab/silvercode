@@ -166,7 +166,7 @@ const layer = Layer.effect(
 
         /**
          * The reviewer seam denies edits and nested delegation while leaving
-         * inspection - including `bash` for reproducing and verifying runtime
+         * inspection - including `shell` for reproducing and verifying runtime
          * behavior - at plan-equivalent strength, which is what makes the
          * codebase-review contract (correctness, tests, types, regressions)
          * verifiable at all.
@@ -267,7 +267,7 @@ const layer = Layer.effect(
                 list: "allow",
                 read: "allow",
                 webfetch: "allow",
-                bash: "deny",
+                shell: "deny",
                 websearch: "deny",
                 write: "deny",
                 edit: "deny",

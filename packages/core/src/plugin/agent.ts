@@ -28,7 +28,7 @@ Guidelines:
 - Adapt your search approach based on the thoroughness level specified by the caller
 - Return file paths as absolute paths in your final response
 - For clear communication, avoid using emojis
-- Do not create any files, or run bash commands that modify the user's system state in any way
+- Do not create any files, or run shell commands that modify the user's system state in any way
 
 Complete the user's search request efficiently and report your findings clearly.`
 
@@ -54,7 +54,7 @@ Your output must be:
 <rules>
 - you MUST use the same language as the user message you are summarizing
 - Title must be grammatically correct and read naturally - no word salad
-- Never include tool names in the title (e.g. "read tool", "bash tool", "edit tool")
+- Never include tool names in the title (e.g. "read tool", "shell tool", "edit tool")
 - Focus on the main topic or question the user needs to retrieve
 - Vary your phrasing - avoid repetitive patterns like always starting with "Analyzing"
 - When a file is mentioned, focus on WHAT the user wants to do WITH the file, not just that they shared it
@@ -135,7 +135,8 @@ export const Plugin = define({
       })
 
       draft.update(AgentV2.ID.make("code"), (item) => {
-        item.description = "Software-engineering specialist. Runs in Git/project folders with LSP and repo-aware context."
+        item.description =
+          "Software-engineering specialist. Runs in Git/project folders with LSP and repo-aware context."
         item.system ??= CODE_SYSTEM
         item.mode = "all"
         item.permissions.push(

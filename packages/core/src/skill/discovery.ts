@@ -66,6 +66,28 @@ export interface Interface {
   readonly pull: (url: string) => Effect.Effect<AbsolutePath[]>
 }
 
+// Windows keeps a directory rename locked while any file inside it is open, so
+// moving the live cache root aside can fail with EPERM/EBUSY for as long as a
+// reader or a file scanner holds a handle. Retry only that move. Promotion and
+// rollback stay single-attempt so a real failure still falls back to the
+// previous root.
+function transientRenameFailure(error: { readonly reason: { readonly _tag: string; readonly cause?: unknown } }) {
+  const reason = error?.reason
+  if (!reason) return false
+  if (reason._tag === "Busy" || reason._tag === "PermissionDenied") return true
+  const code = (reason.cause as { code?: unknown } | undefined)?.code
+  return code === "EBUSY" || code === "EPERM" || code === "EACCES"
+}
+
+const renameLiveRoot = (fs: FSUtil.Interface, from: string, to: string) =>
+  fs.rename(from, to).pipe(
+    Effect.retry({
+      while: transientRenameFailure,
+      times: 5,
+      schedule: Schedule.exponential("10 millis").pipe(Schedule.jittered),
+    }),
+  )
+
 export class Service extends Context.Service<Service, Interface>()("@opencode/v2/SkillDiscovery") {}
 
 const layer = Layer.effect(
@@ -181,8 +203,10 @@ const layer = Layer.effect(
                   yield* fs.writeFileString(path.join(staging, ".opencode-version"), version)
                   yield* Effect.uninterruptible(
                     Effect.gen(function* () {
-                      const cached = yield* fs.exists(root).pipe(Effect.orDie)
-                      if (cached) yield* fs.rename(root, backup)
+                      const cached = yield* renameLiveRoot(fs, root, backup).pipe(
+                        Effect.as(true),
+                        Effect.catchReason("PlatformError", "NotFound", () => Effect.succeed(false)),
+                      )
                       yield* fs.rename(staging, root).pipe(
                         Effect.catch((error) =>
                           Effect.gen(function* () {

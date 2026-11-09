@@ -6,7 +6,7 @@ import { PlatformError, SystemError } from "effect/PlatformError"
 import { Discovery } from "../../src/skill/discovery"
 import { Global } from "@opencode-ai/core/global"
 import { Filesystem } from "@/util/filesystem"
-import { rm } from "fs/promises"
+import { open, rm } from "fs/promises"
 import path from "path"
 import { testEffect } from "../lib/effect"
 
@@ -23,7 +23,9 @@ const cacheDir = path.join(Global.Path.cache, "skills")
 let failPromotion = false
 let failRollback = false
 let removeBackupSkill = false
+let holdLiveRootRename = false
 const promotionFailures: string[] = []
+const liveRootRenames: string[] = []
 const wrappedFs = Layer.effect(FSUtil.Service, Effect.gen(function* () {
   const fs = yield* FSUtil.Service
   return { ...fs, rename: (source: string, dest: string) => {
@@ -38,6 +40,24 @@ const wrappedFs = Layer.effect(FSUtil.Service, Effect.gen(function* () {
       return (removeBackupSkill ? fs.remove(path.join(source,"SKILL.md")) : Effect.void).pipe(
         Effect.andThen(Effect.fail(new PlatformError(new SystemError({_tag:"PermissionDenied",module:"FileSystem",method:"rename",cause:{code:"EPERM"}})))),
       )
+    }
+    // Windows refuses to rename a directory while a file inside it is open.
+    // Hold a real handle across the first live-root rename to model a reader or
+    // scanner that is still finishing, then let the retry succeed.
+    if (dest.includes(".old-")) {
+      return Effect.gen(function* () {
+        if (!holdLiveRootRename) return yield* fs.rename(source, dest)
+        holdLiveRootRename = false
+        const handle = yield* Effect.promise(() => open(path.join(source, "SKILL.md"), "r"))
+        const outcome = yield* fs.rename(source, dest).pipe(
+          Effect.as({ locked: false as const }),
+          Effect.catch((error) => Effect.succeed({ locked: true as const, error })),
+        )
+        yield* Effect.promise(() => handle.close())
+        liveRootRenames.push(outcome.locked ? "locked" : "renamed")
+        if (outcome.locked) return yield* Effect.fail(outcome.error)
+        return undefined
+      })
     }
     return fs.rename(source, dest)
   } }
@@ -204,6 +224,33 @@ describe("Discovery.pull", () => {
 
       yield* discovery.pull(url)
       expect(mutableDownloadCount).toBe(3)
+    }),
+  )
+
+  it.live("refreshes when the live root is briefly locked", () =>
+    Effect.gen(function* () {
+      yield* Effect.promise(() => rm(cacheDir, { recursive: true, force: true }))
+      mutableVersion = "locked-1"
+      mutableContent = "# Old"
+      mutableFiles = ["SKILL.md"]
+      mutableDownloadCount = 0
+      liveRootRenames.length = 0
+      const discovery = yield* Discovery.Service
+      const url = `http://localhost:${server.port}/mutable/`
+
+      const first = yield* discovery.pull(url)
+      expect(first).toHaveLength(1)
+
+      mutableVersion = "locked-2"
+      mutableContent = "# New"
+      holdLiveRootRename = true
+      try {
+        const second = yield* discovery.pull(url)
+        expect(liveRootRenames).toEqual([process.platform === "win32" ? "locked" : "renamed"])
+        expect(yield* Effect.promise(() => Bun.file(path.join(second[0], "SKILL.md")).text())).toBe("# New")
+      } finally {
+        holdLiveRootRename = false
+      }
     }),
   )
   for (const scenario of ["single", "double", "empty-cache", "invalid-backup"] as const) {

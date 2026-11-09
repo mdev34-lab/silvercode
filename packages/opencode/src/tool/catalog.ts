@@ -8,6 +8,7 @@ import { isRecord } from "@/util/record"
 import { InstanceState } from "@/effect/instance-state"
 import { BM25 } from "@/search/bm25"
 import { Wildcard } from "@/util/wildcard"
+import { Wildcard as CoreWildcard } from "@opencode-ai/core/util/wildcard"
 
 /**
  * Catalog of every tool the current agent could use, including the ones that are
@@ -137,7 +138,6 @@ export const CORE_TOOLS = [
   "tool_search",
   "tool_search_regex",
   "shell",
-  "bash",
   "read",
   "glob",
   "grep",
@@ -166,7 +166,9 @@ export function options(config: ConfigV1.Info["tool_search"]): Options {
 }
 
 function matches(id: string, patterns: string[]) {
-  return patterns.some((pattern) => Wildcard.match(id, pattern))
+  // Tool-name patterns are action names: legacy `bash` entries must match the tool
+  // now published as `shell` (#780).
+  return patterns.some((pattern) => CoreWildcard.matchAction(id, pattern))
 }
 
 /** Should this tool be withheld from the model until it is discovered? */

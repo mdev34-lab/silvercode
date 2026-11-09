@@ -189,7 +189,7 @@ export function summarizeActivity(parts: readonly ToolPart[]): ActivitySummary {
 }
 
 
-export type ActivityKind = "explore" | "bash" | "edit" | "misc"
+export type ActivityKind = "explore" | "shell" | "edit" | "misc"
 
 // Working-block kinds, keyed by tool id. Everything not listed here (web
 // tools, LSP, skills, MCP, invalid, ...) stays in the unchanged "Working..."
@@ -200,7 +200,9 @@ const TOOL_KIND: Record<string, ActivityKind> = {
   glob: "explore",
   grep: "explore",
   list: "explore",
-  bash: "bash",
+  shell: "shell",
+  // Legacy persisted parts from before the #780 rename still say "bash".
+  bash: "shell",
   write: "edit",
   edit: "edit",
   apply_patch: "edit",
@@ -219,12 +221,17 @@ export type ActivitySubGroup = {
   parts: ActivityGroupPart[]
 }
 
-// Splits one activity group into per-kind blocks in first-appearance order,
-// merging same-kind calls even when other kinds interleave (read, bash, read
-// -> one Explored block + one Ran block). Reasoning attaches to the block of
-// the tool call that follows it, since that is the action it plans; trailing
-// reasoning lands in the last block. Block ids derive from the group id and
-// the kind, so they stay stable while the run grows during streaming.
+// Splits one activity group into per-kind blocks in chronological order: a
+// change of activity kind closes the current block, and same-kind work after
+// an interleaving kind opens a NEW block (read, shell, read -> Explored, Ran,
+// Explored). Reasoning attaches to the block of the tool call that follows it,
+// since that is the action it plans; trailing reasoning lands in the last
+// block. Block ids are occurrence-indexed (act-<firstToolId>:<kind>:<n>), so
+// growing a run during streaming either grows the tail block or appends a new
+// one without changing earlier blocks' ids. The ActivityGroup <For> keys rows
+// by id (see the comment by subIDs in src/routes/session/index.tsx), so
+// streamed updates never remount earlier sub-blocks or reset their collapse
+// state (which is keyed on the same id).
 export function computeActivitySubGroups(group: ActivityGroup): ActivitySubGroup[] {
   const toolKinds = group.parts.map((item) =>
     item.part.type === "tool" ? activityKindOf(item.part.tool) : undefined,
@@ -247,20 +254,21 @@ export function computeActivitySubGroups(group: ActivityGroup): ActivitySubGroup
     }
     kinds[i] = nextTool[i] ?? prev ?? "misc"
   }
-  const order: ActivityKind[] = []
-  const byKind = new Map<ActivityKind, ActivitySubGroup>()
+  const subs: ActivitySubGroup[] = []
+  const occurrence = new Map<ActivityKind, number>()
+  let current: ActivitySubGroup | undefined
   for (let i = 0; i < group.parts.length; i++) {
     const kind = kinds[i]!
-    let sub = byKind.get(kind)
-    if (!sub) {
-      sub = { id: `${group.id}:${kind}`, kind, items: [], parts: [] }
-      byKind.set(kind, sub)
-      order.push(kind)
+    if (!current || current.kind !== kind) {
+      const n = (occurrence.get(kind) ?? 0) + 1
+      occurrence.set(kind, n)
+      current = { id: `${group.id}:${kind}:${n}`, kind, items: [], parts: [] }
+      subs.push(current)
     }
-    sub.parts.push(group.parts[i]!)
-    if (group.parts[i]!.part.type === "tool") sub.items.push(group.parts[i] as ActivityItem)
+    current.parts.push(group.parts[i]!)
+    if (group.parts[i]!.part.type === "tool") current.items.push(group.parts[i] as ActivityItem)
   }
-  return order.map((kind) => byKind.get(kind)!)
+  return subs
 }
 
 // The target a call counts towards in an Explored/Edited header. Distinct
@@ -312,7 +320,7 @@ function activityTarget(part: ToolPart, platform: NodeJS.Platform): string {
   }
 }
 
-// Distinct-target count for file-oriented blocks (Explored/Edited). Bash and
+// Distinct-target count for file-oriented blocks (Explored/Edited). Shell and
 // misc blocks count calls instead, so they pass targetCount = summary.count.
 export function countActivityTargets(
   items: readonly ActivityItem[],
@@ -348,7 +356,7 @@ export function typedActivityHeader(
     const note = summary.working ? undefined : summary.interrupted ? "interrupted" : summary.denied ? "denied" : undefined
     return { marker, main, failed, note }
   }
-  if (kind === "bash") {
+  if (kind === "shell") {
     const main = summary.working
       ? `Running command...${suffix}`
       : `Ran ${summary.count} command${summary.count === 1 ? "" : "s"}${suffix}`
