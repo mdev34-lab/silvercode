@@ -71,7 +71,7 @@ export type ReviewLoopState = {
   readonly workSeen: boolean
   /** Verdict of the most recent completed valid review; not cleared by later writes. */
   readonly lastReviewVerdict?: "approved" | "needs-fixes"
-  /** Findings listed by the most recent completed valid review report. */
+  /** All findings in the latest valid report, including minor; retained after later writes until a fresh report. */
   readonly openFindings: number
   /** Critical/important findings in that report (blockers), floored at 1 for a needs-fixes report with no findings. */
   readonly blockingFindings: number

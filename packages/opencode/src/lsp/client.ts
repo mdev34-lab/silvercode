@@ -482,7 +482,14 @@ export async function create(input: {
         if (typeof hit.version === "number" && hit.version !== request.version) return
         if (hit.at < request.after && hit.version !== request.version) return
         if (debounceTimer) clearTimeout(debounceTimer)
-        debounceTimer = setTimeout(() => finish(true), Math.max(0, DIAGNOSTICS_DEBOUNCE_MS - (Date.now() - hit.at)))
+        const remaining = DIAGNOSTICS_DEBOUNCE_MS - (Date.now() - hit.at)
+        // A publish that has already been quiet for the whole debounce window
+        // satisfies the wait immediately. Resolving synchronously keeps the
+        // already-published path off the timer queue, whose scheduling latency
+        // on a loaded host otherwise decides how fast settled diagnostics are
+        // reported even though no further settling is needed.
+        if (remaining <= 0) return finish(true)
+        debounceTimer = setTimeout(() => finish(true), remaining)
       }
 
       timeoutTimer = setTimeout(() => finish(false), request.timeout)

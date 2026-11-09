@@ -12,6 +12,7 @@ import { InstanceBootstrap } from "../../src/project/bootstrap"
 import { InstanceStore } from "../../src/project/instance-store"
 import { SessionID } from "../../src/session/schema"
 import { testEffect } from "../lib/effect"
+import { permissionReadiness } from "./readiness"
 
 const noopBootstrap = Layer.succeed(InstanceBootstrap.Service, InstanceBootstrap.Service.of({ run: Effect.void }))
 
@@ -80,10 +81,12 @@ afterEach(() => {
 // than simply not fired yet.
 const countdown = { permission_timeout: { enabled: true, seconds: 1 } }
 
+// Tracked so a wait can fail with the ask's own outcome instead of waiting for a request
+// that ask already settled without publishing.
 const ask = (input: Parameters<Permission.Interface["ask"]>[0]) =>
   Effect.gen(function* () {
     const permission = yield* Permission.Service
-    return yield* permission.ask(input)
+    return yield* permissionReadiness.trackAsk(permission.ask(input))
   })
 
 const reply = (input: Parameters<Permission.Interface["reply"]>[0]) =>
@@ -108,40 +111,9 @@ const bash = (id: string, session = "session_timeout") => ({
   ruleset: [],
 })
 
-// On a timeout the error carries what was observed: how long the wait actually ran, how
-// many polls got to run (a starved event loop runs few), the worst gap between polls, and
-// the pending requests. A slow runner and a request that never arrived look different here.
-// The 1 second bound is unchanged.
-const waitForPending = (count: number) =>
-  Effect.gen(function* () {
-    const started = Date.now()
-    let polls = 0
-    let last = started
-    let worstGap = 0
-    let seen = -1
-    return yield* Effect.gen(function* () {
-      while (true) {
-        const now = Date.now()
-        worstGap = Math.max(worstGap, now - last)
-        last = now
-        polls++
-        const pending = yield* list()
-        seen = pending.length
-        if (pending.length === count) return pending
-        yield* Effect.sleep("10 millis")
-      }
-    }).pipe(
-      Effect.timeoutOrElse({
-        duration: "1 second",
-        orElse: () =>
-          Effect.fail(
-            new Error(
-              `timed out waiting for ${count} pending permission request(s): elapsed=${Date.now() - started}ms polls=${polls} worstPollGap=${worstGap}ms lastSeenPending=${seen}`,
-            ),
-          ),
-      }),
-    )
-  })
+// The guard is the same one second; the wait now observes the publication instead of
+// re-reading the list on a timer, so a late tick cannot spend the guard.
+const waitForPending = permissionReadiness.waitForPending
 
 const rejectAll = () =>
   Effect.gen(function* () {
@@ -166,16 +138,7 @@ const collectReplies = () =>
     return replies
   })
 
-const waitForReplies = (replies: ReadonlyArray<unknown>, count: number) =>
-  Effect.gen(function* () {
-    while (replies.length < count) yield* Effect.sleep("10 millis")
-  }).pipe(
-    Effect.timeoutOrElse({
-      duration: "1 second",
-      orElse: () => Effect.fail(new Error(`timed out waiting for ${count} permission replied event(s)`)),
-    }),
-  )
-
+const waitForReplies = permissionReadiness.waitForReplies
 // Records the instant the request was announced. The deadline is computed immediately
 // before that — measured 2ms apart, with only a log line and the publish in between — so
 // the two instants bracket `expiresAt` to within the countdown itself.
@@ -418,10 +381,16 @@ it.instance(
   () =>
     Effect.gen(function* () {
       const events = yield* EventV2Bridge.Service
+      const entered = yield* Deferred.make<void, never>()
       // Hold the publish open so the reply can be interrupted after it claimed the
       // request but before it finished announcing it.
       const unsub = yield* events.listen((event) =>
-        event.type === Permission.Event.Replied.type ? Effect.sleep("10 seconds") : Effect.void,
+        event.type === Permission.Event.Replied.type
+          ? Effect.gen(function* () {
+              yield* Deferred.succeed(entered, undefined)
+              yield* Effect.sleep("10 seconds")
+            })
+          : Effect.void,
       )
       yield* Effect.addFinalizer(() => unsub)
 
@@ -432,7 +401,8 @@ it.instance(
         requestID: PermissionV1.ID.make("per_timeout_interrupt"),
         reply: "once",
       }).pipe(Effect.forkScoped)
-      yield* Effect.sleep("100 millis")
+      // Interrupt inside the publish, not at an instant picked by a sleep.
+      yield* permissionReadiness.awaitListener(entered, "reply - interrupted mid-publish")
       yield* Fiber.interrupt(answering)
 
       yield* notStranded(Fiber.join(fiber))
@@ -466,7 +436,7 @@ it.instance(
         const fiber = yield* ask(bash("per_timeout_slow_asked")).pipe(Effect.forkScoped)
         // Unlike pending membership, this signal survives the deadline. A delayed
         // observer must not miss the request it is trying to test.
-        const expiresAt = yield* Deferred.await(announced).pipe(Effect.timeout("1 second"))
+        const expiresAt = yield* permissionReadiness.awaitListener(announced, "ask - held asked event")
         expect(expiresAt).toBeGreaterThan(0)
         yield* Effect.sleep(Math.max(0, expiresAt - Date.now()) + 500)
         expect(yield* list()).toHaveLength(0)
@@ -545,8 +515,14 @@ it.instance(
   () =>
     Effect.gen(function* () {
       const events = yield* EventV2Bridge.Service
+      const entered = yield* Deferred.make<void, never>()
       const unsub = yield* events.listen((event) =>
-        event.type === Permission.Event.Replied.type ? Effect.sleep("10 seconds") : Effect.void,
+        event.type === Permission.Event.Replied.type
+          ? Effect.gen(function* () {
+              yield* Deferred.succeed(entered, undefined)
+              yield* Effect.sleep("10 seconds")
+            })
+          : Effect.void,
       )
       yield* Effect.addFinalizer(() => unsub)
 
@@ -558,7 +534,7 @@ it.instance(
         requestID: PermissionV1.ID.make("per_timeout_interrupt_a"),
         reply: "reject",
       }).pipe(Effect.forkScoped)
-      yield* Effect.sleep("100 millis")
+      yield* permissionReadiness.awaitListener(entered, "reply - reject interrupted mid-publish")
       yield* Fiber.interrupt(rejecting)
 
       expectAllRejected(yield* notStranded(cascadedExits(first, second)))
@@ -596,6 +572,54 @@ it.instance(
       yield* Fiber.join(fiber)
       yield* Effect.sleep("200 millis")
       expect(replies).toEqual(["once"])
+    }),
+  { git: true },
+)
+
+// Readiness regressions (#654, #579), at the unchanged one-second guard.
+//
+// The mid-publish interrupts above used to wait a fixed 100ms before interrupting. That is
+// not a readiness claim but a bet on scheduling: on a starved runner the reply may not have
+// started, so the test interrupts a fiber that never claimed the request and still passes
+// for the wrong reason. They now wait for the listener to actually enter the publish, which
+// is the state the test is about. The guard is the same one second.
+
+it.instance(
+  "readiness - a listener that never enters the publish fails the wait, not the interrupt",
+  () =>
+    Effect.gen(function* () {
+      const entered = yield* Deferred.make<void, never>()
+      // No listener signals `entered`, so the wait has nothing to observe. It must report
+      // that, under the same one second the waits in this file use, rather than hanging.
+      const started = Date.now()
+      const exit = yield* permissionReadiness.awaitListener(entered, "readiness - never entered").pipe(Effect.exit)
+      if (Exit.isSuccess(exit)) throw new Error("expected the wait to fail")
+      const elapsed = Date.now() - started
+      expect(String(Cause.squash(exit.cause))).toContain(
+        "readiness - never entered: the listener never entered the publish",
+      )
+      // The unchanged guard, not a longer one and not the suite budget.
+      expect(elapsed).toBeGreaterThanOrEqual(1000)
+      expect(elapsed).toBeLessThan(5000)
+    }),
+  { git: true },
+)
+
+it.instance(
+  "readiness - a wait with nothing to observe still reports the one-second guard",
+  () =>
+    Effect.gen(function* () {
+      // The guard is unchanged, and its message is the one the polling waits produced, so
+      // a caller that sees it is not being told something new.
+      const per = yield* Permission.Service
+      const started = Date.now()
+      const exit = yield* permissionReadiness.waitForPending(1).pipe(Effect.exit)
+      if (Exit.isSuccess(exit)) throw new Error("expected the wait to fail")
+      expect(String(Cause.squash(exit.cause))).toBe("Error: timed out waiting for 1 pending permission request(s)")
+      expect(yield* per.list()).toHaveLength(0)
+      const elapsed = Date.now() - started
+      expect(elapsed).toBeGreaterThanOrEqual(1000)
+      expect(elapsed).toBeLessThan(5000)
     }),
   { git: true },
 )
