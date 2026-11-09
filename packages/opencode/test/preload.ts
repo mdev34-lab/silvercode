@@ -4,7 +4,12 @@ import os from "os"
 import path from "path"
 import fs from "fs/promises"
 import { setTimeout as sleep } from "node:timers/promises"
-import { afterAll } from "bun:test"
+import { afterAll, beforeEach } from "bun:test"
+import { takeActiveOwnedScope } from "./lib/owned-deadline"
+
+// Bun may time out afterEach while an interrupted Effect is still finalizing.
+// Do not enter another test body until that owned execution has settled.
+beforeEach(() => takeActiveOwnedScope())
 
 // Set XDG env vars FIRST, before any src/ imports
 const dir = path.join(os.tmpdir(), "opencode-test-data-" + process.pid)
@@ -36,6 +41,7 @@ process.env["XDG_CACHE_HOME"] = path.join(dir, "cache")
 process.env["XDG_CONFIG_HOME"] = path.join(dir, "config")
 process.env["XDG_STATE_HOME"] = path.join(dir, "state")
 process.env["OPENCODE_MODELS_PATH"] = path.join(import.meta.dir, "tool", "fixtures", "models-api.json")
+process.env["OPENCODE_DISABLE_MODELS_FETCH"] = "true"
 process.env["OPENCODE_EXPERIMENTAL_EVENT_SYSTEM"] = "true"
 process.env["OPENCODE_EXPERIMENTAL_WORKSPACES"] = "true"
 

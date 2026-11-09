@@ -238,34 +238,82 @@ describe("PermissionV2", () => {
     }),
   )
 
-  it.effect("evaluates bash with the normal configured-rule semantics", () =>
+  it.effect("evaluates shell with the normal configured-rule semantics", () =>
     Effect.gen(function* () {
       yield* setup([{ action: "*", resource: "*", effect: "allow" }])
       const service = yield* PermissionV2.Service
-      const bash = assertion({ action: "bash", resources: ["pwd"] })
-      expect(yield* service.ask(bash)).toEqual({ id: PermissionV2.ID.create("per_test"), effect: "allow" })
+      const shell = assertion({ action: "shell", resources: ["pwd"] })
+      expect(yield* service.ask(shell)).toEqual({ id: PermissionV2.ID.create("per_test"), effect: "allow" })
 
       yield* setRules([])
-      expect(yield* service.ask(bash)).toEqual({ id: PermissionV2.ID.create("per_test"), effect: "ask" })
+      expect(yield* service.ask(shell)).toEqual({ id: PermissionV2.ID.create("per_test"), effect: "ask" })
       expect(yield* service.get(PermissionV2.ID.create("per_test"))).toBeDefined()
     }),
   )
 
-  it.effect("uses saved bash approvals while preserving configured deny precedence", () =>
+  // #780: the tool now asserts action "shell", but saved grants and
+  // configured rules persisted under the legacy "bash" action must keep
+  // applying with the same precedence (no deny-to-ask broadening).
+  it.effect("a later s* wildcard does not bypass an explicit legacy bash deny (V2 evaluate)", () =>
+    Effect.sync(() => {
+      // #780: wildcard patterns keep their pre-rename extension; literals keep
+      // last-wins. doom_loop resources are tool ids and follow the same rule.
+      expect(
+        PermissionV2.evaluate("shell", "ls", [
+          { action: "bash", resource: "*", effect: "deny" },
+          { action: "s*", resource: "*", effect: "allow" },
+        ]).effect,
+      ).toBe("deny")
+      expect(
+        PermissionV2.evaluate("shell", "ls", [
+          { action: "bash", resource: "*", effect: "deny" },
+          { action: "shell", resource: "*", effect: "allow" },
+        ]).effect,
+      ).toBe("allow")
+      expect(
+        PermissionV2.evaluate("doom_loop", "shell", [
+          { action: "doom_loop", resource: "bash", effect: "deny" },
+          { action: "doom_loop", resource: "s*", effect: "allow" },
+        ]).effect,
+      ).toBe("deny")
+      expect(
+        PermissionV2.evaluate("doom_loop", "shell", [
+          { action: "doom_loop", resource: "bash", effect: "deny" },
+          { action: "doom_loop", resource: "shell", effect: "allow" },
+        ]).effect,
+      ).toBe("allow")
+      expect(
+        PermissionV2.evaluate("doom_loop", "read", [{ action: "doom_loop", resource: "bash", effect: "deny" }])
+          .effect,
+      ).toBe("ask")
+      // Canonical wildcards name the tool when no legacy deny stands.
+      expect(PermissionV2.evaluate("shell", "ls", [{ action: "s*", resource: "*", effect: "allow" }]).effect).toBe(
+        "allow",
+      )
+      expect(
+        PermissionV2.evaluate("shell", "ls", [
+          { action: "*", resource: "*", effect: "ask" },
+          { action: "s*", resource: "*", effect: "allow" },
+        ]).effect,
+      ).toBe("allow")
+    }),
+  )
+
+  it.effect("uses saved legacy bash approvals for shell while preserving configured deny precedence", () =>
     Effect.gen(function* () {
       yield* setup()
       const saved = yield* PermissionSaved.Service
       yield* saved.add({ projectID: Project.ID.global, action: "bash", resources: ["pwd"] })
 
       const service = yield* PermissionV2.Service
-      expect(yield* service.ask(assertion({ action: "bash", resources: ["pwd"] }))).toEqual({
+      expect(yield* service.ask(assertion({ action: "shell", resources: ["pwd"] }))).toEqual({
         id: PermissionV2.ID.create("per_test"),
         effect: "allow",
       })
       expect(yield* service.list()).toEqual([])
 
       yield* setRules([{ action: "bash", resource: "*", effect: "deny" }])
-      expect(yield* service.ask(assertion({ action: "bash", resources: ["pwd"] }))).toEqual({
+      expect(yield* service.ask(assertion({ action: "shell", resources: ["pwd"] }))).toEqual({
         id: PermissionV2.ID.create("per_test"),
         effect: "deny",
       })

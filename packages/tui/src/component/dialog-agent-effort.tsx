@@ -9,13 +9,11 @@ const ENTRIES: {
   value: Level
   title: string
   description: string
-  details: string[]
 }[] = [
   {
     value: "fast",
     title: "Fast",
-    description: "no review ritual",
-    details: ["Inline self-check and syntax/smoke validation, delivered with an honest unreviewed label"],
+    description: "Reliable workhorse for everyday tasks",
   },
   {
     value: "medium",
@@ -23,16 +21,19 @@ const ENTRIES: {
     // No "· default" here: on home the persisted selection decides the
     // default now, so a static claim on one row would contradict it. The
     // cursor and the footer carry that meaning instead.
-    description: "up to 2 review passes",
-    details: ["Independent review for code changes; only blocking findings force another pass, then an honest status"],
+    description: "Smarter agent for more demanding work",
   },
   {
     value: "thorough",
     title: "Thorough",
-    description: "review until clean",
-    details: ["Structured review contract with severity-driven convergence and full validation gates, no pass cap"],
+    description: "Deep, meticulous work on complex tasks from start to finish",
   },
 ]
+
+// The widest level chip (` Thorough `) is 10 columns; a fixed title cell keeps
+// every description starting in the same column, which is what lets a wrapped
+// description hold its alignment instead of running back under the chip.
+const TITLE_COLUMN = 10
 
 export function DialogAgentEffort() {
   const local = useLocal()
@@ -54,7 +55,7 @@ export function DialogAgentEffort() {
           </>
         ),
         description: entry.description,
-        details: entry.details,
+        titleColumn: TITLE_COLUMN,
         onSelect: () => {
           dialog.clear()
           local.effort.set(entry.value)
@@ -69,6 +70,9 @@ export function DialogAgentEffort() {
       title="Agent effort"
       current={local.effort.current()}
       flat={true}
+      // Breathing room between the three levels, and a description column that
+      // wraps under itself in narrow terminals (#791).
+      optionSpacing={1}
       footer={
         <text fg={theme.textMuted}>
           {local.effort.scoped() ? "Stored on this session" : "Default for new sessions"}

@@ -63,6 +63,34 @@ describe("Policy", () => {
     }),
   )
 
+  it.effect("a later s* doom_loop statement does not bypass an explicit bash deny", () =>
+    Effect.gen(function* () {
+      const policy = yield* Policy.Service
+      yield* policy.load([
+        new Policy.Info({ effect: "deny", action: "doom_loop", resource: "bash" }),
+        new Policy.Info({ effect: "allow", action: "doom_loop", resource: "s*" }),
+      ])
+
+      // #780: `s*` predates the rename (it covered `skill`); it must not
+      // recruit the renamed `shell` tool past the explicit legacy deny.
+      expect(yield* policy.evaluate("doom_loop", "shell", "allow")).toBe("deny")
+      // No statement resources the read tool: the caller's fallback applies.
+      expect(yield* policy.evaluate("doom_loop", "read", "allow")).toBe("allow")
+      expect(yield* policy.evaluate("doom_loop", "read", "deny")).toBe("deny")
+
+      yield* policy.load([
+        new Policy.Info({ effect: "deny", action: "doom_loop", resource: "bash" }),
+        new Policy.Info({ effect: "allow", action: "doom_loop", resource: "shell" }),
+      ])
+      // An explicit later literal still wins.
+      expect(yield* policy.evaluate("doom_loop", "shell", "deny")).toBe("allow")
+
+      yield* policy.load([new Policy.Info({ effect: "allow", action: "s*", resource: "*" })])
+      // Canonical wildcards name the tool when no legacy deny stands.
+      expect(yield* policy.evaluate("shell", "ls", "deny")).toBe("allow")
+    }),
+  )
+
   it.effect("uses the last matching loaded statement", () =>
     Effect.gen(function* () {
       const policy = yield* Policy.Service

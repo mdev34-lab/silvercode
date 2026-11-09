@@ -126,7 +126,7 @@ const EFFORT_PROCESS: Record<AgentEffort.Level, string> = {
   ].join("\n\n"),
   thorough: [
     "## Agent effort: thorough (review passes: until clean, validation gate: full)",
-    "Aim for a clean, current independent review: fix blocking findings and re-review; any write after an approval needs a fresh pass. No pass cap. Without one (or if the reviewer cannot run), finish delivers the result labelled UNREVIEWED, never approved; known blocking findings hold finish back until fixed. Declare full validation evidence (tests, typecheck, parity as applicable) on finish.",
+    "A clean, current independent review is required for approval: fix every known finding, including minor findings, then obtain a fresh clean review; any write after an approval needs a fresh pass. No pass cap. An Approved report with open minor findings does not permit successful finish. A missing or stale review with no known findings still delivers labelled UNREVIEWED, never approved. Declare full validation evidence (tests, typecheck, parity as applicable) on finish.",
   ].join("\n\n"),
 }
 

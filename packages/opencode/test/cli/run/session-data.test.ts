@@ -343,7 +343,7 @@ describe("run session data", () => {
         kind: "tool",
         phase: "start",
         partID: "shell:call-1",
-        tool: "bash",
+        tool: "shell",
         shell: {
           callID: "call-1",
           command: "pwd",
@@ -367,7 +367,7 @@ describe("run session data", () => {
         kind: "tool",
         phase: "progress",
         partID: "shell:call-1",
-        tool: "bash",
+        tool: "shell",
         text: "/tmp/demo\n",
         toolState: "completed",
         shell: {

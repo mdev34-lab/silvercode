@@ -20,11 +20,26 @@ delivered. There are exactly three levels and two switches — no other knobs.
   force another pass; after two passes the result is delivered with an honest
   exhausted/open-findings status instead of looping forever.
 - **`thorough`** keeps requiring a clean, current independent review until one
-  exists. When the reviewer genuinely cannot run (permission, missing agent, or
+  exists. Every known finding, including Minor, must be corrected and followed
+  by a fresh clean review before successful finish; an Approved envelope with
+  open Minor findings is not clean. This uses the current session effort, so
+  switching effort reevaluates the same persisted report without rewriting it.
+  A missing or stale review with no known findings keeps the warning-only
+  delivery behavior. When the reviewer genuinely cannot run (permission, missing agent, or
   the subagent depth limit), a successful finish remains blocked. Only a
   declared failure can deliver as `review-blocked`; a depth-limited child hands
   its unreviewed writes to its parent as `review-pending`. Neither status is
   approval.
+
+## Efficient work at every level
+
+Fast, quick, direct execution matters at every effort level. Depth may vary,
+but effort never justifies inefficient work. Scope searches first, then read
+the needed ranges in batches; include whole files or wider context when needed.
+Make useful independent read, grep, and glob tool calls in parallel; dependent
+calls remain sequential. Avoid redundant exploration fronts and duplicate checks.
+Review evaluates and reports findings and coverage gaps rather than writing tests
+or taking over implementation; existing non-destructive checks remain available.
 
 ## Configuration
 
