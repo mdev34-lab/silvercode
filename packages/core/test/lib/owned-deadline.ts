@@ -82,6 +82,9 @@ type OwnedTestScope = {
 const runs = new Map<symbol, OwnedRun>()
 
 let activeScope: OwnedTestScope | undefined
+// Bun can abandon the afterEach Promise too. Closed means no new runs may
+// attach, not that the fiber's finalizers have finished.
+const drainingScopes = new Set<Promise<void>>()
 
 export function inflightOwnedRunCount(): number {
   return runs.size
@@ -186,7 +189,16 @@ function performReleaseScope(scope: OwnedTestScope): Promise<void> {
 }
 
 function releaseScope(scope: OwnedTestScope): Promise<void> {
-  scope.releasePromise ??= performReleaseScope(scope)
+  if (!scope.releasePromise) {
+    const pending = performReleaseScope(scope)
+    scope.releasePromise = pending
+    drainingScopes.add(pending)
+    // Observe both outcomes without producing an unhandled rejected Promise.
+    void pending.then(
+      () => drainingScopes.delete(pending),
+      () => drainingScopes.delete(pending),
+    )
+  }
   return scope.releasePromise
 }
 
@@ -200,12 +212,14 @@ async function reportScope(scope: OwnedTestScope): Promise<void> {
 }
 
 /**
- * Used by top-level test wrappers (`testEffect` / `testEffectShared`) to flush an unclosed scope
- * if the previous test registered an async dynamic `afterEach` that threw and aborted hooks.
+ * Join both an unclosed scope (hooks skipped) and closed scopes whose release
+ * Promise Bun abandoned on hook timeout. Used by the next-test entry barrier
+ * and by top-level test wrappers (`testEffect` / `testEffectShared`).
  */
 export function takeActiveOwnedScope(): Promise<void> | undefined {
-  if (!activeScope || activeScope.closed) return undefined
-  return releaseScope(activeScope)
+  if (activeScope && !activeScope.closed) void releaseScope(activeScope)
+  if (drainingScopes.size === 0) return undefined
+  return Promise.all(drainingScopes).then(() => undefined)
 }
 
 export function beginOwned<A>(start: () => Promise<A>): Promise<A> {

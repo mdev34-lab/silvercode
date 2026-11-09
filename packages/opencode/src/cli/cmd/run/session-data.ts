@@ -16,7 +16,7 @@
 //   check gates output: if we see a text delta before the message.updated
 //   event that tells us the role, we stash it and flush later via `replay()`.
 //
-// - Tool echo stripping: bash tools may echo their own output in the next
+// - Tool echo stripping: shell tools may echo their own output in the next
 //   assistant text part. `stashEcho()` records completed bash output, and
 //   `stripEcho()` removes it from the start of the next assistant chunk.
 //
@@ -456,11 +456,11 @@ function syncText(data: SessionData, partID: string, next: string) {
   return prev
 }
 
-// Records bash tool output for echo stripping. Some models echo bash output
+// Records shell tool output for echo stripping. Some models echo shell output
 // verbatim at the start of their next text part. We save both the raw and
 // trimmed forms so stripEcho() can match either.
 function stashEcho(data: SessionData, part: ToolPart) {
-  if (part.tool !== "bash") {
+  if (!isShellToolPart(part)) {
     return
   }
 
@@ -656,8 +656,14 @@ function claimShell(data: SessionData, callID: string, source: ShellCall["source
   return next
 }
 
-function bashCommand(part: ToolPart): string | undefined {
-  if (part.tool !== "bash") {
+// Canonical shell parts say "shell"; persisted parts from before the #780
+// rename still say "bash". Both are the same tool for display purposes.
+function isShellToolPart(part: ToolPart): boolean {
+  return part.tool === "shell" || part.tool === "bash"
+}
+
+function shellCommand(part: ToolPart): string | undefined {
+  if (!isShellToolPart(part)) {
     return undefined
   }
 
@@ -681,7 +687,7 @@ function shellCommit(
     kind: "tool",
     source: "tool",
     partID: shellPartID(input.callID),
-    tool: "bash",
+    tool: "shell",
     shell: input,
     ...next,
   }
@@ -923,8 +929,8 @@ export function reduceSessionData(input: SessionDataInput): SessionDataOutput {
 
     if (part.type === "tool") {
       const view = syncPermission(data, part) ?? syncQuestion(data, part)
-      if (part.tool === "bash" && part.callID) {
-        if (claimShell(data, part.callID, "tool", bashCommand(part)).source === "shell") {
+      if (isShellToolPart(part) && part.callID) {
+        if (claimShell(data, part.callID, "tool", shellCommand(part)).source === "shell") {
           return out(data, commits, view)
         }
       }
