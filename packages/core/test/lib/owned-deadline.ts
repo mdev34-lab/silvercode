@@ -310,10 +310,15 @@ export function runOwned<A, E>(execution: Effect.Effect<A, E>, deadline?: OwnedD
   runs.set(key, entry)
   scope.runs.push(entry)
 
+  // Arm the owned deadline before launching the fiber so synchronous evaluation of
+  // `execution` cannot consume host time that was intended to be part of the budget.
+  entry.timer = deadline ? setTimeout(() => controller.abort(), deadline.deadlineMs) : undefined
+
   let exitPromise: Promise<Exit.Exit<A, E>>
   try {
     exitPromise = Effect.runPromiseExit(execution, { signal: controller.signal })
   } catch (error) {
+    clearRunTimer(entry)
     entry.settled = true
     entry.released = true
     runs.delete(key)
@@ -321,8 +326,6 @@ export function runOwned<A, E>(execution: Effect.Effect<A, E>, deadline?: OwnedD
   }
   entry.exit = exitPromise
   afterEach(() => releaseScope(scope))
-
-  entry.timer = deadline ? setTimeout(() => controller.abort(), deadline.deadlineMs) : undefined
 
   const result = exitPromise.then((exit) => {
     clearRunTimer(entry)
