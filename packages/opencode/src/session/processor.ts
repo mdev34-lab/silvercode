@@ -110,6 +110,7 @@ const isRepeatedFailureStep = (step: readonly SessionV1.ToolPart[], name: string
 export type Result = "compact" | "stop" | "continue"
 
 export interface Handle {
+  readonly resuming?: boolean
   readonly message: SessionV1.Assistant
   readonly updateToolCall: (
     toolCallID: string,
@@ -132,6 +133,8 @@ type Input = {
   assistantMessage: SessionV1.Assistant
   sessionID: SessionID
   model: Provider.Model
+  // Only the session loop can resume: it rebuilds the next request from storage.
+  resumeAttempt?: number
 }
 
 export interface Interface {
@@ -198,6 +201,7 @@ const layer = Layer.effect(
         reasoningMap: {},
         reasoningLast: {},
       }
+      let resume = false
       let aborted = false
       // Set from every step-finish event. A stream that ends with no
       // step-finish died instead of completing - without this check the turn
@@ -218,6 +222,7 @@ const layer = Layer.effect(
       let sawToolActivity = false
       let priorStepsMemo: readonly (readonly SessionV1.ToolPart[])[] | undefined
       const doomLoopAskedSteps = new Set<number>()
+      const toolActivityIDs = new Set<string>()
       const clock = createGenerationClock()
 
       const parse = (e: unknown) =>
@@ -538,6 +543,7 @@ const layer = Layer.effect(
 
           case "tool-call": {
             sawToolActivity = true
+            toolActivityIDs.add(value.id)
             if (ctx.assistantMessage.summary) {
               throw new Error(`Tool call not allowed while generating summary: ${value.name}`)
             }
@@ -607,6 +613,7 @@ const layer = Layer.effect(
 
           case "tool-result": {
             sawToolActivity = true
+            toolActivityIDs.add(value.id)
             const toolCall = yield* readToolCall(value.id)
             if (!toolCall && value.result.type === "error") return
             if (value.result.type === "error") {
@@ -641,6 +648,7 @@ const layer = Layer.effect(
 
           case "tool-error": {
             sawToolActivity = true
+            toolActivityIDs.add(value.id)
             yield* failToolCall(value.id, value.error ?? new Error(value.message))
             return
           }
@@ -873,6 +881,7 @@ const layer = Layer.effect(
           "session.id": input.sessionID,
           messageID: input.assistantMessage.id,
         })
+        resume = false
         ctx.needsCompaction = false
         ctx.shouldBreak = (yield* config.get()).experimental?.continue_loop_on_deny !== true
         // Tracks whether the retry loop was terminated because the user
@@ -909,6 +918,7 @@ const layer = Layer.effect(
             sawToolActivity = false
             priorStepsMemo = undefined
             doomLoopAskedSteps.clear()
+            toolActivityIDs.clear()
             // A retry after a stalled or failed stream must not leave the previous attempt's thought open.
             yield* Effect.forEach(Object.keys(ctx.reasoningMap), finishReasoning)
             ctx.reasoningMap = {}
@@ -1020,6 +1030,44 @@ const layer = Layer.effect(
             ),
             Effect.catch((e) =>
               Effect.gen(function* () {
+                // Never retry streamInput here. Only hand control back to the
+                // session loop after verifying every issued call in storage.
+                // Missing, running, pending, and error results all fail closed.
+                if (
+                  e instanceof ProviderError.StreamInterruptedAfterToolCallError &&
+                  input.resumeAttempt !== undefined &&
+                  input.resumeAttempt < SessionRetry.RETRY_MAX_RETRIES &&
+                  !ctx.blocked &&
+                  toolActivityIDs.size > 0
+                ) {
+                  const parts = yield* MessageV2.parts(ctx.assistantMessage.id).pipe(
+                    Effect.provideService(Database.Service, database),
+                  )
+                  const completed = new Set(
+                    parts.flatMap((part) =>
+                      part.type === "tool" && part.state.status === "completed" ? [part.callID] : [],
+                    ),
+                  )
+                  const attempt = input.resumeAttempt + 1
+                  const wait = SessionRetry.delay(attempt)
+                  if (
+                    parts.every((part) => part.type !== "tool" || part.state.status === "completed") &&
+                    [...toolActivityIDs].every((id) => completed.has(id)) &&
+                    (maxDelay === undefined || wait <= maxDelay)
+                  ) {
+                    yield* status.set(ctx.sessionID, {
+                      type: "retry",
+                      attempt,
+                      message: "Stream interrupted; resuming from persisted tool results",
+                      next: Date.now() + wait,
+                    })
+                    // Effect sleep is interruptible: Esc/Ctrl+C wins even in backoff.
+                    yield* Effect.sleep(wait)
+                    ctx.assistantMessage.finish = "tool-calls"
+                    resume = true
+                    return
+                  }
+                }
                 // After real retries, say so in the terminal error: a bare
                 // "stream timed out" reads as if the turn died on the first
                 // failure with no retry marker left behind.
@@ -1035,6 +1083,7 @@ const layer = Layer.effect(
             Effect.ensuring(cleanup()),
           )
 
+          if (resume) return "continue"
           if (ctx.needsCompaction) return "compact"
           // If retries were invalidated by a model switch, continue the loop
           // so runLoop can pick up the new selection.
@@ -1046,6 +1095,9 @@ const layer = Layer.effect(
       })
 
       return {
+        get resuming() {
+          return resume
+        },
         get message() {
           return ctx.assistantMessage
         },

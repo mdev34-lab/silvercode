@@ -24,26 +24,58 @@ export type MessageWithParts = {
   parts: Part[]
 }
 
+export function transcriptHeader(session: SessionInfo): string {
+  let header = `# ${session.title}\n\n`
+  header += `**Session ID:** ${session.id}\n`
+  header += `**Created:** ${new Date(session.time.created).toLocaleString()}\n`
+  header += `**Updated:** ${new Date(session.time.updated).toLocaleString()}\n\n`
+  header += `---\n\n`
+  return header
+}
+
+function formatMessages(
+  messages: MessageWithParts[],
+  options: TranscriptOptions,
+  providers: ReadonlyMap<string, Provider>,
+): string {
+  return messages
+    .toSorted((a, b) => a.info.time.created - b.info.time.created || a.info.id.localeCompare(b.info.id))
+    .map((msg) => `${formatMessage(msg.info, msg.parts, options, providers)}---\n\n`)
+    .join("")
+}
+
 export function formatTranscript(
   session: SessionInfo,
   messages: MessageWithParts[],
   options: TranscriptOptions,
 ): string {
+  return transcriptHeader(session) + formatMessages(messages, options, Model.index(options.providers))
+}
+
+export type TranscriptPage = {
+  rows: MessageWithParts[]
+  cursor?: string
+}
+
+// The complete transcript without holding it all in memory at once: pages are
+// read newest-first (`before` walks older) and only their formatted text is
+// kept, so an export of a very long session does not materialize every message
+// and part in the store or in memory (#815 review).
+export async function formatTranscriptPaged(
+  session: SessionInfo,
+  options: TranscriptOptions,
+  page: (before?: string) => Promise<TranscriptPage>,
+): Promise<string> {
   const providers = Model.index(options.providers)
-  let transcript = `# ${session.title}\n\n`
-  transcript += `**Session ID:** ${session.id}\n`
-  transcript += `**Created:** ${new Date(session.time.created).toLocaleString()}\n`
-  transcript += `**Updated:** ${new Date(session.time.updated).toLocaleString()}\n\n`
-  transcript += `---\n\n`
-
-  for (const msg of messages.toSorted(
-    (a, b) => a.info.time.created - b.info.time.created || a.info.id.localeCompare(b.info.id),
-  )) {
-    transcript += formatMessage(msg.info, msg.parts, options, providers)
-    transcript += `---\n\n`
+  const chunks: string[] = []
+  let before: string | undefined
+  for (;;) {
+    const next = await page(before)
+    chunks.push(formatMessages(next.rows, options, providers))
+    if (!next.cursor) break
+    before = next.cursor
   }
-
-  return transcript
+  return transcriptHeader(session) + chunks.toReversed().join("")
 }
 
 export function formatMessage(
