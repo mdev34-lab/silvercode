@@ -103,6 +103,11 @@ const MAX_MCP_RESOURCE_BLOB_BYTES = 10 * 1024 * 1024
 // model that ignores every nudge cannot keep one prompt alive forever. The
 // counter is per runLoop invocation and is not persisted across re-prompts.
 const MAX_FINISH_NUDGES = 3
+// An exhausted reduction escalates to compaction at most once per prompt turn:
+// when that compaction fails or makes no durable progress, the loop must not
+// schedule another one forever. Past the bound the still-oversized request is
+// dispatched and provider overflow handling governs what happens next.
+const MAX_EXHAUSTED_COMPACTIONS = 1
 const SUPPORTED_MCP_RESOURCE_ATTACHMENT_MIMES = new Set([
   "application/pdf",
   "image/gif",
@@ -1385,6 +1390,7 @@ const layer = Layer.effect(
         let structured: unknown
         let step = 0
         let finishNudges = 0
+        let exhaustedCompactions = 0
         let resumeAttempts = 0
         const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
 
@@ -1813,16 +1819,25 @@ const layer = Layer.effect(
               .pipe(Effect.ignore)
             // Reduction stops at protected content. When it exhausted its eligible steps the
             // prepared request is still over target, so escalate to durable compaction before
-            // dispatching it. This is a threshold compaction and must follow compaction.auto.
+            // dispatching it. This is a threshold compaction and must follow compaction.auto,
+            // and it is bounded per prompt turn: a compaction that failed or made no durable
+            // progress must not be re-scheduled on every following iteration.
             if (reduction.report.outcome === "exhausted" && effortConfig.compaction?.auto !== false) {
-              const latestSelection = yield* turnSelection(sessionID, lastUser)
-              yield* compaction.create({
-                sessionID,
-                agent: lastUser.agent,
-                model: latestSelection,
-                auto: true,
-              })
-              return "continue" as const
+              if (exhaustedCompactions < MAX_EXHAUSTED_COMPACTIONS) {
+                exhaustedCompactions++
+                const latestSelection = yield* turnSelection(sessionID, lastUser)
+                yield* compaction.create({
+                  sessionID,
+                  agent: lastUser.agent,
+                  model: latestSelection,
+                  auto: true,
+                })
+                return "continue" as const
+              }
+              yield* Effect.logWarning(
+                "context reduction still exhausted after compaction; dispatching without further compaction",
+                { "session.id": sessionID, attempts: exhaustedCompactions },
+              )
             }
             const modelMsgs = yield* MessageV2.toModelMessagesEffect([...reduction.messages], model)
             const result = yield* handle.process({
