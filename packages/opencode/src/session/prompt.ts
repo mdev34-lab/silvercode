@@ -1811,6 +1811,19 @@ const layer = Layer.effect(
                 ...reduction.report,
               })
               .pipe(Effect.ignore)
+            // Reduction stops at protected content. When it exhausted its eligible steps the
+            // prepared request is still over target, so escalate to durable compaction before
+            // dispatching it. This is a threshold compaction and must follow compaction.auto.
+            if (reduction.report.outcome === "exhausted" && effortConfig.compaction?.auto !== false) {
+              const latestSelection = yield* turnSelection(sessionID, lastUser)
+              yield* compaction.create({
+                sessionID,
+                agent: lastUser.agent,
+                model: latestSelection,
+                auto: true,
+              })
+              return "continue" as const
+            }
             const modelMsgs = yield* MessageV2.toModelMessagesEffect([...reduction.messages], model)
             const result = yield* handle.process({
               user: effectiveUser,

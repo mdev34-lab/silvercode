@@ -999,6 +999,57 @@ it.instance("loop stops provider overflow instead of auto-compacting when disabl
   }),
 )
 
+it.instance("loop compacts exhausted prepared context before ordinary provider dispatch", () =>
+  Effect.gen(function* () {
+    const pressureCfg = (url: string) => {
+      const base = providerCfg(url)
+      return {
+        ...base,
+        provider: {
+          ...base.provider,
+          test: {
+            ...base.provider.test,
+            models: {
+              ...base.provider.test.models,
+              "test-model": {
+                ...base.provider.test.models["test-model"],
+                limit: { context: 20_000, output: 8_000 },
+              },
+            },
+          },
+        },
+      }
+    }
+    const { llm } = yield* useServerConfig(pressureCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Exhausted" })
+
+    yield* llm.push(
+      reply().text("## Objective\n- Continue after exhausted compaction").stop(),
+      reply().text("continued after exhausted compaction").stop(),
+    )
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "work",
+      noReply: true,
+      parts: [{ type: "text", text: `EXHAUSTED_ONLY ${"x".repeat(44_000)}` }],
+    })
+
+    yield* prompt.loop({ sessionID: chat.id })
+    const inputs = yield* llm.inputs
+    const messages = yield* sessions.messages({ sessionID: chat.id })
+
+    expect(inputs).toHaveLength(2)
+    expect(JSON.stringify(inputs[0])).toContain("Create a new anchored summary")
+    expect(JSON.stringify(inputs[0])).not.toContain("continued after exhausted compaction")
+    expect(JSON.stringify(inputs[1])).toContain("## Objective")
+    expect(JSON.stringify(inputs[1])).not.toContain("Create a new anchored summary")
+    expect(messages.some((message) => message.parts.some((part) => part.type === "compaction"))).toBe(true)
+  }),
+  15_000,
+)
+
 noLLMServer.instance.skip(
   "prompt emits v2 prompted and synthetic events (v2 projector disabled)",
   () =>

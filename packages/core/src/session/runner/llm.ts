@@ -289,7 +289,7 @@ const layer = Layer.effect(
       })
       // Compaction is the escalation reduction cannot perform: it summarizes history durably, so it
       // only runs once the deterministic rungs have given everything they may give.
-      if (yield* compaction.compactIfNeeded({ sessionID: session.id, entries, model, request }))
+      if (yield* compaction.compactIfNeeded({ sessionID: session.id, entries, model, request, reduction: reduction.report }))
         return yield* Effect.die(continueAfterCompaction(currentStep))
       if (reduction.report.outcome === "exhausted")
         yield* Effect.logWarning("context.reduce.exhausted", {

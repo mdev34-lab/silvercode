@@ -1,7 +1,7 @@
 import { mkdtempSync } from "node:fs"
 import { tmpdir } from "node:os"
 import path from "node:path"
-import { describe, expect } from "bun:test"
+import { beforeEach, describe, expect } from "bun:test"
 import {
   LLMClient,
   LLMError,
@@ -61,6 +61,7 @@ import { ModelV2 } from "@opencode-ai/core/model"
 import { Location } from "@opencode-ai/core/location"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { Cause, DateTime, Deferred, Effect, Exit, Fiber, Layer, Schema, Stream } from "effect"
+import * as TestConsole from "effect/testing/TestConsole"
 import { asc, eq } from "drizzle-orm"
 import { testEffect } from "./lib/effect"
 
@@ -182,6 +183,7 @@ const models = SessionRunnerModel.layerWith((session) =>
 )
 const systemContextKey = SystemContext.Key.make("test/context")
 let systemBaseline = "Initial context"
+let compactionAuto: boolean | undefined
 let systemRemoved = false
 let systemUnavailable = false
 let systemLoadHook = Effect.void
@@ -240,6 +242,7 @@ const config = Layer.succeed(
           type: "document",
           info: new Config.Info({
             compaction: new ConfigCompaction.Info({
+              auto: compactionAuto,
               buffer: 3_000,
               keep: new ConfigCompaction.Keep({ tokens: 1_000 }),
             }),
@@ -339,6 +342,7 @@ const setup = Effect.gen(function* () {
   const { db } = yield* Database.Service
   response = []
   systemBaseline = "Initial context"
+  compactionAuto = undefined
   systemRemoved = false
   systemUnavailable = false
   systemLoadHook = Effect.void
@@ -3524,10 +3528,17 @@ describe("SessionRunnerLLM", () => {
     }),
   )
 
-  it.effect("reduces the provider request under context pressure and reports it once per request", () =>
-    Effect.gen(function* () {
-      yield* setup
-      const session = yield* SessionV2.Service
+  describe("reduction", () => {
+    // These tests exercise reduction with an exhausted intermediate request, so keep compaction
+    // out of the picture; escalation is covered separately.
+    beforeEach(() => {
+      compactionAuto = false
+    })
+
+    it.effect("reduces the provider request under context pressure and reports it once per request", () =>
+      Effect.gen(function* () {
+        yield* setup
+        const session = yield* SessionV2.Service
       const events = yield* EventV2.Service
       const reports = yield* reportCollector(events)
       yield* registerBulk
@@ -3588,10 +3599,10 @@ describe("SessionRunnerLLM", () => {
     }),
   )
 
-  it.effect("keeps the reduced projection across turn boundaries instead of resetting it", () =>
-    Effect.gen(function* () {
-      yield* setup
-      const session = yield* SessionV2.Service
+    it.effect("keeps the reduced projection across turn boundaries instead of resetting it", () =>
+      Effect.gen(function* () {
+        yield* setup
+        const session = yield* SessionV2.Service
       const events = yield* EventV2.Service
       const reports = yield* reportCollector(events)
       yield* registerBulk
@@ -3632,7 +3643,8 @@ describe("SessionRunnerLLM", () => {
       expect(userTexts(requests[1]!).at(-1)).toBe("Second follow-up")
       expect(reports.map((report) => report.outcome)).toEqual(["reduced", "reduced"])
     }),
-  )
+    )
+  })
 
   it.effect("escalates to compaction instead of reducing protected content", () =>
     Effect.gen(function* () {
@@ -3665,6 +3677,55 @@ describe("SessionRunnerLLM", () => {
 
       // A report describes a request that is actually sent, so the escalated request has none.
       expect(reports.map((report) => report.outcome)).toEqual(["untouched", "untouched"])
+    }),
+  )
+
+  it.effect("escalates exhausted reduction to compaction below the compaction gate", () =>
+    Effect.gen(function* () {
+      yield* setup
+      requests.length = 0
+      const session = yield* SessionV2.Service
+      const events = yield* EventV2.Service
+      const reports = yield* reportCollector(events)
+      currentModel = pressureModel
+      responses = [
+        fragmentFixture("text", "text-summary", ["## Objective\n- Preserve the exhausted task"]).completeEvents,
+        fragmentFixture("text", "text-final", ["Continued after exhausted compaction"]).completeEvents,
+      ]
+      yield* session.prompt({
+        sessionID,
+        prompt: Prompt.make({ text: `EXHAUSTED_ONLY ${"x".repeat(54_000)}` }),
+        resume: false,
+      })
+      yield* session.resume(sessionID)
+
+      // Capture both measurements: reduction exhausted its eligible steps, while the independent
+      // compaction gate was not crossed. Only exhaustion can explain the compaction attempt.
+      const logs = yield* TestConsole.logLines
+      const escalated = logs.findIndex((line) => line === "session.compaction.escalated")
+      expect(escalated).toBeGreaterThanOrEqual(0)
+      const detail = logs.slice(escalated + 1).find((item) => typeof item === "object" && item !== null) as
+        | {
+            requestTokens: number
+            gate: number
+            reductionTokens: number
+            reductionLimit: number
+            reductionOutcome: string
+          }
+        | undefined
+      expect(detail?.reductionOutcome).toBe("exhausted")
+      expect(detail!.reductionTokens).toBeGreaterThan(detail!.reductionLimit * 0.8)
+      expect(detail!.requestTokens).toBeLessThanOrEqual(detail!.gate)
+
+      // The durable summary was saved before the ordinary provider dispatch proceeded.
+      expect(requests).toHaveLength(2)
+      expect(userTexts(requests[0]!)[0]).toContain("Create a new anchored summary")
+      expect(userTexts(requests[1]!)[0]).toContain("<summary>\n## Objective\n- Preserve the exhausted task")
+      expect(yield* session.context(sessionID)).toMatchObject([
+        { type: "compaction", summary: "## Objective\n- Preserve the exhausted task" },
+        { type: "assistant", finish: "stop" },
+      ])
+      expect(reports.map((report) => report.outcome)).toEqual(["untouched"])
     }),
   )
 })
