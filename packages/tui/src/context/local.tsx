@@ -49,8 +49,11 @@ export function parseModel(model: string) {
 
 // Decides which model update must be pushed to a session when the current
 // selection differs from the session's stored selection while a task is
-// running. Returns undefined when nothing must be sent, which keeps the
-// push idempotent and avoids touching idle sessions. The stored selection
+// running. A session waiting out a retry backoff counts as running: the
+// server cancels the backoff when the persisted model changes, so the
+// selection must reach the session row before the next attempt fires.
+// Returns undefined when nothing must be sent, which keeps the push
+// idempotent and avoids touching idle sessions. The stored selection
 // is agent-scoped, so a selection for a different agent than the one the
 // session is running never pushes.
 export function selectionUpdate(input: {
@@ -58,10 +61,11 @@ export function selectionUpdate(input: {
   modelID?: string
   variant?: string
   agent?: string
-  busy?: boolean
+  status?: string
   session?: { id: string; agent?: string; model?: { providerID: string; id: string; variant?: string } }
 }) {
-  if (!input.providerID || !input.modelID || !input.session || !input.busy) return undefined
+  const running = input.status === "busy" || input.status === "retry"
+  if (!input.providerID || !input.modelID || !input.session || !running) return undefined
   if (input.agent && input.session.agent && input.session.agent !== input.agent) return undefined
   const sameModel =
     input.session.model?.providerID === input.providerID && input.session.model?.id === input.modelID
@@ -894,8 +898,10 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
 
     // While a task is running in the visible session, push model/thinking
     // effort selection changes to the server so they apply at the next agent
-    // turn instead of waiting for the next user message. Comparing against the
-    // synced session row keeps this idempotent and per-session.
+    // turn instead of waiting for the next user message. A retry backoff is
+    // part of the run: the server invalidates it when the persisted model
+    // changes. Comparing against the synced session row keeps this
+    // idempotent and per-session.
     let lastAttempt: string | undefined
     createEffect(
       on(
@@ -917,7 +923,7 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
             modelID: state.modelID,
             variant: state.variant,
             agent: state.agent,
-            busy: state.status === "busy",
+            status: state.status,
             session: state.session,
           })
           if (!update) {
