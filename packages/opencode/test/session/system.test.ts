@@ -353,6 +353,8 @@ describe("session.system", () => {
       expect(output).toContain("once, at the start")
       expect(output).toContain("delegate each implementation step to `code`")
       expect(output).toContain("Direct work is the exception")
+      expect(output).toContain("living scratchpad")
+      expect(output).toContain("at milestones")
       expect(output).toContain("re-deriving or re-planning it at every tool call")
       expect(output).not.toContain("architect-planner")
       expect(output).not.toContain("`scout`")
