@@ -6,7 +6,7 @@ import { testRender, useRenderer } from "@opentui/solid"
 import { onCleanup, onMount, type JSX } from "solid-js"
 import { chmod, mkdir } from "node:fs/promises"
 import path from "node:path"
-import type { GlobalEvent, SessionStatus } from "@opencode-ai/sdk/v2"
+import type { GlobalEvent, Session, SessionStatus } from "@opencode-ai/sdk/v2"
 import { tmpdir } from "../../fixture/fixture"
 import { captureFrame, captureSpans, waitFor, waitUntil } from "../../fixture/frame"
 import { createTuiResolvedConfig } from "../../fixture/tui-runtime"
@@ -1724,8 +1724,12 @@ describe("model selection propagation", () => {
     }
   }
 
-  function rowEvent(id: string, info: Record<string, unknown>): GlobalEvent {
-    return { directory, project: "proj_test", payload: { id, type: "session.updated", properties: { info } } }
+  function rowEvent(id: string, info: Session): GlobalEvent {
+    return {
+      directory,
+      project: "proj_test",
+      payload: { id, type: "session.updated", properties: { sessionID: info.id, info } },
+    }
   }
 
   test("pushes a mid-backoff model switch to the retrying session exactly once", async () => {
@@ -1827,6 +1831,62 @@ describe("model selection propagation", () => {
       harness.release(1)
       await Bun.sleep(100)
       expect(harness.updates.length).toBe(2)
+    } finally {
+      await harness.dispose()
+    }
+  })
+
+  test("keeps a rejected push suppressed across home navigation and other sessions", async () => {
+    const harness = await mountEffort({
+      route: { type: "session", sessionID: SESSION_RUN },
+      model: "test-provider/variant-model",
+      children: () => null,
+      gated: true,
+      sessions: [sessionRow(SESSION_RUN, undefined, runModel), sessionRow(SESSION_OTHER, undefined, runModel)],
+    })
+    try {
+      harness.events.emit(statusEvent(SESSION_RUN, retryStatus(2)))
+      harness.local.model.set({ providerID: "test-provider", modelID: "plain-model" })
+      await waitUntil(() => harness.updates.length >= 1)
+      harness.release(0, "fail")
+      await frameWhere(harness.app, (f) => f.includes("Failed to apply model to the running session"), "failure toast")
+
+      // Leaving the session hides it, but the rejected push is still pending:
+      // the stored row never caught up and the selection never moved.
+      harness.route.navigate({ type: "home" })
+      await waitUntil(() => harness.route.data.type === "home")
+      harness.route.navigate({ type: "session", sessionID: SESSION_RUN })
+      await waitUntil(() => harness.route.data.type === "session" && harness.route.data.sessionID === SESSION_RUN)
+      harness.local.model.set({ providerID: "test-provider", modelID: "plain-model" })
+      await Bun.sleep(100)
+      expect(harness.updates.length).toBe(1)
+
+      // Isolation: another retrying session with the same selection has its
+      // own lifecycle, so it still pushes.
+      harness.events.emit(statusEvent(SESSION_OTHER, retryStatus(2)))
+      await waitUntil(() => harness.sync.data.session_status[SESSION_OTHER]?.type === "retry")
+      harness.route.navigate({ type: "session", sessionID: SESSION_OTHER })
+      await waitUntil(() => harness.route.data.type === "session" && harness.route.data.sessionID === SESSION_OTHER)
+      await waitUntil(() => harness.updates.length >= 2)
+      expect(harness.updates[1]).toEqual({
+        sessionID: SESSION_OTHER,
+        body: { model: { providerID: "test-provider", id: "plain-model" } },
+      })
+      harness.release(1)
+
+      // A real selection change on the original session still pushes.
+      harness.route.navigate({ type: "session", sessionID: SESSION_RUN })
+      await waitUntil(() => harness.route.data.type === "session" && harness.route.data.sessionID === SESSION_RUN)
+      harness.local.model.set({ providerID: "test-provider", modelID: "variant-model" })
+      harness.local.model.variant.set("high")
+      await waitUntil(() => harness.updates.length >= 3)
+      expect(harness.updates[2]).toEqual({
+        sessionID: SESSION_RUN,
+        body: { model: { providerID: "test-provider", id: "variant-model", variant: "high" } },
+      })
+      harness.release(2)
+      await Bun.sleep(100)
+      expect(harness.updates.length).toBe(3)
     } finally {
       await harness.dispose()
     }

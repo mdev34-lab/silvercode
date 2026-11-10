@@ -10,6 +10,7 @@ import { useSDK } from "./sdk"
 import { effectiveVariant } from "../util/model"
 import * as ModelHealth from "../util/model-health"
 import { RGBA } from "@opentui/core"
+import type { SessionStatus } from "@opencode-ai/sdk/v2"
 import { readJson, writeJsonAtomic } from "../util/persistence"
 import { errorMessage } from "../util/error"
 import { useTheme } from "./theme"
@@ -52,6 +53,9 @@ export function parseModel(model: string) {
 // running. A session waiting out a retry backoff counts as running: the
 // server cancels the backoff when the persisted model changes, so the
 // selection must reach the session row before the next attempt fires.
+// Every other status (idle, or no status yet) means the session is not
+// running, so nothing is pushed and the selection simply waits for the next
+// user message; an unrecognized status string also fails safe as not running.
 // Returns undefined when nothing must be sent, which keeps the push
 // idempotent and avoids touching idle sessions. The stored selection
 // is agent-scoped, so a selection for a different agent than the one the
@@ -61,7 +65,7 @@ export function selectionUpdate(input: {
   modelID?: string
   variant?: string
   agent?: string
-  status?: string
+  status?: SessionStatus["type"]
   session?: { id: string; agent?: string; model?: { providerID: string; id: string; variant?: string } }
 }) {
   const running = input.status === "busy" || input.status === "retry"
@@ -902,7 +906,12 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
     // part of the run: the server invalidates it when the persisted model
     // changes. Comparing against the synced session row keeps this
     // idempotent and per-session.
-    let lastAttempt: string | undefined
+    // A rejected push must not retry itself on every unrelated signal change
+    // (a fresh status event, a re-render, leaving and returning to the
+    // session). Attempts are keyed per session and by the selection plus the
+    // stored row they were computed against, so only a real move of either
+    // one re-arms the push; a hidden route alone never does.
+    const attempts = new Map<string, string>()
     createEffect(
       on(
         () => {
@@ -926,16 +935,24 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
             status: state.status,
             session: state.session,
           })
-          if (!update) {
-            lastAttempt = undefined
-            return
-          }
-          // A rejected push must not retry itself on every unrelated signal
-          // change; the same update is attempted once until the selection or
-          // the stored row actually moves.
-          const attempt = JSON.stringify(update)
-          if (attempt === lastAttempt) return
-          lastAttempt = attempt
+          // No push is needed while the session is hidden, idle, or already
+          // matches; that says nothing about a rejected push, so its entry
+          // survives until the selection or the stored row actually moves.
+          if (!update) return
+          const attempt = JSON.stringify({
+            providerID: state.providerID,
+            id: state.modelID,
+            variant: effectiveVariant(state.variant),
+            row: state.session?.model
+              ? {
+                  providerID: state.session.model.providerID,
+                  id: state.session.model.id,
+                  variant: effectiveVariant(state.session.model.variant),
+                }
+              : undefined,
+          })
+          if (attempts.get(update.sessionID) === attempt) return
+          attempts.set(update.sessionID, attempt)
           void sdk.client.session
             .update(update, { throwOnError: true })
             .catch((error) => {

@@ -65,6 +65,20 @@ test("pushes a model update while a session is retrying in backoff", () => {
   })
 })
 
+test("pushes to a retrying session whose row has no model yet", () => {
+  expect(
+    selectionUpdate({
+      providerID: "provider",
+      modelID: "model-b",
+      status: "retry",
+      session: { id: "session" },
+    }),
+  ).toEqual({
+    sessionID: "session",
+    model: { providerID: "provider", id: "model-b", variant: undefined },
+  })
+})
+
 test("keeps idle sessions and sessions without a status untouched", () => {
   expect(
     selectionUpdate({
