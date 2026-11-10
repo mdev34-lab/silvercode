@@ -68,7 +68,7 @@ bun install
 
 The binary is written to `./packages/opencode/dist/silvercode-ai-<platform>/bin/silvercode`. The executable is named `silvercode`.
 
-The repository also contains an `install` script for the future release path. It downloads from this repository's GitHub Releases and installs to `~/.opencode/bin`; it will not work until a release exists.
+The repository also contains an `install` script for the future release path. Once a release is published, the intended one-liner is `curl -fsSL https://github.com/mdev34-lab/silvercode/releases/latest/download/install | bash`. No release exists yet, so that URL returns 404 today; build from source until then. The script installs to `~/.opencode/bin`.
 
 ## Usage
 
