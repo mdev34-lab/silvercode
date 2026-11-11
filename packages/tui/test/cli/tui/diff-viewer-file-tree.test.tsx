@@ -2,6 +2,7 @@
 import { describe, expect, test } from "bun:test"
 import { RGBA } from "@opentui/core"
 import { testRender } from "@opentui/solid"
+import { captureFrame } from "../../fixture/frame"
 import { onMount, type JSX } from "solid-js"
 import { createTuiResolvedConfig } from "../../fixture/tui-runtime"
 import { KVProvider } from "../../../src/context/kv"
@@ -53,7 +54,7 @@ describe("DiffViewerFileTree", () => {
 
     try {
       await renderOnceSettled(app)
-      const lines = visibleLines(await captureFrameWithin(app, performance.now() + 40 * 25))
+      const lines = visibleLines(await captureFrame(app))
 
       expect(lines).toEqual([
         "▾ a",
