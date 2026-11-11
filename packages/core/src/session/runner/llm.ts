@@ -225,6 +225,7 @@ const layer = Layer.effect(
       promotion: SessionInput.Delivery | undefined,
       step: number,
       recoverOverflow?: typeof compaction.compactAfterOverflow,
+      compactions = 0,
     ) {
       const session = yield* getSession(sessionID)
       if (session.location.directory !== location.directory || session.location.workspaceID !== location.workspaceID)
@@ -288,9 +289,18 @@ const layer = Layer.effect(
         toolChoice: isLastStep ? "none" : undefined,
       })
       // Compaction is the escalation reduction cannot perform: it summarizes history durably, so it
-      // only runs once the deterministic rungs have given everything they may give.
-      if (yield* compaction.compactIfNeeded({ sessionID: session.id, entries, model, request }))
-        return yield* Effect.die(continueAfterCompaction(currentStep))
+      // only runs once the deterministic rungs have given everything they may give. It may
+      // escalate at most once per turn; a still-exhausted reduction afterwards dispatches anyway.
+      if (compactions === 0) {
+        const compacted = yield* compaction.compactIfNeeded({ sessionID: session.id, entries, model, request, reduction: reduction.report })
+        if (compacted) return yield* Effect.die(continueAfterCompaction(currentStep))
+      }
+      if (compactions > 0 && reduction.report.outcome === "exhausted")
+        yield* Effect.logWarning("session.compaction.exhausted", {
+          sessionID: session.id,
+          tokens: reduction.report.tokens,
+          limit: reduction.report.limit,
+        })
       if (reduction.report.outcome === "exhausted")
         yield* Effect.logWarning("context.reduce.exhausted", {
           sessionID: session.id,
@@ -440,31 +450,32 @@ const layer = Layer.effect(
       sessionID: SessionSchema.ID,
       promotion: SessionInput.Delivery | undefined,
       step: number,
+      compactions?: number,
     ) => Effect.Effect<{ readonly needsContinuation: boolean; readonly step: number }, RunError>
 
-    const runAfterOverflowCompaction: RunTurn = Effect.fnUntraced(function* (sessionID, promotion, step) {
-      return yield* runTurnAttempt(sessionID, promotion, step).pipe(
+    const runAfterOverflowCompaction: RunTurn = Effect.fnUntraced(function* (sessionID, promotion, step, compactions = 0) {
+      return yield* runTurnAttempt(sessionID, promotion, step, undefined, compactions).pipe(
         Effect.catchDefect(
           Effect.fnUntraced(function* (defect) {
             if (!(defect instanceof TurnTransitionError)) return yield* Effect.die(defect)
             if (defect.transition._tag === "ContinueAfterOverflowCompaction")
               return yield* Effect.die("Post-compaction provider attempt cannot recover another overflow")
             yield* Effect.yieldNow
-            return yield* runAfterOverflowCompaction(sessionID, undefined, defect.transition.step)
+            return yield* runAfterOverflowCompaction(sessionID, undefined, defect.transition.step, compactions + 1)
           }),
         ),
       )
     })
 
-    const runTurn: RunTurn = Effect.fnUntraced(function* (sessionID, promotion, step) {
-      return yield* runTurnAttempt(sessionID, promotion, step, compaction.compactAfterOverflow).pipe(
+    const runTurn: RunTurn = Effect.fnUntraced(function* (sessionID, promotion, step, compactions = 0) {
+      return yield* runTurnAttempt(sessionID, promotion, step, compaction.compactAfterOverflow, compactions).pipe(
         Effect.catchDefect(
           Effect.fnUntraced(function* (defect) {
             if (!(defect instanceof TurnTransitionError)) return yield* Effect.die(defect)
             yield* Effect.yieldNow
             if (defect.transition._tag === "ContinueAfterOverflowCompaction")
               return yield* runAfterOverflowCompaction(sessionID, undefined, defect.transition.step)
-            return yield* runTurn(sessionID, undefined, defect.transition.step)
+            return yield* runTurn(sessionID, undefined, defect.transition.step, compactions + 1)
           }),
         ),
       )

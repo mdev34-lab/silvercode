@@ -21,6 +21,7 @@ import { EventV2Bridge } from "@/event-v2-bridge"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { buildPrompt } from "@opencode-ai/core/session/compaction"
+import { Database } from "@opencode-ai/core/database/database"
 import { SessionCompactionEvent } from "@opencode-ai/schema/session-compaction-event"
 
 export const Event = SessionCompactionEvent
@@ -199,6 +200,7 @@ const layer = Layer.effect(
     const provider = yield* Provider.Service
     const events = yield* EventV2Bridge.Service
     const flags = yield* RuntimeFlags.Service
+    const database = yield* Database.Service
 
     const isOverflow = Effect.fn("SessionCompaction.isOverflow")(function* (input: {
       tokens: SessionV1.Assistant["tokens"]
@@ -551,7 +553,21 @@ const layer = Layer.effect(
 
       if (processor.message.error) return "stop"
       if (result === "continue") {
-        yield* events.publish(Event.Compacted, { sessionID: input.sessionID })
+        const summary = (yield* MessageV2.parts(processor.message.id).pipe(
+          Effect.provideService(Database.Service, database),
+        ))
+          .filter((part): part is SessionV1.TextPart => part.type === "text")
+          .map((part) => part.text.trim())
+          .filter(Boolean)
+          .join("\n\n")
+          .trim()
+        if (summary) {
+          yield* events.publish(Event.Compacted, { sessionID: input.sessionID })
+        } else {
+          yield* Effect.logWarning("compaction produced a blank summary; skipping Compacted event", {
+            "session.id": input.sessionID,
+          })
+        }
       }
       return result
     })
@@ -602,6 +618,7 @@ export const node = LayerNode.make({
     Provider.node,
     EventV2Bridge.node,
     RuntimeFlags.node,
+    Database.node,
   ],
 })
 

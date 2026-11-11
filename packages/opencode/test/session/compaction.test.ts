@@ -6,6 +6,7 @@ import { EventV2Bridge } from "@/event-v2-bridge"
 import { APICallError } from "ai"
 import { Cause, Deferred, Effect, Exit, Fiber, Layer, Schema } from "effect"
 import * as Stream from "effect/Stream"
+import * as TestConsole from "effect/testing/TestConsole"
 import { Config } from "@/config/config"
 import { Snapshot } from "@/snapshot"
 import fs from "node:fs/promises"
@@ -199,6 +200,8 @@ function createCompactionMarker(sessionID: SessionID) {
 function fake(
   input: Parameters<SessionProcessorModule.SessionProcessor.Interface["create"]>[0],
   result: "continue" | "compact",
+  session: SessionNs.Interface,
+  blank: boolean,
 ) {
   const msg = input.assistantMessage
   return {
@@ -208,17 +211,46 @@ function fake(
     updateToolCall: Effect.fn("TestSessionProcessor.updateToolCall")(() => Effect.succeed(undefined)),
     completeToolCall: Effect.fn("TestSessionProcessor.completeToolCall")(() => Effect.void),
     waitForOtherTools: Effect.fn("TestSessionProcessor.waitForOtherTools")(() => Effect.void),
-    process: Effect.fn("TestSessionProcessor.process")(() => Effect.succeed(result)),
+    process: Effect.fn("TestSessionProcessor.process")(function* () {
+      // The real processor persists summary text parts while streaming
+      // (text-start/text-delta/text-end in processor.ts), so a successful
+      // compaction leaves a text part on the assistant message before
+      // process resolves. Reproduce that here, or omit it to simulate a
+      // model that produced a blank summary.
+      if (result === "continue" && !blank) {
+        yield* session.updatePart({
+          id: PartID.ascending(),
+          messageID: msg.id,
+          sessionID: msg.sessionID,
+          type: "text",
+          text: "summary",
+          time: { start: Date.now(), end: Date.now() },
+        })
+      }
+      return result
+    }),
   } satisfies SessionProcessorModule.SessionProcessor.Handle
 }
 
-function processorLayer(result: "continue" | "compact") {
-  return Layer.succeed(
-    SessionProcessorModule.SessionProcessor.Service,
-    SessionProcessorModule.SessionProcessor.Service.of({
-      create: Effect.fn("TestSessionProcessor.create")((input) => Effect.succeed(fake(input, result))),
-    }),
-  )
+// A node, not a bare layer, so the fake can depend on the session service the
+// compiled tree already shares: writes land in the same database compaction
+// reads from.
+function processorLayer(result: "continue" | "compact", blank = false) {
+  return LayerNode.make({
+    service: SessionProcessorModule.SessionProcessor.Service,
+    layer: Layer.effect(
+      SessionProcessorModule.SessionProcessor.Service,
+      Effect.gen(function* () {
+        const session = yield* SessionNs.Service
+        return SessionProcessorModule.SessionProcessor.Service.of({
+          create: Effect.fn("TestSessionProcessor.create")((input) =>
+            Effect.succeed(fake(input, result, session, blank)),
+          ),
+        })
+      }),
+    ),
+    deps: [SessionNs.node],
+  })
 }
 
 function cfg(compaction?: ConfigV1.Info["compaction"]) {
@@ -255,6 +287,7 @@ type CompactionProcessOptions = {
   provider?: ReturnType<typeof wide>
   snapshot?: Layer.Layer<Snapshot.Service>
   config?: Layer.Layer<Config.Service>
+  blankSummary?: boolean
 }
 
 function withCompaction(options?: CompactionProcessOptions) {
@@ -271,7 +304,7 @@ function compactionProcessLayer(options?: CompactionProcessOptions) {
   if (!options?.llm) {
     return AppNodeBuilder.build(compactionTestNode, [
       ...replacements,
-      [SessionProcessorModule.SessionProcessor.node, processorLayer(options?.result ?? "continue")],
+      [SessionProcessorModule.SessionProcessor.node, processorLayer(options?.result ?? "continue", options?.blankSummary)],
       ...(options?.plugin ? ([[Plugin.node, options.plugin]] as const) : []),
       ...(options?.config ? ([[Config.node, options.config]] as const) : []),
     ])
@@ -880,6 +913,35 @@ describe("session.compaction.process", () => {
       expect(seen).toContain(SessionCompaction.Event.Compacted.type)
       expect(seen.filter((type) => type.startsWith("session.next."))).toEqual([])
     }),
+  )
+
+  itCompaction.instance(
+    "does not publish compacted event on blank summary",
+    Effect.gen(function* () {
+      const events = yield* EventV2Bridge.Service
+      const ssn = yield* SessionNs.Service
+      const session = yield* ssn.create({})
+      const msg = yield* createUserMessage(session.id, "hello")
+      const msgs = yield* ssn.messages({ sessionID: session.id })
+      const seen: string[] = []
+      const unsub = yield* events.listen((evt) => {
+        seen.push(evt.type)
+        return Effect.void
+      })
+      yield* Effect.addFinalizer(() => unsub)
+
+      const result = yield* SessionCompaction.use.process({
+        parentID: msg.id,
+        messages: msgs,
+        sessionID: session.id,
+        auto: false,
+      })
+
+      const logs = yield* TestConsole.logLines
+      expect(result).toBe("continue")
+      expect(seen).not.toContain(SessionCompaction.Event.Compacted.type)
+      expect(logs).toContain("compaction produced a blank summary; skipping Compacted event")
+    }).pipe(withCompaction({ blankSummary: true })),
   )
 
   itCompaction.instance(

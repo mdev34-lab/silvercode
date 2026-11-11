@@ -1,6 +1,7 @@
 export * as SessionCompaction from "./compaction"
 
 import { LLM, LLMError, LLMEvent, Message, type LLMRequest, type Model } from "@opencode-ai/llm"
+import type { SessionContext } from "@opencode-ai/schema/session-context"
 import { DateTime, Effect, Stream } from "effect"
 import type { Config } from "../config"
 import type { EventV2 } from "../event"
@@ -78,7 +79,21 @@ type Input = {
   readonly entries: readonly Entry[]
   readonly model: Model
   readonly request: LLMRequest
+  /** The reduction report for the request being prepared, when the caller has one. */
+  readonly reduction?: SessionContext.Report
 }
+
+type Attempt =
+  | { readonly _tag: "completed" }
+  | { readonly _tag: "skipped"; readonly reason: "no-context-limit" | "below-threshold" | "disabled" }
+  | {
+      readonly _tag: "failed"
+      readonly reason:
+        | "no-summarizable-head"
+        | "summary-prompt-too-large"
+        | "provider-failure"
+        | "empty-summary"
+    }
 
 const estimate = (value: unknown) => Token.estimate(JSON.stringify(value))
 
@@ -176,19 +191,25 @@ export const buildPrompt = (input: { readonly previousSummary?: string; readonly
 
 export const make = (dependencies: Dependencies) => {
   const config = settings(dependencies.config)
-  const compactAfterOverflow = Effect.fn("SessionCompaction.compactAfterOverflow")(function* (input: Input) {
+  const fail = (input: Input, reason: Extract<Attempt, { _tag: "failed" }>["reason"]) =>
+    Effect.logWarning("session.compaction.failed", { sessionID: input.sessionID, reason }).pipe(
+      Effect.as({ _tag: "failed" as const, reason }),
+    )
+  const attempt = Effect.fn("SessionCompaction.attempt")(function* (input: Input) {
     const context = input.model.route.defaults.limits?.context
-    if (context === undefined || context <= 0) return false
+    if (context === undefined || context <= 0) return { _tag: "skipped", reason: "no-context-limit" }
     const output = input.request.generation?.maxTokens ?? input.model.route.defaults.limits?.output ?? 0
     const selected = select(input.entries, config.tokens)
     const previousSummary = input.entries.find((entry) => entry.message.type === "compaction")?.message
-    if (!selected || (selected.head.length === 0 && previousSummary?.type !== "compaction")) return false
+    if (!selected || (selected.head.length === 0 && previousSummary?.type !== "compaction"))
+      return yield* fail(input, "no-summarizable-head")
     const summaryPrompt = buildPrompt({
       previousSummary: previousSummary?.type === "compaction" ? previousSummary.summary : undefined,
       context: [previousSummary?.type === "compaction" ? previousSummary.recent : "", selected.head].filter(Boolean),
     })
     const summaryOutput = Math.min(output || SUMMARY_OUTPUT_TOKENS, SUMMARY_OUTPUT_TOKENS)
-    if (Token.estimate(summaryPrompt) > context - summaryOutput) return false
+    if (Token.estimate(summaryPrompt) > context - summaryOutput)
+      return yield* fail(input, "summary-prompt-too-large")
     const messageID = SessionMessage.ID.create()
     yield* dependencies.events.publish(SessionEvent.Compaction.Started, {
       sessionID: input.sessionID,
@@ -218,8 +239,9 @@ export const make = (dependencies: Dependencies) => {
         Effect.as(true),
         Effect.catchTag("LLM.Error", () => Effect.succeed(false)),
       )
+    if (!summarized || failed) return yield* fail(input, "provider-failure")
     const summary = chunks.join("")
-    if (!summarized || failed || !summary.trim()) return false
+    if (!summary.trim()) return yield* fail(input, "empty-summary")
     yield* dependencies.events.publish(SessionEvent.Compaction.Ended, {
       sessionID: input.sessionID,
       messageID,
@@ -228,19 +250,34 @@ export const make = (dependencies: Dependencies) => {
       text: summary,
       recent: selected.recent,
     })
-    return true
+    return { _tag: "completed" }
+  })
+  const compactAfterOverflow = Effect.fn("SessionCompaction.compactAfterOverflow")(function* (input: Input) {
+    return (yield* attempt(input))._tag === "completed"
   })
   const compactIfNeeded = Effect.fn("SessionCompaction.compactIfNeeded")(function* (input: Input) {
     if (!config.auto) return false
     const context = input.model.route.defaults.limits?.context
     if (context === undefined || context <= 0) return false
     const output = input.request.generation?.maxTokens ?? input.model.route.defaults.limits?.output ?? 0
-    if (
-      estimate({ system: input.request.system, messages: input.request.messages, tools: input.request.tools }) <=
-      context - Math.max(output, config.buffer)
-    )
-      return false
-    return yield* compactAfterOverflow(input)
+    const requestTokens = estimate({
+      system: input.request.system,
+      messages: input.request.messages,
+      tools: input.request.tools,
+    })
+    const gate = context - Math.max(output, config.buffer)
+    const exhausted = input.reduction?.outcome === "exhausted"
+    if (requestTokens <= gate && !exhausted) return false
+    if (exhausted && requestTokens <= gate)
+      yield* Effect.logInfo("session.compaction.escalated", {
+        sessionID: input.sessionID,
+        requestTokens,
+        gate,
+        reductionTokens: input.reduction?.tokens,
+        reductionLimit: input.reduction?.limit,
+        reductionOutcome: input.reduction?.outcome,
+      })
+    return (yield* attempt(input))._tag === "completed"
   })
   return {
     compactIfNeeded,
