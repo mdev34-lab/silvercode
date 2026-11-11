@@ -57,6 +57,7 @@ import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { Ripgrep } from "@opencode-ai/core/ripgrep"
 import { Format } from "../../src/format"
 import * as TestClock from "effect/testing/TestClock"
+import * as TestConsole from "effect/testing/TestConsole"
 import { LLMEvent } from "@opencode-ai/llm"
 import { ProviderError } from "@/provider/error"
 import { SessionRetry } from "@/session/retry"
@@ -997,6 +998,200 @@ it.instance("loop stops provider overflow instead of auto-compacting when disabl
     }
     expect(messages.some((message) => message.parts.some((part) => part.type === "compaction"))).toBe(false)
   }),
+)
+
+it.instance("loop compacts exhausted prepared context before ordinary provider dispatch", () =>
+  Effect.gen(function* () {
+    const pressureCfg = (url: string) => {
+      const base = providerCfg(url)
+      return {
+        ...base,
+        provider: {
+          ...base.provider,
+          test: {
+            ...base.provider.test,
+            models: {
+              ...base.provider.test.models,
+              "test-model": {
+                ...base.provider.test.models["test-model"],
+                limit: { context: 20_000, output: 8_000 },
+              },
+            },
+          },
+        },
+      }
+    }
+    const { llm } = yield* useServerConfig(pressureCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Exhausted" })
+
+    yield* llm.push(
+      reply().text("## Objective\n- Continue after exhausted compaction").stop(),
+      reply().text("continued after exhausted compaction").stop(),
+    )
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "work",
+      noReply: true,
+      parts: [{ type: "text", text: `EXHAUSTED_ONLY ${"x".repeat(44_000)}` }],
+    })
+
+    yield* prompt.loop({ sessionID: chat.id })
+    const inputs = yield* llm.inputs
+    const messages = yield* sessions.messages({ sessionID: chat.id })
+
+    expect(inputs).toHaveLength(2)
+    expect(JSON.stringify(inputs[0])).toContain("Create a new anchored summary")
+    expect(JSON.stringify(inputs[0])).not.toContain("continued after exhausted compaction")
+    expect(JSON.stringify(inputs[1])).toContain("## Objective")
+    expect(JSON.stringify(inputs[1])).not.toContain("Create a new anchored summary")
+    expect(messages.some((message) => message.parts.some((part) => part.type === "compaction"))).toBe(true)
+  }),
+  15_000,
+)
+
+it.instance("loop bounds exhausted compaction escalation when compaction makes no progress", () =>
+  Effect.gen(function* () {
+    const pressureCfg = (url: string) => {
+      const base = providerCfg(url)
+      return {
+        ...base,
+        provider: {
+          ...base.provider,
+          test: {
+            ...base.provider.test,
+            models: {
+              ...base.provider.test.models,
+              "test-model": {
+                ...base.provider.test.models["test-model"],
+                limit: { context: 20_000, output: 8_000 },
+              },
+            },
+          },
+        },
+      }
+    }
+    const { llm } = yield* useServerConfig(pressureCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Exhausted bound" })
+
+    // Every compaction reply is itself oversized — varied lines, so the repetition
+    // guard does not abort the stream — so each compaction leaves the prepared context
+    // over target and reduction reports exhausted again on the next pass.
+    const noProgressSummary = Array.from({ length: 1_000 }, (_, i) => `unsummarized detail line ${i} of the task`).join(
+      "\n",
+    )
+    yield* llm.pushMatchRepeat(
+      (hit) => JSON.stringify(hit.body).includes("Create a new anchored summary"),
+      reply().text(noProgressSummary).stop(),
+      20,
+    )
+    yield* llm.pushMatch(
+      (hit) => !JSON.stringify(hit.body).includes("Create a new anchored summary"),
+      reply().text("delivered without further compaction").stop(),
+    )
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "work",
+      noReply: true,
+      parts: [{ type: "text", text: `EXHAUSTED_ONLY ${"x".repeat(44_000)}` }],
+    })
+
+    yield* prompt.loop({ sessionID: chat.id })
+    const inputs = yield* llm.inputs
+    const messages = yield* sessions.messages({ sessionID: chat.id })
+    const logs = yield* TestConsole.logLines
+
+    // One escalation per prompt turn however often reduction still reports exhausted,
+    // then the still-oversized request is dispatched as-is instead of compacting again.
+    const compactions = inputs.filter((input) => JSON.stringify(input).includes("Create a new anchored summary"))
+    expect(compactions).toHaveLength(1)
+    expect(inputs).toHaveLength(2)
+    expect(JSON.stringify(inputs[1])).toContain("unsummarized detail line 0")
+    expect(messages.filter((message) => message.parts.some((part) => part.type === "compaction"))).toHaveLength(1)
+    // The bounded failure is observable, and the turn ends normally instead of looping.
+    expect(logs).toContain("context reduction still exhausted after compaction; dispatching without further compaction")
+  }),
+  15_000,
+)
+
+it.instance("loop keeps original history and dispatches after a blank exhausted-compaction summary", () =>
+  Effect.gen(function* () {
+    const pressureCfg = (url: string) => {
+      const base = providerCfg(url)
+      return {
+        ...base,
+        provider: {
+          ...base.provider,
+          test: {
+            ...base.provider.test,
+            models: {
+              ...base.provider.test.models,
+              "test-model": {
+                ...base.provider.test.models["test-model"],
+                limit: { context: 20_000, output: 8_000 },
+              },
+            },
+          },
+        },
+      }
+    }
+    const { llm } = yield* useServerConfig(pressureCfg)
+    const events = yield* EventV2Bridge.Service
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Exhausted blank" })
+
+    const seen: string[] = []
+    const off = yield* events.listen((evt) => {
+      seen.push(evt.type)
+      return Effect.void
+    })
+
+    yield* llm.pushMatchRepeat(
+      (hit) => JSON.stringify(hit.body).includes("Create a new anchored summary"),
+      reply().text(" \t\n ").stop(),
+      20,
+    )
+    yield* llm.pushMatch(
+      (hit) => !JSON.stringify(hit.body).includes("Create a new anchored summary"),
+      reply().text("delivered without further compaction").stop(),
+    )
+    const original = `EXHAUSTED_ONLY ${"x".repeat(44_000)}`
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "work",
+      noReply: true,
+      parts: [{ type: "text", text: original }],
+    })
+
+    yield* prompt.loop({ sessionID: chat.id })
+    const inputs = yield* llm.inputs
+    const filtered = yield* MessageV2.filterCompactedEffect(chat.id)
+    const logs = yield* TestConsole.logLines
+    yield* off
+
+    const serialized = inputs.map((input) => JSON.stringify(input))
+    const compactions = serialized.filter((input) => input.includes("Create a new anchored summary"))
+    const ordinary = serialized.filter((input) => !input.includes("Create a new anchored summary"))
+    expect(compactions).toHaveLength(1)
+    expect(ordinary).toHaveLength(1)
+    expect(ordinary[0]).toContain(original)
+    expect(ordinary[0]).toContain("did not produce a usable summary")
+    expect(ordinary[0]).not.toContain("Continue if you have next steps")
+    expect(inputs).toHaveLength(2)
+    expect(
+      filtered.some(
+        (message) =>
+          message.info.role === "user" && message.parts.some((part) => part.type === "text" && part.text === original),
+      ),
+    ).toBe(true)
+    expect(seen).not.toContain(SessionCompaction.Event.Compacted.type)
+    expect(logs).toContain("compaction produced a blank summary; skipping Compacted event")
+  }),
+  15_000,
 )
 
 noLLMServer.instance.skip(

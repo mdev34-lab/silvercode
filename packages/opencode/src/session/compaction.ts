@@ -21,6 +21,7 @@ import { EventV2Bridge } from "@/event-v2-bridge"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { buildPrompt } from "@opencode-ai/core/session/compaction"
+import { Database } from "@opencode-ai/core/database/database"
 import { SessionCompactionEvent } from "@opencode-ai/schema/session-compaction-event"
 
 export const Event = SessionCompactionEvent
@@ -199,6 +200,7 @@ const layer = Layer.effect(
     const provider = yield* Provider.Service
     const events = yield* EventV2Bridge.Service
     const flags = yield* RuntimeFlags.Service
+    const database = yield* Database.Service
 
     const isOverflow = Effect.fn("SessionCompaction.isOverflow")(function* (input: {
       tokens: SessionV1.Assistant["tokens"]
@@ -465,7 +467,28 @@ const layer = Layer.effect(
         })
       }
 
-      if (result === "continue" && input.auto) {
+      const summary = (yield* MessageV2.parts(processor.message.id).pipe(
+        Effect.provideService(Database.Service, database),
+      ))
+        .filter((part): part is SessionV1.TextPart => part.type === "text")
+        .map((part) => part.text.trim())
+        .filter(Boolean)
+        .join("\n\n")
+        .trim()
+
+      if (!summary && input.auto) {
+        // The summary flag controls history filtering; a blank result must not hide history,
+        // regardless of whether generation completed or failed. Keep finish/error untouched.
+        processor.message.summary = false
+        yield* session.updateMessage(processor.message)
+      }
+
+      if (result === "continue" && input.auto && !processor.message.error) {
+        const failureText = input.overflow
+          ? replay
+            ? "The previous provider request exceeded its size limit. The compaction attempt did not produce a usable summary. The replayed turn uses text placeholders for media attachments, but the original history may still include those files. If the request depends on them, explain the size-limit failure and ask for smaller or fewer files; do not claim they were processed or removed."
+            : "The previous provider request exceeded its size limit. The compaction attempt did not produce a usable summary, so the original history and its attachments remain in context. If the request depends on them, explain the size-limit failure and ask for smaller or fewer files; do not claim they were processed or removed."
+          : "The compaction attempt did not produce a usable summary. The latest actual user request remains in the conversation above; answer it using the available history without assuming it was compacted."
         if (replay) {
           const original = replay.info
           const replayMsg = yield* session.updateMessage({
@@ -490,6 +513,18 @@ const layer = Layer.effect(
               id: PartID.ascending(),
               messageID: replayMsg.id,
               sessionID: input.sessionID,
+            })
+          }
+          if (!summary) {
+            yield* session.updatePart({
+              id: PartID.ascending(),
+              messageID: replayMsg.id,
+              sessionID: input.sessionID,
+              type: "text",
+              metadata: { compaction_continue: true },
+              synthetic: true,
+              text: failureText,
+              time: { start: Date.now(), end: Date.now() },
             })
           }
         }
@@ -524,11 +559,14 @@ const layer = Layer.effect(
               agent: userMessage.agent,
               model: userMessage.model,
             })
-            const text =
-              (input.overflow
-                ? "The previous request exceeded the provider's size limit due to large media attachments. The conversation was compacted and media files were removed from context. If the user was asking about attached images or files, explain that the attachments were too large to process and suggest they try again with smaller or fewer files.\n\n"
-                : "") +
-              "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed."
+            // MessageV2.latest uses the newest user message as the next turn's input. Keep an
+            // honest follow-up here so the loop can dispatch without implying compaction succeeded.
+            const text = summary
+              ? (input.overflow
+                  ? "The previous request exceeded the provider's size limit due to large media attachments. The conversation was compacted and media files were removed from context. If the user was asking about attached images or files, explain that the attachments were too large to process and suggest they try again with smaller or fewer files.\n\n"
+                  : "") +
+                "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed."
+              : failureText
             yield* session.updatePart({
               id: PartID.ascending(),
               messageID: continueMsg.id,
@@ -551,7 +589,13 @@ const layer = Layer.effect(
 
       if (processor.message.error) return "stop"
       if (result === "continue") {
-        yield* events.publish(Event.Compacted, { sessionID: input.sessionID })
+        if (summary) {
+          yield* events.publish(Event.Compacted, { sessionID: input.sessionID })
+        } else {
+          yield* Effect.logWarning("compaction produced a blank summary; skipping Compacted event", {
+            "session.id": input.sessionID,
+          })
+        }
       }
       return result
     })
@@ -602,6 +646,7 @@ export const node = LayerNode.make({
     Provider.node,
     EventV2Bridge.node,
     RuntimeFlags.node,
+    Database.node,
   ],
 })
 
