@@ -303,10 +303,7 @@ test("branch diff source requests branch VCS diff", async () => {
 })
 
 test("viewer waits for a slow KV state lock before requesting the branch diff", async () => {
-  const lockPromise = Flock.withLock(
-    `tui-kv:${path.join(`/tmp/opencode/state-${process.pid}`, "kv.json")}`,
-    () => new Promise<void>((resolve) => setTimeout(resolve, 400)),
-  )
+  const { lockPromise } = await holdKvLock(400)
   try {
     const viewer = await renderDiffViewer([], 20, {
       name: "diff",
@@ -327,6 +324,40 @@ test("viewer waits for a slow KV state lock before requesting the branch diff", 
   }
 })
 
+test("diff viewer mount timeout destroys its renderer exactly once", async () => {
+  let renderCount = 0
+  let destroyCount = 0
+  const app = {
+    renderOnce: async () => {
+      renderCount++
+    },
+    renderer: {
+      destroy: () => {
+        destroyCount++
+      },
+    },
+  } as unknown as Awaited<ReturnType<typeof testRender>>
+  const error = await waitForViewerReadyAndCleanup(app, () =>
+    waitForViewerReady(app, new Map(), "diff.close", () => false, undefined, () => false),
+  ).then(
+    () => undefined,
+    (reason: unknown) => reason,
+  )
+
+  expect(error).toEqual(new Error("Timed out waiting for the diff viewer to mount"))
+  expect(renderCount).toBe(50)
+  expect(destroyCount).toBe(1)
+  await new Promise((resolve) => setTimeout(resolve, 100))
+  expect(renderCount).toBe(50)
+  expect(destroyCount).toBe(1)
+})
+
+test("KV lock helper propagates an acquisition rejection", async () => {
+  const controller = new AbortController()
+  controller.abort()
+  await expect(holdKvLock(400, controller.signal)).rejects.toBeDefined()
+})
+
 test("last-turn diff source requests session diff", async () => {
   const viewer = await renderDiffViewer([], 20, {
     name: "diff",
@@ -344,6 +375,21 @@ test("last-turn diff source requests session diff", async () => {
   }
 })
 
+const MOUNT_ATTEMPTS = 50 // Each attempt renders once and waits 25ms, about 1.25s minimum. The KV provider mounts children only after its real file lock and read settle; a 400ms held lock mounts in roughly 0.55s. 50 attempts leaves more than twice that margin and still rejects well before Bun's default 5000ms test timeout, so the cleanup wrapper destroys the renderer while the test is active.
+
+async function holdKvLock(durationMs: number, signal?: AbortSignal) {
+  let acquired!: () => void
+  const lockAcquired = new Promise<void>((resolve) => {
+    acquired = resolve
+  })
+  const lockPromise = Flock.withLock(`tui-kv:${path.join(`/tmp/opencode/state-${process.pid}`, "kv.json")}`, () => {
+    acquired()
+    return new Promise<void>((resolve) => setTimeout(resolve, durationMs))
+  }, { signal })
+  await Promise.race([lockAcquired, lockPromise])
+  return { lockPromise }
+}
+
 async function waitForViewerReady(
   app: Awaited<ReturnType<typeof testRender>>,
   commands: Map<string, unknown>,
@@ -353,7 +399,8 @@ async function waitForViewerReady(
   mounted: () => boolean = () => true,
 ) {
   let commandObserved = false
-  while (!mounted()) {
+  for (let attempt = 0; !mounted(); attempt++) {
+    if (attempt >= MOUNT_ATTEMPTS) throw new Error("Timed out waiting for the diff viewer to mount")
     await app.renderOnce()
     await new Promise((resolve) => setTimeout(resolve, 25))
   }
