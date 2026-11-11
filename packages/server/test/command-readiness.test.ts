@@ -1,25 +1,45 @@
 import { describe, expect, test } from "bun:test"
 import { CommandV2 } from "@opencode-ai/core/command"
-import { Location } from "@opencode-ai/core/location"
 import { PluginInternal } from "@opencode-ai/core/plugin/internal"
-import { Project } from "@opencode-ai/core/project"
 import { Effect, Deferred, Layer, Option } from "effect"
-import { AbsolutePath } from "@opencode-ai/core/schema"
-import { CommandGroup } from "@opencode-ai/protocol/groups/command"
-import { HttpApi } from "effect/unstable/httpapi"
+import { Database } from "@opencode-ai/core/database/database"
+import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+import { httpClient } from "@opencode-ai/core/effect/app-node-platform"
+import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
+import { makeLocationNode } from "@opencode-ai/core/effect/app-node"
+import { EventV2 } from "@opencode-ai/core/event"
+import { Credential } from "@opencode-ai/core/credential"
+import { PermissionSaved } from "@opencode-ai/core/permission/saved"
+import { PtyTicket } from "@opencode-ai/core/pty/ticket"
+import { SessionV2 } from "@opencode-ai/core/session"
+import { SessionExecution } from "@opencode-ai/core/session/execution"
+import { LocationServiceMap } from "@opencode-ai/core/location-service-map"
+import { buildLocationServiceMap } from "@opencode-ai/core/location-services"
+import { SessionExecutionLocal } from "@opencode-ai/core/session/execution/local"
+import { ToolOutputStore } from "@opencode-ai/core/tool-output-store"
 import { HttpRouter, HttpServer } from "effect/unstable/http"
-import { HttpApiBuilder, HttpApiMiddleware } from "effect/unstable/httpapi"
-import { CommandHandler } from "../src/handlers/command"
+import { HttpApiBuilder } from "effect/unstable/httpapi"
+import { Api } from "../src/api"
 import { ServerAuth } from "../src/auth"
 import { authorizationLayer } from "../src/middleware/authorization"
 import { schemaErrorLayer } from "../src/middleware/schema-error"
+import { PtyEnvironment } from "../src/pty-environment"
+import { layer as locationLayer } from "../src/location"
+import { sessionLocationLayer } from "../src/middleware/session-location"
+import { handlers } from "../src/handlers"
 
-class TestLocationMiddleware extends HttpApiMiddleware.Service<
-  TestLocationMiddleware,
-  { provides: Location.Service | PluginInternal.Service | CommandV2.Service }
->()("@opencode/HttpApiLocation") {}
-
-const NarrowApi = HttpApi.make("server").add(CommandGroup.middleware(TestLocationMiddleware))
+const applicationServices = LayerNode.group([
+  Database.node,
+  EventV2.node,
+  httpClient,
+  ToolOutputStore.cleanupNode,
+  SessionV2.node,
+  PermissionSaved.node,
+  PtyTicket.node,
+  Credential.node,
+  PtyEnvironment.node,
+  LocationServiceMap.node,
+])
 
 describe("command readiness", () => {
   test("does not list before PluginInternal.ready completes, then lists after", async () => {
@@ -27,13 +47,6 @@ describe("command readiness", () => {
     const enteredReady = await Effect.runPromise(Deferred.make<void>())
     let readyCompleted = false
     let listCalled = false
-
-    const locationService = Location.Service.of({
-      directory: AbsolutePath.make(process.cwd()),
-      workspaceID: undefined,
-      project: { id: Project.ID.global, directory: AbsolutePath.make(process.cwd()) },
-      vcs: undefined,
-    })
 
     const commands = [
       { name: "init", template: "" },
@@ -61,23 +74,33 @@ describe("command readiness", () => {
       reload: () => Effect.void,
     })
 
-    const locationServicesLayer = Layer.mergeAll(
-      Layer.succeed(Location.Service, locationService),
-      Layer.succeed(PluginInternal.Service, pluginInternalService),
-      Layer.succeed(CommandV2.Service, commandService),
-    )
+    const gatedPluginNode = makeLocationNode({
+      service: PluginInternal.Service,
+      layer: Layer.succeed(PluginInternal.Service, pluginInternalService),
+      deps: [],
+    })
 
-    const locationMiddlewareLayer = Layer.succeed(
-      TestLocationMiddleware,
-      TestLocationMiddleware.of((effect) => effect.pipe(Effect.provide(locationServicesLayer))),
-    )
+    const commandNode = makeLocationNode({
+      service: CommandV2.Service,
+      layer: Layer.succeed(CommandV2.Service, commandService),
+      deps: [],
+    })
 
-    const routes = HttpApiBuilder.layer(NarrowApi).pipe(
-      Layer.provide(CommandHandler),
-      Layer.provide(locationMiddlewareLayer),
-      Layer.provide(authorizationLayer),
-      Layer.provide(schemaErrorLayer),
-      Layer.provide(ServerAuth.Config.configLayer({ username: "opencode", password: Option.none() })),
+    const serviceLayer = AppNodeBuilder.build(applicationServices, [
+      [LocationServiceMap.node, buildLocationServiceMap([[PluginInternal.node, gatedPluginNode], [CommandV2.node, commandNode]])],
+      [SessionExecution.node, SessionExecutionLocal.node],
+    ])
+
+    const routes = Layer.mergeAll(
+      HttpApiBuilder.layer(Api, { openapiPath: "/openapi.json" }).pipe(
+        Layer.provide(handlers),
+        Layer.provide(sessionLocationLayer),
+        Layer.provide(locationLayer),
+        Layer.provide(authorizationLayer),
+        Layer.provide(schemaErrorLayer),
+        Layer.provide(ServerAuth.Config.configLayer({ username: "opencode", password: Option.none() })),
+        Layer.provide(serviceLayer),
+      ),
     )
 
     const web = HttpRouter.toWebHandler(routes.pipe(Layer.provide(HttpServer.layerServices)), { disableLogger: true })
