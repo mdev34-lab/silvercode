@@ -11274,13 +11274,16 @@ for (const testCase of declinedWaitCases) {
         const inputs = yield* llm.inputs
         expect(yield* llm.calls).toBe(1)
         const requestText = JSON.stringify(inputs[0])
-        if (testCase.expectsNotification) {
-          expect(requestText).toContain("TERMINAL_CHILD_QUOTA")
-          expect(result.info.parentID).toBe(scenario.notification!.id)
-        } else {
-          if (testCase.notification) expect(requestText).not.toContain("TERMINAL_CHILD_QUOTA")
-          if (!testCase.notification) expect(requestText).toContain(JSON.stringify(declinedWaitRefusal))
-          expect(result.info.parentID).toBe(scenario.rootUser.id)
+        expect(result.info.role).toBe("assistant")
+        if (result.info.role === "assistant") {
+          if (testCase.expectsNotification) {
+            expect(requestText).toContain("TERMINAL_CHILD_QUOTA")
+            expect(result.info.parentID).toBe(scenario.notification!.id)
+          } else {
+            if (testCase.notification) expect(requestText).not.toContain("TERMINAL_CHILD_QUOTA")
+            if (!testCase.notification) expect(requestText).toContain(JSON.stringify(declinedWaitRefusal))
+            expect(result.info.parentID).toBe(scenario.rootUser.id)
+          }
         }
       }),
     { config: cfg },
