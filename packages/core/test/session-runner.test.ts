@@ -3680,6 +3680,59 @@ describe("SessionRunnerLLM", () => {
     }),
   )
 
+  it.effect("bounds exhausted compaction escalation to a single compaction per turn", () =>
+    Effect.gen(function* () {
+      yield* setup
+      requests.length = 0
+      const session = yield* SessionV2.Service
+      const events = yield* EventV2.Service
+      let compactions = 0
+      yield* events.listen((event) =>
+        Effect.sync(() => {
+          if (event.type === SessionEvent.Compaction.Started.type) compactions++
+        }),
+      )
+      response = fragmentFixture("text", "text-first", ["First answer"]).completeEvents
+      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "First question" }), resume: false })
+      yield* session.resume(sessionID)
+      systemBaseline = "Changed context"
+      response = fragmentFixture("text", "text-second", ["Second answer"]).completeEvents
+      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Second question" }), resume: false })
+      yield* session.resume(sessionID)
+      // The surviving System update keeps a summarizable head on every post-compaction retry while
+      // the blocked rebaseline preserves it across compactions, so an unbounded escalation would
+      // compact repeatedly without ever dispatching the provider turn.
+      systemUnavailable = true
+      currentModel = pressureModel
+      const hugeSummary = `## Objective\n- ${"s".repeat(55_000)}`
+      responses = [
+        fragmentFixture("text", "text-summary-1", [hugeSummary]).completeEvents,
+        fragmentFixture("text", "text-summary-2", [hugeSummary]).completeEvents,
+        fragmentFixture("text", "text-summary-3", [hugeSummary]).completeEvents,
+        fragmentFixture("text", "text-final", ["Final answer"]).completeEvents,
+      ]
+      yield* session.prompt({
+        sessionID,
+        prompt: Prompt.make({ text: `EXHAUSTED_ONLY ${"x".repeat(54_000)}` }),
+        resume: false,
+      })
+      yield* session.resume(sessionID)
+
+      expect(compactions).toBe(1)
+      expect(requests).toHaveLength(4)
+      expect(userTexts(requests[2]!)[0]).toContain("Create a new anchored summary")
+      expect(userTexts(requests[3]!)[0]).toContain(`<summary>\n${hugeSummary}`)
+      expect(systemTexts(requests[3]!)).toContain("Changed context")
+      const logs = yield* TestConsole.logLines
+      expect(logs).toContain("session.compaction.exhausted")
+      expect(yield* session.context(sessionID)).toMatchObject([
+        { type: "system" },
+        { type: "compaction", summary: hugeSummary },
+        { type: "assistant", finish: "stop" },
+      ])
+    }),
+  )
+
   it.effect("escalates exhausted reduction to compaction below the compaction gate", () =>
     Effect.gen(function* () {
       yield* setup
