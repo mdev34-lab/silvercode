@@ -14,7 +14,9 @@ import diffViewerPlugin from "../../../src/feature-plugins/system/diff-viewer"
 import { createTuiPluginApi } from "../../fixture/tui-plugin"
 import { createTuiResolvedConfig } from "../../fixture/tui-runtime"
 import { TestTuiContexts } from "../../fixture/tui-environment"
-
+import { Flock } from "@opencode-ai/core/util/flock"
+import path from "path"
+import { onMount, type ParentProps } from "solid-js"
 test("closing the diff viewer returns to the route it opened from", async () => {
   const viewer = await renderDiffViewer([])
   try {
@@ -115,6 +117,7 @@ async function renderDiffViewer(
     NonNullable<Parameters<TuiPluginApi["keymap"]["registerLayer"]>[0]["commands"]>[number]
   >()
   let current = initialRoute ?? startRoute
+  let mounted = false
   let renderDiff: TuiRouteDefinition["render"] | undefined
   let vcsDiffInput: unknown
   let sessionDiffInput: unknown
@@ -176,13 +179,22 @@ async function renderDiffViewer(
           <TuiConfigProvider config={config}>
             <KVProvider>
               <ThemeProvider mode="dark">
-                {renderDiff?.({ params: "params" in current ? current.params : undefined })}
+                <Mounted>
+                  {renderDiff?.({ params: "params" in current ? current.params : undefined })}
+                </Mounted>
               </ThemeProvider>
             </KVProvider>
           </TuiConfigProvider>
         </OpencodeKeymapProvider>
       </TestTuiContexts>
     )
+  }
+
+  function Mounted(props: ParentProps) {
+    onMount(() => {
+      mounted = true
+    })
+    return props.children
   }
 
   const app = await testRender(() => <Harness />, { width: 80, height })
@@ -198,6 +210,7 @@ async function renderDiffViewer(
       "diff.close",
       selectedRequestReady,
       holdSelectedRequestUntilCommandObserved ? () => setTimeout(() => releaseSelectedRequest?.(), 0) : undefined,
+      () => mounted,
     ),
   )
   return {
@@ -289,6 +302,31 @@ test("branch diff source requests branch VCS diff", async () => {
   }
 })
 
+test("viewer waits for a slow KV state lock before requesting the branch diff", async () => {
+  const lockPromise = Flock.withLock(
+    `tui-kv:${path.join(`/tmp/opencode/state-${process.pid}`, "kv.json")}`,
+    () => new Promise<void>((resolve) => setTimeout(resolve, 400)),
+  )
+  try {
+    const viewer = await renderDiffViewer([], 20, {
+      name: "diff",
+      params: { mode: "branch", sessionID: "session-1", returnRoute: startRoute },
+    })
+    try {
+      expect(viewer.current()).toEqual({
+        name: "diff",
+        params: { mode: "branch", sessionID: "session-1", returnRoute: startRoute },
+      })
+      expect(viewer.vcsDiffInput()).toEqual({ directory: "/repo/session", mode: "branch", context: 12 })
+      expect(viewer.sessionDiffInput()).toBeUndefined()
+    } finally {
+      viewer.app.renderer.destroy()
+    }
+  } finally {
+    await lockPromise
+  }
+})
+
 test("last-turn diff source requests session diff", async () => {
   const viewer = await renderDiffViewer([], 20, {
     name: "diff",
@@ -312,8 +350,13 @@ async function waitForViewerReady(
   command: string,
   selectedRequestReady: () => boolean,
   onCommandObserved?: () => void,
+  mounted: () => boolean = () => true,
 ) {
   let commandObserved = false
+  while (!mounted()) {
+    await app.renderOnce()
+    await new Promise((resolve) => setTimeout(resolve, 25))
+  }
   for (let attempt = 0; attempt < 10; attempt++) {
     await app.renderOnce()
     if (commands.has(command) && !commandObserved) {
