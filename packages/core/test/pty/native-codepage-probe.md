@@ -2,6 +2,10 @@
 
 Diagnostic measurement only. Not a product fix. Runs as 6 test cases in normal CI on Windows; skipped on non-Windows. Applies no output decoder; every chunk is recorded as the backend delivered it.
 
+## Node runtime
+
+Node backend cases run through a bounded OS-temporary Node bridge that imports the actual `src/pty/pty.node.ts` wrapper. The import specifier is constructed as a `file:` URL so Windows drive paths remain valid ESM specifiers. They do not run node-pty under Bun.
+
 ## Running
 
 From `packages/core`:
