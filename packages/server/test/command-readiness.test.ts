@@ -99,7 +99,7 @@ describe("command readiness", () => {
         Layer.provide(authorizationLayer),
         Layer.provide(schemaErrorLayer),
         Layer.provide(ServerAuth.Config.configLayer({ username: "opencode", password: Option.none() })),
-        Layer.provide(serviceLayer),
+        Layer.provideMerge(serviceLayer),
       ),
     )
 
