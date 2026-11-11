@@ -1831,7 +1831,7 @@ withMcpTools.instance(
 )
 
 it.instance(
-  "three identical calls in one assistant message reach the denied doom-loop permission",
+  "three identical shell failures across separate generation steps reach the denied doom-loop permission",
   () =>
     Effect.gen(function* () {
       const { dir, llm } = yield* useServerConfig((url) => ({
@@ -1843,33 +1843,96 @@ it.instance(
       const agents = yield* AgentSvc.Service
       const agent = yield* agents.get("build")
       expect(Permission.evaluate("doom_loop", "shell", agent.permission).action).toBe("deny")
-      const session = yield* sessions.create({ title: "Doom-loop positive control" })
+      const session = yield* sessions.create({ title: "Doom-loop sequential control" })
       yield* prompt.prompt({
         sessionID: session.id,
         agent: "build",
         noReply: true,
-        parts: [{ type: "text", text: "run the same harmless command three times" }],
+        parts: [{ type: "text", text: "run the same failing command three times" }],
       })
 
-      const input = { command: "echo SHOULD_NOT_RUN", description: "doom-loop positive control", workdir: dir }
-      // One provider response creates one assistant message with three real tool parts.
-      // A separate llm.tool() reply for each call would not exercise the per-message guard.
-      yield* llm.push(reply().tool("shell", input).tool("shell", input).tool("shell", input))
+      // `shell` reports a non-zero exit as a completed tool result, so this test uses a
+      // workdir that does not exist to produce genuine errored tool executions. Each
+      // provider reply is its own generation step; the identical call must fail in two
+      // separate steps before the third step's call triggers the guard.
+      const input = {
+        command: "printf 'doom-loop-attempt\\n' >> doom-loop-attempts.txt; exit 1",
+        description: "doom-loop sequential positive control",
+        workdir: path.join(dir, "missing-doom-loop-workdir"),
+      }
+      yield* llm.push(reply().tool("shell", input))
+      yield* llm.push(reply().tool("shell", input))
+      yield* llm.push(reply().tool("shell", input))
       const result = yield* prompt.loop({ sessionID: session.id })
       expect(result.info.role).toBe("assistant")
       if (result.info.role !== "assistant") throw new Error("expected an assistant result")
-      // The guard's denied ask interrupts this model step after tool calls were issued.
-      // That is the observable runtime signal (as opposed to an inferred structural window).
+      // The guard's denied ask interrupts the third model step after its tool call was
+      // issued but before the command ran. That interruption is the runtime signal.
       expect(result.info.error).toBeDefined()
       expect(JSON.stringify(result.info.error)).toContain("ProviderStreamInterruptedAfterToolCallError")
 
       const messages = yield* sessions.messages({ sessionID: session.id })
-      const repeated = messages
-        .filter((message) => message.info.role === "assistant")
-        .map((message) => message.parts.filter((part) => part.type === "tool" && part.tool === "shell"))
-        .filter((parts) => parts.length === 3)
-      expect(repeated).toHaveLength(1)
-      expect(repeated[0]?.map((part) => part.type === "tool" && part.state.input)).toEqual([input, input, input])
+      const shellParts = messages
+        .flatMap((message) => message.parts)
+        .filter((part): part is SessionV1.ToolPart => part.type === "tool" && part.tool === "shell")
+      expect(shellParts.map((part) => part.state.input)).toEqual([input, input, input])
+
+      const realFailures = shellParts.filter(
+        (part) => part.state.status === "error" && part.state.metadata?.interrupted !== true,
+      )
+      const interrupted = shellParts.filter(
+        (part) => part.state.status === "error" && part.state.metadata?.interrupted === true,
+      )
+      // The first two steps executed and errored; the third never ran and was settled by
+      // the processor's cleanup as interrupted instead of producing another real error.
+      expect(realFailures).toHaveLength(2)
+      expect(interrupted).toHaveLength(1)
+      expect(interrupted[0]?.state.status === "error" && interrupted[0].state.error).toBe("Tool execution aborted")
+      expect(yield* Effect.promise(() => Bun.file(path.join(dir, "doom-loop-attempts.txt")).exists())).toBe(false)
+    }),
+  20_000,
+)
+
+it.instance(
+  "three identical successful shell calls in one assistant message do not reach the doom-loop permission",
+  () =>
+    Effect.gen(function* () {
+      // Keep `doom_loop` denied so any guard ask halts the turn; a clean result below is
+      // runtime evidence that a same-batch fan-out is not treated as a cross-step loop.
+      const { dir, llm } = yield* useServerConfig((url) => ({
+        ...providerCfg(url),
+        permission: { "*": "allow", doom_loop: "deny" },
+      }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({ title: "Doom-loop same-batch control" })
+      yield* prompt.prompt({
+        sessionID: session.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "run the same harmless command three times in one step" }],
+      })
+
+      const input = { command: "echo DOOM_LOOP_BATCH_OK", description: "doom-loop same-batch control", workdir: dir }
+      yield* llm.push(reply().tool("shell", input).tool("shell", input).tool("shell", input))
+      yield* llm.push(reply().text("done").stop())
+      const result = yield* prompt.loop({ sessionID: session.id })
+      expect(result.info.role).toBe("assistant")
+      if (result.info.role !== "assistant") throw new Error("expected an assistant result")
+      expect(result.info.error).toBeUndefined()
+      expect(result.info.finish).toBe("stop")
+      expect(result.parts.some((part) => part.type === "text" && part.text === "done")).toBe(true)
+
+      const messages = yield* sessions.messages({ sessionID: session.id })
+      const shellParts = messages
+        .flatMap((message) => message.parts)
+        .filter((part): part is SessionV1.ToolPart => part.type === "tool" && part.tool === "shell")
+      expect(shellParts.map((part) => part.state.input)).toEqual([input, input, input])
+      expect(shellParts.map((part) => part.state.status)).toEqual(["completed", "completed", "completed"])
+      for (const part of shellParts) {
+        if (part.state.status !== "completed") throw new Error("expected every batched call to complete")
+        expect(part.state.output).toContain("DOOM_LOOP_BATCH_OK")
+      }
     }),
   20_000,
 )
