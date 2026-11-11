@@ -101,6 +101,11 @@ function isolatedEnv(home: string, configJson: string): Record<string, string> {
     OPENCODE_DISABLE_AUTOCOMPACT: "1",
     OPENCODE_DISABLE_MODELS_FETCH: "1",
     OPENCODE_AUTH_CONTENT: "{}",
+    // Per-fixture persistent DB: overrides the parent test process's
+    // OPENCODE_DB=:memory: / any shared path so sessions persist across the
+    // CLI's separate child processes within one fixture, while remaining
+    // disjoint across fixtures. Explicit opts.env.OPENCODE_DB still overrides.
+    OPENCODE_DB: path.join(home, "opencode-test.db"),
   }
 }
 

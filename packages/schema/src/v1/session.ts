@@ -382,6 +382,7 @@ export const User = Schema.Struct({
     variant: Schema.optional(Schema.String),
   }),
   system: Schema.optional(Schema.String),
+  noReply: Schema.optional(Schema.Boolean),
   tools: Schema.optional(Schema.Record(Schema.String, Schema.Boolean)),
 }).annotate({ identifier: "UserMessage" })
 export type User = Types.DeepMutable<Schema.Schema.Type<typeof User>>
