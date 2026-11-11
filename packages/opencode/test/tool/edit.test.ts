@@ -91,6 +91,21 @@ const onceBus = Effect.fn("EditToolTest.onceBus")(function* (def: typeof Watcher
 
 describe("tool.edit", () => {
   describe("creating new files", () => {
+    it.instance("resolves a relative path from the session's working folder", () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const cwd = path.join(test.directory, "child")
+        yield* Effect.promise(() => fs.mkdir(cwd, { recursive: true }))
+        yield* put(path.join(cwd, "note.txt"), "old")
+        yield* put(path.join(test.directory, "note.txt"), "old")
+
+        yield* run({ filePath: "note.txt", oldString: "old", newString: "new" }, { ...ctx, cwd })
+
+        expect(yield* load(path.join(cwd, "note.txt"))).toBe("new")
+        expect(yield* load(path.join(test.directory, "note.txt"))).toBe("old")
+      }),
+    )
+
     it.instance("creates new file when oldString is empty", () =>
       Effect.gen(function* () {
         const test = yield* TestInstance

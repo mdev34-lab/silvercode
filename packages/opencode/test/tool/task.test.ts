@@ -9,6 +9,7 @@ import { BackgroundJob } from "@/background/job"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { Config } from "@/config/config"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
+import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Ripgrep } from "@opencode-ai/core/ripgrep"
 import { Session } from "@/session/session"
 import { NotFoundError } from "@/storage/storage"
@@ -64,6 +65,7 @@ const layer = <R = never>(
       EventV2Bridge.node,
       Config.node,
       CrossSpawnSpawner.node,
+      FSUtil.node,
       Session.node,
       SessionProjector.node,
       SessionRunState.node,

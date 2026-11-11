@@ -53,6 +53,9 @@ export const ApplyPatchTool = Tool.define(
       }
 
       const instance = yield* InstanceState.context
+      // Relative patch paths resolve from the session's working folder, which is
+      // the project directory unless a delegated child was given another one.
+      const cwd = ctx.cwd ?? instance.directory
 
       // Validate file paths and check permissions
       const fileChanges: Array<{
@@ -70,7 +73,7 @@ export const ApplyPatchTool = Tool.define(
       let totalDiff = ""
 
       for (const hunk of hunks) {
-        const filePath = path.resolve(instance.directory, hunk.path)
+        const filePath = path.resolve(cwd, hunk.path)
         yield* assertExternalDirectoryEffect(ctx, filePath)
 
         switch (hunk.type) {
@@ -139,7 +142,7 @@ export const ApplyPatchTool = Tool.define(
               if (change.removed) deletions += change.count || 0
             }
 
-            const movePath = hunk.move_path ? path.resolve(instance.directory, hunk.move_path) : undefined
+            const movePath = hunk.move_path ? path.resolve(cwd, hunk.move_path) : undefined
             yield* assertExternalDirectoryEffect(ctx, movePath)
 
             fileChanges.push({
