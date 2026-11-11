@@ -82,7 +82,7 @@ import { DialogExportOptions } from "../../ui/dialog-export-options"
 import * as Model from "../../util/model"
 import { pauseMarker } from "../../util/pause"
 import { elapsed, useClock } from "../../util/clock"
-import { formatTranscript } from "../../util/transcript"
+import { formatTranscriptPaged } from "../../util/transcript"
 import { formatGenerationMetrics } from "../../util/generation-metrics"
 import { sessionEpilogue } from "../../util/presentation"
 import { setPreLayoutSiblingMargin } from "../../util/layout"
@@ -396,7 +396,19 @@ export function Session() {
       }
       editor.reconnect(result.data.directory)
       await sync.session.sync(sessionID)
-      if (route.sessionID === sessionID && scroll) scroll.scrollBy(100_000)
+      if (route.sessionID !== sessionID) return
+      // The mount read failed quietly (`sync()` resolves on a messages error,
+      // #26560). Say so instead of leaving an empty timeline without a reason;
+      // nothing was marked complete, so the next visit retries the read (#815).
+      const failure = sync.session.syncError(sessionID)
+      if (failure !== undefined) {
+        toast.show({
+          message: `Failed to load messages: ${errorMessage(failure)}`,
+          variant: "error",
+          duration: 5000,
+        })
+      }
+      if (scroll) scroll.scrollBy(100_000)
     })().catch((error) => {
       if (route.sessionID !== sessionID) return
       toast.show({
@@ -436,6 +448,70 @@ export function Session() {
   // stays put while new output lands under a reader who scrolled up.
   const [scrolledAway, setScrolledAway] = createSignal(false)
   const lastShortcut = useCommandShortcut("session.last")
+  const renderer = useRenderer()
+  // Older history arrives on demand (#815): the store holds the newest page on
+  // mount, the previous page is fetched with the endpoint's `before` cursor
+  // when the reader approaches the top, and the viewport is re-anchored on the
+  // message it was showing so a prepend never scrolls the transcript.
+  // One older page at a time, but every caller shares that page: a prefetch
+  // that is already running must not report "nothing older" to `session.first`.
+  let olderInFlight: Promise<{ added: number; cursor?: string }> | undefined
+  // Chained rAF callbacks outlive an unmount; capture the generation at
+  // schedule time and stop at the first stale frame (same guard as the
+  // diff-viewer's scroll restore).
+  let anchorGeneration = 0
+  onCleanup(() => {
+    anchorGeneration++
+  })
+  const restoreAnchor = (top: number, height: number, attempt = 0) => {
+    const generation = anchorGeneration
+    renderer.requestAnimationFrame(() => {
+      if (generation !== anchorGeneration || !scroll || scroll.isDestroyed) return
+      const grown = scroll.scrollHeight - height
+      // The prepended rows may not be laid out yet; retry a frame or two
+      // instead of leaving the reader shifted.
+      if (grown <= 0 && attempt < 3) return restoreAnchor(top, height, attempt + 1)
+      scroll.scrollTo(top + Math.max(0, grown))
+    })
+  }
+  type OlderPage = Awaited<ReturnType<typeof sync.session.more>>
+  // A failed page must not read as "the timeline ended here": the cursor stays
+  // where it was (the store only advances it on a successful page), so the next
+  // attempt retries the same page. The failure is reported to the reader instead
+  // of being turned into an empty result.
+  let olderFailureShown = false
+  const reportOlderFailure = () => {
+    if (olderFailureShown) return
+    olderFailureShown = true
+    toast.show({ message: "Failed to load older messages", variant: "error" })
+  }
+  const loadOlder = (anchor = true): Promise<OlderPage> => {
+    // A read that is already running is shared, not skipped: callers waiting in
+    // `session.first` must still see the page land, and the reader's scroll
+    // must still be anchored when it does.
+    if (olderInFlight) return olderInFlight
+    const box = scroll
+    if (!box || box.isDestroyed || !sync.session.hasOlder(route.sessionID)) return Promise.resolve({ added: 0 })
+    const top = box.scrollTop
+    const height = box.scrollHeight
+    const task = (async () => {
+      try {
+        const page = await sync.session.more(route.sessionID)
+        if (page.added > 0 && anchor) restoreAnchor(top, height)
+        olderFailureShown = false
+        return page
+      } catch (error) {
+        // The loaded window is left as it is (nothing on screen is dropped) and
+        // the failure reaches the caller.
+        reportOlderFailure()
+        throw error
+      } finally {
+        olderInFlight = undefined
+      }
+    })()
+    olderInFlight = task
+    return task
+  }
   function watchScroll(r: ScrollBoxRenderable) {
     scroll = r
     const update = () =>
@@ -444,6 +520,9 @@ export function Session() {
         const max = Math.max(0, r.scrollHeight - r.viewport.height)
         // Same threshold the scrollbox uses to re-engage sticky scrolling.
         setScrolledAway(max > 1 && r.scrollTop < max - 1)
+        // Prefetch one viewport ahead of the top so older history is there
+        // before the reader reaches a dead end.
+        if (r.scrollTop <= r.viewport.height) void loadOlder().catch(() => undefined)
       })
     r.verticalScrollBar.on("change", update)
     onCleanup(() => r.verticalScrollBar.off("change", update))
@@ -458,7 +537,6 @@ export function Session() {
   }
   const keymap = useOpencodeKeymap()
   const dialog = useDialog()
-  const renderer = useRenderer()
 
   const offSessionStatus = event.on("session.status", (evt) => {
     if (evt.properties.sessionID !== route.sessionID) return
@@ -938,7 +1016,35 @@ export function Session() {
       category: "Session",
       hidden: true,
       run: () => {
-        scroll.scrollTo(0)
+        // "First message" means the oldest persisted message, not the oldest
+        // one the mount window loaded: drain every remaining page first. A
+        // prefetch that is already in flight is awaited through `loadOlder`
+        // instead of reading as "nothing older".
+        void (async () => {
+          let cursor: string | undefined
+          try {
+            for (;;) {
+              if (!sync.session.hasOlder(route.sessionID)) break
+              const page = await loadOlder(false)
+              // A page that adds nothing but moves the cursor is still progress:
+              // its rows were already loaded or were removed live. Only no rows
+              // *and* no cursor movement means the drain cannot get further.
+              if (page.added === 0 && (page.cursor === undefined || page.cursor === cursor)) break
+              cursor = page.cursor
+            }
+          } catch {
+            // Older history is still out there and unreachable right now. Leave
+            // the reader where they are rather than jumping to the oldest
+            // *loaded* message as if it were the first one; the retry is another
+            // Home (or a scroll), and the cursor was never advanced past it.
+            return
+          }
+          // An anchor restore scheduled by the page that was in flight would
+          // land after this scroll and pull the reader off the first message;
+          // an explicit jump to the top wins over pending restores.
+          anchorGeneration++
+          if (scroll && !scroll.isDestroyed) scroll.scrollTo(0)
+        })()
         dialog.clear()
       },
     },
@@ -1048,16 +1154,18 @@ export function Session() {
         try {
           const sessionData = session()
           if (!sessionData) return
-          const sessionMessages = messages()
-          const transcript = formatTranscript(
+          // The transcript is the complete history, never just the rendered
+          // window: read every persisted page instead of the bounded store
+          // (#815).
+          const transcript = await formatTranscriptPaged(
             sessionData,
-            sessionMessages.map((msg) => ({ info: msg, parts: sync.data.part[msg.id] ?? [] })),
             {
               thinking: showThinking(),
               toolDetails: showDetails(),
               assistantMetadata: showAssistantMetadata(),
               providers: sync.data.provider,
             },
+            (before) => sync.session.historyPage(sessionData.id, before),
           )
           await clipboard.write?.(transcript)
           toast.show({ message: "Session transcript copied to clipboard!", variant: "success" })
@@ -1078,9 +1186,12 @@ export function Session() {
         try {
           const sessionData = session()
           if (!sessionData) return
-          const sessionMessages = messages()
+          // Bind the session this command was launched from: the options dialog
+          // awaits the user, and the route can move to another session while it
+          // is open. Metadata and history must both come from the bound session.
+          const sessionID = sessionData.id
 
-          const defaultFilename = `session-${sessionData.id.slice(0, 8)}.md`
+          const defaultFilename = `session-${sessionID.slice(0, 8)}.md`
 
           const options = await DialogExportOptions.show(
             dialog,
@@ -1093,15 +1204,18 @@ export function Session() {
 
           if (options === null) return
 
-          const transcript = formatTranscript(
+          // Export reads every persisted page rather than the bounded store (or
+          // the session's mount window), so an export never truncates the
+          // transcript (#815).
+          const transcript = await formatTranscriptPaged(
             sessionData,
-            sessionMessages.map((msg) => ({ info: msg, parts: sync.data.part[msg.id] ?? [] })),
             {
               thinking: options.thinking,
               toolDetails: options.toolDetails,
               assistantMetadata: options.assistantMetadata,
               providers: sync.data.provider,
             },
+            (before) => sync.session.historyPage(sessionID, before),
           )
 
           if (options.openWithoutSaving) {
@@ -1562,9 +1676,9 @@ function UserMessageRow(props: {
   const sync = useSync()
   const [history, setHistory] = createSignal<{ info: Message; parts: Part[] }[]>()
   const [historyRevision, setHistoryRevision] = createSignal(0)
-  // A removal can affect a launch or duplicate outside this row (or outside
-  // sync's 100-message window). Invalidate immediately and refetch the full
-  // history; the effect cleanup also rejects any older in-flight response.
+  // A removal can affect a launch or duplicate outside this row. Invalidate
+  // immediately and refetch the full history; the effect cleanup also rejects
+  // any older in-flight response.
   const offHistoryRemoval = sdk.event.on("event", (event) => {
     const payload = event.payload
     if ((payload.type !== "message.removed" && payload.type !== "message.part.removed") ||
@@ -1573,9 +1687,9 @@ function UserMessageRow(props: {
     setHistoryRevision((revision) => revision + 1)
   })
   onCleanup(offHistoryRemoval)
-  // Sync retains only the newest 100 messages. Read the complete persisted
-  // history before treating a launch/receipt pair as unique. While loading or
-  // on failure the receipt remains visible on the ordinary fallback path.
+  // Read the complete persisted history before treating a launch/receipt pair
+  // as unique, including rows the live store may not hold. While loading or on
+  // failure the receipt remains visible on the ordinary fallback path.
   createEffect(on(
     () => ({ key: backgroundParts().filter((part) => ReviewReport.TAGS.some((tag) => part.text.includes(`<${tag}`))).map((part) => `${part.id}\n${part.text}`).join("\n"), revision: historyRevision() }),
     ({ key }) => {
@@ -2276,6 +2390,13 @@ function ActivitySubGroupBlock(props: { groupID: string; subID: string }) {
   const kind = createMemo(() => sub()?.kind ?? "misc")
   const items = createMemo(() => sub()?.items ?? [])
   const parts = createMemo(() => sub()?.parts ?? [])
+  // Tool-only blocks remain compact. When a block interleaves reasoning and
+  // tool calls, each rendered part is a separate semantic unit, so leave one
+  // readable row between units without changing their internal anatomy.
+  const mixedDetails = createMemo(() => {
+    const detail = parts()
+    return detail.some((item) => item.part.type === "reasoning") && detail.some((item) => item.part.type === "tool")
+  })
   const summary = createMemo(() => summarizeActivity(items().map((item) => item.part)))
   const targets = createMemo(() => countActivityTargets(items()))
   const expanded = createMemo(() => ctx.activityExpanded(props.subID))
@@ -2357,18 +2478,23 @@ function ActivitySubGroupBlock(props: { groupID: string; subID: string }) {
       </box>
       <Show when={expanded()}>
         <activityDetail.Provider value={true}>
-          <For each={parts()}>{(item) => <ActivityGroupPartRow item={item} />}</For>
+          <For each={parts()}>
+            {(item, index) => <ActivityGroupPartRow item={item} separate={mixedDetails() && index() > 0} />}
+          </For>
         </activityDetail.Provider>
       </Show>
     </box>
   )
 }
 
-function ActivityGroupPartRow(props: { item: ActivityGroupPart }) {
-  if (props.item.part.type === "reasoning") {
-    return <ReasoningPart last={false} part={props.item.part} message={props.item.message} />
-  }
-  return <ToolPart last={false} part={props.item.part} message={props.item.message} />
+function ActivityGroupPartRow(props: { item: ActivityGroupPart; separate: boolean }) {
+  const row =
+    props.item.part.type === "reasoning" ? (
+      <ReasoningPart last={false} part={props.item.part} message={props.item.message} />
+    ) : (
+      <ToolPart last={false} part={props.item.part} message={props.item.message} />
+    )
+  return <box marginTop={props.separate ? 1 : 0}>{row}</box>
 }
 
 function ToolPart(props: { last: boolean; part: ToolPart; message: AssistantMessage; suppressReview?: boolean }) {

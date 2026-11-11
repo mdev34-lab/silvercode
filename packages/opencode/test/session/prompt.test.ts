@@ -1,5 +1,4 @@
 import { ToolCatalog } from "@/tool/catalog"
-import { TaskTool } from "@/tool/task"
 import { applyPartDelta, applyPartUpdated } from "../../../tui/src/util/part"
 import type { Part } from "@opencode-ai/sdk/v2"
 import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
@@ -10,7 +9,7 @@ import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { eq } from "drizzle-orm"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { expect } from "bun:test"
-import { Cause, Deferred, Duration, Effect, Exit, Fiber, Layer, Schema } from "effect"
+import { Cause, Deferred, Duration, Effect, Exit, Fiber, Layer, Schema, Stream, Queue } from "effect"
 import path from "path"
 import { fileURLToPath } from "url"
 import { readdir, readFile } from "node:fs/promises"
@@ -31,7 +30,7 @@ import { Image } from "../../src/image/image"
 
 import { Question } from "../../src/question"
 import { Todo } from "../../src/session/todo"
-import { Session } from "@/session/session"
+import { Session, withAgentEffort } from "@/session/session"
 import { SessionMessageTable } from "@opencode-ai/core/session/sql"
 import { LLM } from "../../src/session/llm"
 import { MessageV2 } from "../../src/session/message-v2"
@@ -57,10 +56,12 @@ import { Truncate } from "@/tool/truncate"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { Ripgrep } from "@opencode-ai/core/ripgrep"
 import { Format } from "../../src/format"
-import { TestInstance } from "../fixture/fixture"
-import { awaitWithTimeout, pollWithTimeout, testEffect } from "../lib/effect"
-import { httpError, raw, reply, TestLLMServer } from "../lib/llm-server"
-import { RuntimeFlags } from "@/effect/runtime-flags"
+import * as TestClock from "effect/testing/TestClock"
+import { LLMEvent } from "@opencode-ai/llm"
+import { ProviderError } from "@/provider/error"
+import { SessionRetry } from "@/session/retry"
+import { TaskTool } from "@/tool/task"
+import { provideTmpdirInstance, TestInstance } from "../fixture/fixture"
 import { RepetitionGuard } from "../../src/session/llm/repetition-guard"
 import {
   continuesPrompt,
@@ -69,9 +70,14 @@ import {
   resultChunks,
   textResult,
 } from "../../src/session/subagent-result"
+import { awaitWithTimeout, pollWithTimeout, testEffect } from "../lib/effect"
+import { httpError, raw, reply, TestLLMServer } from "../lib/llm-server"
+import { RuntimeFlags } from "@/effect/runtime-flags"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { LocationServiceMap, locationServiceMapLayer } from "@opencode-ai/core/location-services"
+
+const FINISH_NUDGE_MARKER = "[WARNING] The turn ended without a successful finish call."
 
 const summary = Layer.succeed(
   SessionSummary.Service,
@@ -339,8 +345,6 @@ const withMcpTools = testEffect(
     },
   }),
 )
-const FINISH_NUDGE_MARKER = "[WARNING] The turn ended without a successful finish call."
-
 const unix = process.platform !== "win32" ? it.instance : it.instance.skip
 const unixNoLLMServer = process.platform !== "win32" ? noLLMServer.instance : noLLMServer.instance.skip
 
@@ -1726,7 +1730,7 @@ withMcpTools.instance(
 )
 
 it.instance(
-  "three identical calls in one assistant message reach the denied doom-loop permission",
+  "three identical shell failures across separate generation steps reach the denied doom-loop permission",
   () =>
     Effect.gen(function* () {
       const { dir, llm } = yield* useServerConfig((url) => ({
@@ -1738,33 +1742,96 @@ it.instance(
       const agents = yield* AgentSvc.Service
       const agent = yield* agents.get("build")
       expect(Permission.evaluate("doom_loop", "shell", agent.permission).action).toBe("deny")
-      const session = yield* sessions.create({ title: "Doom-loop positive control" })
+      const session = yield* sessions.create({ title: "Doom-loop sequential control" })
       yield* prompt.prompt({
         sessionID: session.id,
         agent: "build",
         noReply: true,
-        parts: [{ type: "text", text: "run the same harmless command three times" }],
+        parts: [{ type: "text", text: "run the same failing command three times" }],
       })
 
-      const input = { command: "echo SHOULD_NOT_RUN", description: "doom-loop positive control", workdir: dir }
-      // One provider response creates one assistant message with three real tool parts.
-      // A separate llm.tool() reply for each call would not exercise the per-message guard.
-      yield* llm.push(reply().tool("shell", input).tool("shell", input).tool("shell", input))
+      // `shell` reports a non-zero exit as a completed tool result, so this test uses a
+      // workdir that does not exist to produce genuine errored tool executions. Each
+      // provider reply is its own generation step; the identical call must fail in two
+      // separate steps before the third step's call triggers the guard.
+      const input = {
+        command: "printf 'doom-loop-attempt\\n' >> doom-loop-attempts.txt; exit 1",
+        description: "doom-loop sequential positive control",
+        workdir: path.join(dir, "missing-doom-loop-workdir"),
+      }
+      yield* llm.push(reply().tool("shell", input))
+      yield* llm.push(reply().tool("shell", input))
+      yield* llm.push(reply().tool("shell", input))
       const result = yield* prompt.loop({ sessionID: session.id })
       expect(result.info.role).toBe("assistant")
       if (result.info.role !== "assistant") throw new Error("expected an assistant result")
-      // The guard's denied ask interrupts this model step after tool calls were issued.
-      // That is the observable runtime signal (as opposed to an inferred structural window).
+      // The guard's denied ask interrupts the third model step after its tool call was
+      // issued but before the command ran. That interruption is the runtime signal.
       expect(result.info.error).toBeDefined()
       expect(JSON.stringify(result.info.error)).toContain("ProviderStreamInterruptedAfterToolCallError")
 
       const messages = yield* sessions.messages({ sessionID: session.id })
-      const repeated = messages
-        .filter((message) => message.info.role === "assistant")
-        .map((message) => message.parts.filter((part) => part.type === "tool" && part.tool === "shell"))
-        .filter((parts) => parts.length === 3)
-      expect(repeated).toHaveLength(1)
-      expect(repeated[0]?.map((part) => part.type === "tool" && part.state.input)).toEqual([input, input, input])
+      const shellParts = messages
+        .flatMap((message) => message.parts)
+        .filter((part): part is SessionV1.ToolPart => part.type === "tool" && part.tool === "shell")
+      expect(shellParts.map((part) => part.state.input)).toEqual([input, input, input])
+
+      const realFailures = shellParts.filter(
+        (part) => part.state.status === "error" && part.state.metadata?.interrupted !== true,
+      )
+      const interrupted = shellParts.filter(
+        (part) => part.state.status === "error" && part.state.metadata?.interrupted === true,
+      )
+      // The first two steps executed and errored; the third never ran and was settled by
+      // the processor's cleanup as interrupted instead of producing another real error.
+      expect(realFailures).toHaveLength(2)
+      expect(interrupted).toHaveLength(1)
+      expect(interrupted[0]?.state.status === "error" && interrupted[0].state.error).toBe("Tool execution aborted")
+      expect(yield* Effect.promise(() => Bun.file(path.join(dir, "doom-loop-attempts.txt")).exists())).toBe(false)
+    }),
+  20_000,
+)
+
+it.instance(
+  "three identical successful shell calls in one assistant message do not reach the doom-loop permission",
+  () =>
+    Effect.gen(function* () {
+      // Keep `doom_loop` denied so any guard ask halts the turn; a clean result below is
+      // runtime evidence that a same-batch fan-out is not treated as a cross-step loop.
+      const { dir, llm } = yield* useServerConfig((url) => ({
+        ...providerCfg(url),
+        permission: { "*": "allow", doom_loop: "deny" },
+      }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({ title: "Doom-loop same-batch control" })
+      yield* prompt.prompt({
+        sessionID: session.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "run the same harmless command three times in one step" }],
+      })
+
+      const input = { command: "echo DOOM_LOOP_BATCH_OK", description: "doom-loop same-batch control", workdir: dir }
+      yield* llm.push(reply().tool("shell", input).tool("shell", input).tool("shell", input))
+      yield* llm.push(reply().text("done").stop())
+      const result = yield* prompt.loop({ sessionID: session.id })
+      expect(result.info.role).toBe("assistant")
+      if (result.info.role !== "assistant") throw new Error("expected an assistant result")
+      expect(result.info.error).toBeUndefined()
+      expect(result.info.finish).toBe("stop")
+      expect(result.parts.some((part) => part.type === "text" && part.text === "done")).toBe(true)
+
+      const messages = yield* sessions.messages({ sessionID: session.id })
+      const shellParts = messages
+        .flatMap((message) => message.parts)
+        .filter((part): part is SessionV1.ToolPart => part.type === "tool" && part.tool === "shell")
+      expect(shellParts.map((part) => part.state.input)).toEqual([input, input, input])
+      expect(shellParts.map((part) => part.state.status)).toEqual(["completed", "completed", "completed"])
+      for (const part of shellParts) {
+        if (part.state.status !== "completed") throw new Error("expected every batched call to complete")
+        expect(part.state.output).toContain("DOOM_LOOP_BATCH_OK")
+      }
     }),
   20_000,
 )
@@ -6761,6 +6828,583 @@ it.instance(
     }),
   { git: true },
   10_000,
+)
+
+// No network: count a simulated side effect, persist its result, then die.
+for (const scenario of ["completed", "missing", "bound", "abort"] as const) {
+  const requests: LLM.StreamInput[] = []
+  let executions = 0
+  const simulated = Layer.succeed(
+    LLM.Service,
+    LLM.Service.of({
+      stream: (input) => {
+        if (input.agent.name !== "work")
+          return Stream.make(
+            LLMEvent.stepStart({ index: 0 }),
+            LLMEvent.stepFinish({ index: 0, reason: "stop" }),
+            LLMEvent.finish({ reason: "stop" }),
+          )
+        requests.push(input)
+        const index = requests.length
+        if (index > 1 && scenario !== "bound")
+          return Stream.make(
+            LLMEvent.stepStart({ index: 0 }),
+            LLMEvent.textStart({ id: "answer" }),
+            LLMEvent.textDelta({ id: "answer", text: "recovered" }),
+            LLMEvent.textEnd({ id: "answer" }),
+            LLMEvent.stepFinish({ index: 0, reason: "stop" }),
+            LLMEvent.finish({ reason: "stop" }),
+          )
+        const id = `execution-${index}`
+        return Stream.make(
+          LLMEvent.stepStart({ index: 0 }),
+          LLMEvent.toolCall({ id, name: "probe", input: { index } }),
+        ).pipe(
+          Stream.concat(
+            Stream.fromEffect(
+              Effect.sync(() => {
+                executions++
+                return LLMEvent.toolResult({ id, name: "probe", result: { type: "text", value: `persisted-${index}` } })
+              }),
+            ),
+          ),
+          Stream.concat(
+            scenario === "missing"
+              ? Stream.make(LLMEvent.toolCall({ id: "unfinished", name: "probe", input: { pending: true } }))
+              : Stream.empty,
+          ),
+          Stream.concat(Stream.fail(new ProviderError.ResponseStreamError("simulated transport death"))),
+        )
+      },
+    }),
+  )
+  const simulatedTest = testEffect(
+    LayerNode.compile(promptRoot, [
+      [SessionSummary.node, summary],
+      [LSP.node, lsp],
+      [MCP.node, makeMcp()],
+      [RuntimeFlags.node, runtimeFlags],
+      [LLM.node, simulated],
+    ]),
+  )
+  simulatedTest.effect(`replay-safe stream resumption: ${scenario}`, () =>
+    provideTmpdirInstance(
+      () =>
+        Effect.gen(function* () {
+          requests.length = 0
+          executions = 0
+          const sessions = yield* Session.Service
+          const prompt = yield* SessionPrompt.Service
+          const events = yield* EventV2Bridge.Service
+          const chat = yield* sessions.create({ permission: [{ permission: "*", pattern: "*", action: "allow" }] })
+          yield* user(chat.id, "run once")
+          const pending = yield* Queue.unbounded<void>()
+          const attempts: number[] = []
+          const idle = yield* Deferred.make<void>()
+          const off = yield* events.listen((event) =>
+            Effect.gen(function* () {
+              if (event.type !== SessionStatus.Event.Status.type) return
+              const properties = event.data as typeof SessionStatus.Event.Status.data.Type
+              if (properties.sessionID !== chat.id) return
+              if (properties.status.type === "idle") yield* Deferred.succeed(idle, undefined)
+              if (properties.status.type !== "retry") return
+              attempts.push(properties.status.attempt)
+              yield* Queue.offer(pending, undefined)
+            }),
+          )
+          yield* Effect.addFinalizer(() => off)
+          const run = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+          if (scenario === "missing") {
+            yield* Deferred.await(idle)
+            yield* TestClock.adjust("1 second")
+          }
+          if (scenario !== "missing") {
+            const count = scenario === "bound" ? SessionRetry.RETRY_MAX_RETRIES : 1
+            for (let i = 0; i < count; i++) {
+              yield* Queue.take(pending)
+              if (scenario === "abort") {
+                yield* prompt.cancel(chat.id)
+                yield* TestClock.adjust("1 hour")
+                expect(requests.length).toBe(1)
+                expect(executions).toBe(1)
+                expect((yield* (yield* SessionStatus.Service).get(chat.id)).type).toBe("idle")
+                return
+              }
+              yield* TestClock.adjust("40 seconds")
+            }
+          }
+          const result = yield* Fiber.join(run)
+          const expected = scenario === "bound" ? SessionRetry.RETRY_MAX_RETRIES + 1 : scenario === "completed" ? 2 : 1
+          expect(requests.length).toBe(expected)
+          expect(executions).toBe(scenario === "completed" ? 1 : expected)
+          expect(attempts).toEqual(scenario === "missing" ? [] : Array.from({ length: expected - 1 }, (_, i) => i + 1))
+          for (let i = 1; i < requests.length; i++) {
+            const history = JSON.stringify(requests[i].messages)
+            for (let j = 1; j <= i; j++) expect(history).toContain(`persisted-${j}`)
+            expect(requests[i]).not.toBe(requests[i - 1])
+          }
+          expect(result.info.role).toBe("assistant")
+          if (result.info.role !== "assistant") throw new Error("expected assistant")
+          if (scenario === "completed") expect(result.info.error).toBeUndefined()
+          else expect(JSON.stringify(result.info.error)).toContain("ProviderStreamInterruptedAfterToolCallError")
+          const parts = (yield* sessions.messages({ sessionID: chat.id })).flatMap((m) => m.parts)
+          expect(parts.filter((p) => p.type === "tool" && p.state.status === "completed").length).toBe(executions)
+          if (scenario === "missing") {
+            expect(
+              parts.some((p) => p.type === "tool" && p.callID === "unfinished" && p.state.status === "error"),
+            ).toBe(true)
+          }
+        }),
+      { config: cfg },
+    ),
+  )
+}
+
+// Mid-session agent effort (#748): the selector persists a level on the
+// session row, and every generation step must consume the persisted level it
+// sees when it builds its request. A change made while a request is already in
+// flight therefore applies to the next step (and to the finish call made from
+// it), never retroactively to the request that was already sent, and it never
+// restarts the run or replays completed tool effects.
+for (const [initial, changed] of [
+  ["thorough", "fast"],
+  ["fast", "thorough"],
+] as const) {
+  it.instance(
+    `mid-session effort ${initial} -> ${changed} reaches the next generation step, not the in-flight request`,
+    () =>
+      Effect.gen(function* () {
+        const { dir, llm } = yield* useServerConfig(providerCfg)
+        const prompt = yield* SessionPrompt.Service
+        const sessions = yield* Session.Service
+        const session = yield* sessions.create({
+          title: "Effort switch",
+          permission: [{ permission: "*", pattern: "*", action: "allow" }],
+          metadata: withAgentEffort({}, initial),
+        })
+        const first = path.join(dir, "effort-step-1.txt")
+        const second = path.join(dir, "effort-step-2.txt")
+        yield* prompt.prompt({
+          sessionID: session.id,
+          agent: "work",
+          noReply: true,
+          parts: [{ type: "text", text: "Write two files, one per step." }],
+        })
+        // Step 1 writes the marker that enables the effort policy block.
+        yield* llm.tool("write", { filePath: first, content: "first" })
+        // Step 2 is held open so the selection can change while its request is
+        // already in flight. Step 3's reply is queued up front: the fake server
+        // pulls it when that request arrives.
+        const held = defer<void>()
+        yield* llm.push(reply().tool("write", { filePath: second, content: "second" }).wait(held.promise))
+        yield* llm.push(reply().text("Both files written.").stop())
+
+        const fiber = yield* prompt.loop({ sessionID: session.id }).pipe(Effect.forkChild)
+        yield* awaitWithTimeout(llm.wait(1), "timed out waiting for step 1", "10 seconds")
+        yield* awaitWithTimeout(llm.wait(2), "timed out waiting for step 2", "10 seconds")
+
+        // The request already on the wire keeps the effort it was built with.
+        const inFlight = JSON.stringify((yield* llm.hits)[1]?.body)
+        expect(inFlight).toContain(`## Agent effort: ${initial}`)
+        expect(inFlight).not.toContain(`## Agent effort: ${changed}`)
+
+        // Change the persisted selection in the same session, mid-run.
+        yield* sessions.setMetadata({ sessionID: session.id, metadata: withAgentEffort({}, changed) })
+        held.resolve()
+
+        yield* awaitWithTimeout(llm.wait(3), "timed out waiting for step 3", "10 seconds")
+        const next = JSON.stringify((yield* llm.hits)[2]?.body)
+        expect(next).toContain(`## Agent effort: ${changed}`)
+        expect(next).not.toContain(`## Agent effort: ${initial}`)
+
+        const exit = yield* Fiber.await(fiber)
+        expect(Exit.isSuccess(exit)).toBe(true)
+
+        // One turn, one run, no replay: three requests and the two writes from
+        // before the change landed exactly once.
+        expect(yield* llm.calls).toBe(3)
+        expect(yield* Effect.promise(() => readFile(first, "utf8"))).toBe("first")
+        expect(yield* Effect.promise(() => readFile(second, "utf8"))).toBe("second")
+        const messages = yield* sessions.messages({ sessionID: session.id })
+        expect(messages.filter((message) => message.info.role === "user")).toHaveLength(1)
+        const writes = messages
+          .flatMap((message) => message.parts)
+          .filter((part): part is SessionV1.ToolPart => part.type === "tool" && part.tool === "write")
+        expect(writes).toHaveLength(2)
+        expect(writes.map((part) => part.state.status)).toEqual(["completed", "completed"])
+        // The change stays persisted; nothing reset it back while the run ended.
+        expect((yield* sessions.get(session.id)).metadata?.agentEffort).toBe(changed)
+
+        // The next turn of the same persisted session starts from the changed
+        // level as well: nothing is cached per session across runs.
+        yield* prompt.prompt({
+          sessionID: session.id,
+          agent: "work",
+          noReply: true,
+          parts: [{ type: "text", text: "Confirm the change." }],
+        })
+        yield* llm.text("Confirmed.")
+        yield* prompt.loop({ sessionID: session.id })
+        const followingTurn = JSON.stringify((yield* llm.hits)[3]?.body)
+        expect(followingTurn).toContain(`## Agent effort: ${changed}`)
+        expect(followingTurn).not.toContain(`## Agent effort: ${initial}`)
+        expect(yield* llm.calls).toBe(4)
+        expect(yield* Effect.promise(() => readFile(first, "utf8"))).toBe("first")
+        expect(yield* Effect.promise(() => readFile(second, "utf8"))).toBe("second")
+      }),
+    20_000,
+  )
+}
+
+// The finish checkpoint reads the effective level at its own execution point,
+// so a selection changed mid-turn governs the delivery the model asks for next
+// (#748). Old effects are untouched and the turn is not restarted.
+it.instance(
+  "mid-session effort change is consumed by the finish checkpoint of the same turn",
+  () =>
+    Effect.gen(function* () {
+      const { dir, llm } = yield* useServerConfig((url) => ({
+        ...providerCfg(url),
+        agent: { work: { finishTool: true } },
+      }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({
+        title: "Effort finish switch",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+        metadata: withAgentEffort({}, "thorough"),
+      })
+      const file = path.join(dir, "effort-finish.txt")
+      yield* prompt.prompt({
+        sessionID: session.id,
+        agent: "work",
+        noReply: true,
+        parts: [{ type: "text", text: "Write a file and finish." }],
+      })
+      yield* llm.tool("write", { filePath: file, content: "done" })
+      const held = defer<void>()
+      const extra = path.join(dir, "effort-finish-2.txt")
+      yield* llm.push(reply().tool("write", { filePath: extra, content: "done" }).wait(held.promise))
+      yield* llm.push(
+        reply().text("Delivered.").tool("finish", { reason: "success", result: "Wrote the file." }).stop(),
+      )
+
+      const fiber = yield* prompt.loop({ sessionID: session.id }).pipe(Effect.forkChild)
+      yield* awaitWithTimeout(llm.wait(1), "timed out waiting for step 1", "10 seconds")
+      yield* awaitWithTimeout(llm.wait(2), "timed out waiting for step 2", "10 seconds")
+      expect(JSON.stringify((yield* llm.hits)[1]?.body)).toContain("## Agent effort: thorough")
+
+      // Downgrade while step 2 is in flight: the in-flight request keeps its
+      // thorough prompt, and the finish the model calls next is judged fast.
+      yield* sessions.setMetadata({ sessionID: session.id, metadata: withAgentEffort({}, "fast") })
+      held.resolve()
+      const exit = yield* Fiber.await(fiber)
+      expect(Exit.isSuccess(exit)).toBe(true)
+
+      const messages = yield* sessions.messages({ sessionID: session.id })
+      const finish = messages
+        .flatMap((message) => message.parts)
+        .find((part): part is SessionV1.ToolPart => part.type === "tool" && part.tool === "finish")
+      expect(finish?.state.status).toBe("completed")
+      if (finish?.state.status !== "completed") return
+      // Fast requires no review: the delivery is labelled by the new level and
+      // is not the thorough UNREVIEWED demand the old prompt carried.
+      expect(finish.state.output).toContain("effort fast")
+      expect(finish.state.output).not.toContain("effort thorough")
+      expect(finish.state.metadata?.review).toMatchObject({ effort: "fast" })
+      expect(yield* Effect.promise(() => readFile(file, "utf8"))).toBe("done")
+      expect(yield* llm.calls).toBe(3)
+    }),
+  20_000,
+)
+
+// Upgrade makes the finish checkpoint stricter than the opening selection:
+// the in-flight request keeps the fast policy it was sent with, the next
+// generation step carries thorough, and a finish called with no review on
+// record is judged thorough (softened UNREVIEWED delivery carrying the
+// thorough Review required guidance and full validation gate, never approved
+// and never the stale fast label), while prior writes land once and the
+// persisted change stays thorough.
+it.instance(
+  "mid-session effort upgrade is enforced by the finish checkpoint of the same turn",
+  () =>
+    Effect.gen(function* () {
+      const { dir, llm } = yield* useServerConfig((url) => ({
+        ...providerCfg(url),
+        agent: { work: { finishTool: true } },
+      }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({
+        title: "Effort finish upgrade",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+        metadata: withAgentEffort({}, "fast"),
+      })
+      const file = path.join(dir, "effort-finish-upgrade.txt")
+      yield* prompt.prompt({
+        sessionID: session.id,
+        agent: "work",
+        noReply: true,
+        parts: [{ type: "text", text: "Write a file and finish." }],
+      })
+      yield* llm.tool("write", { filePath: file, content: "done" })
+      const held = defer<void>()
+      const extra = path.join(dir, "effort-finish-upgrade-2.txt")
+      yield* llm.push(reply().tool("write", { filePath: extra, content: "done" }).wait(held.promise))
+      yield* llm.push(
+        reply().text("Delivered.").tool("finish", { reason: "success", result: "Wrote the file." }).stop(),
+      )
+
+      const fiber = yield* prompt.loop({ sessionID: session.id }).pipe(Effect.forkChild)
+      yield* awaitWithTimeout(llm.wait(1), "timed out waiting for step 1", "10 seconds")
+      yield* awaitWithTimeout(llm.wait(2), "timed out waiting for step 2", "10 seconds")
+      expect(JSON.stringify((yield* llm.hits)[1]?.body)).toContain("## Agent effort: fast")
+      expect(JSON.stringify((yield* llm.hits)[1]?.body)).not.toContain("## Agent effort: thorough")
+
+      // Upgrade while step 2 is in flight: the in-flight request keeps its
+      // fast prompt, the next step receives thorough, and finish enforces
+      // thorough at its call point.
+      yield* sessions.setMetadata({ sessionID: session.id, metadata: withAgentEffort({}, "thorough") })
+      held.resolve()
+
+      yield* awaitWithTimeout(llm.wait(3), "timed out waiting for step 3", "10 seconds")
+      expect(JSON.stringify((yield* llm.hits)[2]?.body)).toContain("## Agent effort: thorough")
+      expect(JSON.stringify((yield* llm.hits)[2]?.body)).not.toContain("## Agent effort: fast")
+
+      const exit = yield* Fiber.await(fiber)
+      expect(Exit.isSuccess(exit)).toBe(true)
+      if (!Exit.isSuccess(exit)) return
+      const result = exit.value
+      expect(result.info.role).toBe("assistant")
+      if (result.info.role === "assistant") {
+        expect(result.info.finish).toBe("stop")
+        expect(result.info.error).toBeUndefined()
+      }
+
+      const messages = yield* sessions.messages({ sessionID: session.id })
+      const finishes = messages
+        .flatMap((message) => message.parts)
+        .filter((part): part is SessionV1.ToolPart => part.type === "tool" && part.tool === "finish")
+      expect(finishes).toHaveLength(1)
+      const finish = finishes[0]
+      expect(finish?.state.status).toBe("completed")
+      if (finish?.state.status !== "completed") return
+      // Unreviewed file writes at thorough soften to an UNREVIEWED delivery
+      // carrying the thorough Review required demand and full validation gate,
+      // never approved and never the stale fast fast-path.
+      expect(finish.state.output).toContain("effort thorough")
+      expect(finish.state.output).not.toContain("effort fast")
+      expect(finish.state.output).toContain(
+        "UNREVIEWED: effort thorough asks for a clean current Review and none is in place; this is not an approval.",
+      )
+      expect(finish.state.output).toContain('Review required: effort is "thorough"')
+      expect(finish.state.output).toContain("passes 0 until-clean")
+      expect(finish.state.output).not.toContain("none required")
+      expect(finish.state.output).toContain("validation full/incomplete")
+      expect(finish.state.metadata?.review).toMatchObject({
+        effort: "thorough",
+        disposition: "unreviewed",
+        termination: "unreviewed",
+        reviews: 0,
+      })
+      expect(finish.state.metadata?.review?.termination).not.toBe("approved")
+      expect("maxIterations" in (finish.state.metadata?.review ?? {})).toBe(false)
+      expect(finish.state.metadata?.validation).toMatchObject({ gate: "full", status: "incomplete" })
+
+      expect(yield* llm.calls).toBe(3)
+      expect(messages.filter((message) => message.info.role === "user")).toHaveLength(1)
+      expect((yield* sessions.get(session.id)).metadata?.agentEffort).toBe("thorough")
+      expect(yield* Effect.promise(() => readFile(file, "utf8"))).toBe("done")
+      expect(yield* Effect.promise(() => readFile(extra, "utf8"))).toBe("done")
+      // No replay: the two writes from before the change landed exactly once.
+      const writes = messages
+        .flatMap((message) => message.parts)
+        .filter((part): part is SessionV1.ToolPart => part.type === "tool" && part.tool === "write")
+      expect(writes).toHaveLength(2)
+      expect(writes.map((p) => p.state.status)).toEqual(["completed", "completed"])
+    }),
+  30_000,
+)
+
+// When a Review with blocking findings is on record, fast delivers a declared
+// failure finish while thorough declines it until a clean review covers the
+// fixed tree. Upgrading mid-generation therefore declines a failure finish
+// requested by an already-in-flight fast generation, continues the same turn
+// under thorough, and propagates thorough to newly dispatched task children
+// without rewriting children created before the switch.
+it.instance(
+  "mid-session effort upgrade declines an in-flight failure finish over blocking findings and propagates to newly dispatched task children",
+  () =>
+    Effect.gen(function* () {
+      const { dir, llm } = yield* useServerConfig((url) => ({
+        ...providerCfg(url),
+        agent: {
+          work: { finishTool: true },
+          code: { background: false, finishTool: false },
+        },
+      }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({
+        title: "Effort upgrade blocking review and child dispatch",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+        metadata: withAgentEffort({}, "fast"),
+      })
+      const file = path.join(dir, "effort-upgrade-blocking.txt")
+      const needsFixes = [
+        "<silvercode-review>",
+        JSON.stringify({
+          version: 1,
+          revision: "uncommitted",
+          assessment: "needs-fixes",
+          summary: "Missing guard.",
+          findings: [{ severity: "important", title: "Add the missing guard" }],
+        }),
+        "</silvercode-review>",
+      ].join("\n")
+      const approved = [
+        "<silvercode-review>",
+        JSON.stringify({
+          version: 1,
+          revision: "uncommitted",
+          assessment: "approved",
+          summary: "Clean.",
+          findings: [],
+        }),
+        "</silvercode-review>",
+      ].join("\n")
+
+      yield* prompt.prompt({
+        sessionID: session.id,
+        agent: "work",
+        noReply: true,
+        parts: [{ type: "text", text: "Implement and review the file." }],
+      })
+      // Hit 0 (parent step 1): initial write enables the effort policy block.
+      yield* llm.tool("write", { filePath: file, content: "v1" })
+      // Hit 1 (parent step 2) + Hit 2 (child 1 review): dispatched while fast,
+      // returns a blocking finding.
+      yield* llm.tool("task", { description: "Initial review", subagent_type: "review", prompt: "Review v1." })
+      yield* llm.push(reply().tool("finish", { reason: "success", result: needsFixes }).stop())
+      // Hit 3 (parent step 3, held open): sent with fast, requests a failure
+      // finish that fast would deliver as findings-open, but thorough declines.
+      const held = defer<void>()
+      yield* llm.push(
+        reply()
+          .text("Stopping with open findings.")
+          .tool("finish", { reason: "failure", result: "Stopping with open findings." })
+          .wait(held.promise)
+          .stop(),
+      )
+      // Hit 4 (parent step 4, built after the upgrade): dispatches a new code
+      // child, which inherits thorough, writes v2 (Hit 5), and sees thorough
+      // on its own next step (Hit 6).
+      yield* llm.tool("task", { description: "Fix finding", subagent_type: "code", prompt: "Write v2." })
+      yield* llm.tool("write", { filePath: file, content: "v2" })
+      yield* llm.text("<silvercode-result>Updated file to v2.</silvercode-result>")
+      // Hit 7 (parent step 5) + Hit 8 (child 3 review): clean review at thorough.
+      yield* llm.tool("task", { description: "Verify fix", subagent_type: "review", prompt: "Review v2." })
+      yield* llm.push(reply().tool("finish", { reason: "success", result: approved }).stop())
+      // Hit 9 (parent step 6): approved thorough finish.
+      yield* llm.push(
+        reply().text("Fixed and verified.").tool("finish", { reason: "success", result: "Fixed and verified." }).stop(),
+      )
+
+      const fiber = yield* prompt.loop({ sessionID: session.id }).pipe(Effect.forkChild)
+      yield* awaitWithTimeout(llm.wait(1), "timed out waiting for step 1", "10 seconds")
+      yield* awaitWithTimeout(llm.wait(2), "timed out waiting for step 2", "10 seconds")
+      yield* awaitWithTimeout(llm.wait(3), "timed out waiting for review step", "10 seconds")
+      yield* awaitWithTimeout(llm.wait(4), "timed out waiting for held in-flight finish step", "10 seconds")
+      expect(JSON.stringify((yield* llm.hits)[3]?.body)).toContain("## Agent effort: fast")
+      expect(JSON.stringify((yield* llm.hits)[3]?.body)).not.toContain("## Agent effort: thorough")
+
+      // Flip fast -> thorough while step 3 is already in flight before its
+      // finish tool executes.
+      yield* sessions.setMetadata({ sessionID: session.id, metadata: withAgentEffort({}, "thorough") })
+      held.resolve()
+
+      const exit = yield* Fiber.await(fiber)
+      expect(Exit.isSuccess(exit)).toBe(true)
+      if (!Exit.isSuccess(exit)) return
+      const result = exit.value
+      expect(result.info.role).toBe("assistant")
+      if (result.info.role === "assistant") {
+        expect(result.info.finish).toBe("stop")
+        expect(result.info.error).toBeUndefined()
+      }
+
+      const hits = yield* llm.hits
+      expect(hits).toHaveLength(10)
+      // Parent step 4 (after the declined finish) and the newly dispatched code
+      // child's post-write step both carry thorough, never stale fast.
+      expect(JSON.stringify(hits[4]?.body)).toContain("## Agent effort: thorough")
+      expect(JSON.stringify(hits[4]?.body)).not.toContain("## Agent effort: fast")
+      expect(JSON.stringify(hits[6]?.body)).toContain("## Agent effort: thorough")
+      expect(JSON.stringify(hits[6]?.body)).not.toContain("## Agent effort: fast")
+
+      const messages = yield* sessions.messages({ sessionID: session.id })
+      const finishes = messages
+        .flatMap((message) => message.parts)
+        .filter((part): part is SessionV1.ToolPart => part.type === "tool" && part.tool === "finish")
+      expect(finishes).toHaveLength(2)
+      expect(finishes[0]?.state.status).toBe("error")
+      if (finishes[0]?.state.status === "error") {
+        expect(finishes[0].state.error).toContain('Review required: effort is "thorough"')
+        expect(finishes[0].state.metadata?.review).toMatchObject({
+          nudged: true,
+          effort: "thorough",
+          disposition: "reviewed",
+          blockingFindings: 1,
+        })
+      }
+      expect(finishes[1]?.state.status).toBe("completed")
+      if (finishes[1]?.state.status === "completed") {
+        expect(finishes[1].state.output).toContain("effort thorough")
+        expect(finishes[1].state.output).toContain("passes 2 until-clean")
+        expect(finishes[1].state.metadata?.review).toMatchObject({
+          effort: "thorough",
+          disposition: "reviewed",
+          termination: "approved",
+          reviews: 2,
+        })
+      }
+
+      // Child 1 (created before the switch) keeps fast; Children 2 and 3
+      // (dispatched after the switch) inherit thorough.
+      const tasks = messages
+        .flatMap((message) => message.parts)
+        .filter((part): part is SessionV1.ToolPart => part.type === "tool" && part.tool === "task")
+      expect(tasks).toHaveLength(3)
+      const taskEfforts = tasks.map((part) =>
+        part.state.status === "completed" ? part.state.metadata?.effort : undefined,
+      )
+      expect(taskEfforts).toEqual(["fast", "thorough", "thorough"])
+      for (const [idx, expected] of [
+        [0, "fast"],
+        [1, "thorough"],
+        [2, "thorough"],
+      ] as const) {
+        const part = tasks[idx]
+        if (part?.state.status !== "completed") continue
+        const childID = part.state.metadata?.sessionId
+        expect(typeof childID).toBe("string")
+        if (typeof childID === "string") {
+          expect((yield* sessions.get(SessionID.make(childID))).metadata?.agentEffort).toBe(expected)
+        }
+      }
+
+      // No restart or replay: one user turn, parent's initial write ran once,
+      // final content is v2, and parent selection stays thorough.
+      expect(messages.filter((message) => message.info.role === "user")).toHaveLength(1)
+      const parentWrites = messages
+        .flatMap((message) => message.parts)
+        .filter((part): part is SessionV1.ToolPart => part.type === "tool" && part.tool === "write")
+      expect(parentWrites).toHaveLength(1)
+      expect(parentWrites[0]?.state.status).toBe("completed")
+      expect(yield* Effect.promise(() => readFile(file, "utf8"))).toBe("v2")
+      expect((yield* sessions.get(session.id)).metadata?.agentEffort).toBe("thorough")
+    }),
+  30_000,
 )
 
 // ---------------------------------------------------------------------------

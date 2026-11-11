@@ -26,7 +26,7 @@ test("pushes a model update while a session is busy and the model differs", () =
     selectionUpdate({
       providerID: "provider",
       modelID: "model-b",
-      busy: true,
+      status: "busy",
       session: { id: "session", model: { providerID: "provider", id: "model-a", variant: "default" } },
     }),
   ).toEqual({
@@ -35,13 +35,85 @@ test("pushes a model update while a session is busy and the model differs", () =
   })
 })
 
+// A session waiting out a retry backoff is still running its turn: the
+// server invalidates the backoff when the persisted model changes, so the
+// selection must reach the row before the next attempt fires (#831).
+test("pushes a model update while a session is retrying in backoff", () => {
+  expect(
+    selectionUpdate({
+      providerID: "provider",
+      modelID: "model-b",
+      status: "retry",
+      session: { id: "session", model: { providerID: "provider", id: "model-a", variant: "default" } },
+    }),
+  ).toEqual({
+    sessionID: "session",
+    model: { providerID: "provider", id: "model-b", variant: undefined },
+  })
+  // A thinking-effort change alone during backoff persists too.
+  expect(
+    selectionUpdate({
+      providerID: "provider",
+      modelID: "model-a",
+      variant: "high",
+      status: "retry",
+      session: { id: "session", model: { providerID: "provider", id: "model-a", variant: "default" } },
+    }),
+  ).toEqual({
+    sessionID: "session",
+    model: { providerID: "provider", id: "model-a", variant: "high" },
+  })
+})
+
+test("pushes to a retrying session whose row has no model yet", () => {
+  expect(
+    selectionUpdate({
+      providerID: "provider",
+      modelID: "model-b",
+      status: "retry",
+      session: { id: "session" },
+    }),
+  ).toEqual({
+    sessionID: "session",
+    model: { providerID: "provider", id: "model-b", variant: undefined },
+  })
+})
+
+test("keeps idle sessions and sessions without a status untouched", () => {
+  expect(
+    selectionUpdate({
+      providerID: "provider",
+      modelID: "model-b",
+      status: "idle",
+      session: { id: "session", model: { providerID: "provider", id: "model-a", variant: "default" } },
+    }),
+  ).toBeUndefined()
+  expect(
+    selectionUpdate({
+      providerID: "provider",
+      modelID: "model-b",
+      status: undefined,
+      session: { id: "session", model: { providerID: "provider", id: "model-a", variant: "default" } },
+    }),
+  ).toBeUndefined()
+  expect(
+    selectionUpdate({
+      providerID: "provider",
+      modelID: "model-b",
+      status: "retry",
+      // No row means nothing to compare or push against.
+      session: undefined,
+    }),
+  ).toBeUndefined()
+})
+
 test("pushes an update when only the thinking effort changed", () => {
   expect(
     selectionUpdate({
       providerID: "provider",
       modelID: "model-a",
       variant: "high",
-      busy: true,
+      status: "busy",
       session: { id: "session", model: { providerID: "provider", id: "model-a", variant: "default" } },
     }),
   ).toEqual({
@@ -55,7 +127,7 @@ test("treats the default variant as no variant everywhere", () => {
     selectionUpdate({
       providerID: "provider",
       modelID: "model-a",
-      busy: true,
+      status: "busy",
       session: { id: "session", model: { providerID: "provider", id: "model-a", variant: "default" } },
     }),
   ).toBeUndefined()
@@ -66,7 +138,7 @@ test("treats the default variant as no variant everywhere", () => {
       providerID: "provider",
       modelID: "model-a",
       variant: "default",
-      busy: true,
+      status: "busy",
       session: { id: "session", model: { providerID: "provider", id: "model-a", variant: "default" } },
     }),
   ).toBeUndefined()
@@ -75,7 +147,7 @@ test("treats the default variant as no variant everywhere", () => {
       providerID: "provider",
       modelID: "model-b",
       variant: "default",
-      busy: true,
+      status: "busy",
       session: { id: "session", model: { providerID: "provider", id: "model-a", variant: "high" } },
     }),
   ).toEqual({
@@ -90,7 +162,7 @@ test("never pushes a selection that belongs to another agent", () => {
       providerID: "provider",
       modelID: "model-b",
       agent: "plan",
-      busy: true,
+      status: "busy",
       session: {
         id: "session",
         agent: "work",
@@ -103,7 +175,7 @@ test("never pushes a selection that belongs to another agent", () => {
       providerID: "provider",
       modelID: "model-b",
       agent: "work",
-      busy: true,
+      status: "busy",
       session: {
         id: "session",
         agent: "work",
@@ -121,7 +193,7 @@ test("does not push while the session is idle or the selection already matches",
     selectionUpdate({
       providerID: "provider",
       modelID: "model-b",
-      busy: false,
+      status: "idle",
       session: { id: "session", model: { providerID: "provider", id: "model-a", variant: "default" } },
     }),
   ).toBeUndefined()
@@ -130,7 +202,7 @@ test("does not push while the session is idle or the selection already matches",
       providerID: "provider",
       modelID: "model-a",
       variant: "high",
-      busy: true,
+      status: "busy",
       session: { id: "session", model: { providerID: "provider", id: "model-a", variant: "high" } },
     }),
   ).toBeUndefined()
@@ -138,7 +210,7 @@ test("does not push while the session is idle or the selection already matches",
     selectionUpdate({
       providerID: "provider",
       modelID: "model-a",
-      busy: true,
+      status: "busy",
     }),
   ).toBeUndefined()
 })
