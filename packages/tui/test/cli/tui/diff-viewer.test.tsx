@@ -324,7 +324,7 @@ test("viewer waits for a slow KV state lock before requesting the branch diff", 
   }
 })
 
-test("diff viewer mount timeout destroys its renderer exactly once", async () => {
+test("diff viewer mount deadline with instant renders destroys once", async () => {
   let renderCount = 0
   let destroyCount = 0
   const app = {
@@ -338,17 +338,50 @@ test("diff viewer mount timeout destroys its renderer exactly once", async () =>
     },
   } as unknown as Awaited<ReturnType<typeof testRender>>
   const error = await waitForViewerReadyAndCleanup(app, () =>
-    waitForViewerReady(app, new Map(), "diff.close", () => false, undefined, () => false),
+    waitForViewerReady(app, new Map(), "diff.close", () => false, undefined, () => false, 100),
   ).then(
     () => undefined,
     (reason: unknown) => reason,
   )
 
   expect(error).toEqual(new Error("Timed out waiting for the diff viewer to mount"))
-  expect(renderCount).toBe(50)
   expect(destroyCount).toBe(1)
+  const recordedRenderCount = renderCount
   await new Promise((resolve) => setTimeout(resolve, 100))
-  expect(renderCount).toBe(50)
+  expect(renderCount).toBe(recordedRenderCount)
+  expect(destroyCount).toBe(1)
+})
+
+test("diff viewer mount deadline bounds a pending render and observes its late rejection", async () => {
+  let renderCount = 0
+  let destroyCount = 0
+  let rejectRender!: (error: Error) => void
+  const app = {
+    renderOnce: () => {
+      renderCount++
+      return new Promise<void>((_, reject) => {
+        rejectRender = reject
+      })
+    },
+    renderer: {
+      destroy: () => {
+        destroyCount++
+      },
+    },
+  } as unknown as Awaited<ReturnType<typeof testRender>>
+  const error = await waitForViewerReadyAndCleanup(app, () =>
+    waitForViewerReady(app, new Map(), "diff.close", () => false, undefined, () => false, 100),
+  ).then(
+    () => undefined,
+    (reason: unknown) => reason,
+  )
+
+  expect(error).toEqual(new Error("Timed out waiting for the diff viewer to mount"))
+  expect(destroyCount).toBe(1)
+  expect(renderCount).toBe(1)
+  rejectRender(new Error("late render failure"))
+  await new Promise((resolve) => setTimeout(resolve, 50))
+  expect(renderCount).toBe(1)
   expect(destroyCount).toBe(1)
 })
 
@@ -375,7 +408,7 @@ test("last-turn diff source requests session diff", async () => {
   }
 })
 
-const MOUNT_ATTEMPTS = 50 // Each attempt renders once and waits 25ms, about 1.25s minimum. The KV provider mounts children only after its real file lock and read settle; a 400ms held lock mounts in roughly 0.55s. 50 attempts leaves more than twice that margin and still rejects well before Bun's default 5000ms test timeout, so the cleanup wrapper destroys the renderer while the test is active.
+const MOUNT_DEADLINE_MS = 2000 // Deadline for the KV provider to mount children (real lock + read settle); a 400ms held lock mounts in about 0.55s. Leaves most of Bun's test host budget for the unchanged post-mount loop and cleanup.
 
 async function holdKvLock(durationMs: number, signal?: AbortSignal) {
   let acquired!: () => void
@@ -390,6 +423,22 @@ async function holdKvLock(durationMs: number, signal?: AbortSignal) {
   return { lockPromise }
 }
 
+async function renderWithin(app: Awaited<ReturnType<typeof testRender>>, deadline: number) {
+  const remaining = deadline - performance.now()
+  if (remaining <= 0) throw new Error("Timed out waiting for the diff viewer to mount")
+  // Promise.race below subscribes to render, so a late rejection after expiry is observed.
+  const render = app.renderOnce()
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const expiry = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error("Timed out waiting for the diff viewer to mount")), remaining)
+  })
+  try {
+    await Promise.race([render, expiry])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
+
 async function waitForViewerReady(
   app: Awaited<ReturnType<typeof testRender>>,
   commands: Map<string, unknown>,
@@ -397,11 +446,13 @@ async function waitForViewerReady(
   selectedRequestReady: () => boolean,
   onCommandObserved?: () => void,
   mounted: () => boolean = () => true,
+  mountDeadlineMs = MOUNT_DEADLINE_MS,
 ) {
   let commandObserved = false
-  for (let attempt = 0; !mounted(); attempt++) {
-    if (attempt >= MOUNT_ATTEMPTS) throw new Error("Timed out waiting for the diff viewer to mount")
-    await app.renderOnce()
+  const deadline = performance.now() + mountDeadlineMs
+  while (!mounted()) {
+    await renderWithin(app, deadline)
+    if (mounted()) break
     await new Promise((resolve) => setTimeout(resolve, 25))
   }
   for (let attempt = 0; attempt < 10; attempt++) {
