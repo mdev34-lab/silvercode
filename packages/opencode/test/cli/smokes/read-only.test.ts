@@ -14,9 +14,19 @@
 // Speed: each test pays ~1.5s for bun startup. 7 tests serialize within this
 // file. See script/prebuild-test-cli.ts for an opt-in pre-built binary that
 // cuts per-spawn cost when this suite gets bigger.
-import { describe, expect } from "bun:test"
+import { describe, expect, it } from "bun:test"
 import { Effect } from "effect"
 import { cliIt } from "../../lib/cli-process"
+
+function isDatabasePath(value: string): boolean {
+  if (/[\r\n]/.test(value)) return false
+  return (
+    value === ":memory:" ||
+    /^[A-Za-z]:[\\/].+\.(db|sqlite|sqlite3)$/i.test(value) ||
+    /^\/.+\.(db|sqlite|sqlite3)$/i.test(value) ||
+    /^\\\\[^\\/]+[\\/][^\\/]+[\\/].+\.(db|sqlite|sqlite3)$/i.test(value)
+  )
+}
 
 describe("opencode read-only commands (smoke)", () => {
   // `mcp list` reads MCP server config and pings each one. With the empty
@@ -98,18 +108,55 @@ describe("opencode read-only commands (smoke)", () => {
     60_000,
   )
 
-  // `db path` prints the DB file location. Under harness isolation the DB
-  // resolves to SQLite's `:memory:` (no on-disk pollution between tests);
-  // in production it'd be a path under OPENCODE_TEST_HOME / XDG_DATA_HOME.
-  // Accept either form — both prove the resolver ran without crashing.
+  // `db path` prints the DB file location. The isolation harness gives each
+  // test its own HOME, so the DB resolves to an absolute file under that
+  // home (not `:memory:`); production may also use `:memory:` or an absolute
+  // override. Accept those portable absolute forms only.
   cliIt.live(
     "db path: exits 0 and prints a path or :memory:",
     ({ opencode }) =>
       Effect.gen(function* () {
         const r = yield* opencode.spawn(["db", "path"])
         opencode.expectExit(r, 0, "db path")
-        expect(r.stdout.trim()).toMatch(/^(:memory:|[/\\].+\.(db|sqlite|sqlite3))$/i)
+        expect(isDatabasePath(r.stdout.trim())).toBe(true)
       }),
     60_000,
   )
+})
+
+describe("db path portable predicate (pure controls)", () => {
+  const valid = [
+    ":memory:",
+    "/tmp/oc/opencode-test.db",
+    "/var/lib/opencode/opencode.sqlite",
+    "//tmp/oc/opencode.db",
+    "\\\\server\\share\\file.db",
+    "C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\oc-cli-HD0PKV\\opencode-test.db",
+    "C:/Users/runner/AppData/Local/Temp/oc-cli/opencode-test.sqlite3",
+    "\\\\server\\share\\opencode.db",
+  ]
+  const invalid = [
+    "opencode-test.db",
+    "C:opencode-test.db",
+    "C:\\opencode-test.txt",
+    "/tmp/oc/opencode-test.txt",
+    "garbage",
+    ":memory",
+    "C:\\",
+    "\\foo.db",
+    "\\\\server.db",
+    "\\\\server\\share.db",
+    ":memory:\n",
+    "/tmp/oc/opencode.db\n",
+  ]
+  for (const value of valid) {
+    it(`accepts ${value}`, () => {
+      expect(isDatabasePath(value)).toBe(true)
+    })
+  }
+  for (const value of invalid) {
+    it(`rejects ${value}`, () => {
+      expect(isDatabasePath(value)).toBe(false)
+    })
+  }
 })

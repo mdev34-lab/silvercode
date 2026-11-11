@@ -12,6 +12,13 @@ import fs from "node:fs/promises"
 import path from "node:path"
 import { LLM } from "../../src/session/llm"
 import { SessionCompaction } from "../../src/session/compaction"
+import {
+  compactionContinuationPromptID,
+  continuesPrompt,
+  renderTextResult,
+  resultChunks,
+  textResult,
+} from "../../src/session/subagent-result"
 import { Token } from "@/util/token"
 import { Plugin } from "../../src/plugin"
 import { provideTmpdirInstance, TestInstance } from "../fixture/fixture"
@@ -1140,6 +1147,65 @@ describe("session.compaction.process", () => {
     }).pipe(withCompaction({ plugin: autocontinue(false) })),
   )
 
+  for (const variant of ["completed", "empty", "error", "unfinished", "orphan"] as const) {
+    it.instance(
+      `overflow prefix summary ${variant}`,
+      Effect.gen(function* () {
+        const ssn = yield* SessionNs.Service
+        const session = yield* ssn.create({})
+        yield* createCompactionMarker(session.id)
+        const carrier = (yield* ssn.messages({ sessionID: session.id }))[0]!
+        const summary = yield* createSummaryAssistantMessage(
+          session.id,
+          carrier.info.id,
+          ".",
+          variant === "empty" ? "   " : "earlier summary",
+        )
+        const replay = yield* createUserMessage(session.id, "replay this turn")
+        const task = yield* createUserMessage(session.id, "overflow task")
+        const stored = yield* ssn.messages({ sessionID: session.id })
+        const messages = stored
+          .filter((item) => variant !== "orphan" || item.info.id !== carrier.info.id)
+          .map((item) => {
+            if (item.info.id !== summary.id || item.info.role !== "assistant") return item
+            if (variant === "error")
+              return {
+                ...item,
+                info: {
+                  ...item.info,
+                  finish: "error",
+                  error: new SessionV1.ContextOverflowError({ message: "test" }).toObject(),
+                },
+              }
+            if (variant === "unfinished") return { ...item, info: { ...item.info, finish: undefined } }
+            return item
+          })
+        const result = yield* SessionCompaction.use.process({
+          parentID: task.id,
+          messages,
+          sessionID: session.id,
+          auto: true,
+          overflow: true,
+        })
+        const last = (yield* ssn.messages({ sessionID: session.id })).at(-1)
+        expect(result).toBe("continue")
+        expect(last?.info.role).toBe("user")
+        if (variant === "completed") {
+          expect(last ? compactionContinuationPromptID(last) : undefined).toBe(replay.id)
+          expect(last?.parts.some((part) => part.type === "text" && part.text === "replay this turn")).toBe(true)
+        } else {
+          expect(
+            last?.parts.some(
+              (part) =>
+                part.type === "text" && part.text.includes("previous request exceeded the provider's size limit"),
+            ),
+          ).toBe(true)
+          expect(last ? compactionContinuationPromptID(last) : undefined).not.toBe(replay.id)
+        }
+      }),
+    )
+  }
+
   it.instance(
     "replays the prior user turn on overflow when earlier context exists",
     Effect.gen(function* () {
@@ -1147,6 +1213,13 @@ describe("session.compaction.process", () => {
       const session = yield* ssn.create({})
       yield* createUserMessage(session.id, "root")
       const replay = yield* createUserMessage(session.id, "image")
+      yield* ssn.updatePart({
+        id: PartID.ascending(),
+        messageID: replay.id,
+        sessionID: session.id,
+        type: "text",
+        text: "Before every finish call, deliver a non-empty result envelope.",
+      })
       yield* ssn.updatePart({
         id: PartID.ascending(),
         messageID: replay.id,
@@ -1175,6 +1248,25 @@ describe("session.compaction.process", () => {
       expect(
         last?.parts.some((part) => part.type === "text" && part.text.includes("Attached image/png: cat.png")),
       ).toBe(true)
+      expect(last ? compactionContinuationPromptID(last) : undefined).toBe(replay.id)
+      expect(last?.parts.filter((part) => part.type === "text").length).toBeGreaterThan(1)
+      // Exercise ownership with the replay produced above; the earlier result and
+      // final assistant are focused transcript fixtures, not provider output.
+      const prior = {
+        info: { id: "z1", role: "assistant", parentID: replay.id },
+        parts: [{ type: "text", text: renderTextResult("prior result") }],
+      } as unknown as SessionV1.WithParts
+      const answer = {
+        info: { id: "z3", role: "assistant", parentID: last!.info.id },
+        parts: [{ type: "text", text: "" }],
+      } as unknown as SessionV1.WithParts
+      // Give the actual replay an ordered test ID without changing its parts.
+      const replayed = { ...last!, info: { ...last!.info, id: "z2" } } as SessionV1.WithParts
+      ;(answer.info as { parentID: string }).parentID = "z2"
+      const root = msgs.find((item) => item.info.id === replay.id)!
+      const history = [root, prior, replayed, answer]
+      expect(continuesPrompt(history, answer, replay.id)).toBe(true)
+      expect(textResult(resultChunks(history, answer))).toEqual({ ok: true, text: "prior result" })
     }),
   )
 

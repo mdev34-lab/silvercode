@@ -22,6 +22,7 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { buildPrompt } from "@opencode-ai/core/session/compaction"
 import { SessionCompactionEvent } from "@opencode-ai/schema/session-compaction-event"
+import { COMPACTION_CONTINUATION, compactionContinuationPromptID, turnLineage } from "./subagent-result"
 
 export const Event = SessionCompactionEvent
 
@@ -174,6 +175,7 @@ export interface Interface {
     sessionID: SessionID
     auto: boolean
     overflow?: boolean
+    promptID?: MessageID
   }) => Effect.Effect<"continue" | "stop">
   readonly create: (input: {
     sessionID: SessionID
@@ -322,6 +324,7 @@ const layer = Layer.effect(
       sessionID: SessionID
       auto: boolean
       overflow?: boolean
+      promptID?: MessageID
     }) {
       const parent = input.messages.findLast((m) => m.info.id === input.parentID)
       if (!parent || parent.info.role !== "user") {
@@ -337,21 +340,52 @@ const layer = Layer.effect(
             parts: SessionV1.Part[]
           }
         | undefined
+      let fallbackQueuedID: string | undefined
       if (input.overflow) {
         const idx = input.messages.findIndex((m) => m.info.id === input.parentID)
         for (let i = idx - 1; i >= 0; i--) {
           const msg = input.messages[i]
-          if (msg.info.role === "user" && !msg.parts.some((p) => p.type === "compaction")) {
+          if (
+            msg.info.role === "user" &&
+            !msg.parts.some((p) => p.type === "compaction") &&
+            (!input.promptID || turnLineage(input.messages, msg.info.id) === input.promptID)
+          ) {
             replay = { info: msg.info, parts: msg.parts }
             messages = input.messages.slice(0, i)
             break
           }
         }
         const hasContent =
-          replay && messages.some((m) => m.info.role === "user" && !m.parts.some((p) => p.type === "compaction"))
+          replay &&
+          (messages.some((m) => m.info.role === "user" && !m.parts.some((p) => p.type === "compaction")) ||
+            completedCompactions(messages).some((item) => item.summary))
         if (!hasContent) {
+          // Queued callers remain in storage, but cannot become context for the
+          // earlier caller's overflow summary while its replay is unfinished.
+          const replayID = replay?.info.id
+          const replayIndex = replayID ? input.messages.findIndex((message) => message.info.id === replayID) : -1
+          const queued =
+            replay && input.promptID
+              ? new Set<string>(
+                  input.messages
+                    .slice(replayIndex + 1, idx)
+                    .flatMap((message) =>
+                      message.info.role === "user" &&
+                      message.info.noReply !== true &&
+                      !message.parts.some((part) => part.type === "compaction") &&
+                      turnLineage(input.messages, message.info.id) === message.info.id &&
+                      message.info.id !== input.promptID
+                        ? [message.info.id]
+                        : [],
+                    ),
+                )
+              : new Set<string>()
+          fallbackQueuedID = queued.values().next().value
           replay = undefined
-          messages = input.messages
+          messages = input.messages.filter((message) => {
+            const id = message.info.role === "assistant" ? message.info.parentID : message.info.id
+            return id === undefined || !queued.has(turnLineage(input.messages, id))
+          })
         }
       }
 
@@ -458,16 +492,54 @@ const layer = Layer.effect(
         return "stop"
       }
 
-      if (compactionPart && selected.tail_start_id && compactionPart.tail_start_id !== selected.tail_start_id) {
-        yield* session.updatePart({
-          ...compactionPart,
-          tail_start_id: selected.tail_start_id,
-        })
+      const replayIndex = replay ? input.messages.findIndex((message) => message.info.id === replay.info.id) : -1
+      const taskIndex = input.messages.findIndex((message) => message.info.id === input.parentID)
+      const queued =
+        replayIndex < 0
+          ? undefined
+          : input.messages
+              .slice(replayIndex + 1, taskIndex)
+              .find(
+                (message) =>
+                  message.info.role === "user" &&
+                  message.info.noReply !== true &&
+                  !message.parts.some((part) => part.type === "compaction") &&
+                  turnLineage(input.messages, message.info.id) === message.info.id,
+              )
+      const selectedIndex = selected.tail_start_id
+        ? input.messages.findIndex((message) => message.info.id === selected.tail_start_id)
+        : -1
+      // A prior compaction may already have retained callers that are still
+      // waiting when a later overflow takes the size-limit fallback. Preserve
+      // that retained tail even if there is no replayable user on this pass.
+      const retained =
+        input.auto &&
+        input.overflow &&
+        !replay &&
+        input.messages.some((message) => compactionContinuationPromptID(message))
+          ? input.messages
+              .flatMap((message) =>
+                message.parts.flatMap((part) =>
+                  part.type === "compaction" && part.tail_start_id ? [part.tail_start_id] : [],
+                ),
+              )
+              .map((id) => input.messages.findIndex((message) => message.info.id === id))
+              .filter((index) => index >= 0 && index < taskIndex)
+          : []
+      const queuedID = queued?.info.id ?? fallbackQueuedID
+      const queuedIndex = queuedID ? input.messages.findIndex((message) => message.info.id === queuedID) : -1
+      const tailIndex = [selectedIndex, queuedIndex, ...retained]
+        .filter((index) => index >= 0 && index < taskIndex)
+        .sort((a, b) => a - b)[0]
+      const tailStart = tailIndex === undefined ? undefined : input.messages[tailIndex]?.info.id
+      if (compactionPart && tailStart && compactionPart.tail_start_id !== tailStart) {
+        yield* session.updatePart({ ...compactionPart, tail_start_id: tailStart })
       }
 
       if (result === "continue" && input.auto) {
         if (replay) {
           const original = replay.info
+          const replayPromptID = input.promptID ?? MessageID.make(turnLineage(input.messages, original.id))
           const replayMsg = yield* session.updateMessage({
             id: MessageID.ascending(),
             role: "user",
@@ -479,17 +551,45 @@ const layer = Layer.effect(
             tools: original.tools,
             system: original.system,
           })
+          let linked = false
           for (const part of replay.parts) {
             if (part.type === "compaction") continue
             const replayPart =
               part.type === "file" && MessageV2.isMedia(part.mime)
                 ? { type: "text" as const, text: `[Attached ${part.mime}: ${part.filename ?? "file"}]` }
                 : part
+            // The replay is runner-owned continuation of the compacted turn,
+            // not a new caller boundary. Link its first text part so ownership
+            // and anti-spoof checks resolve to the original prompt.
+            const linkedPart =
+              !linked && replayPart.type === "text"
+                ? {
+                    ...replayPart,
+                    synthetic: true,
+                    metadata: {
+                      ...("metadata" in replayPart ? replayPart.metadata : undefined),
+                      [COMPACTION_CONTINUATION]: { promptID: replayPromptID },
+                    },
+                  }
+                : replayPart
+            if (!linked && replayPart.type === "text") linked = true
             yield* session.updatePart({
-              ...replayPart,
+              ...linkedPart,
               id: PartID.ascending(),
               messageID: replayMsg.id,
               sessionID: input.sessionID,
+            })
+          }
+          if (!linked) {
+            yield* session.updatePart({
+              id: PartID.ascending(),
+              messageID: replayMsg.id,
+              sessionID: input.sessionID,
+              type: "text",
+              synthetic: true,
+              text: "",
+              metadata: { [COMPACTION_CONTINUATION]: { promptID: replayPromptID } },
+              time: { start: Date.now(), end: Date.now() },
             })
           }
         }
@@ -526,7 +626,7 @@ const layer = Layer.effect(
             })
             const text =
               (input.overflow
-                ? "The previous request exceeded the provider's size limit due to large media attachments. The conversation was compacted and media files were removed from context. If the user was asking about attached images or files, explain that the attachments were too large to process and suggest they try again with smaller or fewer files.\n\n"
+                ? "The previous request exceeded the provider's size limit and could not be replayed after compaction. Explain that the request could not be processed and ask the user to retry with a smaller request or fewer attachments. Do not report the request as successfully completed.\n\n"
                 : "") +
               "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed."
             yield* session.updatePart({
@@ -537,7 +637,10 @@ const layer = Layer.effect(
               // Internal marker for auto-compaction followups so provider plugins
               // can distinguish them from manual post-compaction user prompts.
               // This is not a stable plugin contract and may change or disappear.
-              metadata: { compaction_continue: true },
+              metadata: {
+                compaction_continue: true,
+                ...(input.promptID ? { [COMPACTION_CONTINUATION]: { promptID: input.promptID } } : {}),
+              },
               synthetic: true,
               text,
               time: {
