@@ -163,9 +163,30 @@ const isRealUserInput = (message: SessionV1.WithParts) =>
 const answered = (messages: readonly SessionV1.WithParts[], userID: string) =>
   messages.some((message) => message.info.role === "assistant" && message.info.parentID === userID)
 
+// A failed wait-for-subagent finish is not real tool work only when it is the
+// whole declined-wait checkpoint; mixed or unrelated tool calls keep pinning.
+// The refusal is identified by its exact FinishTool message, not by a substring
+// that an unrelated error could contain.
+const declinedWaitRefusal =
+  "Cannot wait: no running background subagents found for this session. " +
+  "Wait only for a task you launched that is still running — a subagent whose run " +
+  "already ended will not report again. " +
+  'If your work is complete, call finish with reason: "success".'
+const isDeclinedWaitForSubagent = (part: SessionV1.ToolPart) =>
+  part.tool === FinishTool.id &&
+  !part.metadata?.providerExecuted &&
+  part.state.status === "error" &&
+  typeof part.state.error === "string" &&
+  part.state.error === declinedWaitRefusal &&
+  part.state.input.reason === "waiting_for_subagent"
+
 const hasToolWork = (message: SessionV1.WithParts) =>
   message.info.role === "assistant" &&
-  (message.info.finish === "tool-calls" ||
+  ((message.info.finish === "tool-calls" &&
+    !(
+      message.parts.some((part) => part.type === "tool") &&
+      message.parts.filter((part): part is SessionV1.ToolPart => part.type === "tool").every(isDeclinedWaitForSubagent)
+    )) ||
     message.parts.some(
       (part) =>
         part.type === "tool" &&

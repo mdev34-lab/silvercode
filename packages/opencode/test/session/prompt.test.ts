@@ -11087,3 +11087,265 @@ it.instance(
   { config: cfg },
   60_000,
 )
+
+const seedDeclinedWaitScenario = Effect.fn("test.seedDeclinedWaitScenario")(function* (input: {
+  sessionID: SessionID
+  notification: boolean
+  mixed: boolean
+  providerExecutedMixed?: boolean
+  reason: string
+  error: string
+}) {
+  const sessions = yield* Session.Service
+  const rootUser = yield* seedUser(input.sessionID, "root actual text", Date.now())
+  const assistant = yield* sessions.updateMessage({
+    id: MessageID.ascending(),
+    sessionID: input.sessionID,
+    role: "assistant",
+    parentID: rootUser.id,
+    mode: "work",
+    agent: "work",
+    cost: 0,
+    path: { cwd: "/tmp", root: "/tmp" },
+    tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+    modelID: ref.modelID,
+    providerID: ref.providerID,
+    time: { created: Date.now(), completed: Date.now() },
+    finish: "tool-calls",
+  } satisfies SessionV1.Assistant)
+  yield* sessions.updatePart({
+    id: PartID.ascending(),
+    messageID: assistant.id,
+    sessionID: input.sessionID,
+    type: "tool",
+    callID: "declined-wait",
+    tool: "finish",
+    state: {
+      status: "error",
+      input: { reason: input.reason, result: "Root awaits child" },
+      error: input.error,
+      metadata: {},
+      time: { start: 1, end: 2 },
+    },
+  } satisfies SessionV1.ToolPart)
+  if (input.mixed) {
+    yield* sessions.updatePart({
+      id: PartID.ascending(),
+      messageID: assistant.id,
+      sessionID: input.sessionID,
+      type: "tool",
+      callID: "real-tool",
+      tool: "shell",
+      state: {
+        status: "completed",
+        input: { command: "printf ok" },
+        output: "ok",
+        title: "shell",
+        metadata: {},
+        time: { start: 1, end: 2 },
+      },
+    } satisfies SessionV1.ToolPart)
+  }
+  if (input.providerExecutedMixed) {
+    yield* sessions.updatePart({
+      id: PartID.ascending(),
+      messageID: assistant.id,
+      sessionID: input.sessionID,
+      type: "tool",
+      callID: "provider-tool",
+      tool: "shell",
+      state: {
+        status: "completed",
+        input: { command: "provider-side" },
+        output: "ok",
+        title: "shell",
+        metadata: {},
+        time: { start: 1, end: 2 },
+      },
+      metadata: { providerExecuted: true },
+    } satisfies SessionV1.ToolPart)
+  }
+  let notification: SessionV1.User | undefined
+  if (input.notification) {
+    notification = yield* sessions.updateMessage({
+      id: MessageID.ascending(),
+      sessionID: input.sessionID,
+      role: "user",
+      agent: "work",
+      model: ref,
+      time: { created: Date.now() + 1 },
+    } satisfies SessionV1.User)
+    yield* sessions.updatePart({
+      id: PartID.ascending(),
+      messageID: notification.id,
+      sessionID: input.sessionID,
+      type: "text",
+      synthetic: true,
+      text: '<task id="child" state="error"><summary>Background task failed</summary><task_result>TERMINAL_CHILD_QUOTA</task_result></task>',
+    } satisfies SessionV1.TextPart)
+  }
+  return { rootUser, notification }
+})
+
+const declinedWaitRefusal =
+  "Cannot wait: no running background subagents found for this session. " +
+  "Wait only for a task you launched that is still running — a subagent whose run " +
+  "already ended will not report again. " +
+  'If your work is complete, call finish with reason: "success".'
+const declinedWaitCases = [
+  {
+    name: "declined wait owns terminal child notification",
+    notification: true,
+    mixed: false,
+    reason: "waiting_for_subagent",
+    error: declinedWaitRefusal,
+    expectsNotification: true,
+  },
+  {
+    name: "rejected wait without terminal notification",
+    notification: false,
+    mixed: false,
+    reason: "waiting_for_subagent",
+    error: declinedWaitRefusal,
+    expectsNotification: false,
+  },
+  {
+    name: "mixed declined wait and real tool is not preempted",
+    notification: true,
+    mixed: true,
+    reason: "waiting_for_subagent",
+    error: declinedWaitRefusal,
+    expectsNotification: false,
+  },
+  {
+    name: "wrong reason keeps declined-wait pinning",
+    notification: true,
+    mixed: false,
+    reason: "success",
+    error: declinedWaitRefusal,
+    expectsNotification: false,
+  },
+  {
+    name: "unrelated error keeps declined-wait pinning",
+    notification: true,
+    mixed: false,
+    reason: "waiting_for_subagent",
+    error: "boom",
+    expectsNotification: false,
+  },
+  {
+    name: "embedded prefix refusal keeps declined-wait pinning",
+    notification: true,
+    mixed: false,
+    reason: "waiting_for_subagent",
+    error: `prefix ${declinedWaitRefusal}`,
+    expectsNotification: false,
+  },
+  {
+    name: "providerExecuted mixed declined wait keeps pinning",
+    notification: true,
+    mixed: false,
+    providerExecutedMixed: true,
+    reason: "waiting_for_subagent",
+    error: declinedWaitRefusal,
+    expectsNotification: false,
+  },
+] as const
+
+for (const testCase of declinedWaitCases) {
+  it.instance(
+    testCase.name,
+    () =>
+      Effect.gen(function* () {
+        const { llm } = yield* useServerConfig(providerCfg)
+        const prompt = yield* SessionPrompt.Service
+        const sessions = yield* Session.Service
+        const chat = yield* sessions.create({ title: testCase.name })
+        const scenario = yield* seedDeclinedWaitScenario({
+          sessionID: chat.id,
+          notification: testCase.notification,
+          mixed: testCase.mixed,
+          providerExecutedMixed: "providerExecutedMixed" in testCase ? testCase.providerExecutedMixed : undefined,
+          reason: testCase.reason,
+          error: testCase.error,
+        })
+        yield* llm.push(reply().text("FOLLOWUP").stop())
+        const result = yield* prompt.loop({ sessionID: chat.id, messageID: scenario.rootUser.id })
+        const inputs = yield* llm.inputs
+        expect(yield* llm.calls).toBe(1)
+        const requestText = JSON.stringify(inputs[0])
+        if (testCase.expectsNotification) {
+          expect(requestText).toContain("TERMINAL_CHILD_QUOTA")
+          expect(result.info.parentID).toBe(scenario.notification!.id)
+        } else {
+          if (testCase.notification) expect(requestText).not.toContain("TERMINAL_CHILD_QUOTA")
+          if (!testCase.notification) expect(requestText).toContain(JSON.stringify(declinedWaitRefusal))
+          expect(result.info.parentID).toBe(scenario.rootUser.id)
+        }
+      }),
+    { config: cfg },
+    30_000,
+  )
+}
+
+it.instance(
+  "declined wait terminal notification owns the original live prompt caller",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig((url) => ({
+        ...providerCfg(url),
+        agent: { work: { finishTool: true }, general: { finishTool: true }, plan: { finishTool: true } },
+      }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "declined wait live caller" })
+      const gate = yield* Deferred.make<void>()
+      yield* llm.push(
+        reply()
+          .tool("finish", { reason: "waiting_for_subagent", result: "Root awaits child" })
+          .wait(deferredAsPromise(gate)),
+        reply().text("FOLLOWUP").tool("finish", { reason: "success", result: "FOLLOWUP" }),
+      )
+
+      const caller = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          agent: "work",
+          model: ref,
+          parts: [{ type: "text", text: "root actual text" }],
+        })
+        .pipe(Effect.forkChild)
+
+      yield* llm.wait(1)
+
+      const notification = yield* sessions.updateMessage({
+        id: MessageID.ascending(),
+        sessionID: chat.id,
+        role: "user",
+        agent: "work",
+        model: ref,
+        time: { created: Date.now() + 1 },
+      } satisfies SessionV1.User)
+      yield* sessions.updatePart({
+        id: PartID.ascending(),
+        messageID: notification.id,
+        sessionID: chat.id,
+        type: "text",
+        synthetic: true,
+        text: '<task id="child" state="error"><summary>Background task failed</summary><task_result>TERMINAL_CHILD_QUOTA</task_result></task>',
+      } satisfies SessionV1.TextPart)
+
+      yield* Deferred.succeed(gate, void 0)
+
+      const exit = yield* Fiber.await(caller)
+      const result = assistantExit(exit)
+      const inputs = yield* llm.inputs
+      expect(yield* llm.calls).toBe(2)
+      const followupRequest = JSON.stringify(inputs[1])
+      expect(followupRequest).toContain("TERMINAL_CHILD_QUOTA")
+      expect(result.info.parentID).toBe(notification.id)
+      expect(textParts(result)).toEqual(["FOLLOWUP"])
+    }),
+  { config: cfg },
+  30_000,
+)
