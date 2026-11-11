@@ -20,6 +20,8 @@ const TEST_BUDGET_MS = 30_000
 const MAX_CAPTURE = 256 * 1024
 const CLEANUP_BUDGET_MS = 5_000
 const CLEANUP_SHUTDOWN_GRACE_MS = 1_000
+const CLEANUP_DEATH_CONFIRM_MS = 1_000
+const CLEANUP_PROBE_INTERVAL_MS = 50
 const STARTUP_RESPONSE_LIMIT = 4
 
 const backends = ["node", "bun"] as const
@@ -531,14 +533,32 @@ function joinChildClose(child: ChildProcess, budgetMs: number) {
   })
 }
 
-function isProcessAlive(pid: number) {
-  if (!Number.isInteger(pid) || pid <= 0) return false
+type Liveness = "alive" | "gone" | "unknown"
+
+// The kill probe used for liveness checks: only the error code it raises carries any
+// evidence about the pid.
+type KillProbe = (pid: number, signal: 0) => unknown
+
+// Strict liveness probe for a positive pid. Only ESRCH proves the pid is gone and only
+// EPERM proves it is still there; every other error is unknown and a pid that is not a
+// positive integer is unknown too. The probe never claims more than the error code
+// supports, and it says nothing about what the operating system reaped.
+function probeProcess(pid: number, kill: KillProbe = process.kill): Liveness {
+  if (!Number.isInteger(pid) || pid <= 0) return "unknown"
   try {
-    process.kill(pid, 0)
-    return true
+    kill(pid, 0)
+    return "alive"
   } catch (error) {
-    // EPERM means the pid exists but is not ours; anything else is not certain.
-    return (error as NodeJS.ErrnoException).code === "EPERM"
+    const code = (error as NodeJS.ErrnoException).code
+    if (code === "ESRCH") return "gone"
+    if (code === "EPERM") return "alive"
+    return "unknown"
+  }
+}
+
+function throwingProbeKill(code: string): KillProbe {
+  return () => {
+    throw Object.assign(new Error(`probe failed with ${code}`), { code })
   }
 }
 
@@ -558,7 +578,7 @@ function createBridgeCleanup(target: {
   kill: () => void
   join: (budgetMs: number) => Promise<boolean>
   killTree?: (pid: number, remainingMs: number) => Promise<{ killed: boolean; tree: boolean }>
-  isAlive?: (pid: number) => boolean
+  probe?: (pid: number) => Liveness
   budgetMs?: number
   onStart?: () => void
 }) {
@@ -570,7 +590,20 @@ function createBridgeCleanup(target: {
       const deadline = Date.now() + (target.budgetMs ?? CLEANUP_BUDGET_MS)
       const remaining = () => Math.max(0, deadline - Date.now())
       const killTree = target.killTree ?? killTreeAsync
-      const isAlive = target.isAlive ?? isProcessAlive
+      const probe = target.probe ?? probeProcess
+      // Confirm the actual death of a pid inside the shared cleanup budget: a kill that
+      // was accepted only proves the signal was delivered.
+      const confirmPtyGone = async (pid: number) => {
+        const probeDeadline = Date.now() + Math.min(remaining(), CLEANUP_DEATH_CONFIRM_MS)
+        for (;;) {
+          const state = probe(pid)
+          if (state === "gone") return true
+          if (state === "unknown") return false
+          const wait = Math.min(CLEANUP_PROBE_INTERVAL_MS, probeDeadline - Date.now())
+          if (wait <= 0) return false
+          await new Promise((resolve) => setTimeout(resolve, wait))
+        }
+      }
       const withinDeadline = async <T>(work: Promise<T>) => {
         const budgetMs = remaining()
         if (budgetMs <= 0) return null
@@ -607,10 +640,8 @@ function createBridgeCleanup(target: {
           bridgeKilled = result.killed
         }
       }
-      let ptyKilled = false
       if (!treeCovered && target.ptyPid !== undefined && target.ptyPid !== target.bridgePid) {
-        const result = await withinDeadline(killTree(target.ptyPid, remaining()))
-        ptyKilled = result?.killed ?? false
+        await withinDeadline(killTree(target.ptyPid, remaining()))
       }
 
       // A shutdown message is only useful while the bridge is still alive and no kill
@@ -627,16 +658,17 @@ function createBridgeCleanup(target: {
       }
 
       // Fail closed: without a confirmed PTY exit the PTY child has to be verifiably
-      // gone. A kill that did not succeed leaves the pid unknown unless the liveness
-      // probe says it is gone, and an unknown pid is recorded as not gone. A PTY pid of
-      // zero or a non-integer is unknown, not gone: the 217 CI procPid case documents a
-      // zero pid, so it must never satisfy the cleanup on its own.
+      // gone. A kill that was accepted is not a proof of death, and a liveness probe only
+      // proves it for a positive pid that answers ESRCH. The actual death is confirmed
+      // by a bounded probe that shares the cleanup deadline; anything else is recorded
+      // as not gone. A PTY pid of zero or a non-integer is unknown, not gone: the 217 CI
+      // procPid case documents a zero pid, so it must never satisfy the cleanup on its
+      // own.
       const ptyPid = target.ptyPid
-      const ptyGone =
-        target.ptyExitConfirmed() ||
-        treeCovered ||
-        ptyKilled ||
-        (typeof ptyPid === "number" && Number.isInteger(ptyPid) && ptyPid > 0 && !isAlive(ptyPid))
+      let ptyGone = target.ptyExitConfirmed() || treeCovered
+      if (!ptyGone && typeof ptyPid === "number" && Number.isInteger(ptyPid) && ptyPid > 0) {
+        ptyGone = await confirmPtyGone(ptyPid)
+      }
 
       if (!ptyGone) {
         outcome = { ok: false, reason: "pty child termination not confirmed" }
@@ -1501,6 +1533,50 @@ function readControlReport(child: ChildProcess) {
 }
 
 describe("native codepage probe bridge cleanup (host-side)", () => {
+  test("classifies a gone pid only from an ESRCH probe error", () => {
+    expect(probeProcess(4242, throwingProbeKill("ESRCH"))).toBe("gone")
+  })
+
+  test("classifies a live pid from an EPERM probe error", () => {
+    expect(probeProcess(4242, throwingProbeKill("EPERM"))).toBe("alive")
+  })
+
+  test("classifies every other probe error as unknown", () => {
+    expect(probeProcess(4242, throwingProbeKill("EINVAL"))).toBe("unknown")
+    expect(probeProcess(4242, throwingProbeKill("EIO"))).toBe("unknown")
+  })
+
+  test("classifies a successful probe as a live pid", () => {
+    expect(probeProcess(4242, () => true)).toBe("alive")
+  })
+
+  test("never probes an invalid pid", () => {
+    let called = false
+    expect(
+      probeProcess(0, () => {
+        called = true
+        return true
+      }),
+    ).toBe("unknown")
+    expect(called).toBe(false)
+  })
+
+  test("observes a real child death with the tri-state liveness probe", async () => {
+    const child = spawnProcess("node", ["-e", "setInterval(() => {}, 1000)"], {
+      stdio: ["pipe", "pipe", "pipe"],
+    })
+    const pid = child.pid
+    if (pid === undefined) throw new Error("child pid is unknown")
+    expect(probeProcess(pid)).toBe("alive")
+    const exited = new Promise<void>((resolve) => { child.once("exit", () => resolve()) })
+    child.kill("SIGKILL")
+    await exited
+    // The pid is no longer running, so the probe must not report it alive. Whether it
+    // reports gone or unknown depends on what the platform can answer for an exited
+    // pid, and neither answer claims anything about OS reaping.
+    expect(probeProcess(pid)).not.toBe("alive")
+  }, 10000)
+
   test("fails closed when the bridge and pty pids are unknown", async () => {
     const cleanup = createBridgeCleanup({
       bridgePid: undefined,
@@ -1516,14 +1592,16 @@ describe("native codepage probe bridge cleanup (host-side)", () => {
     expect(String(outcome.reason)).toContain("unknown")
   })
 
-  test("fails closed when an unconfirmed pty exit is not verifiably gone", async () => {
+  test("fails closed when an accepted kill still leaves the pty alive", async () => {
+    // The kill was accepted, so the signal was delivered, but the death is not proven:
+    // the cleanup must not treat an accepted signal as a gone pid.
     const cleanup = createBridgeCleanup({
       bridgePid: 4242,
       ptyPid: 4243,
       bridgeAlive: () => true,
       ptyExitConfirmed: () => false,
-      killTree: async () => ({ killed: false, tree: false }),
-      isAlive: () => true,
+      killTree: async () => ({ killed: true, tree: false }),
+      probe: () => "alive",
       shutdown: () => {},
       kill: () => {},
       join: async () => true,
@@ -1533,6 +1611,40 @@ describe("native codepage probe bridge cleanup (host-side)", () => {
     expect(String(outcome.reason)).toContain("pty child termination not confirmed")
   })
 
+  test("fails closed when the liveness probe is unknown", async () => {
+    const cleanup = createBridgeCleanup({
+      bridgePid: 4242,
+      ptyPid: 4243,
+      bridgeAlive: () => true,
+      ptyExitConfirmed: () => false,
+      killTree: async () => ({ killed: true, tree: false }),
+      probe: () => "unknown",
+      shutdown: () => {},
+      kill: () => {},
+      join: async () => true,
+    })
+    const outcome = await cleanup.run()
+    expect(outcome.ok).toBe(false)
+    expect(String(outcome.reason)).toContain("pty child termination not confirmed")
+  })
+
+  test("passes only when the liveness probe proves the pid is gone", async () => {
+    const cleanup = createBridgeCleanup({
+      bridgePid: 4242,
+      ptyPid: 4243,
+      bridgeAlive: () => true,
+      ptyExitConfirmed: () => false,
+      killTree: async () => ({ killed: true, tree: false }),
+      probe: () => "gone",
+      shutdown: () => {},
+      kill: () => {},
+      join: async () => true,
+    })
+    const outcome = await cleanup.run()
+    expect(outcome.ok).toBe(true)
+    expect(outcome.reason).toBeNull()
+  })
+
   test("passes when the pty exit was confirmed and the pid is already gone", async () => {
     const cleanup = createBridgeCleanup({
       bridgePid: 4242,
@@ -1540,7 +1652,7 @@ describe("native codepage probe bridge cleanup (host-side)", () => {
       bridgeAlive: () => false,
       ptyExitConfirmed: () => true,
       killTree: async () => ({ killed: false, tree: false }),
-      isAlive: () => false,
+      probe: () => "gone",
       shutdown: () => {},
       kill: () => {},
       join: async () => true,
@@ -1558,7 +1670,7 @@ describe("native codepage probe bridge cleanup (host-side)", () => {
       bridgeAlive: () => true,
       ptyExitConfirmed: () => true,
       killTree: async () => ({ killed: true, tree: true }),
-      isAlive: () => false,
+      probe: () => "gone",
       shutdown: () => {
         shutdownCalls += 1
       },
@@ -1578,7 +1690,7 @@ describe("native codepage probe bridge cleanup (host-side)", () => {
       ptyExitConfirmed: () => true,
       budgetMs: 200,
       killTree: async () => ({ killed: true, tree: true }),
-      isAlive: () => false,
+      probe: () => "gone",
       shutdown: () => {},
       kill: () => {},
       join: () => new Promise<boolean>(() => {}),
@@ -1599,7 +1711,7 @@ describe("native codepage probe bridge cleanup (host-side)", () => {
       bridgeAlive: () => false,
       ptyExitConfirmed: () => false,
       killTree: async () => ({ killed: false, tree: false }),
-      isAlive: () => false,
+      probe: () => "gone",
       shutdown: () => {},
       kill: () => {},
       join: async () => true,
@@ -1616,7 +1728,7 @@ describe("native codepage probe bridge cleanup (host-side)", () => {
       bridgeAlive: () => false,
       ptyExitConfirmed: () => true,
       killTree: async () => ({ killed: false, tree: false }),
-      isAlive: () => false,
+      probe: () => "gone",
       shutdown: () => {},
       kill: () => {},
       join: async () => true,
@@ -1637,7 +1749,7 @@ describe("native codepage probe bridge cleanup (host-side)", () => {
         killTreeCalls += 1
         return { killed: false, tree: false }
       },
-      isAlive: () => false,
+      probe: () => "gone",
       shutdown: () => {},
       kill: () => {},
       join: async () => true,
