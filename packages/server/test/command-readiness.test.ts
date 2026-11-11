@@ -8,14 +8,18 @@ import { AbsolutePath } from "@opencode-ai/core/schema"
 import { CommandGroup } from "@opencode-ai/protocol/groups/command"
 import { HttpApi } from "effect/unstable/httpapi"
 import { HttpRouter, HttpServer } from "effect/unstable/http"
-import { HttpApiBuilder } from "effect/unstable/httpapi"
+import { HttpApiBuilder, HttpApiMiddleware } from "effect/unstable/httpapi"
 import { CommandHandler } from "../src/handlers/command"
-import { LocationMiddleware } from "../src/location"
 import { ServerAuth } from "../src/auth"
 import { authorizationLayer } from "../src/middleware/authorization"
 import { schemaErrorLayer } from "../src/middleware/schema-error"
 
-const NarrowApi = HttpApi.make("server").add(CommandGroup.middleware(LocationMiddleware))
+class TestLocationMiddleware extends HttpApiMiddleware.Service<
+  TestLocationMiddleware,
+  { provides: Location.Service | PluginInternal.Service | CommandV2.Service }
+>()("@opencode/HttpApiLocation") {}
+
+const NarrowApi = HttpApi.make("server").add(CommandGroup.middleware(TestLocationMiddleware))
 
 describe("command readiness", () => {
   test("does not list before PluginInternal.ready completes, then lists after", async () => {
@@ -64,8 +68,8 @@ describe("command readiness", () => {
     )
 
     const locationMiddlewareLayer = Layer.succeed(
-      LocationMiddleware,
-      LocationMiddleware.of((effect) => effect.pipe(Effect.provide(locationServicesLayer))),
+      TestLocationMiddleware,
+      TestLocationMiddleware.of((effect) => effect.pipe(Effect.provide(locationServicesLayer))),
     )
 
     const routes = HttpApiBuilder.layer(NarrowApi).pipe(
