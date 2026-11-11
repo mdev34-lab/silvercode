@@ -5,7 +5,10 @@
 import { describe, expect, test } from "bun:test"
 import { spawn as spawnProcess } from "node:child_process"
 import type { ChildProcess } from "node:child_process"
+import { randomBytes } from "node:crypto"
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { createServer } from "node:net"
+import type { Socket } from "node:net"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import { fileURLToPath, pathToFileURL } from "node:url"
@@ -2473,45 +2476,338 @@ describe("native codepage probe node runtime bridge (host-side)", () => {
   }, 10000)
 
   test("collects the stderr a bridge grandchild writes after the bridge exited", async () => {
-    // The bridge child exits while a grandchild still holds the inherited stderr pipe
-    // and writes to it afterwards. The stderr is only complete at the close event, so
-    // the thrown error has to carry the late diagnostic.
-    const loaded = await loadSpawn("node", {
-      spawnBridgeChild: () => {
-        const child = spawnProcess(
-          "node",
-          [
-            "-e",
-            "const { spawn } = require('node:child_process'); process.stdout.write(JSON.stringify({ type: 'runtime', runtimeVersion: process.version, runtimeBun: null }) + '\\n'); const late = spawn(process.execPath, ['-e', \"setTimeout(() => { process.stderr.write('late-stderr-after-bridge-exit\\\\n'); process.exit(0) }, 400)\"], { stdio: ['ignore', 'ignore', 'inherit'] }); late.unref(); process.exit(4)",
-          ],
-          { stdio: ["pipe", "pipe", "pipe"] },
-        )
-        if (!child.stdin || !child.stdout || !child.stderr) {
-          try { child.kill() } catch {}
-          throw new Error("injected bridge child is missing pipe streams")
-        }
-        return child
-      },
-    })
-    try {
-      let thrown: unknown
+    // The bridge child exits while a detached grandchild still holds the inherited
+    // stderr pipe, and the grandchild writes to that pipe only after the parent
+    // observed that exit. The stderr of a dead bridge is only complete at the close
+    // event, so the thrown error has to carry the late diagnostic.
+    //
+    // The fixture is a loopback TCP channel between the parent and the grandchild:
+    // the grandchild announces itself with a start nonce, the parent releases the
+    // bridge, the bridge exits, and only then does the parent hand the grandchild a
+    // token that was generated after that exit. The marker carries that token, so a
+    // marker that was buffered before the exit can never satisfy the assertion.
+    const markerPrefix = "late-stderr-after-bridge-exit:"
+    const nonce = randomBytes(8).toString("hex")
+    const frameLimit = 1024
+    const bodyBudgetMs = 4_500
+    const cleanupBudgetMs = 4_500
+    const startBudgetMs = 2_000
+    const exitBudgetMs = 2_000
+    const selfExitMs = 4_500
+    const sockets: Socket[] = []
+    const closedSockets = new Set<Socket>()
+    const sequence: string[] = []
+    let startResolve: (() => void) | undefined
+    let exitResolve: (() => void) | undefined
+    let grandchildSocket: Socket | undefined
+    let bridge: ChildProcess | undefined
+    const bridgeState: { exitCode: number | null; closed: boolean } = { exitCode: null, closed: false }
+    let markerObserved = false
+    let stderrTail = ""
+    let rejectedFrames = 0
+    let duplicateStarts = 0
+    let socketErrors = 0
+    let serverErrors = 0
+    let bridgeWriteErrors = 0
+    let loaded: LoadedSpawn | undefined
+    const started = new Promise<void>((resolve) => { startResolve = resolve })
+    const exited = new Promise<void>((resolve) => { exitResolve = resolve })
+
+    // One budget covers every wait of the fixture body, so the body stays inside the
+    // deadline of the test even when a step never arrives. The cleanup owns a second
+    // budget, and both together stay below the timeout of the test.
+    const bodyDeadline = Date.now() + bodyBudgetMs
+    const remainingBody = () => Math.max(0, bodyDeadline - Date.now())
+    const waitFor = async <T>(label: string, budgetMs: number, work: Promise<T>) => {
+      const budget = Math.min(budgetMs, remainingBody())
+      if (budget <= 0) throw new Error(`timed out waiting for ${label}`)
+      let timer: ReturnType<typeof setTimeout> | undefined
       try {
-        await loaded.spawn("node", ["-e", "process.exit(0)"], {
-          name: "xterm-256color",
-          cols: 80,
-          rows: 24,
-        })
-      } catch (error) {
-        thrown = error
+        return await Promise.race([
+          work,
+          new Promise<never>((_, reject) => {
+            timer = setTimeout(() => reject(new Error(`timed out waiting for ${label}`)), budget)
+          }),
+        ])
+      } finally {
+        if (timer) clearTimeout(timer)
       }
+    }
+
+    const server = createServer()
+    let failure: unknown
+    try {
+      const listening = new Promise<void>((resolve, reject) => {
+        const onListenError = (error: Error) => {
+          serverErrors += 1
+          reject(error)
+        }
+        server.once("error", onListenError)
+        server.listen(0, "127.0.0.1", () => {
+          server.off("error", onListenError)
+          server.on("error", () => { serverErrors += 1 })
+          resolve()
+        })
+      })
+      await waitFor("the fixture server to listen", remainingBody(), listening)
+      const address = server.address()
+      if (!address || typeof address === "string") throw new Error("the fixture server did not bind a loopback port")
+      server.on("connection", (socket) => {
+        // Only the grandchild is expected on this channel. A second connection is
+        // refused right away so the accepted sockets stay bounded.
+        if (sockets.length >= 1) {
+          try { socket.destroy() } catch {}
+          return
+        }
+        sockets.push(socket)
+        socket.setEncoding("utf8")
+        socket.on("error", () => { socketErrors += 1 })
+        socket.once("close", () => { closedSockets.add(socket) })
+        let buffer = ""
+        socket.on("data", (chunk: Buffer | string) => {
+          buffer += String(chunk)
+          if (buffer.length > frameLimit) {
+            // A frame that never ends is not a start frame: refuse the channel.
+            buffer = ""
+            rejectedFrames += 1
+            try { socket.destroy() } catch {}
+            return
+          }
+          let index
+          while ((index = buffer.indexOf("\n")) >= 0) {
+            const line = buffer.slice(0, index)
+            buffer = buffer.slice(index + 1)
+            if (line !== `START:${nonce}`) {
+              // An unknown nonce or a malformed frame never authenticates a channel.
+              rejectedFrames += 1
+              try { socket.destroy() } catch {}
+              return
+            }
+            if (grandchildSocket) {
+              // A repeated start frame never re-assigns the channel.
+              duplicateStarts += 1
+              try { socket.destroy() } catch {}
+              return
+            }
+            grandchildSocket = socket
+            sequence.push("start")
+            startResolve?.()
+          }
+        })
+      })
+
+      // The grandchild inherits the stderr of the bridge, reports itself on the
+      // loopback channel and writes the marker only when it is handed a token. It
+      // leaves on its own deadline or when the channel disconnects.
+      const grandchildSource = `
+const net = require("node:net")
+const socket = net.connect(${address.port}, "127.0.0.1", () => {
+  socket.write("START:" + ${JSON.stringify(nonce)} + "\\n")
+})
+socket.setEncoding("utf8")
+let buffer = ""
+socket.on("data", (chunk) => {
+  buffer += chunk
+  if (buffer.length > ${frameLimit}) process.exit(0)
+  let index
+  while ((index = buffer.indexOf("\\n")) >= 0) {
+    const line = buffer.slice(0, index)
+    buffer = buffer.slice(index + 1)
+    if (!line.startsWith("EMIT:")) continue
+    const token = line.slice("EMIT:".length)
+    process.stderr.write(${JSON.stringify(markerPrefix)} + token + "\\n", () => process.exit(0))
+  }
+})
+socket.on("end", () => process.exit(0))
+socket.on("close", () => process.exit(0))
+socket.on("error", () => process.exit(0))
+process.stderr.on("error", () => process.exit(0))
+setTimeout(() => process.exit(0), ${selfExitMs})
+`
+      // The bridge spawns the grandchild and waits for the parent to release it. It
+      // exits on that release and on its own deadline.
+      const bridgeSource = `
+const { spawn } = require("node:child_process")
+process.stdout.write(JSON.stringify({ type: "runtime", runtimeVersion: process.version, runtimeBun: null }) + "\\n")
+const grandchild = spawn(process.execPath, ["-e", ${JSON.stringify(grandchildSource)}], { stdio: ["ignore", "ignore", "inherit"], detached: true })
+grandchild.on("error", () => process.exit(4))
+grandchild.unref()
+process.stdout.on("error", () => process.exit(4))
+process.stderr.on("error", () => process.exit(4))
+process.stdin.on("error", () => process.exit(4))
+process.stdin.setEncoding("utf8")
+let buffer = ""
+process.stdin.on("data", (chunk) => {
+  buffer += chunk
+  if (buffer.length > ${frameLimit}) process.exit(4)
+  let index
+  while ((index = buffer.indexOf("\\n")) >= 0) {
+    const line = buffer.slice(0, index)
+    buffer = buffer.slice(index + 1)
+    if (line.trim() !== "EXIT") continue
+    process.exit(4)
+  }
+})
+setTimeout(() => process.exit(4), ${selfExitMs})
+`
+
+      loaded = await loadSpawn("node", {
+        spawnBridgeChild: () => {
+          const child = spawnProcess("node", ["-e", bridgeSource], { stdio: ["pipe", "pipe", "pipe"] })
+          if (!child.stdin || !child.stdout || !child.stderr) {
+            try { child.kill() } catch {}
+            throw new Error("injected bridge child is missing pipe streams")
+          }
+          bridge = child
+          child.on("exit", (code) => {
+            bridgeState.exitCode = code
+            sequence.push("bridge-exit")
+            exitResolve?.()
+          })
+          child.once("close", () => { bridgeState.closed = true })
+          // The parent drains the same stderr stream the bridge failure path owns: both
+          // listeners observe every chunk, so the capture loses nothing. The tail is
+          // always accumulated, so a marker that is split across chunks is still found,
+          // and the marker is recorded once, on the first complete line that carries it.
+          child.stderr.on("data", (chunk: Buffer | string) => {
+            stderrTail = (stderrTail + String(chunk)).slice(-frameLimit)
+            if (markerObserved) return
+            const complete = stderrTail.slice(0, stderrTail.lastIndexOf("\n") + 1)
+            if (!complete.includes(markerPrefix)) return
+            markerObserved = true
+            sequence.push("marker")
+          })
+          child.stdin.on("error", () => { bridgeWriteErrors += 1 })
+          return child
+        },
+      })
+
+      // The bridge never reports a spawn, so the startup failure path owns the
+      // rejection and builds the diagnostic from the drained stderr.
+      const spawned = loaded
+        .spawn("node", ["-e", "process.exit(0)"], { name: "xterm-256color", cols: 80, rows: 24 })
+        .then(
+          () => ({ failed: false as const, error: undefined }),
+          (error: unknown) => ({ failed: true as const, error }),
+        )
+
+      await waitFor("the grandchild start", startBudgetMs, started)
+      expect(sequence).toContain("start")
+
+      // Release the bridge so it exits while the grandchild still holds the stderr pipe.
+      const bridgeStdin = bridge?.stdin
+      if (!bridgeStdin) throw new Error("the injected bridge child has no stdin pipe")
+      try {
+        bridgeStdin.write("EXIT\n")
+      } catch (error) {
+        bridgeWriteErrors += 1
+        throw new Error(`the bridge stdin write failed: ${String(error)}`)
+      }
+
+      await waitFor("the bridge exit", exitBudgetMs, exited)
+      expect(bridgeState.exitCode).toBe(4)
+
+      // The token is generated after the exit was observed, so the grandchild can only
+      // write it after the bridge is gone.
+      const token = randomBytes(12).toString("hex")
+      const socket = grandchildSocket
+      if (!socket) throw new Error("the fixture never accepted the grandchild connection")
+      try {
+        socket.write(`EMIT:${token}\n`)
+      } catch (error) {
+        throw new Error(`the grandchild channel write failed: ${String(error)}`)
+      }
+
+      const outcome = await waitFor("the bridge failure", remainingBody(), spawned)
+      expect(outcome.failed).toBe(true)
+      const thrown = outcome.failed ? outcome.error : undefined
       expect(thrown).toBeInstanceOf(Error)
       const message = String((thrown as Error).message)
       expect(message).toContain("node PTY bridge exited before spawn")
       expect(message).toContain("exitCode=4")
-      expect(message).toContain("late-stderr-after-bridge-exit")
-    } finally {
-      loaded.close()
+      expect(message).toMatch(/runtime=v\d+\.\d+\.\d+/)
+      const markerAt = message.indexOf(markerPrefix)
+      expect(markerAt).toBeGreaterThanOrEqual(0)
+      expect(message.slice(markerAt, markerAt + markerPrefix.length + token.length)).toBe(`${markerPrefix}${token}`)
+
+      // The drained stderr of the parent carries that exact marker as well.
+      expect(stderrTail).toContain(`${markerPrefix}${token}`)
+
+      // The start was observed before the exit and the marker only after it.
+      expect(sequence.indexOf("start")).toBeGreaterThanOrEqual(0)
+      expect(sequence.indexOf("start")).toBeLessThan(sequence.indexOf("bridge-exit"))
+      expect(sequence.indexOf("marker")).toBeGreaterThan(sequence.indexOf("bridge-exit"))
+      expect(markerObserved).toBe(true)
+      expect(serverErrors).toBe(0)
+      expect(bridgeWriteErrors).toBe(0)
+      expect(socketErrors).toBe(0)
+      expect(rejectedFrames).toBe(0)
+      expect(duplicateStarts).toBe(0)
+    } catch (error) {
+      failure = error
     }
+
+    // The cleanup shares one deadline of its own: the sockets and the server are torn
+    // down, only the live bridge child is killed, and every join is awaited. Nothing
+    // here claims what the operating system reaped for the grandchild: the grandchild
+    // is only released through the channel it owns.
+    const deadline = Date.now() + cleanupBudgetMs
+    const remaining = () => Math.max(0, deadline - Date.now())
+    const cleanupErrors: string[] = []
+    for (const socket of sockets) {
+      try { socket.destroy() } catch {}
+    }
+    if (bridge && bridge.exitCode === null && bridge.signalCode === null) {
+      try { bridge.kill() } catch {}
+    }
+    const serverClosed = await new Promise<boolean>((resolve) => {
+      const timer = setTimeout(() => resolve(false), remaining())
+      try {
+        server.close(() => {
+          clearTimeout(timer)
+          resolve(true)
+        })
+      } catch (error) {
+        clearTimeout(timer)
+        // Only a server that was never running is fine to skip. Any other failure is a
+        // cleanup failure and must not be reported as a closed server.
+        const code = (error as NodeJS.ErrnoException).code
+        resolve(code === "ERR_SERVER_NOT_RUNNING")
+      }
+    })
+    if (!serverClosed) cleanupErrors.push("the fixture server did not close within the cleanup budget")
+    for (const socket of sockets) {
+      if (closedSockets.has(socket)) continue
+      const closed = await new Promise<boolean>((resolve) => {
+        const timer = setTimeout(() => resolve(false), remaining())
+        socket.once("close", () => {
+          clearTimeout(timer)
+          resolve(true)
+        })
+      })
+      if (!closed) cleanupErrors.push("a fixture socket did not close within the cleanup budget")
+    }
+    const bridgeJoined = await new Promise<boolean>((resolve) => {
+      if (bridgeState.closed || !bridge) {
+        resolve(true)
+        return
+      }
+      const timer = setTimeout(() => resolve(false), remaining())
+      bridge.once("close", () => {
+        clearTimeout(timer)
+        resolve(true)
+      })
+    })
+    if (!bridgeJoined) cleanupErrors.push("the bridge child did not close within the cleanup budget")
+    loaded?.close()
+
+    const diagnostics = `rejectedFrames=${rejectedFrames} duplicateStarts=${duplicateStarts} socketErrors=${socketErrors} serverErrors=${serverErrors} bridgeWriteErrors=${bridgeWriteErrors}`
+    if (failure !== undefined) {
+      if (cleanupErrors.length === 0) throw failure
+      const text = failure instanceof Error ? failure.message : String(failure)
+      throw new Error(`${text} (${diagnostics}; cleanup failures: ${cleanupErrors.join("; ")})`, { cause: failure })
+    }
+    if (cleanupErrors.length > 0) throw new Error(`${diagnostics}; cleanup failures: ${cleanupErrors.join("; ")}`)
   }, 10000)
 
   test("never tree-kills the numeric pid of an exited bridge child", async () => {
