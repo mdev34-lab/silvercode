@@ -1537,74 +1537,400 @@ describe("native codepage probe startup handshake (host-side)", () => {
   })
 
 
-// Arena scratch control: the whole parent-write control runs under Node so the outer
-// Bun pipe semantics never decide the outcome. The control spawns a Node grandchild,
-// writes 16 MiB to its stdin and reports the asynchronous stream error as JSON.
+// The whole control runs under Node so the outer Bun pipe semantics never decide the
+// outcome. It exercises a generic extra writable pipe and never stdin: descriptor 3
+// is created by explicit stdio, the grandchild closes only descriptor 3, and the
+// parent writes 16 MiB to child.stdio[3] after the grandchild acknowledges that
+// close. The grandchild stays alive so liveness is observable at ack and at write
+// time, and it self-exits after 4500 ms so a killed or failing control cannot leave
+// it behind. One 4000 ms deadline measured from the start of the control bounds the
+// ack wait and the error wait together, and a separate 1000 ms cleanup deadline is
+// settled only by a real ChildProcess close event.
 const EPIPE_CONTROL_SCRIPT = `const { spawn } = require("node:child_process")
 
-const grandchild = spawn(
-  process.execPath,
-  ["-e", "require('node:fs').closeSync(0); process.stdout.write('ready\\\\n'); setInterval(() => {}, 1000)"],
-  { stdio: ["pipe", "pipe", "pipe"] },
-)
+const requested = String(process.argv[2] || "")
+const mode = requested === "negative" || requested === "no-ack" ? requested : "positive"
+const budgetMs = 4000
+const cleanupBudgetMs = 1000
+const captureLimit = 512
+const ackLimit = 4096
+const payload = "x".repeat(16 * 1024 * 1024)
+const childCode = [
+  'const fs = require("node:fs")',
+  'const mode = process.argv[1]',
+  'const closed = mode === "positive"',
+  'const silent = mode === "no-ack"',
+  'let closeError = null',
+  'if (closed) { try { fs.closeSync(3) } catch (error) { closeError = String((error && error.code) || error) } }',
+  'if (!silent) console.log(JSON.stringify({ fd3: true, closed: closed, closeError: closeError }))',
+  '// Fail-safe: a killed or failing control cannot leave this grandchild behind.',
+  'setTimeout(() => { process.exit(0) }, 4500)',
+  'setInterval(() => {}, 1000)',
+].join("\\n")
 
-let reported = false
-let timer = null
-const finish = (payload) => {
-  if (reported) return
-  reported = true
-  if (timer) clearTimeout(timer)
-  process.stdout.write(JSON.stringify(payload) + "\\n")
-  try { grandchild.kill("SIGKILL") } catch {}
-  const done = () => process.exit(0)
-  if (grandchild.exitCode !== null || grandchild.signalCode !== null) done()
-  else grandchild.once("close", done)
+const grandchild = spawn(process.execPath, ["-e", childCode, mode], {
+  stdio: ["ignore", "pipe", "pipe", "pipe"],
+})
+
+const fd3 = grandchild.stdio[3]
+// child.stdio[3] is a public net.Socket. Its documented allowHalfOpen property keeps
+// the writable side open when the readable side sees EOF, so the write reaches the OS
+// instead of being auto-ended by Node before it can produce a real EPIPE.
+if (fd3) fd3.allowHalfOpen = true
+
+// The grandchild stderr pipe is drained so a chatty grandchild cannot fill it and
+// block. Only a bounded prefix is kept, and it is reported only when it is not empty.
+let stderr = ""
+const stderrLimit = 512
+if (grandchild.stderr) {
+  grandchild.stderr.setEncoding("utf8")
+  grandchild.stderr.on("data", (chunk) => {
+    if (stderr.length >= stderrLimit) return
+    stderr += chunk
+    if (stderr.length > stderrLimit) stderr = stderr.slice(0, stderrLimit)
+  })
 }
 
-grandchild.stdin.on("error", (error) => {
-  finish({
-    epipe: true,
-    code: error && error.code ? String(error.code) : null,
-    message: String(error && error.message),
-  })
+const started = Date.now()
+let reported = false
+let deadlineTimer = null
+let ack = null
+let ackSeen = false
+let childAliveAtAck = false
+let childAliveAtWrite = false
+let writeReturned = false
+let syncThrow = false
+let stdout = ""
+let grandchildClosed = false
+
+// The close event is the only proof that the grandchild ended and its stdio
+// streams are done. Exit alone leaves the pipes open, so it is not a join.
+grandchild.once("close", () => { grandchildClosed = true })
+
+const bounded = (value) => String(value === undefined || value === null ? "" : value).slice(0, captureLimit)
+const alive = () => grandchild.exitCode === null && grandchild.signalCode === null
+const elapsed = () => Date.now() - started
+const errorFields = (error) => ({
+  epipe: Boolean(error && error.code === "EPIPE"),
+  code: error && error.code ? String(error.code) : null,
+  errno: error && error.errno !== undefined ? error.errno : null,
+  syscall: error && error.syscall ? String(error.syscall) : null,
+  message: bounded(error && error.message ? error.message : error),
 })
 
-grandchild.stdout.once("data", () => {
-  try {
-    grandchild.stdin.write("x".repeat(16 * 1024 * 1024))
-  } catch (error) {
-    finish({ epipe: false, code: "SYNC_THROW", message: String(error) })
+const releaseStdio = () => {
+  if (fd3) fd3.destroy()
+  if (grandchild.stdout) grandchild.stdout.destroy()
+  if (grandchild.stderr) grandchild.stderr.destroy()
+}
+
+function finish(report) {
+  if (reported) return
+  reported = true
+  if (deadlineTimer) clearTimeout(deadlineTimer)
+  const cleanupStarted = Date.now()
+  const cleanup = { killAttempted: false, joined: false, timedOut: false, closeObserved: false, elapsedMs: 0, exitCode: null, signalCode: null, done: false }
+  const done = (timedOut) => {
+    if (cleanup.done) return
+    cleanup.done = true
+    cleanup.closeObserved = grandchildClosed
+    cleanup.joined = !timedOut && grandchildClosed
+    cleanup.timedOut = timedOut
+    cleanup.elapsedMs = Date.now() - cleanupStarted
+    cleanup.exitCode = grandchild.exitCode
+    cleanup.signalCode = grandchild.signalCode
+    releaseStdio()
+    const line = JSON.stringify(Object.assign({}, report, {
+      mode: mode,
+      fd3: Boolean(fd3),
+      ack: ack,
+      closed: Boolean(ack && ack.closed === true),
+      childAliveAtAck: childAliveAtAck,
+      childAliveAtWrite: childAliveAtWrite,
+      stderr: stderr.length > 0 ? stderr : undefined,
+      totalElapsedMs: elapsed(),
+      cleanup: cleanup,
+    }))
+    process.stdout.write(line + "\\n", () => process.exit(0))
   }
+  if (grandchildClosed) {
+    done(false)
+    return
+  }
+  const joinTimer = setTimeout(() => {
+    try { grandchild.kill("SIGKILL") } catch {}
+    done(true)
+  }, cleanupBudgetMs)
+  grandchild.once("close", () => {
+    clearTimeout(joinTimer)
+    done(false)
+  })
+  if (alive()) {
+    try {
+      grandchild.kill("SIGKILL")
+      cleanup.killAttempted = true
+    } catch (error) {
+      // A failed kill proves nothing: keep waiting for a real close event so the
+      // report can never claim a join that did not happen.
+      cleanup.killError = bounded(error && error.message)
+    }
+  }
+  // The parent side of the extra pipes is released here, otherwise the writable
+  // descriptor nobody reads from keeps the close event from ever arriving.
+  // The close event still proves the grandchild itself ended.
+  releaseStdio()
+}
+
+// One deadline covers the whole observation: the ack wait and the error wait
+// share a single 4000 ms window measured from the start of the control.
+deadlineTimer = setTimeout(() => {
+  if (!ackSeen) {
+    finish({ epipe: false, code: "ACK_TIMEOUT", errno: null, syscall: null, message: "no ack inside the control budget", async: false, syncThrow: false, elapsedMs: elapsed(), budgetMs: budgetMs })
+    return
+  }
+  finish({
+    epipe: false,
+    code: "NO_ERROR",
+    errno: null,
+    syscall: null,
+    message: "no asynchronous stream error inside the control budget",
+    async: false,
+    syncThrow: false,
+    elapsedMs: elapsed(),
+    budgetMs: budgetMs,
+  })
+}, budgetMs)
+
+if (!fd3) {
+  finish({ epipe: false, code: "NO_FD3", errno: null, syscall: null, message: "child.stdio[3] is missing", async: false, syncThrow: false, elapsedMs: elapsed(), budgetMs: budgetMs })
+} else {
+  grandchild.stdout.setEncoding("utf8")
+  grandchild.stdout.on("data", (chunk) => {
+    if (ackSeen) return
+    stdout += chunk
+    if (stdout.length > ackLimit) {
+      finish({ epipe: false, code: "ACK_OVERFLOW", errno: null, syscall: null, message: "ack capture exceeded " + ackLimit + " bytes", async: false, syncThrow: false, elapsedMs: elapsed(), budgetMs: budgetMs })
+      return
+    }
+    const index = stdout.indexOf("\\n")
+    if (index < 0) return
+    try {
+      ack = JSON.parse(stdout.slice(0, index))
+    } catch (error) {
+      finish({ epipe: false, code: "ACK_PARSE", errno: null, syscall: null, message: bounded(error && error.message ? error.message : error), async: false, syncThrow: false, elapsedMs: elapsed(), budgetMs: budgetMs })
+      return
+    }
+    ackSeen = true
+    childAliveAtAck = alive()
+    if (!fd3.writable) {
+      finish({ epipe: false, code: "FD3_NOT_WRITABLE", errno: null, syscall: null, message: "child.stdio[3] is not writable after fd3 ack", async: false, syncThrow: false, elapsedMs: elapsed(), budgetMs: budgetMs })
+      return
+    }
+    try {
+      fd3.write(payload)
+      writeReturned = true
+      childAliveAtWrite = alive()
+    } catch (error) {
+      syncThrow = true
+      childAliveAtWrite = alive()
+      finish(Object.assign({ async: false, syncThrow: true, elapsedMs: elapsed(), budgetMs: budgetMs }, errorFields(error)))
+      return
+    }
+  })
+
+  fd3.on("error", (error) => {
+    finish(Object.assign({
+      async: writeReturned,
+      syncThrow: syncThrow,
+      elapsedMs: elapsed(),
+      budgetMs: budgetMs,
+    }, errorFields(error)))
+  })
+}
+
+grandchild.on("exit", () => {
+  if (ackSeen) return
+  finish({ epipe: false, code: "CONTROL_EXITED", errno: null, syscall: null, message: "control exited before the fd3 ack", async: false, syncThrow: false, elapsedMs: elapsed(), budgetMs: budgetMs })
 })
 
-timer = setTimeout(() => {
-  finish({ epipe: false, code: "NO_ERROR", message: "no asynchronous stream error inside the control budget" })
-}, 4000)
+grandchild.on("error", (error) => {
+  finish({ epipe: false, code: "SPAWN_ERROR", errno: null, syscall: null, message: bounded(error && error.message ? error.message : error), async: false, syncThrow: false, elapsedMs: 0, budgetMs: budgetMs })
+})
 `
 
+type ControlReport = {
+  mode: string
+  fd3: boolean
+  ack: { fd3?: boolean; closed?: boolean; closeError?: string | null } | null
+  closed: boolean
+  childAliveAtAck: boolean
+  childAliveAtWrite: boolean
+  async: boolean
+  syncThrow: boolean
+  epipe: boolean
+  code: string | null
+  errno: number | null
+  syscall: string | null
+  message: string
+  stderr: string
+  elapsedMs: number
+  budgetMs: number
+  totalElapsedMs: number
+  cleanup: {
+    killAttempted: boolean
+    joined: boolean
+    timedOut: boolean
+    closeObserved: boolean
+    elapsedMs: number
+    exitCode: number | null
+    signalCode: string | null
+    killError?: string
+  }
+}
+
+const CONTROL_REPORT_LIMIT_BYTES = 8192
+const CONTROL_REPORT_TIMEOUT_MS = 5000
+const CONTROL_STDERR_LIMIT_BYTES = 512
+
 function readControlReport(child: ChildProcess) {
-  return new Promise<{ epipe: boolean; code: string | null; message: string }>((resolve) => {
+  return new Promise<ControlReport>((resolve) => {
     let buffer = ""
+    let stderr = ""
     let settled = false
-    const settle = (value: { epipe: boolean; code: string | null; message: string }) => {
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const fallback = (code: string, message: string): ControlReport => ({
+      mode: "",
+      fd3: false,
+      ack: null,
+      closed: false,
+      childAliveAtAck: false,
+      childAliveAtWrite: false,
+      async: false,
+      syncThrow: false,
+      epipe: false,
+      code,
+      errno: null,
+      syscall: null,
+      message,
+      stderr,
+      elapsedMs: -1,
+      budgetMs: -1,
+      totalElapsedMs: -1,
+      cleanup: {
+        killAttempted: false,
+        joined: false,
+        timedOut: false,
+        closeObserved: false,
+        elapsedMs: -1,
+        exitCode: null,
+        signalCode: null,
+      },
+    })
+    const settle = (value: ControlReport) => {
       if (settled) return
       settled = true
+      if (timer) clearTimeout(timer)
       resolve(value)
     }
+    // The control can spend 4000 ms observing plus 1000 ms cleaning up, so the
+    // report read is bounded by that same 5 s window instead of hanging.
+    timer = setTimeout(() => {
+      settle(fallback("REPORT_TIMEOUT", `control produced no report within ${CONTROL_REPORT_TIMEOUT_MS} ms`))
+    }, CONTROL_REPORT_TIMEOUT_MS)
+    // The control stderr pipe is drained so a chatty control cannot fill it and
+    // block. Only a bounded prefix is kept for the failure diagnostics.
+    child.stderr?.setEncoding("utf8")
+    child.stderr?.on("data", (chunk: string) => {
+      if (stderr.length >= CONTROL_STDERR_LIMIT_BYTES) return
+      stderr += chunk
+      if (stderr.length > CONTROL_STDERR_LIMIT_BYTES) stderr = stderr.slice(0, CONTROL_STDERR_LIMIT_BYTES)
+    })
     child.stdout?.setEncoding("utf8")
     child.stdout?.on("data", (chunk: string) => {
+      if (settled) return
       buffer += chunk
+      if (buffer.length > CONTROL_REPORT_LIMIT_BYTES) {
+        settle(fallback("REPORT_OVERFLOW", `control report exceeded ${CONTROL_REPORT_LIMIT_BYTES} bytes`))
+        return
+      }
       const index = buffer.indexOf("\n")
       if (index < 0) return
       try {
         const parsed = JSON.parse(buffer.slice(0, index))
-        settle({ epipe: parsed.epipe === true, code: parsed.code ?? null, message: String(parsed.message ?? "") })
+        settle({
+          mode: String(parsed.mode ?? ""),
+          fd3: parsed.fd3 === true,
+          ack: parsed.ack ?? null,
+          closed: parsed.closed === true,
+          childAliveAtAck: parsed.childAliveAtAck === true,
+          childAliveAtWrite: parsed.childAliveAtWrite === true,
+          async: parsed.async === true,
+          syncThrow: parsed.syncThrow === true,
+          epipe: parsed.epipe === true,
+          code: parsed.code ?? null,
+          errno: typeof parsed.errno === "number" ? parsed.errno : null,
+          syscall: parsed.syscall ?? null,
+          message: String(parsed.message ?? ""),
+          stderr: String(parsed.stderr ?? ""),
+          elapsedMs: typeof parsed.elapsedMs === "number" ? parsed.elapsedMs : -1,
+          budgetMs: typeof parsed.budgetMs === "number" ? parsed.budgetMs : -1,
+          totalElapsedMs: typeof parsed.totalElapsedMs === "number" ? parsed.totalElapsedMs : -1,
+          cleanup: {
+            killAttempted: parsed.cleanup?.killAttempted === true,
+            joined: parsed.cleanup?.joined === true,
+            timedOut: parsed.cleanup?.timedOut === true,
+            closeObserved: parsed.cleanup?.closeObserved === true,
+            elapsedMs: typeof parsed.cleanup?.elapsedMs === "number" ? parsed.cleanup.elapsedMs : -1,
+            exitCode: typeof parsed.cleanup?.exitCode === "number" ? parsed.cleanup.exitCode : null,
+            signalCode: parsed.cleanup?.signalCode ?? null,
+            killError: parsed.cleanup?.killError,
+          },
+        })
       } catch (error) {
-        settle({ epipe: false, code: "PARSE_ERROR", message: String(error) })
+        settle(fallback("PARSE_ERROR", String(error)))
       }
     })
-    child.on("close", () => settle({ epipe: false, code: "CONTROL_EXITED", message: "control exited without a report" }))
+    child.on("error", (error) => settle(fallback("CONTROL_ERROR", String(error))))
+    child.on("close", () => settle(fallback("CONTROL_EXITED", "control exited without a report")))
   })
+}
+
+// A join is only proven by the ChildProcess close event, which fires after the
+// process ended and its stdio streams are closed. Exit alone is not proof.
+function joinControlChild(child: ChildProcess, state: { closed: boolean }) {
+  return new Promise<boolean>((resolve) => {
+    if (state.closed) {
+      resolve(true)
+      return
+    }
+    const timer = setTimeout(() => resolve(false), CLEANUP_SHUTDOWN_GRACE_MS)
+    child.once("close", () => {
+      clearTimeout(timer)
+      resolve(true)
+    })
+  })
+}
+
+async function runEpipeControl(mode: "positive" | "negative" | "no-ack") {
+  const dir = mkdtempSync(path.join(tmpdir(), "silvercode-epipe-control-"))
+  const scriptPath = path.join(dir, "control.cjs")
+  writeFileSync(scriptPath, EPIPE_CONTROL_SCRIPT, "utf8")
+  const child = spawnProcess("node", [scriptPath, mode], { stdio: ["pipe", "pipe", "pipe"] })
+  const state = { closed: false }
+  child.on("close", () => {
+    state.closed = true
+  })
+  try {
+    const report = await readControlReport(child)
+    const joined = await joinControlChild(child, state)
+    return { report, joined }
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) {
+      try { child.kill("SIGKILL") } catch {}
+    }
+    await joinControlChild(child, state)
+    try { rmSync(dir, { recursive: true, force: true }) } catch {}
+  }
 }
 
 describe("native codepage probe bridge cleanup (host-side)", () => {
@@ -1937,7 +2263,10 @@ describe("native codepage probe node runtime bridge (host-side)", () => {
         cols: 80,
         rows: 24,
       }) as RuntimeProc
-      await new Promise((resolve) => setTimeout(resolve, 100))
+      const deadline = Date.now() + 5000
+      while (((proc.earlyDataCount ?? 0) <= 0 || (proc.earlyExitCount ?? 0) <= 0) && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 10))
+      }
       expect(proc.earlyDataCount).toBeGreaterThan(0)
       expect(proc.earlyExitCount).toBeGreaterThan(0)
       const chunks: string[] = []
@@ -1946,7 +2275,6 @@ describe("native codepage probe node runtime bridge (host-side)", () => {
       proc.onExit((event) => {
         exitCode = event.exitCode
       })
-      const deadline = Date.now() + 5000
       while (exitCode === undefined && Date.now() < deadline) {
         await new Promise((resolve) => setTimeout(resolve, 10))
       }
@@ -2365,31 +2693,82 @@ describe("native codepage probe node runtime bridge (host-side)", () => {
     expect(empty).toContain("signal=null")
   })
 
-  test("runs the asynchronous EPIPE control entirely under Node", async () => {
+  test("produces a real asynchronous EPIPE on a generic extra Node pipe", async () => {
     // The whole parent-write control runs in a Node child so the Bun parent pipe
-    // semantics never decide the outcome. The control spawns a Node grandchild,
-    // writes 16 MiB to its stdin and reports the asynchronous stream error as JSON.
-    const dir = mkdtempSync(path.join(tmpdir(), "silvercode-epipe-control-"))
-    const scriptPath = path.join(dir, "control.cjs")
-    writeFileSync(scriptPath, EPIPE_CONTROL_SCRIPT, "utf8")
-    const child = spawnProcess("node", [scriptPath], { stdio: ["pipe", "pipe", "pipe"] })
-    try {
-      const report = await readControlReport(child)
-      // The bounded report is logged and carried by the assertion, so a control that
-      // fails on a platform shows the actual outcome instead of a bare false.
-      console.log(`[native-codepage-probe] epipe-control ${JSON.stringify(report)}`)
-      expect(report).toEqual({
-        epipe: true,
-        code: expect.stringContaining("EPIPE"),
-        message: expect.any(String),
-      })
-      if (child.exitCode === null && child.signalCode === null) {
-        await new Promise<void>((resolve) => { child.once("close", () => resolve()) })
-      }
-    } finally {
-      try { child.kill() } catch {}
-      try { rmSync(dir, { recursive: true, force: true }) } catch {}
-    }
+    // semantics never decide the outcome. Descriptor 3 is a generic writable pipe
+    // created by explicit stdio and never stdin: the grandchild closes only
+    // descriptor 3, acknowledges that close over stdout, and stays alive while the
+    // parent writes 16 MiB to child.stdio[3].
+    const { report, joined } = await runEpipeControl("positive")
+    // The bounded report is logged and carried by the assertion, so a control that
+    // fails on a platform shows the actual outcome instead of a bare false.
+    console.log(`[native-codepage-probe] epipe-control ${JSON.stringify(report)}`)
+    expect(joined).toBe(true)
+    expect(report).toMatchObject({
+      mode: "positive",
+      fd3: true,
+      closed: true,
+      childAliveAtAck: true,
+      childAliveAtWrite: true,
+      async: true,
+      syncThrow: false,
+      epipe: true,
+      code: "EPIPE",
+      budgetMs: 4000,
+    })
+    expect(report.code).toContain("EPIPE")
+    expect(report.message.length).toBeLessThanOrEqual(512)
+    expect(report.elapsedMs).toBeLessThan(report.budgetMs)
+    expect(report.cleanup).toMatchObject({ killAttempted: true, joined: true, timedOut: false, closeObserved: true })
+  }, 10000)
+
+  test("keeps the generic extra Node pipe error-free while its reader stays open", async () => {
+    // Negative control for the same descriptor-coverage contract: the grandchild
+    // leaves descriptor 3 open, acknowledges, and stays alive. The parent must observe
+    // no stream error until the single 4000 ms deadline measured from the start of
+    // the control, which proves the positive arm is driven by the real descriptor
+    // close rather than by a synthetic error.
+    const { report, joined } = await runEpipeControl("negative")
+    console.log(`[native-codepage-probe] epipe-control ${JSON.stringify(report)}`)
+    expect(joined).toBe(true)
+    expect(report).toMatchObject({
+      mode: "negative",
+      fd3: true,
+      closed: false,
+      childAliveAtAck: true,
+      childAliveAtWrite: true,
+      async: false,
+      syncThrow: false,
+      epipe: false,
+      code: "NO_ERROR",
+      budgetMs: 4000,
+    })
+    expect(report.message.length).toBeLessThanOrEqual(512)
+    expect(report.elapsedMs).toBeGreaterThanOrEqual(report.budgetMs)
+    expect(report.cleanup).toMatchObject({ killAttempted: true, joined: true, timedOut: false, closeObserved: true })
+  }, 10000)
+
+  test("gives up on an external control child that never acknowledges", async () => {
+    // The no-ack mode keeps a genuine external Node child alive without ever
+    // acknowledging, so the control must stop waiting on the single 4000 ms
+    // deadline from its start and still join that child inside the cleanup bound.
+    const { report, joined } = await runEpipeControl("no-ack")
+    console.log(`[native-codepage-probe] epipe-control ${JSON.stringify(report)}`)
+    expect(joined).toBe(true)
+    expect(report).toMatchObject({
+      mode: "no-ack",
+      fd3: true,
+      ack: null,
+      closed: false,
+      async: false,
+      syncThrow: false,
+      epipe: false,
+      code: "ACK_TIMEOUT",
+      budgetMs: 4000,
+    })
+    expect(report.message.length).toBeLessThanOrEqual(512)
+    expect(report.totalElapsedMs).toBeLessThan(5000)
+    expect(report.cleanup).toMatchObject({ killAttempted: true, joined: true, timedOut: false, closeObserved: true })
   }, 10000)
 
   test("tracks startup write jobs with a four-job cap", async () => {
