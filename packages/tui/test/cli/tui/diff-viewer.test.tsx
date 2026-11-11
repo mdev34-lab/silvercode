@@ -14,7 +14,9 @@ import diffViewerPlugin from "../../../src/feature-plugins/system/diff-viewer"
 import { createTuiPluginApi } from "../../fixture/tui-plugin"
 import { createTuiResolvedConfig } from "../../fixture/tui-runtime"
 import { TestTuiContexts } from "../../fixture/tui-environment"
-
+import { Flock } from "@opencode-ai/core/util/flock"
+import path from "path"
+import { onMount, type ParentProps } from "solid-js"
 test("closing the diff viewer returns to the route it opened from", async () => {
   const viewer = await renderDiffViewer([])
   try {
@@ -115,6 +117,7 @@ async function renderDiffViewer(
     NonNullable<Parameters<TuiPluginApi["keymap"]["registerLayer"]>[0]["commands"]>[number]
   >()
   let current = initialRoute ?? startRoute
+  let mounted = false
   let renderDiff: TuiRouteDefinition["render"] | undefined
   let vcsDiffInput: unknown
   let sessionDiffInput: unknown
@@ -176,13 +179,22 @@ async function renderDiffViewer(
           <TuiConfigProvider config={config}>
             <KVProvider>
               <ThemeProvider mode="dark">
-                {renderDiff?.({ params: "params" in current ? current.params : undefined })}
+                <Mounted>
+                  {renderDiff?.({ params: "params" in current ? current.params : undefined })}
+                </Mounted>
               </ThemeProvider>
             </KVProvider>
           </TuiConfigProvider>
         </OpencodeKeymapProvider>
       </TestTuiContexts>
     )
+  }
+
+  function Mounted(props: ParentProps) {
+    onMount(() => {
+      mounted = true
+    })
+    return props.children
   }
 
   const app = await testRender(() => <Harness />, { width: 80, height })
@@ -198,6 +210,7 @@ async function renderDiffViewer(
       "diff.close",
       selectedRequestReady,
       holdSelectedRequestUntilCommandObserved ? () => setTimeout(() => releaseSelectedRequest?.(), 0) : undefined,
+      () => mounted,
     ),
   )
   return {
@@ -289,6 +302,95 @@ test("branch diff source requests branch VCS diff", async () => {
   }
 })
 
+test("viewer waits for a slow KV state lock before requesting the branch diff", async () => {
+  const { lockPromise } = await holdKvLock(400)
+  try {
+    const viewer = await renderDiffViewer([], 20, {
+      name: "diff",
+      params: { mode: "branch", sessionID: "session-1", returnRoute: startRoute },
+    })
+    try {
+      expect(viewer.current()).toEqual({
+        name: "diff",
+        params: { mode: "branch", sessionID: "session-1", returnRoute: startRoute },
+      })
+      expect(viewer.vcsDiffInput()).toEqual({ directory: "/repo/session", mode: "branch", context: 12 })
+      expect(viewer.sessionDiffInput()).toBeUndefined()
+    } finally {
+      viewer.app.renderer.destroy()
+    }
+  } finally {
+    await lockPromise
+  }
+})
+
+test("diff viewer mount deadline with instant renders destroys once", async () => {
+  let renderCount = 0
+  let destroyCount = 0
+  const app = {
+    renderOnce: async () => {
+      renderCount++
+    },
+    renderer: {
+      destroy: () => {
+        destroyCount++
+      },
+    },
+  } as unknown as Awaited<ReturnType<typeof testRender>>
+  const error = await waitForViewerReadyAndCleanup(app, () =>
+    waitForViewerReady(app, new Map(), "diff.close", () => false, undefined, () => false, 100),
+  ).then(
+    () => undefined,
+    (reason: unknown) => reason,
+  )
+
+  expect(error).toEqual(new Error("Timed out waiting for the diff viewer to mount"))
+  expect(destroyCount).toBe(1)
+  const recordedRenderCount = renderCount
+  await new Promise((resolve) => setTimeout(resolve, 100))
+  expect(renderCount).toBe(recordedRenderCount)
+  expect(destroyCount).toBe(1)
+})
+
+test("diff viewer mount deadline bounds a pending render and observes its late rejection", async () => {
+  let renderCount = 0
+  let destroyCount = 0
+  let rejectRender!: (error: Error) => void
+  const app = {
+    renderOnce: () => {
+      renderCount++
+      return new Promise<void>((_, reject) => {
+        rejectRender = reject
+      })
+    },
+    renderer: {
+      destroy: () => {
+        destroyCount++
+      },
+    },
+  } as unknown as Awaited<ReturnType<typeof testRender>>
+  const error = await waitForViewerReadyAndCleanup(app, () =>
+    waitForViewerReady(app, new Map(), "diff.close", () => false, undefined, () => false, 100),
+  ).then(
+    () => undefined,
+    (reason: unknown) => reason,
+  )
+
+  expect(error).toEqual(new Error("Timed out waiting for the diff viewer to mount"))
+  expect(destroyCount).toBe(1)
+  expect(renderCount).toBe(1)
+  rejectRender(new Error("late render failure"))
+  await new Promise((resolve) => setTimeout(resolve, 50))
+  expect(renderCount).toBe(1)
+  expect(destroyCount).toBe(1)
+})
+
+test("KV lock helper propagates an acquisition rejection", async () => {
+  const controller = new AbortController()
+  controller.abort()
+  await expect(holdKvLock(400, controller.signal)).rejects.toBeDefined()
+})
+
 test("last-turn diff source requests session diff", async () => {
   const viewer = await renderDiffViewer([], 20, {
     name: "diff",
@@ -306,14 +408,53 @@ test("last-turn diff source requests session diff", async () => {
   }
 })
 
+const MOUNT_DEADLINE_MS = 2000 // Deadline for the KV provider to mount children (real lock + read settle); a 400ms held lock mounts in about 0.55s. Leaves most of Bun's test host budget for the unchanged post-mount loop and cleanup.
+
+async function holdKvLock(durationMs: number, signal?: AbortSignal) {
+  let acquired!: () => void
+  const lockAcquired = new Promise<void>((resolve) => {
+    acquired = resolve
+  })
+  const lockPromise = Flock.withLock(`tui-kv:${path.join(`/tmp/opencode/state-${process.pid}`, "kv.json")}`, () => {
+    acquired()
+    return new Promise<void>((resolve) => setTimeout(resolve, durationMs))
+  }, { signal })
+  await Promise.race([lockAcquired, lockPromise])
+  return { lockPromise }
+}
+
+async function renderWithin(app: Awaited<ReturnType<typeof testRender>>, deadline: number) {
+  const remaining = deadline - performance.now()
+  if (remaining <= 0) throw new Error("Timed out waiting for the diff viewer to mount")
+  // Promise.race below subscribes to render, so a late rejection after expiry is observed.
+  const render = app.renderOnce()
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const expiry = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error("Timed out waiting for the diff viewer to mount")), remaining)
+  })
+  try {
+    await Promise.race([render, expiry])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
+
 async function waitForViewerReady(
   app: Awaited<ReturnType<typeof testRender>>,
   commands: Map<string, unknown>,
   command: string,
   selectedRequestReady: () => boolean,
   onCommandObserved?: () => void,
+  mounted: () => boolean = () => true,
+  mountDeadlineMs = MOUNT_DEADLINE_MS,
 ) {
   let commandObserved = false
+  const deadline = performance.now() + mountDeadlineMs
+  while (!mounted()) {
+    await renderWithin(app, deadline)
+    if (mounted()) break
+    await new Promise((resolve) => setTimeout(resolve, 25))
+  }
   for (let attempt = 0; attempt < 10; attempt++) {
     await app.renderOnce()
     if (commands.has(command) && !commandObserved) {
