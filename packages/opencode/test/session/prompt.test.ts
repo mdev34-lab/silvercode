@@ -1117,6 +1117,83 @@ it.instance("loop bounds exhausted compaction escalation when compaction makes n
   15_000,
 )
 
+it.instance("loop keeps original history and dispatches after a blank exhausted-compaction summary", () =>
+  Effect.gen(function* () {
+    const pressureCfg = (url: string) => {
+      const base = providerCfg(url)
+      return {
+        ...base,
+        provider: {
+          ...base.provider,
+          test: {
+            ...base.provider.test,
+            models: {
+              ...base.provider.test.models,
+              "test-model": {
+                ...base.provider.test.models["test-model"],
+                limit: { context: 20_000, output: 8_000 },
+              },
+            },
+          },
+        },
+      }
+    }
+    const { llm } = yield* useServerConfig(pressureCfg)
+    const events = yield* EventV2Bridge.Service
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Exhausted blank" })
+
+    const seen: string[] = []
+    const off = yield* events.listen((evt) => {
+      seen.push(evt.type)
+      return Effect.void
+    })
+
+    yield* llm.pushMatchRepeat(
+      (hit) => JSON.stringify(hit.body).includes("Create a new anchored summary"),
+      reply().text(" \t\n ").stop(),
+      20,
+    )
+    yield* llm.pushMatch(
+      (hit) => !JSON.stringify(hit.body).includes("Create a new anchored summary"),
+      reply().text("delivered without further compaction").stop(),
+    )
+    const original = `EXHAUSTED_ONLY ${"x".repeat(44_000)}`
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "work",
+      noReply: true,
+      parts: [{ type: "text", text: original }],
+    })
+
+    yield* prompt.loop({ sessionID: chat.id })
+    const inputs = yield* llm.inputs
+    const filtered = yield* MessageV2.filterCompactedEffect(chat.id)
+    const logs = yield* TestConsole.logLines
+    yield* off
+
+    const serialized = inputs.map((input) => JSON.stringify(input))
+    const compactions = serialized.filter((input) => input.includes("Create a new anchored summary"))
+    const ordinary = serialized.filter((input) => !input.includes("Create a new anchored summary"))
+    expect(compactions).toHaveLength(1)
+    expect(ordinary).toHaveLength(1)
+    expect(ordinary[0]).toContain(original)
+    expect(ordinary[0]).toContain("did not produce a usable summary")
+    expect(ordinary[0]).not.toContain("Continue if you have next steps")
+    expect(inputs).toHaveLength(2)
+    expect(
+      filtered.some(
+        (message) =>
+          message.info.role === "user" && message.parts.some((part) => part.type === "text" && part.text === original),
+      ),
+    ).toBe(true)
+    expect(seen).not.toContain(SessionCompaction.Event.Compacted.type)
+    expect(logs).toContain("compaction produced a blank summary; skipping Compacted event")
+  }),
+  15_000,
+)
+
 noLLMServer.instance.skip(
   "prompt emits v2 prompted and synthetic events (v2 projector disabled)",
   () =>

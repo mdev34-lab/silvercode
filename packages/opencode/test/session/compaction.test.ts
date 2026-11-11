@@ -212,20 +212,19 @@ function fake(
     completeToolCall: Effect.fn("TestSessionProcessor.completeToolCall")(() => Effect.void),
     waitForOtherTools: Effect.fn("TestSessionProcessor.waitForOtherTools")(() => Effect.void),
     process: Effect.fn("TestSessionProcessor.process")(function* () {
-      // The real processor persists summary text parts while streaming
-      // (text-start/text-delta/text-end in processor.ts), so a successful
-      // compaction leaves a text part on the assistant message before
-      // process resolves. Reproduce that here, or omit it to simulate a
-      // model that produced a blank summary.
-      if (result === "continue" && !blank) {
+      if (result === "continue") {
+        // The real processor persists streamed text (including whitespace-only
+        // output) and its normal finish before the compaction call continues.
         yield* session.updatePart({
           id: PartID.ascending(),
           messageID: msg.id,
           sessionID: msg.sessionID,
           type: "text",
-          text: "summary",
+          text: blank ? " \t\n " : "summary",
           time: { start: Date.now(), end: Date.now() },
         })
+        msg.finish = "stop"
+        yield* session.updateMessage(msg)
       }
       return result
     }),
@@ -942,6 +941,76 @@ describe("session.compaction.process", () => {
       expect(seen).not.toContain(SessionCompaction.Event.Compacted.type)
       expect(logs).toContain("compaction produced a blank summary; skipping Compacted event")
     }).pipe(withCompaction({ blankSummary: true })),
+  )
+
+  itCompaction.instance(
+    "preserves overflow guidance when an auto-compaction summary is blank",
+    Effect.gen(function* () {
+      const compact = yield* SessionCompaction.Service
+      const ssn = yield* SessionNs.Service
+      const session = yield* ssn.create({})
+      const original = yield* createUserMessage(session.id, "original request")
+      yield* ssn.updatePart({
+        id: PartID.ascending(),
+        messageID: original.id,
+        sessionID: session.id,
+        type: "file",
+        mime: "image/png",
+        filename: "large.png",
+        url: "https://example.com/large.png",
+      })
+
+      yield* compact.create({ sessionID: session.id, agent: "work", model: ref, auto: true })
+      const before = yield* ssn.messages({ sessionID: session.id })
+      const marker = before.at(-1)
+      expect(marker?.info.role).toBe("user")
+      if (marker?.info.role !== "user") throw new Error("Expected an auto-compaction marker")
+
+      const result = yield* compact.process({
+        parentID: marker.info.id,
+        messages: before,
+        sessionID: session.id,
+        auto: true,
+        overflow: true,
+      })
+      const after = yield* ssn.messages({ sessionID: session.id })
+      const followup = after.findLast(
+        (message) =>
+          message.info.role === "user" && message.info.id !== original.id && message.info.id !== marker.info.id,
+      )
+      const followupText = followup?.parts
+        .filter((part): part is SessionV1.TextPart => part.type === "text")
+        .map((part) => part.text)
+        .join("\n")
+      const completed = after.find(
+        (message) => message.info.role === "assistant" && message.info.parentID === marker.info.id,
+      )
+      const filtered = MessageV2.filterCompacted(yield* MessageV2.stream(session.id))
+
+      expect(result).toBe("continue")
+      expect(completed?.info.role).toBe("assistant")
+      if (completed?.info.role === "assistant") {
+        expect(completed.info.finish).toBe("stop")
+        expect(completed.info.error).toBeUndefined()
+        expect(completed.info.summary).toBe(false)
+        expect(completed.parts.some((part) => part.type === "text" && part.text.trim() === "")).toBe(true)
+      }
+      expect(followupText).toContain("did not produce a usable summary")
+      expect(followupText).toContain("previous provider request exceeded its size limit")
+      expect(followupText).toContain("original history and its attachments remain in context")
+      expect(followupText).not.toContain("conversation was compacted")
+      expect(followupText).not.toContain("media files were removed from context")
+      expect(followupText).not.toContain("Continue if you have next steps")
+      expect(
+        filtered.some(
+          (message) =>
+            message.info.role === "user" &&
+            message.info.id === original.id &&
+            message.parts.some((part) => part.type === "text" && part.text === "original request") &&
+            message.parts.some((part) => part.type === "file" && part.filename === "large.png"),
+        ),
+      ).toBe(true)
+    }).pipe(withCompaction({ blankSummary: true, plugin: autocontinue(true) })),
   )
 
   itCompaction.instance(
