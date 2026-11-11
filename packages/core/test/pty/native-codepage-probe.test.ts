@@ -23,6 +23,7 @@ const CLEANUP_SHUTDOWN_GRACE_MS = 1_000
 const CLEANUP_DEATH_CONFIRM_MS = 1_000
 const CLEANUP_PROBE_INTERVAL_MS = 50
 const STARTUP_RESPONSE_LIMIT = 4
+const DIAGNOSTIC_CAPTURE_LIMIT = 4096
 
 const backends = ["node", "bun"] as const
 const modes = ["baseline", "chcp", "setconsole"] as const
@@ -70,6 +71,23 @@ function appendBoundedCapture(buffer: string, chunk: string, limit: number) {
   return { buffer: combined.slice(-limit), overflow: true }
 }
 
+// Bounded diagnostic for a bridge that never reported a spawn. The stderr capture is
+// already bounded, and it is capped again here so the thrown error never carries an
+// unbounded payload. Only the newest characters of the capture are retained, so the
+// head of a longer stderr is dropped on purpose.
+function bridgeFailureDiagnostic(input: {
+  reason: string
+  exitCode: number | null
+  signal: string | null
+  runtimeVersion: string | undefined
+  stderr: string
+}) {
+  const stderrText = input.stderr.length > 0 ? input.stderr : "<empty>"
+  const capped =
+    stderrText.length > DIAGNOSTIC_CAPTURE_LIMIT ? stderrText.slice(-DIAGNOSTIC_CAPTURE_LIMIT) : stderrText
+  return `${input.reason} (exitCode=${input.exitCode ?? "null"} signal=${input.signal ?? "null"} runtime=${input.runtimeVersion ?? "unknown"} stderr=${capped})`
+}
+
 // Pure exit-code normalization for PTY exit events. A missing or invalid exit code is
 // never reported as a clean exit, and a signaled exit never reports exit code 0.
 function normalizePtyExitCode(exitCode: unknown, signal: unknown) {
@@ -85,7 +103,11 @@ function normalizePtyExitCode(exitCode: unknown, signal: unknown) {
 // parent-side handlers under test are the production ones.
 type BridgeChildFactory = (scriptPath: string) => ChildProcess
 
-async function loadSpawn(backend: Backend, options?: { spawnBridgeChild?: BridgeChildFactory }): Promise<LoadedSpawn> {
+// Tree kill used by the startup failure path. Tests inject a recording wrapper around
+// the real tree kill so they can observe which numeric pid the path targets.
+type KillTree = (pid: number, remainingMs: number) => Promise<{ killed: boolean; tree: boolean }>
+
+async function loadSpawn(backend: Backend, options?: { spawnBridgeChild?: BridgeChildFactory; killTree?: KillTree }): Promise<LoadedSpawn> {
   if (backend === "bun") {
     const mod = await import("../../src/pty/pty.bun.ts")
     return {
@@ -102,7 +124,8 @@ async function loadSpawn(backend: Backend, options?: { spawnBridgeChild?: Bridge
   return {
     spawn: async (file, args, opts) => {
       const scriptPath = path.join(tmpdir(), `silvercode-node-pty-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}.mjs`)
-      const script = `import { spawn as spawnPty } from ${JSON.stringify(sourceUrl)}
+      const script = `process.stdout.write(JSON.stringify({ type: "runtime", runtimeVersion: process.version, runtimeBun: process.versions.bun ?? null }) + "\\n")
+const { spawn: spawnPty } = await import(${JSON.stringify(sourceUrl)})
 
 const proc = spawnPty(${JSON.stringify(file)}, ${JSON.stringify(args)}, ${JSON.stringify(opts)})
 let stdinBuffer = ""
@@ -189,12 +212,6 @@ process.stdout.write(JSON.stringify({ type: "spawned", pid: proc.pid, runtimeVer
       })
       let spawnedSettled = false
       let spawnedTimer: ReturnType<typeof setTimeout> | undefined
-      spawnedTimer = setTimeout(() => {
-        if (!spawnedSettled) {
-          spawnedSettled = true
-          spawnedReject?.(new Error("node PTY bridge did not spawn in time"))
-        }
-      }, 5_000)
       let stdoutBuffer = ""
       let stderrBuffer = ""
       let stderrOverflow = false
@@ -214,6 +231,25 @@ process.stdout.write(JSON.stringify({ type: "spawned", pid: proc.pid, runtimeVer
       let bridgeSignal: string | null = null
       let earlyDataCount = 0
       let earlyExitCount = 0
+      // The bridge reports its runtime before it imports the PTY wrapper, so a bridge
+      // that dies while loading it still names the runtime it died in.
+      let bridgeRuntimeVersion: string | undefined
+      const describeBridgeFailure = (reason: string, code: number | null, signal: string | null) =>
+        bridgeFailureDiagnostic({
+          reason,
+          exitCode: code,
+          signal,
+          runtimeVersion: bridgeRuntimeVersion,
+          stderr: stderrBuffer,
+        })
+      spawnedTimer = setTimeout(() => {
+        if (!spawnedSettled) {
+          spawnedSettled = true
+          spawnedReject?.(
+            new Error(describeBridgeFailure("node PTY bridge did not spawn in time", bridgeExitCode, bridgeSignal)),
+          )
+        }
+      }, 5_000)
 
       const settleSpawned = (value: { pid: number; runtimeVersion: string; runtimeBun: string | null }) => {
         if (spawnedSettled) return
@@ -254,7 +290,9 @@ process.stdout.write(JSON.stringify({ type: "spawned", pid: proc.pid, runtimeVer
           if (!line.trim()) continue
           let message: any
           try { message = JSON.parse(line) } catch { continue }
-          if (message.type === "spawned") {
+          if (message.type === "runtime") {
+            bridgeRuntimeVersion = message.runtimeVersion
+          } else if (message.type === "spawned") {
             settleSpawned({ pid: message.pid, runtimeVersion: message.runtimeVersion, runtimeBun: message.runtimeBun })
           } else if (message.type === "data") {
             if (dataListeners.size > 0) {
@@ -304,7 +342,12 @@ process.stdout.write(JSON.stringify({ type: "spawned", pid: proc.pid, runtimeVer
 
       child.on("error", (error) => {
         bridgeFailure = true
-        rejectSpawned(error)
+        rejectSpawned(
+          new Error(
+            describeBridgeFailure(`node PTY bridge failed: ${error.message}`, bridgeExitCode, bridgeSignal),
+            { cause: error },
+          ),
+        )
         for (const resolveWrite of pendingWrites.values()) resolveWrite({ ok: false, message: String(error), timedOut: false })
         pendingWrites.clear()
       })
@@ -322,12 +365,22 @@ process.stdout.write(JSON.stringify({ type: "spawned", pid: proc.pid, runtimeVer
         for (const resolveWrite of pendingWrites.values()) resolveWrite({ ok: false, message: String(error), timedOut: false })
         pendingWrites.clear()
       })
+      let childClosed = false
+      child.once("close", () => {
+        childClosed = true
+      })
       child.on("exit", (code, signal) => {
         bridgeExited = true
         bridgeExitCode = code
         bridgeSignal = signal ?? null
         if (!spawnedSettled) {
-          rejectSpawned(new Error(`node PTY bridge exited before spawn with code ${code}`))
+          // The bridge died before it reported a spawn. Its stderr is only complete once
+          // the child's stdio has closed, so the rejection waits for that drain and the
+          // diagnostic is built from the drained capture, not from the exit event.
+          const reject = () =>
+            rejectSpawned(new Error(describeBridgeFailure("node PTY bridge exited before spawn", code, signal ?? null)))
+          if (childClosed) reject()
+          else child.once("close", reject)
         }
         for (const resolveWrite of pendingWrites.values()) resolveWrite({ ok: false, message: "bridge exited", timedOut: false })
         pendingWrites.clear()
@@ -353,8 +406,27 @@ process.stdout.write(JSON.stringify({ type: "spawned", pid: proc.pid, runtimeVer
         spawned = await spawnedPromise
       } catch (error) {
         // Startup failure path: tree first, then the bridge itself.
-        if (child.pid !== undefined) await killTreeAsync(child.pid, CLEANUP_BUDGET_MS)
-        try { child.kill() } catch {}
+        //
+        // The numeric pid of the bridge child is targeted only while no exit or signal
+        // has been observed for that ChildProcess: both `exitCode` and `signalCode` must
+        // still be null. Once either is set, that number may already belong to an
+        // unrelated process, so it is never targeted. The close-time drain widens exactly
+        // that window, which is why the check is made here instead of relying on the pid
+        // alone.
+        //
+        // This is the observed-exit contract of the ChildProcess, not an OS ownership
+        // handle. It does not close the race between the OS reaping the process and the
+        // exit event being delivered, and it cannot prove what happened to descendants
+        // of a bridge that was already reaped. Those descendants stay unknown, and no
+        // cleanup proof is claimed for them.
+        //
+        // This is the bridge child's own pid, not the copied `proc.pid` of the PTY child:
+        // the two are unrelated values with unrelated lifetimes.
+        const killTree = options?.killTree ?? killTreeAsync
+        if (child.pid !== undefined && child.exitCode === null && child.signalCode === null) {
+          await killTree(child.pid, CLEANUP_BUDGET_MS)
+          try { child.kill() } catch {}
+        }
         try { rmSync(scriptPath, { force: true }) } catch {}
         throw error
       }
@@ -1967,6 +2039,271 @@ describe("native codepage probe node runtime bridge (host-side)", () => {
     }
   }, 10000)
 
+  test("reports the bridge stderr, exit code, and runtime when the bridge exits before spawn", async () => {
+    // A genuine Node bridge child that reports its runtime, writes to stderr, and exits
+    // before it reports a spawn. The thrown error has to carry every piece the child
+    // produced, so a real early failure is never reported as an empty stderr.
+    const loaded = await loadSpawn("node", {
+      spawnBridgeChild: () => {
+        const child = spawnProcess(
+          "node",
+          [
+            "-e",
+            "process.stdout.write(JSON.stringify({ type: 'runtime', runtimeVersion: process.version, runtimeBun: null }) + '\\n'); process.stderr.write('bridge-boom-before-spawn\\n'); process.exit(3)",
+          ],
+          { stdio: ["pipe", "pipe", "pipe"] },
+        )
+        if (!child.stdin || !child.stdout || !child.stderr) {
+          try { child.kill() } catch {}
+          throw new Error("injected bridge child is missing pipe streams")
+        }
+        return child
+      },
+    })
+    try {
+      let thrown: unknown
+      try {
+        await loaded.spawn("node", ["-e", "process.exit(0)"], {
+          name: "xterm-256color",
+          cols: 80,
+          rows: 24,
+        })
+      } catch (error) {
+        thrown = error
+      }
+      expect(thrown).toBeInstanceOf(Error)
+      const message = String((thrown as Error).message)
+      expect(message).toContain("node PTY bridge exited before spawn")
+      expect(message).toContain("exitCode=3")
+      expect(message).toContain("signal=null")
+      expect(message).toMatch(/runtime=v\d+\.\d+\.\d+/)
+      expect(message).toContain("stderr=bridge-boom-before-spawn")
+    } finally {
+      loaded.close()
+    }
+  }, 10000)
+
+  test("collects the stderr a bridge grandchild writes after the bridge exited", async () => {
+    // The bridge child exits while a grandchild still holds the inherited stderr pipe
+    // and writes to it afterwards. The stderr is only complete at the close event, so
+    // the thrown error has to carry the late diagnostic.
+    const loaded = await loadSpawn("node", {
+      spawnBridgeChild: () => {
+        const child = spawnProcess(
+          "node",
+          [
+            "-e",
+            "const { spawn } = require('node:child_process'); process.stdout.write(JSON.stringify({ type: 'runtime', runtimeVersion: process.version, runtimeBun: null }) + '\\n'); const late = spawn(process.execPath, ['-e', \"setTimeout(() => { process.stderr.write('late-stderr-after-bridge-exit\\\\n'); process.exit(0) }, 400)\"], { stdio: ['ignore', 'ignore', 'inherit'] }); late.unref(); process.exit(4)",
+          ],
+          { stdio: ["pipe", "pipe", "pipe"] },
+        )
+        if (!child.stdin || !child.stdout || !child.stderr) {
+          try { child.kill() } catch {}
+          throw new Error("injected bridge child is missing pipe streams")
+        }
+        return child
+      },
+    })
+    try {
+      let thrown: unknown
+      try {
+        await loaded.spawn("node", ["-e", "process.exit(0)"], {
+          name: "xterm-256color",
+          cols: 80,
+          rows: 24,
+        })
+      } catch (error) {
+        thrown = error
+      }
+      expect(thrown).toBeInstanceOf(Error)
+      const message = String((thrown as Error).message)
+      expect(message).toContain("node PTY bridge exited before spawn")
+      expect(message).toContain("exitCode=4")
+      expect(message).toContain("late-stderr-after-bridge-exit")
+    } finally {
+      loaded.close()
+    }
+  }, 10000)
+
+  test("never tree-kills the numeric pid of an exited bridge child", async () => {
+    // The bridge child exits before it reports a spawn, so the startup failure path runs
+    // after the exit was already observed. The numeric pid can be reused at that point,
+    // so it must never reach the tree kill. The injected tree kill only records: it
+    // deliberately performs no kill, because a stale pid must never be signalled.
+    const killTreeCalls: number[] = []
+    let injectedPid = 0
+    const loaded = await loadSpawn("node", {
+      killTree: async (pid) => {
+        killTreeCalls.push(pid)
+        return { killed: false, tree: false }
+      },
+      spawnBridgeChild: () => {
+        const child = spawnProcess("node", ["-e", "process.exit(3)"], {
+          stdio: ["pipe", "pipe", "pipe"],
+        })
+        if (!child.stdin || !child.stdout || !child.stderr) {
+          try { child.kill() } catch {}
+          throw new Error("injected bridge child is missing pipe streams")
+        }
+        if (child.pid !== undefined) injectedPid = child.pid
+        return child
+      },
+    })
+    try {
+      let thrown: unknown
+      try {
+        await loaded.spawn("node", ["-e", "process.exit(0)"], {
+          name: "xterm-256color",
+          cols: 80,
+          rows: 24,
+        })
+      } catch (error) {
+        thrown = error
+      }
+      expect(thrown).toBeInstanceOf(Error)
+      expect(String((thrown as Error).message)).toContain("node PTY bridge exited before spawn")
+      expect(killTreeCalls).toEqual([])
+      expect(injectedPid).toBeGreaterThan(0)
+    } finally {
+      loaded.close()
+    }
+  }, 15000)
+
+  test("never tree-kills the numeric pid of a bridge child that exited on a signal", async () => {
+    // The bridge child terminates itself with SIGTERM, so the exit is observed through
+    // `signalCode` with a null `exitCode`. That is the other guard arm: an observed
+    // signal must keep the numeric pid out of the tree kill just like an observed exit
+    // code does.
+    const killTreeCalls: number[] = []
+    let injectedPid = 0
+    let observed: { exitCode: number | null; signalCode: NodeJS.Signals | null } | undefined
+    const loaded = await loadSpawn("node", {
+      killTree: async (pid) => {
+        killTreeCalls.push(pid)
+        return { killed: false, tree: false }
+      },
+      spawnBridgeChild: () => {
+        const child = spawnProcess("node", ["-e", "process.kill(process.pid, 'SIGTERM')"], {
+          stdio: ["pipe", "pipe", "pipe"],
+        })
+        if (!child.stdin || !child.stdout || !child.stderr) {
+          try { child.kill() } catch {}
+          throw new Error("injected bridge child is missing pipe streams")
+        }
+        child.on("exit", (code, signal) => {
+          observed = { exitCode: code, signalCode: signal }
+        })
+        if (child.pid !== undefined) injectedPid = child.pid
+        return child
+      },
+    })
+    try {
+      let thrown: unknown
+      try {
+        await loaded.spawn("node", ["-e", "process.exit(0)"], {
+          name: "xterm-256color",
+          cols: 80,
+          rows: 24,
+        })
+      } catch (error) {
+        thrown = error
+      }
+      expect(thrown).toBeInstanceOf(Error)
+      expect(String((thrown as Error).message)).toContain("node PTY bridge exited before spawn")
+      expect(injectedPid).toBeGreaterThan(0)
+      expect(observed).toBeDefined()
+      // The child was observed as exited before the startup failure path ran.
+      expect(observed?.exitCode !== null || observed?.signalCode !== null).toBe(true)
+      if (process.platform !== "win32") {
+        // POSIX reports the SIGTERM through `signalCode` with a null `exitCode`, which is
+        // the guard arm this control covers. Windows reports a terminated process through
+        // the exit code instead.
+        expect(observed?.signalCode).toBe("SIGTERM")
+        expect(observed?.exitCode).toBeNull()
+      } else {
+        expect(observed?.exitCode).toBeGreaterThan(0)
+      }
+      expect(killTreeCalls).toEqual([])
+    } finally {
+      loaded.close()
+    }
+  }, 15000)
+
+  test("tree-kills a live bridge child when the spawn deadline is exceeded", async () => {
+    // The bridge child stays live and never reports a spawn, so the existing 5s startup
+    // deadline ends the wait and the startup failure path still owns a live child: the
+    // tree kill must run against that live pid.
+    const killTreeCalls: number[] = []
+    let injectedPid = 0
+    let injected: ChildProcess | undefined
+    const loaded = await loadSpawn("node", {
+      killTree: async (pid, remainingMs) => {
+        killTreeCalls.push(pid)
+        return killTreeAsync(pid, remainingMs)
+      },
+      spawnBridgeChild: () => {
+        const child = spawnProcess("node", ["-e", "setInterval(() => {}, 1000)"], {
+          stdio: ["pipe", "pipe", "pipe"],
+        })
+        if (!child.stdin || !child.stdout || !child.stderr) {
+          try { child.kill() } catch {}
+          throw new Error("injected bridge child is missing pipe streams")
+        }
+        injected = child
+        if (child.pid !== undefined) injectedPid = child.pid
+        return child
+      },
+    })
+    try {
+      let thrown: unknown
+      try {
+        await loaded.spawn("node", ["-e", "process.exit(0)"], {
+          name: "xterm-256color",
+          cols: 80,
+          rows: 24,
+        })
+      } catch (error) {
+        thrown = error
+      }
+      expect(thrown).toBeInstanceOf(Error)
+      expect(String((thrown as Error).message)).toContain("node PTY bridge did not spawn in time")
+      expect(injectedPid).toBeGreaterThan(0)
+      expect(killTreeCalls).toEqual([injectedPid])
+    } finally {
+      try { injected?.kill() } catch {}
+      loaded.close()
+    }
+  }, 15000)
+
+  test("caps the bridge diagnostic to the newest stderr tail and reports empty fields", () => {
+    const stderr = "HEAD-" + "x".repeat(DIAGNOSTIC_CAPTURE_LIMIT) + "TAIL-MARKER"
+    const capped = bridgeFailureDiagnostic({
+      reason: "node PTY bridge exited before spawn",
+      exitCode: null,
+      signal: null,
+      runtimeVersion: undefined,
+      stderr,
+    })
+    expect(capped).toContain("TAIL-MARKER")
+    expect(capped).not.toContain("HEAD-")
+    expect(capped).toContain("exitCode=null")
+    expect(capped).toContain("signal=null")
+    expect(capped).toContain("runtime=unknown")
+    expect(capped.length).toBeLessThanOrEqual(DIAGNOSTIC_CAPTURE_LIMIT + 256)
+
+    const empty = bridgeFailureDiagnostic({
+      reason: "node PTY bridge did not spawn in time",
+      exitCode: null,
+      signal: null,
+      runtimeVersion: undefined,
+      stderr: "",
+    })
+    expect(empty).toContain("stderr=<empty>")
+    expect(empty).toContain("runtime=unknown")
+    expect(empty).toContain("exitCode=null")
+    expect(empty).toContain("signal=null")
+  })
+
   test("runs the asynchronous EPIPE control entirely under Node", async () => {
     // The whole parent-write control runs in a Node child so the Bun parent pipe
     // semantics never decide the outcome. The control spawns a Node grandchild,
@@ -1977,8 +2314,14 @@ describe("native codepage probe node runtime bridge (host-side)", () => {
     const child = spawnProcess("node", [scriptPath], { stdio: ["pipe", "pipe", "pipe"] })
     try {
       const report = await readControlReport(child)
-      expect(report.epipe).toBe(true)
-      expect(String(report.code)).toContain("EPIPE")
+      // The bounded report is logged and carried by the assertion, so a control that
+      // fails on a platform shows the actual outcome instead of a bare false.
+      console.log(`[native-codepage-probe] epipe-control ${JSON.stringify(report)}`)
+      expect(report).toEqual({
+        epipe: true,
+        code: expect.stringContaining("EPIPE"),
+        message: expect.any(String),
+      })
       if (child.exitCode === null && child.signalCode === null) {
         await new Promise<void>((resolve) => { child.once("close", () => resolve()) })
       }

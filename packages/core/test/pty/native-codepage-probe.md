@@ -54,6 +54,34 @@ The harness responds only to a top-level DA1 query (`CSI c` or `CSI 0 c`) with a
 
 The PowerShell startup-query explanation remains an unproven hypothesis. The harness now records DA response counts, startup-marker visibility, and PID identities, but Linux cannot establish Windows ConPTY behavior.
 
+## Native Node boundary (unresolved)
+
+On Windows CI the Node backend produces output only up to and including `PROBE_STAGE helper-startup`: no `PROBE_CP` stage is recorded, the helper never reaches `PROBE_DONE`, and the case ends on the 20s guard. The Bun backend reaches `PROBE_DONE` in the same run.
+
+The recorded `procPid`/`wrapperPid` of 0 is a measurement artifact, not a finding: `@lydell/node-pty` copies the agent pid into the terminal at construction and only refreshes it on `ready_datapipe`, so the wrapper reads a pid that is still 0. This explains the recorded number only. It is not a claim about why the Node backend stalls, and it is not treated as evidence for any cause.
+
+To narrow the boundary, the helper now emits `PROBE_STAGE add-type-start`/`add-type-end` around the `Add-Type` compile and `PROBE_STAGE cp-before-start`/`cp-before-end` around the first codepage read. A failed phase emits one bounded `PROBE_ERROR` line and then rethrows, so the helper still exits nonzero and the failing phase is named instead of inferred.
+
+These markers are emitted after the startup marker, so the startup responder gate is unchanged: the harness still answers the DA1 query exactly as before, and the phase markers never enable or disable the responder.
+
+This is a measurement improvement, not a root cause. The cause of the Node-backend stall is still unknown: this host never executes native Windows ConPTY, and nothing in the recorded output proves what the child was waiting for.
+
+## Bridge failure diagnostics
+
+A bridge that exits before it reports a spawn now fails with the bounded stderr it wrote, its exit code, its signal, and its runtime version instead of an empty stderr. On that early-exit path the diagnostic is built when the child's stdio closes, not when it exits, so stderr written after the bridge exited is included; the drain is bounded by the existing 5s startup deadline. The `child` error path reports the stderr available at that moment, and the startup deadline path reports whatever is available if the close event has not arrived in time. The bridge reports its runtime before it imports the PTY wrapper, so a bridge that dies while loading it still names the runtime it died in. The stderr capture is bounded twice: the stream capture keeps the newest bytes up to the capture cap, and the diagnostic keeps the newest 4096 characters of that capture, so the head of a longer capture is dropped on purpose.
+
+## Startup failure cleanup ownership
+
+When the bridge never reports a spawn, the startup failure path tree-kills the bridge before it is killed itself. The numeric pid of the bridge child is targeted only while no exit or signal has been observed for that `ChildProcess`: both `exitCode` and `signalCode` must still be null. Once either is set, that number may already belong to an unrelated process, so it is never targeted. The close-time drain of the early-exit path widens exactly that window, so the observed-exit check is what keeps the numeric pid out of the tree kill.
+
+This is the observed-exit contract of the `ChildProcess`, not an OS ownership handle. It does not close the race between the OS reaping the process and the exit event being delivered, and it provides no way to prove what happened to descendants of a bridge that was already reaped. Those descendants remain unknown and unproved, and no cleanup proof is claimed for them.
+
+The pid in question is the bridge child's own pid. It is unrelated to the copied `proc.pid` of the PTY child, which is a different value with a different lifetime.
+
+Both observed-exit arms are covered by host-side controls: a bridge child that exits with a code, a bridge child that terminates itself with `SIGTERM`, and a live bridge child that is still tree-killed when the startup deadline is exceeded.
+
+The path keeps the existing bounds: the 5s startup deadline and the 5s cleanup budget.
+
 ## Native execution status
 
 Native Windows ConPTY is NOT executed on this Linux host. Off-Windows runs skip all 6 native cases. Native behavior remains unknown; this is not a product fix.

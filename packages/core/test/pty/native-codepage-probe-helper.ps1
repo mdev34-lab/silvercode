@@ -7,9 +7,33 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+function Emit-Line([string]$line) {
+  [Console]::Out.WriteLine($line)
+  [Console]::Out.Flush()
+}
+
+# Bounded diagnostic for a failed phase. The message is capped so a large compiler
+# error cannot flood the capture, and the phase name says which step failed. The
+# caller rethrows afterwards, so the helper still exits nonzero on failure.
+function Emit-PhaseError([string]$phase, $errorRecord) {
+  $message = ""
+  $errorType = ""
+  try { $message = [string]$errorRecord } catch { $message = "" }
+  try { $errorType = [string]$errorRecord.Exception.GetType().FullName } catch { $errorType = "" }
+  if ($message.Length -gt 512) { $message = $message.Substring(0, 512) }
+  $payload = [ordered]@{
+    phase = $phase
+    type = $errorType
+    message = $message
+  } | ConvertTo-Json -Compress
+  Emit-Line ("PROBE_ERROR " + $payload)
+}
+
 [Console]::Out.WriteLine("PROBE_STAGE helper-startup")
 [Console]::Out.Flush()
 
+Emit-Line "PROBE_STAGE add-type-start"
+try {
 Add-Type @'
 using System;
 using System.ComponentModel;
@@ -70,11 +94,11 @@ public static class NativeConsoleProbe
     }
 }
 '@
-
-function Emit-Line([string]$line) {
-  [Console]::Out.WriteLine($line)
-  [Console]::Out.Flush()
+} catch {
+  Emit-PhaseError "add-type" $_
+  throw
 }
+Emit-Line "PROBE_STAGE add-type-end"
 
 function Emit-Cp([string]$stage) {
   $payload = [ordered]@{
@@ -126,7 +150,14 @@ function Invoke-Cmd([string]$arguments) {
 }
 
 Set-Location -LiteralPath $WorkDir
-Emit-Cp "before"
+Emit-Line "PROBE_STAGE cp-before-start"
+try {
+  Emit-Cp "before"
+} catch {
+  Emit-PhaseError "emit-cp-before" $_
+  throw
+}
+Emit-Line "PROBE_STAGE cp-before-end"
 
 switch ($Mode) {
   "chcp" {
