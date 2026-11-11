@@ -4,7 +4,9 @@ Diagnostic measurement only. Not a product fix. Runs as 6 test cases in normal C
 
 ## Node runtime
 
-Node backend cases run through a bounded OS-temporary Node bridge that imports the actual `src/pty/pty.node.ts` wrapper. The import specifier is constructed as a `file:` URL so Windows drive paths remain valid ESM specifiers. They do not run node-pty under Bun.
+Node backend cases run through a bounded OS-temporary Node bridge that imports the actual `src/pty/pty.node.ts` wrapper. The import specifier is constructed as a `file:` URL (`sourceUrl`) so Windows drive paths remain valid ESM specifiers. They do not run node-pty under Bun.
+
+Host-side node runtime tests use `useNodeExecutable` so the generated bridge passes its own `process.execPath` to the PTY wrapper; otherwise the literal file is passed through unchanged. This matters on Windows because a literal executable name is looked up without appending `.exe`, so bare `node` can fail there even when Node is available. Native `Add-Type` behavior plus the two pipe fixtures remain unknown on this host.
 
 ## Running
 

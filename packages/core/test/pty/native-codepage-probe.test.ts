@@ -43,7 +43,7 @@ type StartupGate = {
 }
 type Spawn = (file: string, args: string[], opts: Opts) => Promise<Proc>
 type LoadedSpawn = { spawn: Spawn; close: () => void; runtimeVersion?: string; runtimeBun?: string | null }
-type RuntimeProc = Proc & { bridgePid?: number; runtimeVersion?: string; runtimeBun?: string | null; bridgeOverflow?: boolean; stderrOverflow?: boolean; bridgeFailure?: boolean; bridgeError?: Error; ptyExitConfirmed?: boolean; cleanupFailed?: boolean; cleanupReason?: string | null; cleanupTransportError?: Error; bridgeExitCode?: number | null; bridgeSignal?: string | null; earlyDataCount?: number; earlyExitCount?: number; stderr?: string; writeAndWait?: (data: string, timeoutMs: number) => Promise<{ ok: boolean; message: string; timedOut: boolean }>; close?: () => Promise<void> }
+type RuntimeProc = Proc & { bridgePid?: number; runtimeVersion?: string; runtimeBun?: string | null; runtimeExecPath?: string; requestedExecutable?: string; bridgeOverflow?: boolean; stderrOverflow?: boolean; bridgeFailure?: boolean; bridgeError?: Error; ptyExitConfirmed?: boolean; cleanupFailed?: boolean; cleanupReason?: string | null; cleanupTransportError?: Error; bridgeExitCode?: number | null; bridgeSignal?: string | null; earlyDataCount?: number; earlyExitCount?: number; stderr?: string; writeAndWait?: (data: string, timeoutMs: number) => Promise<{ ok: boolean; message: string; timedOut: boolean }>; close?: () => Promise<void> }
 
 const windowsTest = process.platform === "win32" ? test : test.skip
 
@@ -107,7 +107,7 @@ type BridgeChildFactory = (scriptPath: string) => ChildProcess
 // the real tree kill so they can observe which numeric pid the path targets.
 type KillTree = (pid: number, remainingMs: number) => Promise<{ killed: boolean; tree: boolean }>
 
-async function loadSpawn(backend: Backend, options?: { spawnBridgeChild?: BridgeChildFactory; killTree?: KillTree }): Promise<LoadedSpawn> {
+async function loadSpawn(backend: Backend, options?: { spawnBridgeChild?: BridgeChildFactory; killTree?: KillTree; useNodeExecutable?: boolean }): Promise<LoadedSpawn> {
   if (backend === "bun") {
     const mod = await import("../../src/pty/pty.bun.ts")
     return {
@@ -127,7 +127,8 @@ async function loadSpawn(backend: Backend, options?: { spawnBridgeChild?: Bridge
       const script = `process.stdout.write(JSON.stringify({ type: "runtime", runtimeVersion: process.version, runtimeBun: process.versions.bun ?? null }) + "\\n")
 const { spawn: spawnPty } = await import(${JSON.stringify(sourceUrl)})
 
-const proc = spawnPty(${JSON.stringify(file)}, ${JSON.stringify(args)}, ${JSON.stringify(opts)})
+const requestedExecutable = ${options?.useNodeExecutable === true ? "process.execPath" : JSON.stringify(file)}
+const proc = spawnPty(requestedExecutable, ${JSON.stringify(args)}, ${JSON.stringify(opts)})
 let stdinBuffer = ""
 
 process.stdin.setEncoding("utf8")
@@ -181,7 +182,7 @@ proc.onData((data) => {
 proc.onExit((event) => {
   process.stdout.write(JSON.stringify({ type: "exit", exitCode: event.exitCode ?? null, signal: event.signal ?? null }) + "\\n")
 })
-process.stdout.write(JSON.stringify({ type: "spawned", pid: proc.pid, runtimeVersion: process.version, runtimeBun: process.versions.bun ?? null }) + "\\n")
+process.stdout.write(JSON.stringify({ type: "spawned", pid: proc.pid, runtimeVersion: process.version, runtimeBun: process.versions.bun ?? null, runtimeExecPath: process.execPath, requestedExecutable }) + "\\n")
 `
       writeFileSync(scriptPath, script)
 
@@ -204,9 +205,9 @@ process.stdout.write(JSON.stringify({ type: "spawned", pid: proc.pid, runtimeVer
       const exitListeners = new Set<(event: { exitCode: number }) => void>()
       const pendingWrites = new Map<number, (result: { ok: boolean; message: string; timedOut: boolean }) => void>()
       let nextWriteId = 0
-      let spawnedResolve: ((value: { pid: number; runtimeVersion: string; runtimeBun: string | null }) => void) | undefined
+      let spawnedResolve: ((value: { pid: number; runtimeVersion: string; runtimeBun: string | null; runtimeExecPath: string; requestedExecutable: string }) => void) | undefined
       let spawnedReject: ((error: Error) => void) | undefined
-      const spawnedPromise = new Promise<{ pid: number; runtimeVersion: string; runtimeBun: string | null }>((resolve, reject) => {
+      const spawnedPromise = new Promise<{ pid: number; runtimeVersion: string; runtimeBun: string | null; runtimeExecPath: string; requestedExecutable: string }>((resolve, reject) => {
         spawnedResolve = resolve
         spawnedReject = reject
       })
@@ -251,7 +252,7 @@ process.stdout.write(JSON.stringify({ type: "spawned", pid: proc.pid, runtimeVer
         }
       }, 5_000)
 
-      const settleSpawned = (value: { pid: number; runtimeVersion: string; runtimeBun: string | null }) => {
+      const settleSpawned = (value: { pid: number; runtimeVersion: string; runtimeBun: string | null; runtimeExecPath: string; requestedExecutable: string }) => {
         if (spawnedSettled) return
         spawnedSettled = true
         if (spawnedTimer) clearTimeout(spawnedTimer)
@@ -293,7 +294,7 @@ process.stdout.write(JSON.stringify({ type: "spawned", pid: proc.pid, runtimeVer
           if (message.type === "runtime") {
             bridgeRuntimeVersion = message.runtimeVersion
           } else if (message.type === "spawned") {
-            settleSpawned({ pid: message.pid, runtimeVersion: message.runtimeVersion, runtimeBun: message.runtimeBun })
+            settleSpawned({ pid: message.pid, runtimeVersion: message.runtimeVersion, runtimeBun: message.runtimeBun, runtimeExecPath: message.runtimeExecPath, requestedExecutable: message.requestedExecutable })
           } else if (message.type === "data") {
             if (dataListeners.size > 0) {
               for (const listener of dataListeners) listener(message.data)
@@ -447,6 +448,8 @@ process.stdout.write(JSON.stringify({ type: "spawned", pid: proc.pid, runtimeVer
         bridgePid: child.pid,
         runtimeVersion: spawned.runtimeVersion,
         runtimeBun: spawned.runtimeBun,
+        runtimeExecPath: spawned.runtimeExecPath,
+        requestedExecutable: spawned.requestedExecutable,
         bridgeOverflow,
         get stderr() { return stderrBuffer },
         onData(listener) {
@@ -1837,10 +1840,11 @@ describe("native codepage probe bridge cleanup (host-side)", () => {
 
 describe("native codepage probe node runtime bridge (host-side)", () => {
   test("spawns through the actual Node runtime and captures output", async () => {
-    const loaded = await loadSpawn("node")
+    const loaded = await loadSpawn("node", { useNodeExecutable: true })
+    const missingExecutable = path.join(tmpdir(), `silvercode-missing-node-${process.pid}-${Date.now()}`)
     let proc!: RuntimeProc
     try {
-      proc = await loaded.spawn("node", ["-e", "console.log('bridge-ok'); process.exit(0)"], {
+      proc = await loaded.spawn(missingExecutable, ["-e", "console.log('bridge-ok'); process.exit(0)"], {
         name: "xterm-256color",
         cols: 80,
         rows: 24,
@@ -1849,6 +1853,12 @@ describe("native codepage probe node runtime bridge (host-side)", () => {
       expect(typeof proc!.runtimeVersion).toBe("string")
       expect(proc!.bridgePid).toBeGreaterThan(0)
       expect(proc!.bridgeOverflow).toBe(false)
+      const requestedExecutable = proc!.requestedExecutable
+      expect(typeof requestedExecutable).toBe("string")
+      expect(requestedExecutable).toBe(proc!.runtimeExecPath)
+      expect(path.isAbsolute(requestedExecutable!)).toBe(true)
+      const executableBase = path.basename(requestedExecutable!).toLowerCase()
+      expect(executableBase === "node" || executableBase === "node.exe").toBe(true)
       const chunks: string[] = []
       let exitCode: number | null | undefined
       proc.onData((chunk) => chunks.push(chunk))
@@ -1867,8 +1877,59 @@ describe("native codepage probe node runtime bridge (host-side)", () => {
     }
   }, 10000)
 
-  test("queues early data and exit until listeners attach", async () => {
+  test("rejects a missing literal executable without useNodeExecutable", async () => {
     const loaded = await loadSpawn("node")
+    const missingExecutable = path.join(tmpdir(), `silvercode-missing-node-${process.pid}-${Date.now()}`)
+    let proc: RuntimeProc | undefined
+    try {
+      let rejection: Error | undefined
+      try {
+        proc = await loaded.spawn(
+          missingExecutable,
+          ["-e", "console.log('unexpected-literal-replaced'); process.exit(0)"],
+          { name: "xterm-256color", cols: 80, rows: 24 },
+        ) as RuntimeProc
+      } catch (error) {
+        rejection = error as Error
+      }
+      if (rejection) {
+        // Windows pre-spawn rejection: the bridge exits before it reports a spawn.
+        expect(rejection.message).toMatch(/FileNotFound|file not found|system cannot find the file|ENOENT/i)
+        return
+      }
+      // POSIX node-pty returns a terminal for a missing executable, so the spawn
+      // succeeds and the child exits nonzero without running the sentinel script.
+      expect(proc).toBeDefined()
+      expect(proc!.requestedExecutable).toBe(missingExecutable)
+      expect(proc!.runtimeBun).toBeNull()
+      const runtimeExecPath = proc!.runtimeExecPath
+      expect(typeof runtimeExecPath).toBe("string")
+      expect(path.isAbsolute(runtimeExecPath!)).toBe(true)
+      const runtimeBase = path.basename(runtimeExecPath!).toLowerCase()
+      expect(runtimeBase === "node" || runtimeBase === "node.exe").toBe(true)
+      const chunks: string[] = []
+      let exitCode: number | undefined
+      proc!.onData((chunk) => chunks.push(chunk))
+      proc!.onExit((event) => {
+        exitCode = event.exitCode
+      })
+      const deadline = Date.now() + 5000
+      while (exitCode === undefined && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 10))
+      }
+      const output = chunks.join("")
+      expect(exitCode).toBeDefined()
+      expect(exitCode).not.toBe(0)
+      expect(output).not.toContain("unexpected-literal-replaced")
+      expect(output).not.toContain("bridge-ok")
+    } finally {
+      try { await proc?.close?.() } catch {}
+      loaded.close()
+    }
+  }, 15000)
+
+  test("queues early data and exit until listeners attach", async () => {
+    const loaded = await loadSpawn("node", { useNodeExecutable: true })
     let proc!: RuntimeProc
     try {
       proc = await loaded.spawn("node", ["-e", "console.log('early-data'); process.exit(7)"], {
@@ -1910,7 +1971,7 @@ describe("native codepage probe node runtime bridge (host-side)", () => {
   })
 
   test("records a nonzero bridge exit as failure", async () => {
-    const loaded = await loadSpawn("node")
+    const loaded = await loadSpawn("node", { useNodeExecutable: true })
     let proc!: RuntimeProc
     try {
       proc = await loaded.spawn("node", ["-e", "setInterval(() => {}, 1000)"], {
@@ -1955,7 +2016,7 @@ describe("native codepage probe node runtime bridge (host-side)", () => {
   })
 
   test("reports exactly one nonzero exit when the bridge dies while the PTY is alive", async () => {
-    const loaded = await loadSpawn("node")
+    const loaded = await loadSpawn("node", { useNodeExecutable: true })
     let proc!: RuntimeProc
     try {
       proc = await loaded.spawn("node", ["-e", "setInterval(() => {}, 1000)"], {
@@ -2349,7 +2410,7 @@ describe("native codepage probe node runtime bridge (host-side)", () => {
   })
 
   test("reports write failure instead of ok when bridge exits", async () => {
-    const loaded = await loadSpawn("node")
+    const loaded = await loadSpawn("node", { useNodeExecutable: true })
     let proc!: RuntimeProc
     try {
       proc = await loaded.spawn("node", ["-e", "setInterval(() => {}, 1000)"], {
