@@ -551,7 +551,19 @@ const layer = Layer.effect(
 
       if (processor.message.error) return "stop"
       if (result === "continue") {
-        yield* events.publish(Event.Compacted, { sessionID: input.sessionID })
+        const summary = (yield* MessageV2.parts(processor.message.id))
+          .filter((part): part is SessionV1.TextPart => part.type === "text")
+          .map((part) => part.text.trim())
+          .filter(Boolean)
+          .join("\n\n")
+          .trim()
+        if (summary) {
+          yield* events.publish(Event.Compacted, { sessionID: input.sessionID })
+        } else {
+          yield* Effect.logWarning("compaction produced a blank summary; skipping Compacted event", {
+            "session.id": input.sessionID,
+          })
+        }
       }
       return result
     })
