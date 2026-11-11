@@ -17,6 +17,7 @@ const fileText = "ação-日本 ok"
 const CASE_GUARD_MS = 20_000
 const TEST_BUDGET_MS = 30_000
 const MAX_CAPTURE = 256 * 1024
+const STARTUP_RESPONSE_LIMIT = 4
 
 const backends = ["node", "bun"] as const
 const modes = ["baseline", "chcp", "setconsole"] as const
@@ -25,6 +26,15 @@ type Backend = (typeof backends)[number]
 type Mode = (typeof modes)[number]
 type CpStage = { stage: string; input: number; output: number }
 type SetOutputCp = { requested: number; success: boolean; lastError: number }
+type StartupGate = {
+  startupBuffer: string
+  startupMarkerSeen: boolean
+  queryBuffer: string
+  startupResponseCount: number
+  startupResponsesExceeded: boolean
+  startupQueryBufferOverflow: boolean
+  parserDisabled: boolean
+}
 type Spawn = (file: string, args: string[], opts: Opts) => Proc
 
 const windowsTest = process.platform === "win32" ? test : test.skip
@@ -65,6 +75,12 @@ function childEnv() {
 }
 
 function killTree(proc: Proc) {
+  if (!Number.isInteger(proc.pid) || proc.pid <= 0 || proc.pid === process.pid) {
+    try {
+      proc.kill()
+    } catch {}
+    return
+  }
   try {
     spawnSync("taskkill", ["/pid", String(proc.pid), "/t", "/f"], {
       windowsHide: true,
@@ -182,6 +198,133 @@ function observations(output: string) {
   }
 }
 
+const DA1_RESPONSE = "\u001b[?1;2c"
+
+function consumeDa1Queries(buffer: string): { responses: string[]; rest: string } {
+  const responses: string[] = []
+  let i = 0
+
+  while (i < buffer.length) {
+    const ch = buffer[i]
+    if (ch !== "\u001b") {
+      i += 1
+      continue
+    }
+    if (i + 1 >= buffer.length) return { responses, rest: buffer.slice(i) }
+
+    const next = buffer[i + 1]
+    if (next === "]" || next === "P" || next === "_" || next === "^" || next === "X") {
+      let end = -1
+      if (next === "]") {
+        const bell = buffer.indexOf("\u0007", i)
+        const st = buffer.indexOf("\u001b\\", i)
+        if (bell >= 0 && (st < 0 || bell < st)) end = bell + 1
+        else if (st >= 0) end = st + 2
+      } else {
+        const st = buffer.indexOf("\u001b\\", i)
+        if (st >= 0) end = st + 2
+      }
+      if (end < 0) return { responses, rest: buffer.slice(i) }
+      i = end
+      continue
+    }
+    if (next === "[") {
+      let j = i + 2
+      while (j < buffer.length && (buffer.charCodeAt(j) < 0x40 || buffer.charCodeAt(j) > 0x7e)) j++
+      if (j >= buffer.length) return { responses, rest: buffer.slice(i) }
+      const params = buffer.slice(i + 2, j)
+      if (buffer[j] === "c" && (params === "" || params === "0")) responses.push(DA1_RESPONSE)
+      i = j + 1
+      continue
+    }
+    if ("()*+,-./".includes(next)) {
+      if (i + 3 > buffer.length) return { responses, rest: buffer.slice(i) }
+      i += 3
+      continue
+    }
+    i += 2
+  }
+
+  return { responses, rest: "" }
+}
+
+function initialStartupGate(): StartupGate {
+  return {
+    startupBuffer: "",
+    startupMarkerSeen: false,
+    queryBuffer: "",
+    startupResponseCount: 0,
+    startupResponsesExceeded: false,
+    startupQueryBufferOverflow: false,
+    parserDisabled: false,
+  }
+}
+
+function processStartupChunk(state: StartupGate, chunk: string): { state: StartupGate; responses: string[] } {
+  const marker = "PROBE_STAGE helper-startup"
+  const startupMarkerSeen = state.startupMarkerSeen || state.startupBuffer.includes(marker) || chunk.includes(marker) || (state.startupBuffer + chunk.slice(0, marker.length)).includes(marker)
+  const startupBuffer = chunk.length >= 256
+    ? chunk.slice(-256)
+    : state.startupBuffer.length + chunk.length > 256
+      ? (state.startupBuffer + chunk).slice(-256)
+      : state.startupBuffer + chunk
+
+  if (startupMarkerSeen || state.parserDisabled) {
+    return {
+      state: {
+        startupBuffer,
+        startupMarkerSeen,
+        queryBuffer: "",
+        startupResponseCount: state.startupResponseCount,
+        startupResponsesExceeded: state.startupResponsesExceeded,
+        startupQueryBufferOverflow: state.startupQueryBufferOverflow,
+        parserDisabled: true,
+      },
+      responses: [],
+    }
+  }
+
+  if (state.queryBuffer.length + chunk.length > MAX_CAPTURE) {
+    return {
+      state: {
+        startupBuffer,
+        startupMarkerSeen,
+        queryBuffer: "",
+        startupResponseCount: state.startupResponseCount,
+        startupResponsesExceeded: state.startupResponsesExceeded,
+        startupQueryBufferOverflow: true,
+        parserDisabled: true,
+      },
+      responses: [],
+    }
+  }
+
+  const consumed = consumeDa1Queries(state.queryBuffer + chunk)
+  let startupResponseCount = state.startupResponseCount
+  let startupResponsesExceeded = state.startupResponsesExceeded
+  const responses: string[] = []
+  for (const _response of consumed.responses) {
+    startupResponseCount += 1
+    if (startupResponseCount > STARTUP_RESPONSE_LIMIT) startupResponsesExceeded = true
+    else responses.push(DA1_RESPONSE)
+  }
+  const startupQueryBufferOverflow = consumed.rest.length > 4096
+  const queryBuffer = startupQueryBufferOverflow ? "" : consumed.rest
+  const parserDisabled = startupResponsesExceeded || startupQueryBufferOverflow
+  return {
+    state: {
+      startupBuffer,
+      startupMarkerSeen,
+      queryBuffer,
+      startupResponseCount,
+      startupResponsesExceeded,
+      startupQueryBufferOverflow,
+      parserDisabled,
+    },
+    responses,
+  }
+}
+
 async function runCase(backend: Backend, mode: Mode) {
   const spawn = await loadSpawn(backend)
   const workDir = mkdtempSync(path.join(tmpdir(), `silvercode-native-codepage-${backend}-${mode}-`))
@@ -209,6 +352,7 @@ async function runCase(backend: Backend, mode: Mode) {
   let truncated = false
   let exited = false
   let cleanedUp = false
+  let startupGate = initialStartupGate()
   let proc: Proc | undefined
   let dataSub: { dispose: () => void } | undefined
   let exitSub: { dispose: () => void } | undefined
@@ -233,6 +377,9 @@ async function runCase(backend: Backend, mode: Mode) {
       env: childEnv(),
     })
     dataSub = proc.onData((chunk) => {
+      const processed = processStartupChunk(startupGate, chunk)
+      startupGate = processed.state
+      for (const response of processed.responses) proc!.write(response)
       if (captured >= MAX_CAPTURE) {
         truncated = true
         return
@@ -287,6 +434,11 @@ async function runCase(backend: Backend, mode: Mode) {
       chcpExit: chcpExit ?? null,
       cmdExits: parseCmdExits(output),
       observations: observations(output),
+      startupMarkerSeen: startupGate.startupMarkerSeen,
+      startupResponseCount: startupGate.startupResponseCount,
+      startupResponsesExceeded: startupGate.startupResponsesExceeded,
+      startupQueryBufferOverflow: startupGate.startupQueryBufferOverflow,
+      startupParserDisabled: startupGate.parserDisabled,
     }
     const resultPath = path.join(resultsDir, `${backend}-${mode}.json`)
     writeFileSync(resultPath, JSON.stringify(result, null, 2))
@@ -302,6 +454,13 @@ async function runCase(backend: Backend, mode: Mode) {
       chcpExit: result.chcpExit,
       cmdExits: result.cmdExits,
       observations: result.observations,
+      startupMarkerSeen: startupGate.startupMarkerSeen,
+      startupResponseCount: startupGate.startupResponseCount,
+      startupResponsesExceeded: startupGate.startupResponsesExceeded,
+      startupQueryBufferOverflow: startupGate.startupQueryBufferOverflow,
+      startupParserDisabled: startupGate.parserDisabled,
+      procPid: proc?.pid ?? null,
+      runnerPid: process.pid,
       outputBytes: result.output.length,
       chunkCount: result.chunks.length,
       chunkLengths: result.chunkLengths,
@@ -342,6 +501,11 @@ describe("810 native ConPTY codepage probe (Windows only)", () => {
            expect(result.truncated).toBe(false)
            expect(result.exitCode).toBe(0)
            expect(result.observations.helperDone).toBe(true)
+           expect(result.startupMarkerSeen).toBe(true)
+           expect(result.startupResponsesExceeded).toBe(false)
+           expect(result.startupResponseCount).toBeLessThanOrEqual(4)
+           expect(result.startupQueryBufferOverflow).toBe(false)
+           expect(result.startupParserDisabled).toBe(false)
            expect(result.output.includes("PROBE_DONE")).toBe(true)
            expect(result.observations.controlMarkersBalanced).toBe(true)
            expect(result.observations.allControlSectionsPresent).toBe(true)
@@ -386,3 +550,159 @@ describe("810 native ConPTY codepage probe (Windows only)", () => {
     }
   }
 })
+
+
+describe("native codepage probe startup handshake (host-side)", () => {
+  test("responds to a DA1 query split at every position", () => {
+    for (const query of ["\u001b[c", "\u001b[0c"]) {
+      for (let split = 1; split < query.length; split++) {
+        let buffer = ""
+        const responses: string[] = []
+        const first = consumeDa1Queries(buffer + query.slice(0, split))
+        buffer = first.rest
+        responses.push(...first.responses)
+        const second = consumeDa1Queries(buffer + query.slice(split))
+        buffer = second.rest
+        responses.push(...second.responses)
+        expect(responses).toHaveLength(1)
+        expect(responses[0]).toBe(DA1_RESPONSE)
+      }
+    }
+  })
+
+  test("responds when every character is a separate chunk", () => {
+    const query = "\u001b[0c"
+    let buffer = ""
+    const responses: string[] = []
+    for (const char of query) {
+      const consumed = consumeDa1Queries(buffer + char)
+      buffer = consumed.rest
+      responses.push(...consumed.responses)
+    }
+    expect(responses).toHaveLength(1)
+    expect(responses[0]).toBe(DA1_RESPONSE)
+  })
+
+  test("does not respond to other CSI final bytes", () => {
+    for (const input of ["\u001b[1c", "\u001b[?c", "\u001b[>c", "\u001b[2c"]) {
+      expect(consumeDa1Queries(input).responses).toHaveLength(0)
+    }
+  })
+
+  test("does not respond to OSC titles or synthetic probe controls", () => {
+    const chunks = ["\u001b]0;title\u0007", "PROBE_WIDE \u251c\u00ba\r\n", "PROBE_RAW_CP437 full"]
+    let buffer = ""
+    const responses: string[] = []
+    for (const chunk of chunks) {
+      const consumed = consumeDa1Queries(buffer + chunk)
+      buffer = consumed.rest
+      responses.push(...consumed.responses)
+    }
+    expect(responses).toHaveLength(0)
+  })
+
+  test("ignores DA1-like text inside OSC, DCS, APC, PM, and SOS", () => {
+    const cases = [
+      "\u001b]0;title \u001b[c \u0007",
+      "\u001b]2;\u001b[0c\u0007",
+      "\u001bPq\u001b[c\u001b\\",
+      "\u001b_\u001b[0c\u001b\\",
+      "\u001b^\u001b[c\u001b\\",
+      "\u001bX\u001b[0c\u001b\\",
+    ]
+    for (const input of cases) {
+      expect(consumeDa1Queries(input).responses).toHaveLength(0)
+    }
+  })
+
+  test("ignores a split OSC terminator followed by a real query", () => {
+    let buffer = ""
+    const responses: string[] = []
+    const first = consumeDa1Queries(buffer + "\u001b]0;title \u001b[c ")
+    buffer = first.rest
+    responses.push(...first.responses)
+    const second = consumeDa1Queries(buffer + "\u0007\u001b[c")
+    buffer = second.rest
+    responses.push(...second.responses)
+    expect(responses).toHaveLength(1)
+    expect(responses[0]).toBe(DA1_RESPONSE)
+  })
+
+  test("ignores a split OSC ST terminator followed by a real query", () => {
+    let buffer = ""
+    const responses: string[] = []
+    const first = consumeDa1Queries(buffer + "\u001b]0;title \u001b[c \u001b")
+    buffer = first.rest
+    responses.push(...first.responses)
+    const second = consumeDa1Queries(buffer + "\\\u001b[c")
+    buffer = second.rest
+    responses.push(...second.responses)
+    expect(responses).toHaveLength(1)
+    expect(responses[0]).toBe(DA1_RESPONSE)
+  })
+
+  test("ignores a split DCS ST terminator followed by a real query", () => {
+    let buffer = ""
+    const responses: string[] = []
+    const first = consumeDa1Queries(buffer + "\u001bPq \u001b[c \u001b")
+    buffer = first.rest
+    responses.push(...first.responses)
+    const second = consumeDa1Queries(buffer + "\\\u001b[c")
+    buffer = second.rest
+    responses.push(...second.responses)
+    expect(responses).toHaveLength(1)
+    expect(responses[0]).toBe(DA1_RESPONSE)
+  })
+
+  test("disables responder for a large chunk containing the startup marker", () => {
+    const chunk = "x".repeat(1000) + "PROBE_STAGE helper-startup" + "\u001b[c"
+    const processed = processStartupChunk(initialStartupGate(), chunk)
+    expect(processed.responses).toHaveLength(0)
+    expect(processed.state.startupMarkerSeen).toBe(true)
+  })
+
+  test("disables responder when the startup marker is split across chunks", () => {
+    const first = processStartupChunk(initialStartupGate(), "x".repeat(300) + "PROBE_STAGE helper-")
+    const second = processStartupChunk(first.state, "startup" + "\u001b[c")
+    expect(first.state.startupMarkerSeen).toBe(false)
+    expect(second.responses).toHaveLength(0)
+    expect(second.state.startupMarkerSeen).toBe(true)
+  })
+
+  test("does not answer a DA-like query inside a large terminated OSC", () => {
+    const input = "\u001b]0;" + "x".repeat(4090) + "\u001b[c" + "\u0007"
+    const processed = processStartupChunk(initialStartupGate(), input)
+    expect(processed.responses).toHaveLength(0)
+    expect(processed.state.startupQueryBufferOverflow).toBe(false)
+  })
+
+  test("fails closed when an unterminated control buffer exceeds 4096 bytes", () => {
+    const input = "\u001b]0;" + "x".repeat(4097)
+    const processed = processStartupChunk(initialStartupGate(), input)
+    expect(processed.responses).toHaveLength(0)
+    expect(processed.state.startupQueryBufferOverflow).toBe(true)
+  })
+
+
+  test("stays disabled across repeated oversized unterminated controls", () => {
+    for (const control of ["\u001b]0;", "\u001bP"]) {
+      const chunks = [control + "x".repeat(5000)]
+      for (let i = 0; i < 8; i++) chunks.push("\u001b[c" + "y".repeat(2 * 1024 * 1024))
+      chunks.push("\u001b\\" + "\u001b[c")
+      let state = initialStartupGate()
+      const responses: string[] = []
+      for (const chunk of chunks) {
+        const processed = processStartupChunk(state, chunk)
+        state = processed.state
+        responses.push(...processed.responses)
+        expect(state.startupBuffer.length).toBeLessThanOrEqual(256)
+        expect(state.queryBuffer.length).toBeLessThanOrEqual(4096)
+        expect(state.parserDisabled).toBe(true)
+      }
+      expect(state.startupQueryBufferOverflow).toBe(true)
+      expect(responses).toHaveLength(0)
+    }
+  })
+
+})
+

@@ -40,6 +40,14 @@ Results are written only to a bounded OS temporary directory and removed after a
 
 Inputs are synthetic and non-sensitive (file name `ação-日本.txt`, text `ação-日本 ok`). No private owner data or source logs are included.
 
+## Startup handshake
+
+The harness responds only to a top-level DA1 query (`CSI c` or `CSI 0 c`) with a bounded VT100 DA1 response (`ESC[?1;2c`). Bytes inside OSC or DCS sequences are not treated as queries, including when the query-like text is split across chunks. This addresses the observed PowerShell startup query; it is measurement harness behavior, not a product fix.
+
+## Root-cause status
+
+The PowerShell startup-query explanation remains an unproven hypothesis. The harness now records DA response counts, startup-marker visibility, and PID identities, but Linux cannot establish Windows ConPTY behavior.
+
 ## Native execution status
 
 Native Windows ConPTY is NOT executed on this Linux host. Off-Windows runs skip all 6 native cases. Native behavior remains unknown; this is not a product fix.

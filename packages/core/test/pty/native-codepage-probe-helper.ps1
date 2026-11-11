@@ -7,6 +7,9 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+[Console]::Out.WriteLine("PROBE_STAGE helper-startup")
+[Console]::Out.Flush()
+
 Add-Type @'
 using System;
 using System.ComponentModel;
