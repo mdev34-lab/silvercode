@@ -32,6 +32,8 @@ The package test command remains `bun test --timeout 15000 --only-failures`; eac
 
 Per-case guard is 20s; per-test budget is 30s.
 
+Cleanup shares one 5000 ms deadline for the whole joined cleanup: the tree kill runs first, then the bridge is asked to shut down only while it is still alive, then the bridge is killed and the close is joined with whatever budget is left. Each bridge and PTY pid is killed at most once, and repeated cleanup calls return the same joined promise instead of paying the deadline again. The cleanup fails closed: it is recorded as a cleanup failure, and fails the case, when the deadline is missed, when the bridge and PTY pids cannot be resolved, or when the PTY child termination cannot be confirmed by a confirmed PTY exit, a tree kill, a successful pid kill, or a liveness probe. A PTY pid of zero or a non-integer is unknown rather than gone, so it never satisfies the cleanup on its own. A stdin transport error raised by the intentional cleanup is recorded separately and is not reported as a measurement failure.
+
 ## Paths
 
 Test imports resolve to `../../src/pty/...` relative to this directory. The helper is `native-codepage-probe-helper.ps1`.

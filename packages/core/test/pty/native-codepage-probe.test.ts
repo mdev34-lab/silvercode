@@ -3,8 +3,8 @@
 // It intentionally does not apply any output decoder: every chunk is recorded as the backend delivered it.
 // Diagnostic measurement only; not a product fix.
 import { describe, expect, test } from "bun:test"
-import { spawnSync } from "node:child_process"
 import { spawn as spawnProcess } from "node:child_process"
+import type { ChildProcess } from "node:child_process"
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import path from "node:path"
@@ -18,6 +18,8 @@ const fileText = "ação-日本 ok"
 const CASE_GUARD_MS = 20_000
 const TEST_BUDGET_MS = 30_000
 const MAX_CAPTURE = 256 * 1024
+const CLEANUP_BUDGET_MS = 5_000
+const CLEANUP_SHUTDOWN_GRACE_MS = 1_000
 const STARTUP_RESPONSE_LIMIT = 4
 
 const backends = ["node", "bun"] as const
@@ -38,7 +40,7 @@ type StartupGate = {
 }
 type Spawn = (file: string, args: string[], opts: Opts) => Promise<Proc>
 type LoadedSpawn = { spawn: Spawn; close: () => void; runtimeVersion?: string; runtimeBun?: string | null }
-type RuntimeProc = Proc & { bridgePid?: number; runtimeVersion?: string; runtimeBun?: string | null; bridgeOverflow?: boolean; stderr?: string; writeAndWait?: (data: string, timeoutMs: number) => Promise<{ ok: boolean; message: string; timedOut: boolean }>; close?: () => void }
+type RuntimeProc = Proc & { bridgePid?: number; runtimeVersion?: string; runtimeBun?: string | null; bridgeOverflow?: boolean; stderrOverflow?: boolean; bridgeFailure?: boolean; bridgeError?: Error; ptyExitConfirmed?: boolean; cleanupFailed?: boolean; cleanupReason?: string | null; cleanupTransportError?: Error; bridgeExitCode?: number | null; bridgeSignal?: string | null; earlyDataCount?: number; earlyExitCount?: number; stderr?: string; writeAndWait?: (data: string, timeoutMs: number) => Promise<{ ok: boolean; message: string; timedOut: boolean }>; close?: () => Promise<void> }
 
 const windowsTest = process.platform === "win32" ? test : test.skip
 
@@ -57,7 +59,31 @@ function powershellPath() {
   return existsSync(candidate) ? candidate : "powershell.exe"
 }
 
-async function loadSpawn(backend: Backend): Promise<LoadedSpawn> {
+// Pure bounded append used by the real bridge stderr handler so host-side tests can
+// exercise the exact same capture semantics. Retains the newest `limit` characters and
+// reports whether anything was dropped.
+function appendBoundedCapture(buffer: string, chunk: string, limit: number) {
+  const combined = buffer + chunk
+  if (combined.length <= limit) return { buffer: combined, overflow: false }
+  return { buffer: combined.slice(-limit), overflow: true }
+}
+
+// Pure exit-code normalization for PTY exit events. A missing or invalid exit code is
+// never reported as a clean exit, and a signaled exit never reports exit code 0.
+function normalizePtyExitCode(exitCode: unknown, signal: unknown) {
+  const signaled = signal !== null && signal !== undefined && signal !== 0
+  if (typeof exitCode === "number" && Number.isFinite(exitCode)) {
+    if (exitCode === 0 && signaled) return 1
+    return exitCode
+  }
+  return 1
+}
+
+// Bridge child factory for the node backend. Tests inject a real child process so the
+// parent-side handlers under test are the production ones.
+type BridgeChildFactory = (scriptPath: string) => ChildProcess
+
+async function loadSpawn(backend: Backend, options?: { spawnBridgeChild?: BridgeChildFactory }): Promise<LoadedSpawn> {
   if (backend === "bun") {
     const mod = await import("../../src/pty/pty.bun.ts")
     return {
@@ -80,8 +106,19 @@ const proc = spawnPty(${JSON.stringify(file)}, ${JSON.stringify(args)}, ${JSON.s
 let stdinBuffer = ""
 
 process.stdin.setEncoding("utf8")
+process.stdin.on("error", (error) => {
+  try { proc.kill() } catch {}
+  try { process.stderr.write(String(error) + "\\n") } catch {}
+  process.exit(1)
+})
+process.stdout.on("error", (error) => {
+  try { proc.kill() } catch {}
+  try { process.stderr.write(String(error) + "\\n") } catch {}
+  process.exit(1)
+})
 process.stdin.on("data", (chunk) => {
   if (stdinBuffer.length + chunk.length > 262144) {
+    try { proc.kill() } catch {}
     process.stderr.write("stdin buffer overflow\\n")
     process.exit(1)
   }
@@ -101,16 +138,23 @@ process.stdin.on("data", (chunk) => {
     } else if (message.type === "kill") {
       try { proc.kill(message.signal) } catch {}
     } else if (message.type === "shutdown") {
+      try { proc.kill() } catch {}
       process.exit(0)
     }
   }
 })
 
 proc.onData((data) => {
-  process.stdout.write(JSON.stringify({ type: "data", data }) + "\\n")
+  try {
+    process.stdout.write(JSON.stringify({ type: "data", data }) + "\\n")
+  } catch (error) {
+    try { proc.kill() } catch {}
+    process.stderr.write(String(error) + "\\n")
+    process.exit(1)
+  }
 })
 proc.onExit((event) => {
-  process.stdout.write(JSON.stringify({ type: "exit", exitCode: event.exitCode ?? 0 }) + "\\n")
+  process.stdout.write(JSON.stringify({ type: "exit", exitCode: event.exitCode ?? null, signal: event.signal ?? null }) + "\\n")
 })
 process.stdout.write(JSON.stringify({ type: "spawned", pid: proc.pid, runtimeVersion: process.version, runtimeBun: process.versions.bun ?? null }) + "\\n")
 `
@@ -118,9 +162,11 @@ process.stdout.write(JSON.stringify({ type: "spawned", pid: proc.pid, runtimeVer
 
       let child
       try {
-        child = spawnProcess("node", ["--experimental-strip-types", scriptPath], {
-          stdio: ["pipe", "pipe", "pipe"],
-        })
+        child = options?.spawnBridgeChild
+          ? options.spawnBridgeChild(scriptPath)
+          : spawnProcess("node", ["--experimental-strip-types", scriptPath], {
+              stdio: ["pipe", "pipe", "pipe"],
+            })
       } catch (error) {
         try { rmSync(scriptPath, { force: true }) } catch {}
         throw error
@@ -149,11 +195,23 @@ process.stdout.write(JSON.stringify({ type: "spawned", pid: proc.pid, runtimeVer
       }, 5_000)
       let stdoutBuffer = ""
       let stderrBuffer = ""
+      let stderrOverflow = false
       let bridgeOverflow = false
       let earlyDataOverflow = false
       let earlyExitOverflow = false
       let ptyExited = false
+      let ptyExitConfirmed = false
+      let cleanupStarted = false
+      let cleanupTransportError: Error | undefined
+      let bridgeError: Error | undefined
       let bridgeExited = false
+      let closePromise: Promise<void> | undefined
+      let bridgeExitNotified = false
+      let bridgeFailure = false
+      let bridgeExitCode: number | null = null
+      let bridgeSignal: string | null = null
+      let earlyDataCount = 0
+      let earlyExitCount = 0
 
       const settleSpawned = (value: { pid: number; runtimeVersion: string; runtimeBun: string | null }) => {
         if (spawnedSettled) return
@@ -168,8 +226,19 @@ process.stdout.write(JSON.stringify({ type: "spawned", pid: proc.pid, runtimeVer
         spawnedReject?.(error)
       }
 
-      child.stdout.setEncoding("utf8")
-      child.stdout.on("data", (chunk: string) => {
+      // The bridge is always spawned with explicit pipe stdio, so the streams must be
+      // present. Narrow them once here and fail before any handler is attached when a
+      // caller injects a child without pipes.
+      const stdin = child.stdin
+      const stdout = child.stdout
+      const stderr = child.stderr
+      if (!stdin || !stdout || !stderr) {
+        try { child.kill() } catch {}
+        throw new Error("node PTY bridge child is missing pipe streams")
+      }
+
+      stdout.setEncoding("utf8")
+      stdout.on("data", (chunk: string) => {
         if (stdoutBuffer.length + chunk.length > MAX_CAPTURE) {
           bridgeOverflow = true
           stdoutBuffer = ""
@@ -189,6 +258,7 @@ process.stdout.write(JSON.stringify({ type: "spawned", pid: proc.pid, runtimeVer
             if (dataListeners.size > 0) {
               for (const listener of dataListeners) listener(message.data)
             } else {
+              earlyDataCount += 1
               if (queuedDataChars + String(message.data).length > MAX_CAPTURE) {
                 earlyDataOverflow = true
               } else {
@@ -197,13 +267,21 @@ process.stdout.write(JSON.stringify({ type: "spawned", pid: proc.pid, runtimeVer
               }
             }
           } else if (message.type === "exit") {
-            ptyExited = true
-            const event = { exitCode: message.exitCode }
-            if (exitListeners.size > 0) {
-              for (const listener of exitListeners) listener(event)
+            if (ptyExited || bridgeExitNotified) {
+              // duplicate PTY exit, or a late PTY exit arriving after the bridge-failure
+              // fallback already notified listeners; ignore it so listeners observe
+              // exactly one exit and no confirmed PTY exit is manufactured
             } else {
-              if (queuedExit.length >= 16) earlyExitOverflow = true
-              else queuedExit.push(event)
+              ptyExited = true
+              ptyExitConfirmed = true
+              const event = { exitCode: normalizePtyExitCode(message.exitCode, message.signal), signal: message.signal ?? undefined }
+              if (exitListeners.size > 0) {
+                for (const listener of exitListeners) listener(event)
+              } else {
+                earlyExitCount += 1
+                if (queuedExit.length >= 16) earlyExitOverflow = true
+                else queuedExit.push(event)
+              }
             }
           } else if (message.type === "writeResult") {
             const resolveWrite = pendingWrites.get(message.requestId)
@@ -215,48 +293,80 @@ process.stdout.write(JSON.stringify({ type: "spawned", pid: proc.pid, runtimeVer
         }
       })
 
-      child.stderr.setEncoding("utf8")
-      child.stderr.on("data", (chunk: string) => {
-        if (stderrBuffer.length + chunk.length > MAX_CAPTURE) {
-          stderrBuffer = stderrBuffer.slice(-(MAX_CAPTURE - chunk.length)) + chunk
-        } else {
-          stderrBuffer += chunk
-        }
+      stderr.setEncoding("utf8")
+      stderr.on("data", (chunk: string) => {
+        const appended = appendBoundedCapture(stderrBuffer, chunk, MAX_CAPTURE)
+        stderrBuffer = appended.buffer
+        if (appended.overflow) stderrOverflow = true
       })
 
       child.on("error", (error) => {
+        bridgeFailure = true
         rejectSpawned(error)
         for (const resolveWrite of pendingWrites.values()) resolveWrite({ ok: false, message: String(error), timedOut: false })
         pendingWrites.clear()
       })
-      child.on("exit", (code) => {
+      stdin.on("error", (error) => {
+        if (cleanupStarted) {
+          // The intentional cleanup can break the bridge stdin transport: that is a
+          // cleanup event, not a measurement failure.
+          cleanupTransportError = error
+        } else {
+          // A broken parent-side stdin means the bridge can no longer be driven. That is
+          // a bridge failure even when the child process itself is still alive.
+          bridgeFailure = true
+          bridgeError = error
+        }
+        for (const resolveWrite of pendingWrites.values()) resolveWrite({ ok: false, message: String(error), timedOut: false })
+        pendingWrites.clear()
+      })
+      child.on("exit", (code, signal) => {
         bridgeExited = true
+        bridgeExitCode = code
+        bridgeSignal = signal ?? null
         if (!spawnedSettled) {
           rejectSpawned(new Error(`node PTY bridge exited before spawn with code ${code}`))
         }
-        if (!ptyExited) {
-          ptyExited = true
-          const event = { exitCode: code ?? 0 }
+        for (const resolveWrite of pendingWrites.values()) resolveWrite({ ok: false, message: "bridge exited", timedOut: false })
+        pendingWrites.clear()
+        if (!ptyExited && !bridgeExitNotified) {
+          bridgeExitNotified = true
+          bridgeFailure = true
+          // The bridge died before a PTY exit was confirmed, so this is a bridge failure
+          // exit and never a confirmed PTY exit: report a nonzero code and keep the raw
+          // code and signal in bridgeExitCode/bridgeSignal.
+          const event = { exitCode: typeof code === "number" && code !== 0 ? code : 1, signal: signal ?? undefined }
           if (exitListeners.size > 0) {
             for (const listener of exitListeners) listener(event)
           } else {
+            earlyExitCount += 1
             if (queuedExit.length < 16) queuedExit.push(event)
             else earlyExitOverflow = true
           }
         }
-        for (const resolveWrite of pendingWrites.values()) resolveWrite({ ok: false, message: "bridge exited", timedOut: false })
-        pendingWrites.clear()
       })
 
       let spawned
       try {
         spawned = await spawnedPromise
       } catch (error) {
-        try { killTree({ pid: child.pid, kill() { child.kill() }, onData() { return { dispose() {} } }, onExit() { return { dispose() {} } }, write() {}, resize() {} } as unknown as Proc) } catch {}
+        // Startup failure path: tree first, then the bridge itself.
+        if (child.pid !== undefined) await killTreeAsync(child.pid, CLEANUP_BUDGET_MS)
         try { child.kill() } catch {}
         try { rmSync(scriptPath, { force: true }) } catch {}
         throw error
       }
+
+      const cleanup = createBridgeCleanup({
+        bridgePid: child.pid,
+        ptyPid: spawned.pid,
+        bridgeAlive: () => child.exitCode === null && child.signalCode === null,
+        ptyExitConfirmed: () => ptyExitConfirmed,
+        shutdown: () => { try { stdin.write(JSON.stringify({ type: "shutdown" }) + "\n") } catch {} },
+        kill: () => { try { child.kill() } catch {} },
+        join: (budgetMs) => joinChildClose(child, budgetMs),
+        onStart: () => { cleanupStarted = true },
+      })
 
       const proc: RuntimeProc = {
         pid: spawned.pid,
@@ -277,12 +387,18 @@ process.stdout.write(JSON.stringify({ type: "spawned", pid: proc.pid, runtimeVer
           return { dispose() { exitListeners.delete(listener) } }
         },
         write(data) {
-          try { child.stdin.write(JSON.stringify({ type: "write", requestId: 0, data }) + "\n") } catch {}
+          try { stdin.write(JSON.stringify({ type: "write", requestId: 0, data }) + "\n") } catch {}
         },
         writeAndWait(data, timeoutMs) {
           return new Promise((resolve) => {
             if (pendingWrites.size >= 4) {
               resolve({ ok: false, message: "too many pending writes", timedOut: false })
+              return
+            }
+            if (stdin.destroyed || stdin.writableEnded) {
+              // The bridge is gone, so the ack can never arrive: fail fast rather than
+              // waiting out the timeout.
+              resolve({ ok: false, message: "bridge stdin closed", timedOut: false })
               return
             }
             const requestId = ++nextWriteId
@@ -301,7 +417,7 @@ process.stdout.write(JSON.stringify({ type: "spawned", pid: proc.pid, runtimeVer
               resolve(result)
             })
             try {
-              child.stdin.write(JSON.stringify({ type: "write", requestId, data }) + "\n")
+              stdin.write(JSON.stringify({ type: "write", requestId, data }) + "\n")
             } catch (error) {
               if (settled) return
               settled = true
@@ -313,17 +429,30 @@ process.stdout.write(JSON.stringify({ type: "spawned", pid: proc.pid, runtimeVer
         },
         resize() {},
         kill(signal) {
-          try { child.stdin.write(JSON.stringify({ type: "kill", signal }) + "\n") } catch {}
+          try { stdin.write(JSON.stringify({ type: "kill", signal }) + "\n") } catch {}
         },
         close() {
-          try { child.stdin.write(JSON.stringify({ type: "shutdown" }) + "\n") } catch {}
-          try { child.kill() } catch {}
-          try { rmSync(scriptPath, { force: true }) } catch {}
+          if (closePromise) return closePromise
+          closePromise = cleanup.run().then(() => {
+            try { rmSync(scriptPath, { force: true }) } catch {}
+          })
+          return closePromise
         },
       }
 
       // reflect overflow flags lazily
-      Object.defineProperty(proc, "bridgeOverflow", { get() { return bridgeOverflow || earlyDataOverflow || earlyExitOverflow } })
+      Object.defineProperty(proc, "bridgeOverflow", { get() { return bridgeOverflow || earlyDataOverflow || earlyExitOverflow || stderrOverflow } })
+      Object.defineProperty(proc, "stderrOverflow", { get() { return stderrOverflow } })
+      Object.defineProperty(proc, "bridgeFailure", { get() { return bridgeFailure } })
+      Object.defineProperty(proc, "bridgeError", { get() { return bridgeError } })
+      Object.defineProperty(proc, "ptyExitConfirmed", { get() { return ptyExitConfirmed } })
+      Object.defineProperty(proc, "cleanupFailed", { get() { return !cleanup.outcome().ok } })
+      Object.defineProperty(proc, "cleanupReason", { get() { return cleanup.outcome().reason } })
+      Object.defineProperty(proc, "cleanupTransportError", { get() { return cleanupTransportError } })
+      Object.defineProperty(proc, "bridgeExitCode", { get() { return bridgeExitCode } })
+      Object.defineProperty(proc, "bridgeSignal", { get() { return bridgeSignal } })
+      Object.defineProperty(proc, "earlyDataCount", { get() { return earlyDataCount } })
+      Object.defineProperty(proc, "earlyExitCount", { get() { return earlyExitCount } })
 
       return proc
     },
@@ -343,27 +472,187 @@ function childEnv() {
   return env
 }
 
-function killTree(proc: Proc) {
-  const bridgePid = (proc as RuntimeProc).bridgePid
-  const pid = typeof bridgePid === "number" && bridgePid > 0 ? bridgePid : proc.pid
-  if (!Number.isInteger(pid) || pid <= 0 || pid === process.pid) {
+// Async tree kill bounded by the remaining cleanup budget. The bridge process tree owns
+// the PTY child, so the tree is terminated before the bridge is asked to quit. The
+// result reports whether the pid was terminated and whether a real tree kill covered
+// the descendants: on POSIX there is no tree kill, so the caller still has to kill the
+// known PTY pid. It makes no claim about what the operating system reaped.
+function killTreeAsync(pid: number, remainingMs: number) {
+  return new Promise<{ killed: boolean; tree: boolean }>((resolve) => {
+    if (!Number.isInteger(pid) || pid <= 0 || pid === process.pid) {
+      resolve({ killed: false, tree: false })
+      return
+    }
+    if (process.platform !== "win32") {
+      try {
+        process.kill(pid, "SIGKILL")
+        resolve({ killed: true, tree: false })
+      } catch {
+        resolve({ killed: false, tree: false })
+      }
+      return
+    }
+    let child: ChildProcess
     try {
-      proc.kill()
-    } catch {}
-    return
-  }
-  try {
-    spawnSync("taskkill", ["/pid", String(pid), "/t", "/f"], {
-      windowsHide: true,
-      stdio: "ignore",
-      timeout: 5_000,
+      child = spawnProcess("taskkill", ["/pid", String(pid), "/t", "/f"], {
+        windowsHide: true,
+        stdio: "ignore",
+      })
+    } catch {
+      resolve({ killed: false, tree: false })
+      return
+    }
+    const timer = setTimeout(() => {
+      try { child.kill() } catch {}
+      resolve({ killed: false, tree: false })
+    }, remainingMs)
+    child.on("error", () => {
+      clearTimeout(timer)
+      resolve({ killed: false, tree: false })
     })
-  } catch {}
-  try {
-    proc.kill()
-  } catch {}
+    child.on("close", (code) => {
+      clearTimeout(timer)
+      resolve({ killed: code === 0, tree: code === 0 })
+    })
+  })
 }
 
+function joinChildClose(child: ChildProcess, budgetMs: number) {
+  return new Promise<boolean>((resolve) => {
+    if (child.exitCode !== null || child.signalCode !== null) {
+      resolve(true)
+      return
+    }
+    const timer = setTimeout(() => resolve(false), budgetMs)
+    child.once("close", () => {
+      clearTimeout(timer)
+      resolve(true)
+    })
+  })
+}
+
+function isProcessAlive(pid: number) {
+  if (!Number.isInteger(pid) || pid <= 0) return false
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    // EPERM means the pid exists but is not ours; anything else is not certain.
+    return (error as NodeJS.ErrnoException).code === "EPERM"
+  }
+}
+
+type CleanupOutcome = { ok: boolean; reason: string | null }
+
+// One bounded, idempotent cleanup for a bridge child and the PTY child it owns. The
+// whole cleanup shares a single deadline: the tree kill runs first, then the bridge is
+// asked to shut down, then the bridge is killed and the close is joined with whatever
+// budget is left. Repeated calls return the same promise, so no path pays the deadline
+// again. The cleanup fails closed when the PTY child termination cannot be confirmed.
+function createBridgeCleanup(target: {
+  bridgePid: number | undefined
+  ptyPid: number | undefined
+  bridgeAlive: () => boolean
+  ptyExitConfirmed: () => boolean
+  shutdown: () => void
+  kill: () => void
+  join: (budgetMs: number) => Promise<boolean>
+  killTree?: (pid: number, remainingMs: number) => Promise<{ killed: boolean; tree: boolean }>
+  isAlive?: (pid: number) => boolean
+  budgetMs?: number
+  onStart?: () => void
+}) {
+  let cleanup: Promise<CleanupOutcome> | undefined
+  let outcome: CleanupOutcome = { ok: true, reason: null }
+  const run = () => {
+    if (cleanup) return cleanup
+    cleanup = (async () => {
+      const deadline = Date.now() + (target.budgetMs ?? CLEANUP_BUDGET_MS)
+      const remaining = () => Math.max(0, deadline - Date.now())
+      const killTree = target.killTree ?? killTreeAsync
+      const isAlive = target.isAlive ?? isProcessAlive
+      const withinDeadline = async <T>(work: Promise<T>) => {
+        const budgetMs = remaining()
+        if (budgetMs <= 0) return null
+        return new Promise<T | null>((resolve) => {
+          const timer = setTimeout(() => resolve(null), budgetMs)
+          void work.then(
+            (value) => {
+              clearTimeout(timer)
+              resolve(value)
+            },
+            () => {
+              clearTimeout(timer)
+              resolve(null)
+            },
+          )
+        })
+      }
+
+      target.onStart?.()
+
+      if (target.bridgePid === undefined && target.ptyPid === undefined) {
+        outcome = { ok: false, reason: "unknown bridge and pty pids" }
+        return outcome
+      }
+
+      // Tree first: the PTY child belongs to the bridge tree, so the tree is terminated
+      // before the bridge is asked to quit. Each pid is killed at most once.
+      let treeCovered = false
+      let bridgeKilled = false
+      if (target.bridgePid !== undefined && target.bridgeAlive()) {
+        const result = await withinDeadline(killTree(target.bridgePid, remaining()))
+        if (result) {
+          treeCovered = result.tree
+          bridgeKilled = result.killed
+        }
+      }
+      let ptyKilled = false
+      if (!treeCovered && target.ptyPid !== undefined && target.ptyPid !== target.bridgePid) {
+        const result = await withinDeadline(killTree(target.ptyPid, remaining()))
+        ptyKilled = result?.killed ?? false
+      }
+
+      // A shutdown message is only useful while the bridge is still alive and no kill
+      // already took it down: writing to a dead bridge stdin would raise EPIPE and be
+      // misreported as a measurement failure.
+      if (!bridgeKilled && target.bridgeAlive()) {
+        try { target.shutdown() } catch {}
+      }
+
+      let joined = await withinDeadline(target.join(Math.min(remaining(), CLEANUP_SHUTDOWN_GRACE_MS)))
+      if (joined !== true) {
+        try { target.kill() } catch {}
+        joined = await withinDeadline(target.join(remaining()))
+      }
+
+      // Fail closed: without a confirmed PTY exit the PTY child has to be verifiably
+      // gone. A kill that did not succeed leaves the pid unknown unless the liveness
+      // probe says it is gone, and an unknown pid is recorded as not gone. A PTY pid of
+      // zero or a non-integer is unknown, not gone: the 217 CI procPid case documents a
+      // zero pid, so it must never satisfy the cleanup on its own.
+      const ptyPid = target.ptyPid
+      const ptyGone =
+        target.ptyExitConfirmed() ||
+        treeCovered ||
+        ptyKilled ||
+        (typeof ptyPid === "number" && Number.isInteger(ptyPid) && ptyPid > 0 && !isAlive(ptyPid))
+
+      if (!ptyGone) {
+        outcome = { ok: false, reason: "pty child termination not confirmed" }
+        return outcome
+      }
+      if (joined !== true || remaining() <= 0) {
+        outcome = { ok: false, reason: "cleanup deadline exceeded" }
+        return outcome
+      }
+      outcome = { ok: true, reason: null }
+      return outcome
+    })()
+    return cleanup
+  }
+  return { run, outcome: () => outcome }
+}
 function parseJsonLines(output: string, prefix: string) {
   const values: unknown[] = []
   const escaped = prefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
@@ -596,6 +885,30 @@ function processStartupChunk(state: StartupGate, chunk: string): { state: Startu
   }
 }
 
+function createStartupWriteTracker() {
+  const jobs = new Set<Promise<void>>()
+  return {
+    tryAdd(job: Promise<void>) {
+      if (jobs.size >= 4) return false
+      jobs.add(job)
+      void job.finally(() => jobs.delete(job))
+      return true
+    },
+    snapshot() {
+      return [...jobs]
+    },
+    get size() {
+      return jobs.size
+    },
+  }
+}
+
+// Shared wait for in-flight startup writes: the probe runner and its host-side test
+// both go through this, so the test exercises the runner behavior instead of a copy.
+async function awaitStartupWrites(tracker: ReturnType<typeof createStartupWriteTracker>, guard: Promise<unknown>) {
+  await Promise.race([Promise.all(tracker.snapshot()).catch(() => {}), guard])
+}
+
 async function runCase(backend: Backend, mode: Mode) {
   let caseTimedOut = false
   let caseGuardTimer: ReturnType<typeof setTimeout> | undefined
@@ -606,20 +919,29 @@ async function runCase(backend: Backend, mode: Mode) {
   let proc: RuntimeProc | undefined
   let cleanedUp = false
   let exited = false
+  let cleanupPromise: Promise<void> | undefined
   let dataSub: { dispose: () => void } | undefined
   let exitSub: { dispose: () => void } | undefined
   let workDir: string | undefined
   let resultsDir: string | undefined
+  let exitDrainTimer: ReturnType<typeof setTimeout> | undefined
   const cleanupProc = () => {
-    if (cleanedUp) return
+    if (cleanupPromise) return cleanupPromise
     cleanedUp = true
-    if (proc && !exited) killTree(proc)
-    try {
-      proc?.kill()
-    } catch {}
-    try {
-      void proc?.close?.()
-    } catch {}
+    cleanupPromise = (async () => {
+      if (!proc) return
+      // `exited` can be set by the synthetic bridge-failure fallback exit, so it never
+      // proves the bridge or the PTY child are gone. The joined cleanup owns the bridge
+      // tree and the PTY pid, is tree-first, idempotent and bounded by one deadline.
+      if (proc.close) {
+        await proc.close()
+        return
+      }
+      // Backends without a joined close still get the tree-first kill.
+      await killTreeAsync(proc.pid, CLEANUP_BUDGET_MS)
+      try { proc.kill() } catch {}
+    })()
+    return cleanupPromise
   }
   caseGuardTimer = setTimeout(() => {
     caseTimedOut = true
@@ -654,7 +976,7 @@ async function runCase(backend: Backend, mode: Mode) {
       fileText,
     ]
     const chunks: string[] = []
-    const startupWriteJobs = new Set<Promise<void>>()
+    const startupWriteTracker = createStartupWriteTracker()
     let captured = 0
     let truncated = false
     let startupGate = initialStartupGate()
@@ -673,9 +995,14 @@ async function runCase(backend: Backend, mode: Mode) {
     ])
     if (spawnResult.kind === "timeout") {
       void spawnPromise.then((lateProc) => {
-        try { killTree(lateProc) } catch {}
-        try { lateProc.kill() } catch {}
-        try { (lateProc as RuntimeProc).close?.() } catch {}
+        const late = lateProc as RuntimeProc
+        if (late.close) {
+          void late.close().then(() => {}).catch(() => {})
+          return
+        }
+        void killTreeAsync(late.pid, CLEANUP_BUDGET_MS).then(() => {
+          try { late.kill() } catch {}
+        })
       }).catch(() => {})
       throw new Error("case timed out during spawn")
     }
@@ -693,7 +1020,7 @@ async function runCase(backend: Backend, mode: Mode) {
       const processed = processStartupChunk(startupGate, chunk)
       startupGate = processed.state
       if (processed.responses.length > 0) {
-        if (startupWriteJobs.size >= 4) {
+        if (startupWriteTracker.size >= 4) {
           startupWriteError = "too many startup write jobs"
           caseTimedOut = true
           cleanupProc()
@@ -733,11 +1060,9 @@ async function runCase(backend: Backend, mode: Mode) {
               caseTimedOut = true
               cleanupProc()
               resolveGuard?.({ timedOut: true })
-            } finally {
-              startupWriteJobs.delete(jobPromise)
             }
           })()
-          startupWriteJobs.add(jobPromise)
+          startupWriteTracker.tryAdd(jobPromise)
         }
       }
     })
@@ -745,7 +1070,7 @@ async function runCase(backend: Backend, mode: Mode) {
       try {
         exitSub = proc!.onExit((event) => {
           exited = true
-          setTimeout(() => resolve({ timedOut: false, exitCode: event.exitCode }), 100)
+          exitDrainTimer = setTimeout(() => resolve({ timedOut: false, exitCode: event.exitCode }), 100)
         })
       } catch (error) {
         reject(error)
@@ -753,11 +1078,11 @@ async function runCase(backend: Backend, mode: Mode) {
     })
     const finalExit = await Promise.race([exitPromise, guardPromise])
     // await inflight startup writes briefly
-    await Promise.race([
-      Promise.all([...startupWriteJobs]).catch(() => {}),
-      guardPromise,
-    ])
+    await awaitStartupWrites(startupWriteTracker, guardPromise)
     if (finalExit.timedOut) cleanupProc()
+    // Join the cleanup before the result is built so a cleanup failure is recorded
+    // rather than hidden behind the case guard.
+    await cleanupProc()
     const output = chunks.join("")
     const cpStages = parseCpStages(output)
     const setOutputCp = parseSetOutputCp(output)
@@ -772,6 +1097,17 @@ async function runCase(backend: Backend, mode: Mode) {
       bridgeBun: proc?.runtimeBun ?? null,
       bridgePid: proc?.bridgePid ?? null,
       bridgeOverflow: proc?.bridgeOverflow ?? false,
+      stderrOverflow: proc?.stderrOverflow ?? false,
+      bridgeFailure: proc?.bridgeFailure ?? false,
+      bridgeError: proc?.bridgeError ? String(proc.bridgeError) : null,
+      ptyExitConfirmed: proc?.ptyExitConfirmed ?? false,
+      cleanupFailed: proc?.cleanupFailed ?? false,
+      cleanupReason: proc?.cleanupReason ?? null,
+      cleanupTransportError: proc?.cleanupTransportError ? String(proc.cleanupTransportError) : null,
+      bridgeExitCode: proc?.bridgeExitCode ?? null,
+      bridgeSignal: proc?.bridgeSignal ?? null,
+      earlyDataCount: proc?.earlyDataCount ?? 0,
+      earlyExitCount: proc?.earlyExitCount ?? 0,
       bridgeStderr: proc?.stderr ?? "",
       startedAt,
       durationMs: Date.now() - started,
@@ -821,6 +1157,17 @@ async function runCase(backend: Backend, mode: Mode) {
       bridgeRuntime: proc?.runtimeVersion ?? null,
       bridgeBun: proc?.runtimeBun ?? null,
       bridgeOverflow: proc?.bridgeOverflow ?? false,
+      stderrOverflow: proc?.stderrOverflow ?? false,
+      bridgeFailure: proc?.bridgeFailure ?? false,
+      bridgeError: proc?.bridgeError ? String(proc.bridgeError) : null,
+      ptyExitConfirmed: proc?.ptyExitConfirmed ?? false,
+      cleanupFailed: proc?.cleanupFailed ?? false,
+      cleanupReason: proc?.cleanupReason ?? null,
+      cleanupTransportError: proc?.cleanupTransportError ? String(proc.cleanupTransportError) : null,
+      bridgeExitCode: proc?.bridgeExitCode ?? null,
+      bridgeSignal: proc?.bridgeSignal ?? null,
+      earlyDataCount: proc?.earlyDataCount ?? 0,
+      earlyExitCount: proc?.earlyExitCount ?? 0,
       bridgeStderr: proc?.stderr ?? "",
       runnerPid: process.pid,
       outputBytes: result.output.length,
@@ -836,11 +1183,11 @@ async function runCase(backend: Backend, mode: Mode) {
     return result
   } finally {
     if (caseGuardTimer) clearTimeout(caseGuardTimer)
+    if (exitDrainTimer) clearTimeout(exitDrainTimer)
     dataSub?.dispose()
     exitSub?.dispose()
-    cleanupProc()
     try {
-      await proc?.close?.()
+      await cleanupProc()
     } catch {}
     try {
       if (workDir) rmSync(workDir, { recursive: true, force: true })
@@ -877,6 +1224,13 @@ describe("810 native ConPTY codepage probe (Windows only)", () => {
            expect(result.startupWriteError).toBeNull()
            expect(result.startupWriteTimedOut).toBe(false)
            expect(result.bridgeOverflow).toBe(false)
+           expect(result.bridgeFailure).toBe(false)
+           // Only the node bridge owns a joined cleanup and a confirmed PTY exit: the bun
+           // backend has neither, so neither is asserted here.
+           if (backend === "node") {
+             expect(result.cleanupFailed).toBe(false)
+             expect(result.ptyExitConfirmed).toBe(true)
+           }
            expect(result.output.includes("PROBE_DONE")).toBe(true)
            expect(result.observations.controlMarkersBalanced).toBe(true)
            expect(result.observations.allControlSectionsPresent).toBe(true)
@@ -1076,6 +1430,227 @@ describe("native codepage probe startup handshake (host-side)", () => {
   })
 
 
+// Arena scratch control: the whole parent-write control runs under Node so the outer
+// Bun pipe semantics never decide the outcome. The control spawns a Node grandchild,
+// writes 16 MiB to its stdin and reports the asynchronous stream error as JSON.
+const EPIPE_CONTROL_SCRIPT = `const { spawn } = require("node:child_process")
+
+const grandchild = spawn(
+  process.execPath,
+  ["-e", "require('node:fs').closeSync(0); process.stdout.write('ready\\\\n'); setInterval(() => {}, 1000)"],
+  { stdio: ["pipe", "pipe", "pipe"] },
+)
+
+let reported = false
+let timer = null
+const finish = (payload) => {
+  if (reported) return
+  reported = true
+  if (timer) clearTimeout(timer)
+  process.stdout.write(JSON.stringify(payload) + "\\n")
+  try { grandchild.kill("SIGKILL") } catch {}
+  const done = () => process.exit(0)
+  if (grandchild.exitCode !== null || grandchild.signalCode !== null) done()
+  else grandchild.once("close", done)
+}
+
+grandchild.stdin.on("error", (error) => {
+  finish({
+    epipe: true,
+    code: error && error.code ? String(error.code) : null,
+    message: String(error && error.message),
+  })
+})
+
+grandchild.stdout.once("data", () => {
+  try {
+    grandchild.stdin.write("x".repeat(16 * 1024 * 1024))
+  } catch (error) {
+    finish({ epipe: false, code: "SYNC_THROW", message: String(error) })
+  }
+})
+
+timer = setTimeout(() => {
+  finish({ epipe: false, code: "NO_ERROR", message: "no asynchronous stream error inside the control budget" })
+}, 4000)
+`
+
+function readControlReport(child: ChildProcess) {
+  return new Promise<{ epipe: boolean; code: string | null; message: string }>((resolve) => {
+    let buffer = ""
+    let settled = false
+    const settle = (value: { epipe: boolean; code: string | null; message: string }) => {
+      if (settled) return
+      settled = true
+      resolve(value)
+    }
+    child.stdout?.setEncoding("utf8")
+    child.stdout?.on("data", (chunk: string) => {
+      buffer += chunk
+      const index = buffer.indexOf("\n")
+      if (index < 0) return
+      try {
+        const parsed = JSON.parse(buffer.slice(0, index))
+        settle({ epipe: parsed.epipe === true, code: parsed.code ?? null, message: String(parsed.message ?? "") })
+      } catch (error) {
+        settle({ epipe: false, code: "PARSE_ERROR", message: String(error) })
+      }
+    })
+    child.on("close", () => settle({ epipe: false, code: "CONTROL_EXITED", message: "control exited without a report" }))
+  })
+}
+
+describe("native codepage probe bridge cleanup (host-side)", () => {
+  test("fails closed when the bridge and pty pids are unknown", async () => {
+    const cleanup = createBridgeCleanup({
+      bridgePid: undefined,
+      ptyPid: undefined,
+      bridgeAlive: () => false,
+      ptyExitConfirmed: () => false,
+      shutdown: () => {},
+      kill: () => {},
+      join: async () => true,
+    })
+    const outcome = await cleanup.run()
+    expect(outcome.ok).toBe(false)
+    expect(String(outcome.reason)).toContain("unknown")
+  })
+
+  test("fails closed when an unconfirmed pty exit is not verifiably gone", async () => {
+    const cleanup = createBridgeCleanup({
+      bridgePid: 4242,
+      ptyPid: 4243,
+      bridgeAlive: () => true,
+      ptyExitConfirmed: () => false,
+      killTree: async () => ({ killed: false, tree: false }),
+      isAlive: () => true,
+      shutdown: () => {},
+      kill: () => {},
+      join: async () => true,
+    })
+    const outcome = await cleanup.run()
+    expect(outcome.ok).toBe(false)
+    expect(String(outcome.reason)).toContain("pty child termination not confirmed")
+  })
+
+  test("passes when the pty exit was confirmed and the pid is already gone", async () => {
+    const cleanup = createBridgeCleanup({
+      bridgePid: 4242,
+      ptyPid: 4243,
+      bridgeAlive: () => false,
+      ptyExitConfirmed: () => true,
+      killTree: async () => ({ killed: false, tree: false }),
+      isAlive: () => false,
+      shutdown: () => {},
+      kill: () => {},
+      join: async () => true,
+    })
+    const outcome = await cleanup.run()
+    expect(outcome.ok).toBe(true)
+    expect(outcome.reason).toBeNull()
+  })
+
+  test("does not write to a bridge stdin that a tree kill already took down", async () => {
+    let shutdownCalls = 0
+    const cleanup = createBridgeCleanup({
+      bridgePid: 4242,
+      ptyPid: 4243,
+      bridgeAlive: () => true,
+      ptyExitConfirmed: () => true,
+      killTree: async () => ({ killed: true, tree: true }),
+      isAlive: () => false,
+      shutdown: () => {
+        shutdownCalls += 1
+      },
+      kill: () => {},
+      join: async () => true,
+    })
+    const outcome = await cleanup.run()
+    expect(outcome.ok).toBe(true)
+    expect(shutdownCalls).toBe(0)
+  })
+
+  test("bounds the whole cleanup with one shared deadline", async () => {
+    const cleanup = createBridgeCleanup({
+      bridgePid: 4242,
+      ptyPid: 4243,
+      bridgeAlive: () => false,
+      ptyExitConfirmed: () => true,
+      budgetMs: 200,
+      killTree: async () => ({ killed: true, tree: true }),
+      isAlive: () => false,
+      shutdown: () => {},
+      kill: () => {},
+      join: () => new Promise<boolean>(() => {}),
+    })
+    const started = Date.now()
+    const outcome = await cleanup.run()
+    const elapsed = Date.now() - started
+    expect(outcome.ok).toBe(false)
+    expect(elapsed).toBeLessThanOrEqual(2000)
+  })
+
+  test("fails closed when the bridge is gone and the pty pid is unknown", async () => {
+    // The 217 CI procPid case documents a zero pid: an unknown pid must never satisfy
+    // the cleanup on its own.
+    const cleanup = createBridgeCleanup({
+      bridgePid: undefined,
+      ptyPid: 0,
+      bridgeAlive: () => false,
+      ptyExitConfirmed: () => false,
+      killTree: async () => ({ killed: false, tree: false }),
+      isAlive: () => false,
+      shutdown: () => {},
+      kill: () => {},
+      join: async () => true,
+    })
+    const outcome = await cleanup.run()
+    expect(outcome.ok).toBe(false)
+    expect(String(outcome.reason)).toContain("pty child termination not confirmed")
+  })
+
+  test("passes with a confirmed pty exit even when the pty pid is unknown", async () => {
+    const cleanup = createBridgeCleanup({
+      bridgePid: undefined,
+      ptyPid: 0,
+      bridgeAlive: () => false,
+      ptyExitConfirmed: () => true,
+      killTree: async () => ({ killed: false, tree: false }),
+      isAlive: () => false,
+      shutdown: () => {},
+      kill: () => {},
+      join: async () => true,
+    })
+    const outcome = await cleanup.run()
+    expect(outcome.ok).toBe(true)
+    expect(outcome.reason).toBeNull()
+  })
+
+  test("runs the cleanup once for repeated calls", async () => {
+    let killTreeCalls = 0
+    const cleanup = createBridgeCleanup({
+      bridgePid: 4242,
+      ptyPid: 4243,
+      bridgeAlive: () => false,
+      ptyExitConfirmed: () => true,
+      killTree: async () => {
+        killTreeCalls += 1
+        return { killed: false, tree: false }
+      },
+      isAlive: () => false,
+      shutdown: () => {},
+      kill: () => {},
+      join: async () => true,
+    })
+    const first = cleanup.run()
+    const second = cleanup.run()
+    expect(second).toBe(first)
+    const outcome = await first
+    expect(outcome.ok).toBe(true)
+    expect(killTreeCalls).toBe(1)
+  })
+})
+
 describe("native codepage probe node runtime bridge (host-side)", () => {
   test("spawns through the actual Node runtime and captures output", async () => {
     const loaded = await loadSpawn("node")
@@ -1118,6 +1693,8 @@ describe("native codepage probe node runtime bridge (host-side)", () => {
         rows: 24,
       }) as RuntimeProc
       await new Promise((resolve) => setTimeout(resolve, 100))
+      expect(proc.earlyDataCount).toBeGreaterThan(0)
+      expect(proc.earlyExitCount).toBeGreaterThan(0)
       const chunks: string[] = []
       let exitCode: number | undefined
       proc.onData((chunk) => chunks.push(chunk))
@@ -1137,18 +1714,178 @@ describe("native codepage probe node runtime bridge (host-side)", () => {
   }, 10000)
 
   test("awaits inflight startup write jobs before dump", async () => {
-    const jobs = new Set<Promise<void>>()
+    const tracker = createStartupWriteTracker()
     let done = false
     const job = (async () => {
       await new Promise((resolve) => setTimeout(resolve, 150))
       done = true
     })()
-    jobs.add(job)
-    await Promise.race([
-      Promise.all([...jobs]).catch(() => {}),
-      new Promise((resolve) => setTimeout(resolve, 1000)),
-    ])
+    expect(tracker.tryAdd(job)).toBe(true)
+    await awaitStartupWrites(tracker, new Promise((resolve) => setTimeout(resolve, 1000)))
     expect(done).toBe(true)
+  })
+
+  test("records a nonzero bridge exit as failure", async () => {
+    const loaded = await loadSpawn("node")
+    let proc!: RuntimeProc
+    try {
+      proc = await loaded.spawn("node", ["-e", "setInterval(() => {}, 1000)"], {
+        name: "xterm-256color",
+        cols: 80,
+        rows: 24,
+      }) as RuntimeProc
+      const exits: number[] = []
+      proc.onExit((event) => exits.push(event.exitCode))
+      try { process.kill(proc.bridgePid!, "SIGKILL") } catch {}
+      const deadline = Date.now() + 5000
+      while (proc.bridgeFailure !== true && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 10))
+      }
+      expect(proc.bridgeFailure).toBe(true)
+      expect(exits.length).toBe(1)
+    } finally {
+      try { await (proc as RuntimeProc | undefined)?.close?.() } catch {}
+      loaded.close()
+    }
+  }, 10000)
+
+  test("bounds stderr capture for an oversized chunk", () => {
+    // The previous version wrote to the PTY child's stderr, which is PTY data rather than
+    // bridge stderr, so it never exercised the bridge capture path. Drive the same helper
+    // the real stderr handler uses instead.
+    const oversized = "x".repeat(2 * MAX_CAPTURE)
+
+    const single = appendBoundedCapture("", oversized, MAX_CAPTURE)
+    expect(single.buffer.length).toBeLessThanOrEqual(MAX_CAPTURE)
+    expect(single.overflow).toBe(true)
+
+    let buffer = ""
+    let overflow = false
+    for (let i = 0; i < 8; i++) {
+      const appended = appendBoundedCapture(buffer, oversized, MAX_CAPTURE)
+      buffer = appended.buffer
+      overflow = overflow || appended.overflow
+    }
+    expect(buffer.length).toBeLessThanOrEqual(MAX_CAPTURE)
+    expect(overflow).toBe(true)
+  })
+
+  test("reports exactly one nonzero exit when the bridge dies while the PTY is alive", async () => {
+    const loaded = await loadSpawn("node")
+    let proc!: RuntimeProc
+    try {
+      proc = await loaded.spawn("node", ["-e", "setInterval(() => {}, 1000)"], {
+        name: "xterm-256color",
+        cols: 80,
+        rows: 24,
+      }) as RuntimeProc
+      const exits: number[] = []
+      proc.onExit((event) => exits.push(event.exitCode))
+      try { process.kill(proc.bridgePid!, "SIGKILL") } catch {}
+      const deadline = Date.now() + 5000
+      while (exits.length === 0 && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 10))
+      }
+      expect(exits.length).toBe(1)
+      expect(exits[0]).toBeGreaterThan(0)
+      expect(proc.bridgeFailure).toBe(true)
+      expect(proc.ptyExitConfirmed).toBe(false)
+      const write = await proc.writeAndWait!("after-bridge-death", 1000)
+      expect(write.ok).toBe(false)
+      expect(write.timedOut).toBe(false)
+      expect(write.message.length).toBeGreaterThan(0)
+    } finally {
+      try { await (proc as RuntimeProc | undefined)?.close?.() } catch {}
+      loaded.close()
+    }
+  }, 10000)
+
+  test("marks the bridge failed when the parent stdin stream errors", async () => {
+    // The error is injected into the real bridge stdin stream, so the production
+    // handler is the one under test: it must flag the bridge failure, remember the
+    // error and settle the pending ack without a timeout.
+    let injected: ChildProcess | undefined
+    const loaded = await loadSpawn("node", {
+      spawnBridgeChild: () => {
+        const child = spawnProcess(
+          "node",
+          [
+            "-e",
+            "process.stdout.write(JSON.stringify({ type: 'spawned', pid: process.pid, runtimeVersion: process.version, runtimeBun: null }) + '\\n'); setInterval(() => {}, 1000)",
+          ],
+          { stdio: ["pipe", "pipe", "pipe"] },
+        )
+        // The hook must hand back a piped child: assert the pipes are present and fail
+        // before the bridge attaches any handler otherwise.
+        if (!child.stdin || !child.stdout || !child.stderr) {
+          try { child.kill() } catch {}
+          throw new Error("injected bridge child is missing pipe streams")
+        }
+        injected = child
+        return child
+      },
+    })
+    const uncaught: unknown[] = []
+    const onUncaught = (error: unknown) => {
+      uncaught.push(error)
+    }
+    process.on("uncaughtException", onUncaught)
+    let proc!: RuntimeProc
+    try {
+      proc = await loaded.spawn("node", ["-e", "process.exit(0)"], {
+        name: "xterm-256color",
+        cols: 80,
+        rows: 24,
+      }) as RuntimeProc
+      const injectedStdin = injected?.stdin
+      if (!injectedStdin) throw new Error("injected bridge child is missing its stdin pipe")
+      const pending = proc.writeAndWait!("pending-ack", 5000)
+      injectedStdin.emit("error", new Error("EPIPE: injected parent stdin failure"))
+      const write = await pending
+      expect(write.ok).toBe(false)
+      expect(write.timedOut).toBe(false)
+      expect(write.message).toContain("injected parent stdin failure")
+      expect(proc.bridgeFailure).toBe(true)
+      expect(String(proc.bridgeError)).toContain("injected parent stdin failure")
+      expect(uncaught).toHaveLength(0)
+    } finally {
+      process.off("uncaughtException", onUncaught)
+      try { await (proc as RuntimeProc | undefined)?.close?.() } catch {}
+      loaded.close()
+    }
+  }, 10000)
+
+  test("runs the asynchronous EPIPE control entirely under Node", async () => {
+    // The whole parent-write control runs in a Node child so the Bun parent pipe
+    // semantics never decide the outcome. The control spawns a Node grandchild,
+    // writes 16 MiB to its stdin and reports the asynchronous stream error as JSON.
+    const dir = mkdtempSync(path.join(tmpdir(), "silvercode-epipe-control-"))
+    const scriptPath = path.join(dir, "control.cjs")
+    writeFileSync(scriptPath, EPIPE_CONTROL_SCRIPT, "utf8")
+    const child = spawnProcess("node", [scriptPath], { stdio: ["pipe", "pipe", "pipe"] })
+    try {
+      const report = await readControlReport(child)
+      expect(report.epipe).toBe(true)
+      expect(String(report.code)).toContain("EPIPE")
+      if (child.exitCode === null && child.signalCode === null) {
+        await new Promise<void>((resolve) => { child.once("close", () => resolve()) })
+      }
+    } finally {
+      try { child.kill() } catch {}
+      try { rmSync(dir, { recursive: true, force: true }) } catch {}
+    }
+  }, 10000)
+
+  test("tracks startup write jobs with a four-job cap", async () => {
+    const tracker = createStartupWriteTracker()
+    const jobs = [1, 2, 3, 4, 5].map(() => new Promise<void>((resolve) => setTimeout(resolve, 10)))
+    expect(tracker.tryAdd(jobs[0])).toBe(true)
+    expect(tracker.tryAdd(jobs[1])).toBe(true)
+    expect(tracker.tryAdd(jobs[2])).toBe(true)
+    expect(tracker.tryAdd(jobs[3])).toBe(true)
+    expect(tracker.tryAdd(jobs[4])).toBe(false)
+    await Promise.all(tracker.snapshot())
+    expect(tracker.size).toBe(0)
   })
 
   test("constructs a file URL for the Node bridge source import", () => {
@@ -1166,8 +1903,12 @@ describe("native codepage probe node runtime bridge (host-side)", () => {
         rows: 24,
       }) as RuntimeProc
       try { process.kill(proc.bridgePid!) } catch {}
-      const result = await proc.writeAndWait!("never-acked", 50)
+      // The ack failure is driven by the bridge exit, not by a short timeout race: the
+      // budget stays inside the host test budget and the write must still fail without
+      // timing out.
+      const result = await proc.writeAndWait!("never-acked", 5000)
       expect(result.ok).toBe(false)
+      expect(result.timedOut).toBe(false)
     } finally {
       try { await (proc as RuntimeProc | undefined)?.close?.() } catch {}
       loaded.close()
