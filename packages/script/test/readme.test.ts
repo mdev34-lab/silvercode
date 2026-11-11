@@ -64,7 +64,7 @@ describe("README shell snippets", () => {
     const installs = [...readme.matchAll(/curl -fsSL (\S+)\/install \| bash/g)].map((m) => m[1]!)
     expect(installs.length).toBeGreaterThan(0)
     for (const base of installs) {
-      expect(base).toBe("https://github.com/mdev34-lab/alphacode/releases/latest/download")
+      expect(base).toBe("https://github.com/mdev34-lab/silvercode/releases/latest/download")
     }
   })
 })
