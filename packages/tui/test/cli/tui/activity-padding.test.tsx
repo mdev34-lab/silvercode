@@ -286,7 +286,7 @@ function failedToolPart(
     type: "tool",
     callID: id,
     tool,
-    state: { status: "error", input, output: "", title: "", error, metadata: {}, time: { start, end } },
+    state: { status: "error", input, error, metadata: {}, time: { start, end } },
   }
 }
 
