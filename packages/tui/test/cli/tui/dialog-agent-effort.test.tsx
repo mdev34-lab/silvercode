@@ -6,6 +6,7 @@ import { testRender, useRenderer } from "@opentui/solid"
 import { onCleanup, onMount, type JSX } from "solid-js"
 import { chmod, mkdir } from "node:fs/promises"
 import path from "node:path"
+import type { GlobalEvent, Session, SessionStatus } from "@opencode-ai/sdk/v2"
 import { tmpdir } from "../../fixture/fixture"
 import { captureFrame, captureSpans, waitFor, waitUntil } from "../../fixture/frame"
 import { createTuiResolvedConfig } from "../../fixture/tui-runtime"
@@ -46,7 +47,11 @@ const SESSION_THOROUGH = "ses_effort_thorough"
 const SESSION_FAST = "ses_effort_fast"
 const SESSION_PLAIN = "ses_effort_plain"
 
-function sessionRow(id: string, metadata?: Record<string, unknown>) {
+function sessionRow(
+  id: string,
+  metadata?: Record<string, unknown>,
+  model?: { providerID: string; id: string; variant?: string },
+) {
   return {
     id,
     slug: id,
@@ -56,6 +61,7 @@ function sessionRow(id: string, metadata?: Record<string, unknown>) {
     directory,
     time: { created: 0, updated: 0 },
     metadata,
+    model,
   }
 }
 
@@ -132,6 +138,8 @@ type Harness = {
   // Bodies of the session.create calls a home submit issued.
   creates: Record<string, unknown>[]
   sessions: ReturnType<typeof sessionRow>[]
+  // Emit server events (session.status, session.updated) into the synced store.
+  events: ReturnType<typeof createEventSource>
   // Gated mode only: answer PATCH number `index` (and emit its session.updated event), or fail it.
   release: (index: number, outcome?: "ok" | "fail") => void
   dispose: () => Promise<void>
@@ -143,6 +151,8 @@ async function mountEffort(input: {
   children: () => JSX.Element
   agentVariant?: string
   configEffort?: "fast" | null
+  // Replaces the default three sessions; the first is not required to be the routed one.
+  sessions?: ReturnType<typeof sessionRow>[]
   // Hold every session.update PATCH until the test releases it.
   gated?: boolean
   // Reuse a state directory (restart coverage); a fresh tmpdir is created otherwise.
@@ -157,7 +167,7 @@ async function mountEffort(input: {
 
   const events = createEventSource()
   const agentModel = parseModel(input.model)
-  const sessions = [
+  const sessions = input.sessions ?? [
     sessionRow(SESSION_THOROUGH, { agentEffort: "thorough", task: "keep-me" }),
     sessionRow(SESSION_FAST, { agentEffort: "fast", task: "keep-me" }),
     sessionRow(SESSION_PLAIN),
@@ -322,6 +332,7 @@ async function mountEffort(input: {
     updates,
     creates,
     sessions,
+    events,
     release(index, outcome = "ok") {
       gates[index](outcome)
     },
@@ -1686,7 +1697,198 @@ describe("agent effort selector", () => {
       }
     }
   })
+})
 
+// The #831 boundary: while the routed session waits out a retry backoff, a
+// provider/model switch must be persisted through session.update so the
+// server cancels the backoff and the next attempt uses the new selection,
+// instead of only changing what the TUI displays. The same harness as the
+// effort selector drives the real LocalProvider effect and captures the real
+// SDK PATCH.
+describe("model selection propagation", () => {
+  const SESSION_RUN = "ses_model_push_retry"
+  const SESSION_OTHER = "ses_model_push_other"
+  // The model the failed turn ran with, persisted on the session row.
+  const runModel = { providerID: "test-provider", id: "variant-model", variant: "default" }
 
+  function retryStatus(attempt: number): SessionStatus {
+    return { type: "retry", attempt, message: "Rate limit exceeded", next: Date.now() + 30_000 }
+  }
 
+  function statusEvent(sessionID: string, status: SessionStatus): GlobalEvent {
+    const tag = status.type === "retry" ? `retry_${status.attempt}` : status.type
+    return {
+      directory,
+      project: "proj_test",
+      payload: { id: `evt_status_${sessionID}_${tag}`, type: "session.status", properties: { sessionID, status } },
+    }
+  }
+
+  function rowEvent(id: string, info: Session): GlobalEvent {
+    return {
+      directory,
+      project: "proj_test",
+      payload: { id, type: "session.updated", properties: { sessionID: info.id, info } },
+    }
+  }
+
+  test("pushes a mid-backoff model switch to the retrying session exactly once", async () => {
+    const harness = await mountEffort({
+      route: { type: "session", sessionID: SESSION_RUN },
+      model: "test-provider/variant-model",
+      children: () => null,
+      sessions: [sessionRow(SESSION_RUN, undefined, runModel), sessionRow(SESSION_OTHER)],
+    })
+    try {
+      harness.events.emit(statusEvent(SESSION_RUN, retryStatus(2)))
+      await waitUntil(() => harness.sync.data.session_status[SESSION_RUN]?.type === "retry")
+
+      // The user switches models mid-backoff: the selection must reach the
+      // persisted row, and the visible selection follows immediately.
+      harness.local.model.set({ providerID: "test-provider", modelID: "plain-model" })
+      await waitUntil(() => harness.updates.length >= 1)
+      expect(harness.updates).toEqual([
+        { sessionID: SESSION_RUN, body: { model: { providerID: "test-provider", id: "plain-model" } } },
+      ])
+      expect(harness.local.model.current()).toEqual({ providerID: "test-provider", modelID: "plain-model" })
+
+      // The scripted server answers the PATCH but never syncs the new model
+      // into the row, so the same update keeps being recomputed: a fresh
+      // status event for the same backoff and repeating the unchanged
+      // selection must not re-send it.
+      harness.events.emit(statusEvent(SESSION_RUN, retryStatus(3)))
+      harness.local.model.set({ providerID: "test-provider", modelID: "plain-model" })
+      await Bun.sleep(100)
+      expect(harness.updates.length).toBe(1)
+
+      // Once the row itself catches up with the pushed model, the unchanged
+      // selection stays silent through row-driven churn too.
+      harness.events.emit(
+        rowEvent("evt_row_caught_up", {
+          ...harness.sessions[0],
+          model: { providerID: "test-provider", id: "plain-model" },
+        }),
+      )
+      await waitUntil(() => harness.sync.session.get(SESSION_RUN)?.model?.id === "plain-model")
+      harness.local.model.set({ providerID: "test-provider", modelID: "plain-model" })
+      await Bun.sleep(100)
+      expect(harness.updates.length).toBe(1)
+    } finally {
+      await harness.dispose()
+    }
+  })
+
+  test("never pushes for an idle routed session while another session retries", async () => {
+    const harness = await mountEffort({
+      route: { type: "session", sessionID: SESSION_RUN },
+      model: "test-provider/variant-model",
+      children: () => null,
+      sessions: [sessionRow(SESSION_RUN, undefined, runModel), sessionRow(SESSION_OTHER)],
+    })
+    try {
+      // The backoff belongs to another session; the routed one is idle.
+      harness.events.emit(statusEvent(SESSION_RUN, { type: "idle" }))
+      harness.events.emit(statusEvent(SESSION_OTHER, retryStatus(2)))
+      await waitUntil(() => harness.sync.data.session_status[SESSION_OTHER]?.type === "retry")
+
+      harness.local.model.set({ providerID: "test-provider", modelID: "plain-model" })
+      await Bun.sleep(100)
+      expect(harness.updates).toEqual([])
+    } finally {
+      await harness.dispose()
+    }
+  })
+
+  test("a rejected push warns once and stays quiet until the selection really changes", async () => {
+    const harness = await mountEffort({
+      route: { type: "session", sessionID: SESSION_RUN },
+      model: "test-provider/variant-model",
+      children: () => null,
+      gated: true,
+      sessions: [sessionRow(SESSION_RUN, undefined, runModel), sessionRow(SESSION_OTHER)],
+    })
+    try {
+      harness.events.emit(statusEvent(SESSION_RUN, retryStatus(2)))
+      harness.local.model.set({ providerID: "test-provider", modelID: "plain-model" })
+      await waitUntil(() => harness.updates.length >= 1)
+      harness.release(0, "fail")
+      await frameWhere(harness.app, (f) => f.includes("Failed to apply model to the running session"), "failure toast")
+
+      // An unrelated signal for the same backoff must not retry the
+      // rejected write.
+      harness.events.emit(statusEvent(SESSION_RUN, retryStatus(3)))
+      await Bun.sleep(100)
+      expect(harness.updates.length).toBe(1)
+
+      // A genuinely different selection still pushes after a failure.
+      harness.local.model.set({ providerID: "test-provider", modelID: "variant-model" })
+      harness.local.model.variant.set("high")
+      await waitUntil(() => harness.updates.length >= 2)
+      expect(harness.updates[1]).toEqual({
+        sessionID: SESSION_RUN,
+        body: { model: { providerID: "test-provider", id: "variant-model", variant: "high" } },
+      })
+      harness.release(1)
+      await Bun.sleep(100)
+      expect(harness.updates.length).toBe(2)
+    } finally {
+      await harness.dispose()
+    }
+  })
+
+  test("keeps a rejected push suppressed across home navigation and other sessions", async () => {
+    const harness = await mountEffort({
+      route: { type: "session", sessionID: SESSION_RUN },
+      model: "test-provider/variant-model",
+      children: () => null,
+      gated: true,
+      sessions: [sessionRow(SESSION_RUN, undefined, runModel), sessionRow(SESSION_OTHER, undefined, runModel)],
+    })
+    try {
+      harness.events.emit(statusEvent(SESSION_RUN, retryStatus(2)))
+      harness.local.model.set({ providerID: "test-provider", modelID: "plain-model" })
+      await waitUntil(() => harness.updates.length >= 1)
+      harness.release(0, "fail")
+      await frameWhere(harness.app, (f) => f.includes("Failed to apply model to the running session"), "failure toast")
+
+      // Leaving the session hides it, but the rejected push is still pending:
+      // the stored row never caught up and the selection never moved.
+      harness.route.navigate({ type: "home" })
+      await waitUntil(() => harness.route.data.type === "home")
+      harness.route.navigate({ type: "session", sessionID: SESSION_RUN })
+      await waitUntil(() => harness.route.data.type === "session" && harness.route.data.sessionID === SESSION_RUN)
+      harness.local.model.set({ providerID: "test-provider", modelID: "plain-model" })
+      await Bun.sleep(100)
+      expect(harness.updates.length).toBe(1)
+
+      // Isolation: another retrying session with the same selection has its
+      // own lifecycle, so it still pushes.
+      harness.events.emit(statusEvent(SESSION_OTHER, retryStatus(2)))
+      await waitUntil(() => harness.sync.data.session_status[SESSION_OTHER]?.type === "retry")
+      harness.route.navigate({ type: "session", sessionID: SESSION_OTHER })
+      await waitUntil(() => harness.route.data.type === "session" && harness.route.data.sessionID === SESSION_OTHER)
+      await waitUntil(() => harness.updates.length >= 2)
+      expect(harness.updates[1]).toEqual({
+        sessionID: SESSION_OTHER,
+        body: { model: { providerID: "test-provider", id: "plain-model" } },
+      })
+      harness.release(1)
+
+      // A real selection change on the original session still pushes.
+      harness.route.navigate({ type: "session", sessionID: SESSION_RUN })
+      await waitUntil(() => harness.route.data.type === "session" && harness.route.data.sessionID === SESSION_RUN)
+      harness.local.model.set({ providerID: "test-provider", modelID: "variant-model" })
+      harness.local.model.variant.set("high")
+      await waitUntil(() => harness.updates.length >= 3)
+      expect(harness.updates[2]).toEqual({
+        sessionID: SESSION_RUN,
+        body: { model: { providerID: "test-provider", id: "variant-model", variant: "high" } },
+      })
+      harness.release(2)
+      await Bun.sleep(100)
+      expect(harness.updates.length).toBe(3)
+    } finally {
+      await harness.dispose()
+    }
+  })
 })

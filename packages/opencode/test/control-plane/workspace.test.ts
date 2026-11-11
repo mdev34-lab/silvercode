@@ -4,7 +4,7 @@ import fs from "node:fs/promises"
 import Http from "node:http"
 import path from "node:path"
 import { NodeHttpServer } from "@effect/platform-node"
-import { Effect, Exit, Fiber, Layer, Schema } from "effect"
+import { Cause, Effect, Exit, Fiber, Latch, Layer, Schema } from "effect"
 import { HttpServer, HttpServerRequest, HttpServerResponse } from "effect/unstable/http"
 import { eq } from "drizzle-orm"
 import { GlobalBus, type GlobalEvent } from "@/bus/global"
@@ -1118,6 +1118,196 @@ describe("workspace CRUD", () => {
   })
 })
 
+type SyncHistoryPhase =
+  | "server.setup"
+  | "fixture.bootstrap"
+  | "session.local"
+  | "sync.start"
+  | "history.observed"
+  | "history.responded"
+  | "replay.wait"
+  | "replay.assertions"
+  | "workspace.remove"
+  | "replay.event-id"
+  | "capture.dispose"
+  | "capture.disposed"
+  | "fixture.returned"
+  | "exit.finalization"
+
+type SyncHistoryDiagnostic = {
+  phase: SyncHistoryPhase
+  breadcrumbs: SyncHistoryPhase[]
+  counts: Partial<Record<SyncHistoryPhase, number>>
+  fiberId: number
+  cause: {
+    Fail: number
+    Die: number
+    Interrupt: number
+    interruptors: (number | undefined)[]
+  }
+}
+
+function syncHistoryDiagnostics(
+  report: (diagnostic: SyncHistoryDiagnostic) => Effect.Effect<unknown, unknown> = (diagnostic) =>
+    Effect.sync(() => console.error("[workspace-sync-history]", JSON.stringify(diagnostic))),
+) {
+  let phase: SyncHistoryPhase = "server.setup"
+  const breadcrumbs: SyncHistoryPhase[] = []
+  const counts: SyncHistoryDiagnostic["counts"] = {}
+  const note = (next: SyncHistoryPhase) => {
+    counts[next] = Math.min(32, (counts[next] ?? 0) + 1)
+    if (breadcrumbs.length === 16) breadcrumbs.shift()
+    breadcrumbs.push(next)
+  }
+  return {
+    phase(next: SyncHistoryPhase) {
+      phase = next
+      note(next)
+    },
+    note,
+    observe: <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+      effect.pipe(
+        Effect.onExit((exit) =>
+          Effect.withFiber((fiber) =>
+            Effect.suspend(() => {
+              note("exit.finalization")
+              if (Exit.isSuccess(exit)) return Effect.void
+              const cause: SyncHistoryDiagnostic["cause"] = { Fail: 0, Die: 0, Interrupt: 0, interruptors: [] }
+              for (const reason of exit.cause.reasons) {
+                cause[reason._tag] = Math.min(32, cause[reason._tag] + 1)
+                if (Cause.isInterruptReason(reason) && cause.interruptors.length < 8) {
+                  cause.interruptors.push(reason.fiberId)
+                }
+              }
+              return report({ phase, breadcrumbs: [...breadcrumbs], counts: { ...counts }, fiberId: fiber.id, cause })
+            }),
+          ).pipe(Effect.exit, Effect.asVoid, Effect.uninterruptible),
+        ),
+      ),
+  }
+}
+
+describe("sync history diagnostics", () => {
+  test("keeps success quiet and preserves the value and scoped cleanup", async () => {
+    const reports: SyncHistoryDiagnostic[] = []
+    const cleanup: string[] = []
+    const diagnostic = syncHistoryDiagnostics((report) => Effect.sync(() => reports.push(report)))
+    const result = await Effect.runPromise(
+      Effect.gen(function* () {
+        yield* Effect.addFinalizer(() => Effect.sync(() => cleanup.push("scope")))
+        diagnostic.phase("session.local")
+        return 7
+      }).pipe(Effect.ensuring(Effect.sync(() => cleanup.push("body"))), diagnostic.observe, Effect.scoped),
+    )
+    expect(result).toBe(7)
+    expect(reports).toEqual([])
+    expect(cleanup).toEqual(["body", "scope"])
+  })
+
+  test("preserves the failure cause and cleanup with bounded, redacted breadcrumbs", async () => {
+    const reports: SyncHistoryDiagnostic[] = []
+    const cleanup: string[] = []
+    const diagnostic = syncHistoryDiagnostics((report) => Effect.sync(() => reports.push(report)))
+    const secret = new Error("synthetic private payload")
+    const cause = Cause.combine(Cause.fail(secret), Cause.die(secret))
+    const exit = await Effect.runPromiseExit(
+      Effect.gen(function* () {
+        yield* Effect.addFinalizer(() => Effect.sync(() => cleanup.push("scope")))
+        diagnostic.phase("replay.wait")
+        for (let n = 0; n < 40; n++) diagnostic.note("history.observed")
+        return yield* Effect.failCause(cause).pipe(
+          Effect.ensuring(
+            Effect.sync(() => {
+              diagnostic.note("capture.dispose")
+              cleanup.push("capture")
+              diagnostic.note("capture.disposed")
+            }),
+          ),
+        )
+      }).pipe(diagnostic.observe, Effect.scoped),
+    )
+    expect(Exit.isFailure(exit)).toBe(true)
+    if (Exit.isFailure(exit)) expect(exit.cause).toBe(cause)
+    expect(cleanup).toEqual(["capture", "scope"])
+    expect(reports).toHaveLength(1)
+    expect(reports[0]).toMatchObject({
+      phase: "replay.wait",
+      counts: { "history.observed": 32, "capture.dispose": 1, "capture.disposed": 1, "exit.finalization": 1 },
+      cause: { Fail: 1, Die: 1, Interrupt: 0, interruptors: [] },
+    })
+    expect(reports[0]!.breadcrumbs).toHaveLength(16)
+    expect(JSON.stringify(reports)).not.toContain(secret.message)
+  })
+
+  test("reports real interruption without consuming it or skipping cleanup", async () => {
+    const reports: SyncHistoryDiagnostic[] = []
+    const cleanup: string[] = []
+    const diagnostic = syncHistoryDiagnostics((report) =>
+      Effect.sync(() => {
+        cleanup.push("report")
+        reports.push(report)
+      }),
+    )
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const ready = yield* Latch.make()
+        const interruptor = yield* Effect.withFiber((fiber) => Effect.succeed(fiber.id))
+        const child = yield* Effect.forkChild(
+          Effect.gen(function* () {
+            yield* Effect.addFinalizer(() => Effect.sync(() => cleanup.push("scope")))
+            diagnostic.phase("replay.wait")
+            yield* ready.open
+            return yield* Effect.never
+          }).pipe(Effect.ensuring(Effect.sync(() => cleanup.push("body"))), diagnostic.observe, Effect.scoped),
+        )
+        yield* ready.await
+        yield* Fiber.interrupt(child)
+        const exit = yield* Fiber.await(child)
+        expect(Exit.isFailure(exit)).toBe(true)
+        if (Exit.isFailure(exit)) expect(Cause.hasInterruptsOnly(exit.cause)).toBe(true)
+        expect(reports).toHaveLength(1)
+        expect(reports[0]).toMatchObject({ phase: "replay.wait", fiberId: child.id, cause: { Fail: 0, Die: 0 } })
+        expect(reports[0]!.cause.Interrupt).toBeGreaterThan(0)
+        expect(reports[0]!.cause.interruptors).toContain(interruptor)
+      }),
+    )
+    expect(cleanup).toEqual(["body", "report", "scope"])
+  })
+
+  test("reporter throws, failures, defects and interruption never replace the original cause", async () => {
+    const original = new Error("original failure")
+    const broken = new Error("reporter failure")
+    const reporters = [
+      () => {
+        throw broken
+      },
+      () => Effect.fail(broken),
+      () => Effect.die(broken),
+      () => Effect.interrupt,
+    ]
+    for (const cause of [Cause.fail(original), Cause.die(original), Cause.interrupt()]) {
+      for (const reporter of reporters) {
+        const cleanup: string[] = []
+        let calls = 0
+        const diagnostic = syncHistoryDiagnostics(() => {
+          calls++
+          return reporter()
+        })
+        const exit = await Effect.runPromiseExit(
+          Effect.gen(function* () {
+            yield* Effect.addFinalizer(() => Effect.sync(() => cleanup.push("scope")))
+            return yield* Effect.failCause(cause)
+          }).pipe(Effect.ensuring(Effect.sync(() => cleanup.push("body"))), diagnostic.observe, Effect.scoped),
+        )
+        expect(Exit.isFailure(exit)).toBe(true)
+        if (Exit.isFailure(exit)) expect(exit.cause).toBe(cause)
+        expect(calls).toBe(1)
+        expect(cleanup).toEqual(["body", "scope"])
+      }
+    }
+  })
+})
+
 describe("workspace sync state", () => {
   it.instance(
     "startWorkspaceSyncing is disabled by the experimental workspace flag",
@@ -1386,11 +1576,13 @@ describe("workspace sync state", () => {
   )
 
   it.live("sync history sends the local sequence fence and replays returned events in workspace context", () => {
+    const diagnostic = syncHistoryDiagnostics()
     const historyBodies: unknown[] = []
     let historySessionID: SessionID | undefined
     let historySession: SessionNs.Info | undefined
     let historyNextSeq = 0
     return Effect.gen(function* () {
+      diagnostic.phase("server.setup")
       yield* HttpServer.serveEffect()(
         Effect.gen(function* () {
           const req = yield* HttpServerRequest.HttpServerRequest
@@ -1398,8 +1590,9 @@ describe("workspace sync state", () => {
           const url = new URL(req.url, "http://localhost")
           if (url.pathname === "/history/global/event") return HttpServerResponse.fromWeb(eventStreamResponse())
           if (url.pathname === "/history/sync/history") {
+            diagnostic.note("history.observed")
             historyBodies.push(bodyText ? JSON.parse(bodyText) : undefined)
-            return HttpServerResponse.fromWeb(
+            const response = HttpServerResponse.fromWeb(
               Response.json([
                 {
                   id: EventV2.ID.create(),
@@ -1410,17 +1603,21 @@ describe("workspace sync state", () => {
                 },
               ]),
             )
+            diagnostic.note("history.responded")
+            return response
           }
           return HttpServerResponse.text("unexpected", { status: 500 })
         }),
       )
       const url = yield* serverUrl()
+      diagnostic.phase("fixture.bootstrap")
       yield* provideTmpdirInstance(
         () =>
           Effect.gen(function* () {
             const workspace = yield* Workspace.Service
             const sessionSvc = yield* SessionNs.Service
             const instance = yield* requireInstance
+            diagnostic.phase("session.local")
             const captured = captureGlobalEvents()
             try {
               const type = unique("history-replay")
@@ -1433,13 +1630,16 @@ describe("workspace sync state", () => {
               historySession = { ...session, workspaceID: info.id, title: "from history" }
               historyNextSeq = ((yield* sessionSequence(session.id)) ?? -1) + 1
 
+              diagnostic.phase("sync.start")
               yield* workspace.startWorkspaceSyncing(instance.project.id)
 
+              diagnostic.phase("replay.wait")
               yield* eventuallyEffect(
                 Effect.gen(function* () {
                   expect((yield* sessionSvc.get(session.id).pipe(Effect.orDie)).title).toBe("from history")
                 }),
               )
+              diagnostic.phase("replay.assertions")
               expect(historyBodies).toEqual([{ [session.id]: historyNextSeq - 1 }])
               expect(
                 captured.events.some(
@@ -1450,18 +1650,23 @@ describe("workspace sync state", () => {
                     event.payload.properties.info.title === "from history",
                 ),
               ).toBe(true)
+              diagnostic.phase("workspace.remove")
               yield* workspace.remove(info.id)
+              diagnostic.phase("replay.event-id")
               const replayed = captured.events.find(
                 (event) => event.workspace === info.id && event.payload.type === "session.updated",
               )
               expectEventID(replayed?.payload.id)
             } finally {
+              diagnostic.note("capture.dispose")
               captured.dispose()
+              diagnostic.note("capture.disposed")
             }
           }),
         { git: true },
       )
-    })
+      diagnostic.note("fixture.returned")
+    }).pipe(diagnostic.observe)
   })
 
   it.live("SSE forwards non-heartbeat events and ignores heartbeats", () =>
