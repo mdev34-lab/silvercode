@@ -8,6 +8,7 @@ import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
+import type { Opts, Proc } from "../../src/pty/pty"
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const helper = path.join(here, "native-codepage-probe-helper.ps1")
@@ -24,13 +25,7 @@ type Backend = (typeof backends)[number]
 type Mode = (typeof modes)[number]
 type CpStage = { stage: string; input: number; output: number }
 type SetOutputCp = { requested: number; success: boolean; lastError: number }
-type Proc = {
-  pid: number
-  onData: (listener: (chunk: string) => void) => { dispose: () => void }
-  onExit: (listener: (event: { exitCode: number }) => void) => { dispose: () => void }
-  kill: () => void
-}
-type Spawn = (file: string, args: string[], opts: Record<string, unknown>) => Proc
+type Spawn = (file: string, args: string[], opts: Opts) => Proc
 
 const windowsTest = process.platform === "win32" ? test : test.skip
 
@@ -52,10 +47,10 @@ function powershellPath() {
 async function loadSpawn(backend: Backend): Promise<Spawn> {
   if (backend === "node") {
     const mod = await import("../../src/pty/pty.node.ts")
-    return mod.spawn as Spawn
+    return mod.spawn
   }
-    const mod = await import("../../src/pty/pty.bun.ts")
-  return mod.spawn as Spawn
+  const mod = await import("../../src/pty/pty.bun.ts")
+  return mod.spawn
 }
 
 function childEnv() {
