@@ -18,13 +18,13 @@ import {
 } from "../../fixture/session-route"
 import { captureSpans } from "../../fixture/frame"
 
-// Activity block spacing contract, as corrected: one blank terminal row
-// BETWEEN activity blocks and nowhere else. A block header is joined to the
-// block's own detail rows — the first detail row follows its header with no
-// blank row between them (a tool panel's own padding and gap rows belong to the
-// panel, they are not a separator) — and every detail line shares one compact
-// two-column inner indent under the header. Rows outside a block (a lone tool
-// call, a non-work call, assistant text) keep the transcript's own spacing.
+// Activity block spacing contract: one blank terminal row between activity
+// blocks; in an expanded block that mixes Thought and tool details, one blank
+// row between successive semantic units. A header stays joined to its first
+// detail row, tool-only blocks stay compact, and preview/body lines keep their
+// own anatomy. Every detail line shares one compact two-column inner indent
+// under the header. Rows outside a block (a lone tool call, a non-work call,
+// assistant text) keep the transcript's own spacing.
 //
 // These tests mount the real `<Session />` route and read the rendered
 // character frame, so they measure the rows a user sees rather than the props
@@ -247,6 +247,87 @@ function mountThought(size: keyof typeof SIZES, options: { nested: boolean; mode
     sessions: [session],
     messages,
     kv: { activity_groups_expanded: true, thinking_mode: options.mode ?? "show" },
+  })
+}
+
+// The #816 report is a single Edited block whose semantic rows are interleaved:
+// Thought, an expanded write preview, Thought, a failed edit, Thought. Keep the
+// write preview deliberately long so the mounted frame proves the three-line
+// preview is intact at normal 130 and narrow 80 columns.
+const MIXED_SIZES = {
+  normal: { width: 130, height: 36 },
+  narrow: { width: 80, height: 36 },
+} as const
+const MIXED_PATH = `src${path.sep}mixed.ts`
+const MIXED_HEADER = "Edited 1 file"
+const MIXED_THOUGHTS = ["Thought: Prepare the write", "Thought: Check the preview", "Thought: Reassess the failure"]
+const MIXED_WRITE_LINES = Array.from({ length: 15 }, (_, index) => `const line${String(index + 1).padStart(2, "0")} = ${index + 1}`)
+const MIXED_WRITE_FIRST = MIXED_WRITE_LINES[0]!
+const MIXED_WRITE_THIRD = MIXED_WRITE_LINES[2]!
+const MIXED_WRITE_FOURTH = MIXED_WRITE_LINES[3]!
+const MIXED_WRITE_LAST = MIXED_WRITE_LINES.at(-1)!
+const MIXED_WRITE_TITLE = `# Wrote ${MIXED_PATH}`
+const MIXED_EDIT = `← Edit ${MIXED_PATH}`
+const MIXED_EDIT_ERROR = "could not find the expected replacement"
+
+function failedToolPart(
+  id: string,
+  messageID: string,
+  tool: string,
+  input: Record<string, unknown>,
+  error: string,
+  start: number,
+  end: number,
+): ToolPart {
+  return {
+    id,
+    sessionID: SESSION,
+    messageID,
+    type: "tool",
+    callID: id,
+    tool,
+    state: { status: "error", input, output: "", title: "", error, metadata: {}, time: { start, end } },
+  }
+}
+
+function mountMixedActivity(size: keyof typeof MIXED_SIZES, expanded: boolean) {
+  const session = sessionInfo(SESSION, { title: "Keep activity detail spacing readable" })
+  const user = userMessage("msg_00_user", SESSION)
+  const work = assistantMessage("msg_01_work", SESSION, { time: { created: at(1), completed: at(8) } })
+  const parts: Part[] = [
+    reasoningPart(work.id, "prt_mixed_thought_1", "**Prepare the write**", at(1), at(1.2)),
+    toolPart(
+      "prt_mixed_write",
+      work.id,
+      "write",
+      { filePath: "src/mixed.ts", content: MIXED_WRITE_LINES.join("\n") },
+      { diagnostics: [] },
+      at(1.2),
+      at(3),
+    ),
+    reasoningPart(work.id, "prt_mixed_thought_2", "**Check the preview**", at(3), at(3.2)),
+    failedToolPart(
+      "prt_mixed_edit",
+      work.id,
+      "edit",
+      { filePath: "src/mixed.ts", oldString: "const missing = true", newString: "const found = true" },
+      MIXED_EDIT_ERROR,
+      at(3.2),
+      at(5),
+    ),
+    reasoningPart(work.id, "prt_mixed_thought_3", "**Reassess the failure**", at(5), at(5.2)),
+  ]
+  const messages: NonNullable<MountOptions["messages"]> = {
+    [SESSION]: [
+      { info: user, parts: [textPart("prt_user", user, "Keep the detail spacing readable")] },
+      { info: work, parts },
+    ],
+  }
+  return mountSessionRoute({
+    ...MIXED_SIZES[size],
+    sessions: [session],
+    messages,
+    kv: { activity_groups_expanded: expanded, thinking_mode: "hide" },
   })
 }
 
@@ -597,6 +678,112 @@ async function capture(app: Awaited<ReturnType<typeof mountSessionRoute>>["app"]
 }
 
 describe("activity block spacing", () => {
+  test("normal 130: mixed Thought/write preview/Thought/failed Edit/Thought separates units and keeps controls", async () => {
+    const { app } = await mountMixedActivity("normal", false)
+    await settle(app)
+    const collapsed = await settledFrame(app, `+ ${MIXED_HEADER}`)
+    expect(collapsed).not.toContain(MIXED_THOUGHTS[0]!)
+    expect(collapsed).not.toContain(MIXED_WRITE_TITLE)
+
+    const collapsedRows = collapsed.split("\n")
+    const collapsedRow = collapsedRows.findIndex((line) => line.includes(`+ ${MIXED_HEADER}`))
+    expect(collapsedRow).toBeGreaterThan(-1)
+    await app.mockMouse.click(collapsedRows[collapsedRow]!.indexOf(`+ ${MIXED_HEADER}`) + 2, collapsedRow)
+    await settle(app)
+    let frame = await settledFrame(app, MIXED_THOUGHTS[2]!)
+    await capture(app, "issue816-mixed-normal-expanded")
+
+    const anchor = `− ${MIXED_HEADER}`
+    // Header-first remains compact; after that every Thought/tool unit has one
+    // blank terminal row. The write panel's own title, three preview rows and
+    // affordance stay consecutive.
+    expectNoBlankRowBetween(frame, anchor, anchor, MIXED_THOUGHTS[0]!)
+    expectOneBlankRowBetween(frame, anchor, MIXED_THOUGHTS[0]!, MIXED_WRITE_TITLE)
+    expectNoBlankRowBetween(frame, anchor, MIXED_WRITE_TITLE, MIXED_WRITE_FIRST)
+    expectNoBlankRowBetween(frame, anchor, MIXED_WRITE_THIRD, "Click to expand")
+    expectOneBlankRowBetween(frame, anchor, "Click to expand", MIXED_THOUGHTS[1]!)
+    expectOneBlankRowBetween(frame, anchor, MIXED_THOUGHTS[1]!, MIXED_EDIT)
+    expectOneBlankRowBetween(frame, anchor, MIXED_EDIT, MIXED_THOUGHTS[2]!)
+    expect(frame).toContain(MIXED_WRITE_FIRST)
+    expect(frame).toContain(MIXED_WRITE_THIRD)
+    expect(frame).not.toContain(MIXED_WRITE_FOURTH)
+    expect(frame).not.toContain(MIXED_EDIT_ERROR)
+    expect(columnOf(frame, `+ ${MIXED_THOUGHTS[0]!}`)).toBe(columnOf(frame, anchor) + 2)
+    expect(columnOf(frame, MIXED_EDIT)).toBe(columnOf(frame, anchor) + 2)
+
+    // A 15-line Write is initially a three-line preview; its native expand and
+    // collapse behavior still works without changing the semantic separators.
+    let rows = frame.split("\n")
+    let row = rows.findIndex((line) => line.includes("Click to expand"))
+    expect(row).toBeGreaterThan(-1)
+    await app.mockMouse.click(rows[row]!.indexOf("Click to expand") + 2, row)
+    await settle(app)
+    frame = await settledFrame(app, MIXED_WRITE_LAST)
+    expect(frame).toContain("Click to collapse")
+    expectOneBlankRowBetween(frame, anchor, "Click to collapse", MIXED_THOUGHTS[1]!)
+
+    rows = frame.split("\n")
+    row = rows.findIndex((line) => line.includes("Click to collapse"))
+    expect(row).toBeGreaterThan(-1)
+    await app.mockMouse.click(rows[row]!.indexOf("Click to collapse") + 2, row)
+    await settle(app)
+    frame = await settledFrame(app, "Click to expand")
+    expect(frame).not.toContain(MIXED_WRITE_LAST)
+
+    // Failed edits remain clickable. Its error expands inside that semantic
+    // unit, while the exactly-one-row boundary to the final Thought remains.
+    rows = frame.split("\n")
+    row = rows.findIndex((line) => line.includes(MIXED_EDIT))
+    expect(row).toBeGreaterThan(-1)
+    await app.mockMouse.click(rows[row]!.indexOf(MIXED_EDIT) + 2, row)
+    await settle(app)
+    frame = await settledFrame(app, MIXED_EDIT_ERROR)
+    await capture(app, "issue816-mixed-normal-error-expanded")
+    expectNoBlankRowBetween(frame, anchor, MIXED_EDIT, MIXED_EDIT_ERROR)
+    expectOneBlankRowBetween(frame, anchor, MIXED_EDIT_ERROR, MIXED_THOUGHTS[2]!)
+
+    // A second mouse click in OpenTUI's double-click window becomes a text
+    // selection; wait past that window before proving the error can close.
+    await Bun.sleep(600)
+    rows = frame.split("\n")
+    row = rows.findIndex((line) => line.includes(MIXED_EDIT))
+    await app.mockMouse.click(rows[row]!.indexOf(MIXED_EDIT) + 2, row)
+    await settle(app)
+    await waitFor(app, () => (!app.captureCharFrame().includes(MIXED_EDIT_ERROR) ? true : undefined))
+    frame = await frameOf(app)
+    expect(frame).not.toContain(MIXED_EDIT_ERROR)
+
+    rows = frame.split("\n")
+    row = rows.findIndex((line) => line.includes(anchor))
+    expect(row).toBeGreaterThan(-1)
+    await app.mockMouse.click(rows[row]!.indexOf(anchor) + 2, row)
+    await settle(app)
+    const collapsedAgain = await settledFrame(app, `+ ${MIXED_HEADER}`)
+    expect(collapsedAgain).not.toContain(MIXED_WRITE_TITLE)
+  })
+
+  test("narrow 80: mixed semantic detail keeps one-row boundaries and its three-line Write preview", async () => {
+    const { app } = await mountMixedActivity("narrow", true)
+    await settle(app)
+    const frame = await settledFrame(app, MIXED_THOUGHTS[2]!)
+    await capture(app, "issue816-mixed-narrow-expanded")
+
+    const anchor = `− ${MIXED_HEADER}`
+    expectNoBlankRowBetween(frame, anchor, anchor, MIXED_THOUGHTS[0]!)
+    expectOneBlankRowBetween(frame, anchor, MIXED_THOUGHTS[0]!, MIXED_WRITE_TITLE)
+    expectNoBlankRowBetween(frame, anchor, MIXED_WRITE_TITLE, MIXED_WRITE_FIRST)
+    expectNoBlankRowBetween(frame, anchor, MIXED_WRITE_THIRD, "Click to expand")
+    expectOneBlankRowBetween(frame, anchor, "Click to expand", MIXED_THOUGHTS[1]!)
+    expectOneBlankRowBetween(frame, anchor, MIXED_THOUGHTS[1]!, MIXED_EDIT)
+    expectOneBlankRowBetween(frame, anchor, MIXED_EDIT, MIXED_THOUGHTS[2]!)
+    expect(frame).toContain(MIXED_WRITE_FIRST)
+    expect(frame).toContain(MIXED_WRITE_THIRD)
+    expect(frame).not.toContain(MIXED_WRITE_FOURTH)
+    expect(frame).not.toContain(MIXED_EDIT_ERROR)
+    expect(columnOf(frame, `+ ${MIXED_THOUGHTS[0]!}`)).toBe(columnOf(frame, anchor) + 2)
+    expect(columnOf(frame, MIXED_EDIT)).toBe(columnOf(frame, anchor) + 2)
+  })
+
   for (const size of ["normal", "narrow"] as const) {
     test(`${size}: collapsed blocks keep one blank row between them`, async () => {
       const { app } = await mountProposal(size)
@@ -680,27 +867,24 @@ describe("activity block spacing", () => {
 
   // Normal width shows the whole run, so every boundary of the proposal's
   // example (command panel, read, edit) is measured in one frame.
-  test("normal: expanded blocks keep one blank row between them and none before their details", async () => {
+  test("normal: mixed details separate semantically while tool-only blocks remain compact", async () => {
     const { app } = await mountProposal("normal", { kv: { activity_groups_expanded: true } })
     await settle(app)
     const frame = await settledFrame(app, "Edited 1 file")
     await capture(app, "activity-padding-expanded-normal")
 
     const anchor = "− Ran 1 command"
-    // The header is joined to the reasoning that planned the command: the
-    // assistant turn starts the transcript's flat run directly under it.
+    // Header-first stays compact; the Thought and command panel are separate
+    // semantic units, so they get exactly one blank terminal row.
     expectNoBlankRowBetween(frame, anchor, "− Ran 1 command", "+ Thought: Planning the edit")
-    // No blank row between the header and the call it summarizes.
-    expectNoBlankRowBetween(frame, anchor, "+ Thought: Planning the edit", "$ rg -n")
-    // The panel inside a block draws no padding or gap rows of its own: the
-    // command, every output row and the expand hint are consecutive content
-    // rows. Border glyphs are stripped, so a border-only row counts as blank.
+    expectOneBlankRowBetween(frame, anchor, "+ Thought: Planning the edit", "$ rg -n")
+    // The panel itself remains compact: command, output and affordance are
+    // consecutive content rows, with no extra blank row in the preview.
     expectNoBlankRowBetween(frame, anchor, "$ rg -n", "28:class App:")
     expectNoBlankRowBetween(frame, anchor, "30:        self.name = name", "…")
     expectNoBlankRowBetween(frame, anchor, "…", "Click to expand")
-    // The whole block, header to the last row of its panel, holds no blank row.
-    expectNoBlankRows(frame, anchor, "− Ran 1 command", "Click to expand")
-    // A one-line detail row starts directly under its own header too.
+    expectNoBlankRows(frame, anchor, "$ rg -n", "Click to expand")
+    // Tool-only blocks still join each header directly to its detail.
     expectNoBlankRowBetween(frame, anchor, "− Explored 1 file", READ_ROW_INPUT)
     expectNoBlankRowBetween(frame, anchor, "− Edited 1 file", EDIT_ROW)
     // Between blocks: the panel's bottom padding row is the row after it, so a
@@ -790,12 +974,11 @@ describe("activity block spacing", () => {
   // the transcript's own anatomy (the panel's margin and its own padding, the
   // inline row's single blank row), and a non-work call stays on the transcript
   // column with exactly one blank row between it and the block above.
-  // Nested reasoning inside a block has a body too. When it is open (the
-  // "show" display mode, or after clicking it in "hide" mode) the body is the
-  // next row of the block: no blank row between the reasoning header and its
-  // first line of text. The body's own markdown blank lines are content and
-  // are preserved, and the block is compact from the header to its last row.
-  test("normal: an expanded nested reasoning body starts directly under its header", async () => {
+  // Nested reasoning inside a mixed block keeps its own body anatomy: no blank
+  // row between its header and first body line, and markdown blank lines remain
+  // content. One semantic separator follows its final body line before the
+  // next tool row.
+  test("normal: an expanded nested reasoning body keeps its content spacing and semantic boundary", async () => {
     const { app } = await mountThought("normal", { nested: true })
     await settle(app)
     const frame = await settledFrame(app, THOUGHT_LAST)
@@ -812,10 +995,9 @@ describe("activity block spacing", () => {
       "```",
       "",
     ])
-    // The last line of the body is followed directly by the next detail row.
-    // The body's own blank lines are markdown content, which is why the
-    // whole-block rule is not asserted across a body — only at its seams.
-    expectNoBlankRowBetween(frame, anchor, THOUGHT_LAST, READ_ROW_INPUT)
+    // The body's own blank lines are markdown content. After the final body
+    // line, the next tool is a new semantic unit and gets one separator.
+    expectOneBlankRowBetween(frame, anchor, THOUGHT_LAST, READ_ROW_INPUT)
 
     // Order and content survive: title, paragraph, fenced block, trailing text.
     const rows = rowsOf(frame, anchor)
@@ -849,9 +1031,9 @@ describe("activity block spacing", () => {
     expect(await colorOf(app, THOUGHT_PARA)).toEqual({ fg: [128, 128, 128, 255], bg: [10, 10, 10, 255], attributes: 0 })
   })
 
-  // The same compaction at 80 columns: the body follows its header directly and
-  // the block stays compact, so a narrow window does not reintroduce the gap.
-  test("narrow: an expanded nested reasoning body stays compact", async () => {
+  // At 80 columns the body still follows its header directly, while its
+  // following tool remains a separate semantic unit.
+  test("narrow: an expanded nested reasoning body keeps its semantic boundary", async () => {
     const { app } = await mountThought("narrow", { nested: true })
     await settle(app)
     const frame = await settledFrame(app, THOUGHT_LAST)
@@ -859,14 +1041,14 @@ describe("activity block spacing", () => {
 
     const anchor = "− Explored 1 file"
     expectNoBlankRowBetween(frame, anchor, THOUGHT_TITLE, THOUGHT_PARA)
-    expectNoBlankRowBetween(frame, anchor, THOUGHT_LAST, READ_ROW_INPUT)
+    expectOneBlankRowBetween(frame, anchor, THOUGHT_LAST, READ_ROW_INPUT)
     expect({ rows: between(rowsOf(frame, anchor), THOUGHT_PARA, "```python") }).toEqual({ rows: [""] })
   })
 
   // The header is still the control it was: in "hide" mode clicking the
-  // collapsed thought opens its body, and the opened body is compact inside the
-  // block (the hide mode's own body indent is preserved).
-  test("normal: clicking a nested thought opens a compact body", async () => {
+  // collapsed thought opens its body, preserves its own body indent, and keeps
+  // the next tool on the other side of the semantic separator.
+  test("normal: clicking a nested thought preserves its body and semantic boundary", async () => {
     const { app } = await mountThought("normal", { nested: true, mode: "hide" })
     await settle(app)
     const collapsed = await settledFrame(app, "+ Thought: Planning the edit")
@@ -881,7 +1063,7 @@ describe("activity block spacing", () => {
 
     const anchor = "− Explored 1 file"
     expectNoBlankRowBetween(frame, anchor, `- ${THOUGHT_TITLE}`, THOUGHT_PARA)
-    expectNoBlankRowBetween(frame, anchor, THOUGHT_LAST, READ_ROW_INPUT)
+    expectOneBlankRowBetween(frame, anchor, THOUGHT_LAST, READ_ROW_INPUT)
     // The collapsed marker is gone and the body is indented two columns past
     // the reasoning header, as hide mode draws it.
     expect(frame).not.toContain("+ Thought: Planning the edit")
