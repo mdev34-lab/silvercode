@@ -2407,8 +2407,9 @@ const layer = Layer.effect(
                 ),
             )
             const showEffortProcess =
+              agent.name !== "think" &&
               !isReviewAgent(agent.name) &&
-              (sessionWroteFiles || (effort === "fast" && agent.name !== "think"))
+              (sessionWroteFiles || effort === "fast")
             const system = [
               ...env,
               ...instructions,
@@ -2422,10 +2423,8 @@ const layer = Layer.effect(
               // must not recursively review themselves. Think keeps its own
               // effort-scaled research guidance instead of the Work process block.
               ...(showEffortProcess ? [EFFORT_PROCESS[effort]] : []),
-              // Surface Think's level whenever its process block did not fire.
-              ...(agent.name === "think" && (isReviewAgent(agent.name) || !sessionWroteFiles)
-                ? [`## Agent effort: ${effort}`]
-                : []),
+              // Think always receives its effective level for research depth.
+              ...(agent.name === "think" ? [`## Agent effort: ${effort}`] : []),
             ]
             const format = lastUser.format ?? { type: "text" as const }
             if (format.type === "json_schema") system.push(STRUCTURED_OUTPUT_SYSTEM_PROMPT)

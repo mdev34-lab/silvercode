@@ -966,6 +966,136 @@ it.instance(
 )
 
 it.instance(
+  "fast Think preserves its bare effort label after a plan-file write",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({
+        title: "Fast Think after plan write",
+        metadata: withAgentEffort({}, "fast"),
+      })
+      const earlier = yield* user(chat.id, "Draft an implementation plan.")
+      const assistant: SessionV1.Assistant = {
+        id: MessageID.ascending(),
+        role: "assistant",
+        parentID: earlier.id,
+        sessionID: chat.id,
+        mode: "think",
+        agent: "think",
+        cost: 0,
+        path: { cwd: "/tmp", root: "/tmp" },
+        tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+        modelID: ref.modelID,
+        providerID: ref.providerID,
+        time: { created: Date.now() },
+      }
+      yield* sessions.updateMessage(assistant)
+      yield* sessions.updatePart({
+        id: PartID.ascending(),
+        messageID: assistant.id,
+        sessionID: chat.id,
+        type: "tool",
+        callID: "call-seed-think-plan-write",
+        tool: "write",
+        state: {
+          status: "completed",
+          input: { filePath: ".opencode/plans/implementation.md", content: "Plan" },
+          output: "ok",
+          title: "write",
+          metadata: { reviewLoop: { writesFiles: true } },
+          time: { start: Date.now(), end: Date.now() },
+        },
+      } as SessionV1.ToolPart)
+
+      yield* llm.hang
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "think",
+        model: ref,
+        noReply: true,
+        parts: [{ type: "text", text: "Refine the implementation plan." }],
+      })
+      const fiber = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+      yield* awaitWithTimeout(llm.wait(1), "timed out waiting for Think after a plan-file write", "10 seconds")
+
+      const body = JSON.stringify((yield* llm.hits)[0]?.body)
+      expect(body).toContain("You are Think, the planning specialist.")
+      expect(body.match(/## Agent effort: fast/g)).toHaveLength(1)
+      expect(body).not.toContain("## Agent effort: fast (review passes: off, validation gate: minimal)")
+      expect(body).not.toContain("Start straightforward implementation from the user's first request.")
+      yield* Fiber.interrupt(fiber)
+    }),
+  15_000,
+)
+
+it.instance(
+  "fast Think preserves its bare effort label after compaction",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({
+        title: "Fast Think after compaction",
+        metadata: withAgentEffort({}, "fast"),
+      })
+      const compacted = yield* user(chat.id, "Earlier plan work.")
+      yield* sessions.updatePart({
+        id: PartID.ascending(),
+        messageID: compacted.id,
+        sessionID: chat.id,
+        type: "compaction",
+        auto: false,
+      } as SessionV1.CompactionPart)
+      const summary: SessionV1.Assistant = {
+        id: MessageID.ascending(),
+        role: "assistant",
+        parentID: compacted.id,
+        sessionID: chat.id,
+        mode: "compaction",
+        agent: "compaction",
+        summary: true,
+        finish: "stop",
+        cost: 0,
+        path: { cwd: "/tmp", root: "/tmp" },
+        tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+        modelID: ref.modelID,
+        providerID: ref.providerID,
+        time: { created: Date.now() },
+      }
+      yield* sessions.updateMessage(summary)
+      yield* sessions.updatePart({
+        id: PartID.ascending(),
+        messageID: summary.id,
+        sessionID: chat.id,
+        type: "text",
+        text: "Summary of the earlier plan work.",
+      })
+
+      yield* llm.hang
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "think",
+        model: ref,
+        noReply: true,
+        parts: [{ type: "text", text: "Continue the implementation plan." }],
+      })
+      const fiber = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+      yield* awaitWithTimeout(llm.wait(1), "timed out waiting for Think after compaction", "10 seconds")
+
+      const body = JSON.stringify((yield* llm.hits)[0]?.body)
+      expect(body).toContain("You are Think, the planning specialist.")
+      expect(body.match(/## Agent effort: fast/g)).toHaveLength(1)
+      expect(body).not.toContain("## Agent effort: fast (review passes: off, validation gate: minimal)")
+      expect(body).not.toContain("Start straightforward implementation from the user's first request.")
+      yield* Fiber.interrupt(fiber)
+    }),
+  15_000,
+)
+
+it.instance(
   "fast effort preserves the Review report contract without injecting Work process guidance",
   () =>
     Effect.gen(function* () {
