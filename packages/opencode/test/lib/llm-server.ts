@@ -51,6 +51,7 @@ type Sse = {
 }
 
 type HttpError = {
+  wait?: PromiseLike<unknown>
   type: "http-error"
   status: number
   body: unknown
@@ -105,12 +106,12 @@ function finishLine(reason: string, usage?: Usage) {
   return chunk({ finish: reason, usage })
 }
 
-function toolStartLine(id: string, name: string) {
+function toolStartLine(id: string, name: string, index: number) {
   return chunk({
     delta: {
       tool_calls: [
         {
-          index: 0,
+          index,
           id,
           type: "function",
           function: {
@@ -123,12 +124,12 @@ function toolStartLine(id: string, name: string) {
   })
 }
 
-function toolArgsLine(value: string) {
+function toolArgsLine(value: string, index: number) {
   return chunk({
     delta: {
       tool_calls: [
         {
-          index: 0,
+          index,
           function: {
             arguments: value,
           },
@@ -528,8 +529,9 @@ export class Reply {
 
   tool(name: string, input: unknown) {
     const id = this.#id()
+    const index = this.#seq - 1
     const args = JSON.stringify(input)
-    this.#tail = [...this.#tail, toolStartLine(id, name), toolArgsLine(args)]
+    this.#tail = [...this.#tail, toolStartLine(id, name, index), toolArgsLine(args, index)]
     return this.toolCalls()
   }
 
@@ -539,15 +541,17 @@ export class Reply {
    */
   toolRaw(name: string, args: string) {
     const id = this.#id()
-    this.#tail = [...this.#tail, toolStartLine(id, name), toolArgsLine(args)]
+    const index = this.#seq - 1
+    this.#tail = [...this.#tail, toolStartLine(id, name, index), toolArgsLine(args, index)]
     return this.toolCalls()
   }
 
   pendingTool(name: string, input: unknown) {
     const id = this.#id()
+    const index = this.#seq - 1
     const args = JSON.stringify(input)
     const size = Math.max(1, Math.floor(args.length / 2))
-    this.#tail = [...this.#tail, toolStartLine(id, name), toolArgsLine(args.slice(0, size))]
+    this.#tail = [...this.#tail, toolStartLine(id, name, index), toolArgsLine(args.slice(0, size), index)]
     return this
   }
 
@@ -579,7 +583,9 @@ export class Reply {
     this.#reset = false
     this.#tail = [
       ...this.#tail,
-      { error: { code: "server_error", message: typeof message === "string" ? message : "boom", type: "server_error" } },
+      {
+        error: { code: "server_error", message: typeof message === "string" ? message : "boom", type: "server_error" },
+      },
     ]
     return this
   }
@@ -597,13 +603,13 @@ export class Reply {
       type: "sse",
       head: this.#head,
       // Without a finish reason the usage still rides its own final chunk:
-    // some providers complete a response, send the usage accounting, and
-    // omit finish metadata - a completed response, not a dropped stream.
-    tail: this.#finish
-      ? [...this.#tail, finishLine(this.#finish, this.#usage)]
-      : this.#usage
-        ? [...this.#tail, chunk({ usage: this.#usage })]
-        : this.#tail,
+      // some providers complete a response, send the usage accounting, and
+      // omit finish metadata - a completed response, not a dropped stream.
+      tail: this.#finish
+        ? [...this.#tail, finishLine(this.#finish, this.#usage)]
+        : this.#usage
+          ? [...this.#tail, chunk({ usage: this.#usage })]
+          : this.#tail,
       onSend: this.#onSend,
       wait: this.#wait,
       hang: this.#hang,
@@ -617,11 +623,7 @@ export function reply() {
   return new Reply()
 }
 
-export function httpError(
-  status: number,
-  body: unknown,
-  headers?: Record<string, string>,
-): Item {
+export function httpError(status: number, body: unknown, headers?: Record<string, string>): Item {
   return {
     type: "http-error",
     status,
@@ -754,7 +756,8 @@ function requestIdentifiers(body: Record<string, unknown>): Identifiers {
         else add("session", [...path, key].join("."), child)
       }
       if (direct("conversation") || (normalized === "id" && /conversation/.test(parentPath))) {
-        if (Array.isArray(child)) child.slice(0, 12).forEach((entry) => add("conversation", [...path, key].join("."), entry))
+        if (Array.isArray(child))
+          child.slice(0, 12).forEach((entry) => add("conversation", [...path, key].join("."), entry))
         else add("conversation", [...path, key].join("."), child)
       }
       if (direct("message") || (normalized === "id" && /messages?/.test(parentPath))) {
@@ -927,7 +930,10 @@ export class TestLLMServer extends Context.Service<TestLLMServer, TestLLMServer.
         }
         hits = [...hits, current]
         yield* notify()
-        if (next.type !== "sse") return fail(next)
+        if (next.type !== "sse") {
+          if (next.wait) yield* Effect.promise(() => Promise.resolve(next.wait))
+          return fail(next)
+        }
         if (mode === "responses") return send(responses(next, modelFrom(body)))
         if (next.reset) {
           yield* reset(next)
@@ -994,7 +1000,9 @@ export class TestLLMServer extends Context.Service<TestLLMServer, TestLLMServer.
         fail: Effect.fn("TestLLMServer.fail")(function* (message: unknown = "boom") {
           queue(reply().streamError(message).item())
         }),
-        cut: Effect.fn("TestLLMServer.cut")(function* (message: unknown = "Zen stream ended before the completion finished") {
+        cut: Effect.fn("TestLLMServer.cut")(function* (
+          message: unknown = "Zen stream ended before the completion finished",
+        ) {
           queue(reply().cut(message).item())
         }),
         error: Effect.fn("TestLLMServer.error")(function* (

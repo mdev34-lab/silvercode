@@ -2,6 +2,7 @@
 import { createDefaultOpenTuiKeymap } from "@opentui/keymap/opentui"
 import { captureFrame, captureSpans } from "./frame"
 import { testRender, useRenderer } from "@opentui/solid"
+import type { Renderable, ScrollBoxRenderable } from "@opentui/core"
 import { onCleanup } from "solid-js"
 import { mkdir } from "node:fs/promises"
 import path from "node:path"
@@ -24,7 +25,7 @@ import { TestTuiContexts } from "./tui-environment"
 import { createTuiAttention } from "../../src/attention"
 import { TuiConfigProvider, useTuiConfig } from "../../src/config"
 import { ArgsProvider } from "../../src/context/args"
-import { ClipboardProvider } from "../../src/context/clipboard"
+import { ClipboardProvider, type ClipboardService } from "../../src/context/clipboard"
 import { DataProvider } from "../../src/context/data"
 import { EditorContextProvider } from "../../src/context/editor"
 import { EpilogueProvider } from "../../src/context/epilogue"
@@ -39,6 +40,7 @@ import { PromptRefProvider } from "../../src/context/prompt"
 import { RouteProvider, useRoute } from "../../src/context/route"
 import { SDKProvider, useSDK } from "../../src/context/sdk"
 import { SyncProvider, useSync } from "../../src/context/sync"
+import type { TuiPaths } from "../../src/context/runtime"
 import { ThemeProvider, useTheme } from "../../src/context/theme"
 import SidebarContext from "../../src/feature-plugins/sidebar/context"
 import SidebarFooter from "../../src/feature-plugins/sidebar/footer"
@@ -168,7 +170,16 @@ export type MountOptions = {
   // Answers the writes a test drives (abort, prompt submit) before the fixture's
   // read-only routes. Anything still unaccounted for keeps throwing, so a stray
   // request fails the run instead of passing silently.
-  respond?: (request: FetchRequest) => Response | undefined
+  respond?: (request: FetchRequest) => Response | Promise<Response> | undefined
+  // Transcript export writes into `paths.cwd`; default is the sandbox path.
+  paths?: Partial<TuiPaths>
+  // Captures what copy/export commands hand to the clipboard.
+  clipboard?: ClipboardService
+  // How `x-next-cursor` names the next page. `offset` is an index into the
+  // timeline and shifts when rows are deleted; `id` is the oldest row's id, the
+  // stable form the server returns, and the only one that models pagination
+  // while the timeline is being mutated.
+  cursor?: "offset" | "id"
 }
 
 const setups: { app: Setup; dispose: () => Promise<void> }[] = []
@@ -182,6 +193,10 @@ export async function disposeSessionRoutes() {
 
 export async function mountSessionRoute(options: MountOptions) {
   const tmp = await tmpdir()
+  // Every paged read this mount served, oldest row last. Tests use it to assert
+  // that no page re-delivers a message the reader already has, which is what a
+  // stable cursor buys and an offset cursor loses under deletion.
+  const pages: { before: string | null; ids: string[] }[] = []
   await Bun.write(`${tmp.path}/kv.json`, JSON.stringify(options.kv ?? {}))
 
   const routed = options.sessions[0]
@@ -203,7 +218,31 @@ export async function mountSessionRoute(options: MountOptions) {
     const session = options.sessions.find((item) => url.pathname === `/session/${item.id}`)
     if (session) return json(session)
     const messages = options.sessions.find((item) => url.pathname === `/session/${item.id}/message`)
-    if (messages) return json(options.messages?.[messages.id] ?? [])
+    if (messages) {
+      const rows = options.messages?.[messages.id] ?? []
+      // Same page contract as the server: a `limit` answers the newest page in
+      // ascending order and points at older rows through `x-next-cursor`,
+      // while an omitted `limit` is the complete timeline (the endpoint pages
+      // internally). Mounts of long sessions therefore see the real wire
+      // behavior instead of an always-complete fixture.
+      const limit = url.searchParams.get("limit")
+      if (!limit) return json(rows)
+      const before = url.searchParams.get("before")
+      if (options.cursor === "id") {
+        const found = before ? rows.findIndex((row) => row.info.id === before) : rows.length
+        const end = found < 0 ? rows.length : found
+        const start = Math.max(0, end - Number(limit))
+        const next = start > 0 ? rows[start]?.info.id : undefined
+        const page = rows.slice(start, end)
+        pages.push({ before, ids: page.map((row) => row.info.id) })
+        return json(page, next ? { headers: { "x-next-cursor": next } } : undefined)
+      }
+      const end = before ? Number(before) : rows.length
+      const start = Math.max(0, end - Number(limit))
+      const page = rows.slice(start, end)
+      pages.push({ before, ids: page.map((row) => row.info.id) })
+      return json(page, start > 0 ? { headers: { "x-next-cursor": String(start) } } : undefined)
+    }
     if (/^\/session\/[^/]+\/(todo|diff)$/.test(url.pathname)) return json([])
     if (url.pathname === "/session") return json(options.sessions)
     if (url.pathname === "/session/status") return json(options.status ?? {})
@@ -222,6 +261,7 @@ export async function mountSessionRoute(options: MountOptions) {
   const pluginRuntime = createPluginRuntime()
   let keymapRef: OpenTuiKeymap | undefined
   let syncRef: ReturnType<typeof useSync> | undefined
+  let navigateRef: ReturnType<typeof useRoute>["navigate"] | undefined
 
   // Mirrors the plugin host (packages/opencode/src/plugin/tui/runtime.ts): slots
   // only render once the registry exists, and the builtin sidebar plugins own
@@ -237,6 +277,7 @@ export async function mountSessionRoute(options: MountOptions) {
       bindings: tuiConfig.keybinds.get("command.palette.show"),
     }))
     const renderer = useRenderer()
+    navigateRef = useRoute().navigate
     const adapters = createTuiApiAdapters({
       version: "0.0.0-test",
       tuiConfig,
@@ -280,7 +321,7 @@ export async function mountSessionRoute(options: MountOptions) {
     onCleanup(off)
 
     return (
-      <ClipboardProvider>
+      <ClipboardProvider value={options.clipboard}>
         <OpencodeKeymapProvider keymap={keymap}>
           <ToastProvider>
             <RouteProvider initialRoute={{ type: "session", sessionID: routed.id }}>
@@ -331,7 +372,10 @@ export async function mountSessionRoute(options: MountOptions) {
 
   const app = await testRender(
     () => (
-      <TestTuiContexts directory={directory} paths={{ home: "/tmp", state: tmp.path, worktree: directory }}>
+      <TestTuiContexts
+        directory={directory}
+        paths={{ home: "/tmp", state: tmp.path, worktree: directory, ...options.paths }}
+      >
         <ArgsProvider>
           <KVProvider>
             <Harness />
@@ -356,7 +400,33 @@ export async function mountSessionRoute(options: MountOptions) {
   }
   await settle(app)
 
-  return { app, events, sync, requests: calls.requests, keymap: () => keymapRef! }
+  return {
+    app,
+    events,
+    sync,
+    requests: calls.requests,
+    pages,
+    keymap: () => keymapRef!,
+    // Route changes a test drives while a command is still awaiting input.
+    navigate: (sessionID: string) => navigateRef!({ type: "session", sessionID }),
+  }
+}
+
+// The transcript's ScrollBox, found in the mounted tree. Tests drive it to read
+// and move the real scroll window instead of replaying hundreds of wheel events,
+// which made paging tests depend on how many rows one wheel step happens to move.
+export function scrollBox(app: Setup): ScrollBoxRenderable | undefined {
+  const walk = (node: Renderable | undefined): ScrollBoxRenderable | undefined => {
+    if (!node) return undefined
+    const candidate = node as Renderable & Partial<ScrollBoxRenderable>
+    if (typeof candidate.scrollTop === "number" && typeof candidate.scrollTo === "function") return candidate as ScrollBoxRenderable
+    for (const child of node.getChildren?.() ?? []) {
+      const found = walk(child)
+      if (found) return found
+    }
+    return undefined
+  }
+  return walk(app.renderer.root)
 }
 
 // The frame pump lives in its own module so the tests that mount their own app share it.

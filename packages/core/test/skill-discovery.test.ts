@@ -1,4 +1,5 @@
 import fs from "fs/promises"
+import { open as openFile } from "fs/promises"
 import path from "path"
 import { describe, expect, test } from "bun:test"
 import { Effect, Layer } from "effect"
@@ -19,6 +20,7 @@ async function pull(
   files: Record<string, string> = {},
   cache?: Awaited<ReturnType<typeof tmpdir>>,
   failures?: { promotion: boolean; rollback: boolean; invalidBackup?: boolean; seen: string[] },
+  hold?: { locked: boolean; attempts: string[] },
 ) {
   const tmp = cache ?? (await tmpdir())
   const requests: string[] = []
@@ -43,6 +45,24 @@ async function pull(
       return {
         ...fs,
         rename: (source: string, destination: string) => {
+          if (hold && destination.includes(".old-")) {
+            return Effect.gen(function* () {
+              if (!hold.locked) return yield* fs.rename(source, destination)
+              hold.locked = false
+              // Windows refuses to rename a directory while a file inside it is
+              // open. Hold a real handle across the first live-root rename to
+              // model a reader that is still finishing, then let the retry pass.
+              const handle = yield* Effect.promise(() => openFile(path.join(source, "SKILL.md"), "r"))
+              const outcome = yield* fs.rename(source, destination).pipe(
+                Effect.as({ locked: false as const }),
+                Effect.catch((error) => Effect.succeed({ locked: true as const, error })),
+              )
+              yield* Effect.promise(() => handle.close())
+              hold.attempts.push(outcome.locked ? "locked" : "renamed")
+              if (outcome.locked) return yield* Effect.fail(outcome.error)
+              return undefined
+            })
+          }
           if (failures?.promotion && source.includes(".tmp-") && destination.endsWith("deploy")) {
             failures.promotion = false
             failures.seen.push("promotion")
@@ -176,6 +196,31 @@ describe("SkillDiscovery.pull", () => {
         tmp,
       )
       expect(third.requests).toEqual([`${base}index.json`])
+    } finally {
+      await tmp[Symbol.asyncDispose]()
+    }
+  })
+
+  test("refreshes when the live root is briefly locked", async () => {
+    const tmp = await tmpdir()
+    try {
+      const first = await pull(
+        [{ name: "deploy", version: "1", files: ["SKILL.md"] }],
+        { [`${base}deploy/SKILL.md`]: "# Old" },
+        tmp,
+      )
+      expect(first.directories).toHaveLength(1)
+
+      const hold = { locked: true, attempts: [] as string[] }
+      await pull(
+        [{ name: "deploy", version: "2", files: ["SKILL.md"] }],
+        { [`${base}deploy/SKILL.md`]: "# New" },
+        tmp,
+        undefined,
+        hold,
+      )
+      expect(hold.attempts).toEqual([process.platform === "win32" ? "locked" : "renamed"])
+      expect(await fs.readFile(path.join(first.directories[0], "SKILL.md"), "utf8")).toBe("# New")
     } finally {
       await tmp[Symbol.asyncDispose]()
     }

@@ -37,12 +37,12 @@ running process, which is what makes `status` non-blocking and `cancel` real.
 
 `shell_background` with `action`:
 
-| Action   | Behavior                                                                 |
-| -------- | ------------------------------------------------------------------------ |
-| `list`   | the calling session's shell jobs, newest first                            |
-| `status` | current status plus partial output; returns immediately                   |
-| `output` | output captured so far, bounded by the truncation limits                  |
-| `cancel` | claims the cancellation, then kills the process tree                      |
+| Action   | Behavior                                                 |
+| -------- | -------------------------------------------------------- |
+| `list`   | the calling session's shell jobs, newest first           |
+| `status` | current status plus partial output; returns immediately  |
+| `output` | output captured so far, bounded by the truncation limits |
+| `cancel` | claims the cancellation, then kills the process tree     |
 
 No TUI surface is added: the job list is already exposed by the experimental
 server route, and the model-facing envelopes carry everything the agent needs.

@@ -288,7 +288,7 @@ describe("TUI inline tool wrapping", () => {
       "list_mcp_resources",
       "list_mcp_resource_templates",
       "read_mcp_resource",
-      "bash",
+      "shell",
       "read",
       "glob",
       "grep",
@@ -320,10 +320,10 @@ describe("TUI inline tool wrapping", () => {
 
   test("keeps finish visible when completed tool details are hidden", () => {
     expect(shouldHideTool("finish", "completed", false)).toBe(false)
-    expect(shouldHideTool("bash", "completed", false)).toBe(true)
+    expect(shouldHideTool("shell", "completed", false)).toBe(true)
     expect(shouldHideTool("plugin_tool", "completed", false)).toBe(true)
-    expect(shouldHideTool("bash", "running", false)).toBe(false)
-    expect(shouldHideTool("bash", "completed", true)).toBe(false)
+    expect(shouldHideTool("shell", "running", false)).toBe(false)
+    expect(shouldHideTool("shell", "completed", true)).toBe(false)
   })
 
   test("derives finish result from output before input fallback", () => {

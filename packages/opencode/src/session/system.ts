@@ -29,6 +29,7 @@ import { LocationServiceMap, locationServiceMapLayer } from "@opencode-ai/core/l
 import { Reference } from "@opencode-ai/core/reference"
 import { MCP } from "@/mcp"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
+import { AgentEffort } from "@opencode-ai/schema/agent-effort"
 
 export const STE_LITE = PROMPT_STE_LITE
 
@@ -73,7 +74,11 @@ export interface Interface {
   readonly environment: (model: Provider.Model) => Effect.Effect<string[]>
   readonly skills: (agent: Agent.Info) => Effect.Effect<string | undefined>
   readonly mcp: (agent: Agent.Info, permission?: PermissionV1.Ruleset) => Effect.Effect<string | undefined>
-  readonly delegation: (agent: Agent.Info, permission?: PermissionV1.Ruleset) => Effect.Effect<string | undefined>
+  readonly delegation: (
+    agent: Agent.Info,
+    permission?: PermissionV1.Ruleset,
+    effort?: AgentEffort.Level,
+  ) => Effect.Effect<string | undefined>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/SystemPrompt") {}
@@ -146,6 +151,7 @@ const layer = Layer.effect(
       delegation: Effect.fn("SystemPrompt.delegation")(function* (
         agent: Agent.Info,
         permission?: PermissionV1.Ruleset,
+        effort?: AgentEffort.Level,
       ) {
         // Only primary-style callers drive delegation; subagents execute.
         if (agent.mode === "subagent") return
@@ -156,7 +162,13 @@ const layer = Layer.effect(
         const work = yield* agents.get("work")
         if (work?.native === true && agent === work)
           return [
-            "Programming requests are best done as Think planning, then Code implementation, then a clean Review. Prefer that route for programming, including small edits; you may do the work yourself when the route is not available or would not help, and say so.",
+            effort === "fast"
+              ? [
+                  "At fast effort, handle straightforward programming directly when Think/Code handoffs add no value.",
+                  "When they materially help, use Think for planning and Code for implementation.",
+                  "An independent clean Review is not required at fast; honor explicit user review requests.",
+                ].join(" ")
+              : "Programming requests are best done as Think planning, then Code implementation, then a clean Review. Prefer that route for programming, including small edits; you may do the work yourself when the route is not available or would not help, and say so.",
             "Non-programming work should not go to Code. At fast effort, medium-sized work may be manual; complex or thorough work goes to General; medium effort balances direct work and General delegation.",
             "When it is unclear whether a request changes software, carry on with the work (inspect, run commands, delegate); use the question tool only if the answer would change what you do. Do not relabel programming work to avoid its workflow.",
             "Failed, cancelled or pending children are not successful stage completion. A pass budget cannot excuse reporting success with blocking findings.",

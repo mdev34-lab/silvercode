@@ -286,6 +286,44 @@ describe("SessionContextReduction", () => {
     expect(outputText(result.messages[3])[0]).toContain("secret")
   })
 
+  test("protected-tool names match across the bash/shell rename in both directions", () => {
+    // #780: policies written as `tools: ["bash"]` must protect new `shell` calls, and a
+    // `tools: ["shell"]` policy must protect archived `bash` calls.
+    const history = (name: string, label: string) => [
+      user("run it"),
+      assistant([completed("call-1", name, { command: "ls" }, big(label))]),
+      user(big("filler question")),
+      assistant([text(big("filler answer"))]),
+      user("latest question"),
+      assistant([text("latest answer")]),
+    ]
+    const allOutput = (messages: readonly SessionMessage.Message[]) =>
+      messages.flatMap((message) => outputText(message)).join("\n")
+
+    // Control: without protection the old tool output is reduced away.
+    const control = reduce({
+      messages: history("shell", "shellout"),
+      model: windowModel(2_000),
+      policy: policy({ protection: { recentTurns: 1, tools: [], files: [] } }),
+    })
+    expect(control.report.outcome).toBe("reduced")
+    expect(allOutput(control.messages)).not.toContain("shellout")
+
+    const legacy = reduce({
+      messages: history("shell", "shellout"),
+      model: windowModel(2_000),
+      policy: policy({ protection: { recentTurns: 1, tools: ["bash"], files: [] } }),
+    })
+    expect(allOutput(legacy.messages)).toContain("shellout")
+
+    const archived = reduce({
+      messages: history("bash", "bashout"),
+      model: windowModel(2_000),
+      policy: policy({ protection: { recentTurns: 1, tools: ["shell"], files: [] } }),
+    })
+    expect(allOutput(archived.messages)).toContain("bashout")
+  })
+
   test("is deterministic: the same history and policy always produce the same projection", () => {
     const history = [
       user("read it"),

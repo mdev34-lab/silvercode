@@ -10,7 +10,7 @@ import fsNode from "fs/promises"
 import { Flag } from "@opencode-ai/core/flag/flag"
 import { Auth } from "../auth"
 import { Env } from "../env"
-import { applyEdits, modify } from "jsonc-parser"
+import { applyEdits, type Edit, findNodeAtLocation, modify, parseTree } from "jsonc-parser"
 import { existsSync } from "fs"
 import { Account } from "@/account/account"
 import { isRecord } from "@/util/record"
@@ -37,8 +37,210 @@ import { withTransientReadRetry } from "@/util/effect-http-client"
 
 // Custom merge function that concatenates array fields instead of replacing them
 // Keep remeda's deep conditional merge type out of hot config-loading paths; TS profiling showed it dominates here.
+const SHELL_TOOL_SPELLINGS = ["bash", "shell"] as const
+
+// Internal provenance for a tools-derived shell deny: the folded tools map
+// keeps the canonical `shell` key and records separately that the surviving
+// value came from a legacy `bash` write. Non-enumerable, so the config value
+// and the wire stay canonical.
+const LEGACY_SHELL_TOOL_DENY = Symbol.for("@opencode/config/legacy-shell-tool-deny")
+
+function markLegacyShellToolDeny(tools: Record<string, boolean>): Record<string, boolean> {
+  globalThis.Object.defineProperty(tools, LEGACY_SHELL_TOOL_DENY, {
+    value: true,
+    enumerable: false,
+    configurable: true,
+  })
+  return tools
+}
+
+function isLegacyShellToolDeny(tools: unknown): boolean {
+  if (typeof tools !== "object" || tools === null) return false
+  return (tools as Record<PropertyKey, unknown>)[LEGACY_SHELL_TOOL_DENY] === true
+}
+
+function writesShellTools(tools: unknown): boolean {
+  if (!isRecord(tools)) return false
+  return SHELL_TOOL_SPELLINGS.some((key) => typeof tools[key] === "boolean")
+}
+
+function legacyShellToolDeny(tools: unknown): boolean {
+  if (!isRecord(tools)) return false
+  if (isLegacyShellToolDeny(tools)) return true
+  let legacy = false
+  for (const [key, value] of Object.entries(tools)) {
+    if (key === "bash") legacy = value === false
+    else if (key === "shell") legacy = false
+  }
+  return legacy
+}
+
+// #780: legacy `tools` records may spell the shell tool `bash`. Fold that key
+// to `shell` in each layer before merging so the boolean resolves by layer
+// order, whichever spelling a layer used. The fold also records whether the
+// surviving value came from the legacy spelling; the derived permission map
+// stays canonical.
+function foldTools(tools: Record<string, boolean> | undefined): Record<string, boolean> | undefined {
+  if (!tools || !("bash" in tools)) return tools
+  const out: Record<string, boolean> = {}
+  let legacyDeny = false
+  for (const [key, value] of Object.entries(tools)) {
+    const canonical = key === "bash" ? "shell" : key
+    delete out[canonical]
+    out[canonical] = value
+    if (canonical === "shell") legacyDeny = key === "bash" && !value
+  }
+  return legacyDeny ? markLegacyShellToolDeny(out) : out
+}
+
+/** Which layer wrote the last real shell tools slot decides the merged provenance. */
+function carryToolsProvenance(merged: Info, target: Info, source: Info): Info {
+  const owner = writesShellTools(source.tools) ? source.tools : target.tools
+  if (!legacyShellToolDeny(owner) || !isRecord(merged.tools)) return merged
+  return { ...merged, tools: markLegacyShellToolDeny(merged.tools as Record<string, boolean>) }
+}
+
+/**
+ * #780: the schema decode canonicalises a legacy `tools: { bash: false }` to a
+ * `shell` deny, so a decoded layer can no longer tell that deny apart from an
+ * explicit canonical rule. Mark the decoded permission map while the raw layer
+ * still shows both spellings. The marker is internal, so map and wire stay
+ * canonical.
+ */
+function markToolsProvenance<T>(info: T, raw: unknown): T {
+  if (!isRecord(info) || !isRecord(raw)) return info
+  for (const field of ["agent", "mode"] as const) {
+    const rawRecords = raw[field]
+    const records = info[field]
+    if (!isRecord(rawRecords) || !isRecord(records)) continue
+    for (const [name, rawEntry] of Object.entries(rawRecords)) {
+      if (!isRecord(rawEntry)) continue
+      const entry = records[name]
+      if (!isRecord(entry) || !isRecord(entry.permission)) continue
+      if (!legacyShellToolDeny(rawEntry.tools)) continue
+      if (ConfigPermissionV1.writesShellRename(rawEntry.permission)) continue
+      if (entry.permission.shell !== "deny") continue
+      ConfigPermissionV1.markDerivedShellDeny(entry.permission)
+    }
+  }
+  return info
+}
+
+function decodeConfig(data: unknown, source: string): Info {
+  const input = normalizeLoadedConfig(data)
+  return markToolsProvenance(ConfigParse.schema(ConfigV1.Info, input, source), input)
+}
+
+function foldRecordTools<T>(record: T): T {
+  if (!isRecord(record)) return record
+  let out = record
+  for (const [name, entry] of Object.entries(record)) {
+    if (!isRecord(entry)) continue
+    const tools = foldTools(entry.tools as Record<string, boolean> | undefined)
+    if (tools === entry.tools) continue
+    if (out === record) out = { ...record }
+    ;(out as Record<string, unknown>)[name] = { ...entry, tools }
+  }
+  return out
+}
+
+function foldConfigTools(config: Info): Info {
+  const tools = foldTools(config.tools)
+  const agent = foldRecordTools(config.agent)
+  const mode = foldRecordTools(config.mode)
+  if (tools === config.tools && agent === config.agent && mode === config.mode) return config
+  return { ...config, tools, agent, mode }
+}
+
+// #780: an empty `bash`/`shell` pattern map writes no rule. Drop it from a
+// layer before merging so it cannot replace a flat deny with `{}` or count as
+// a last write for the rename pair.
+function stripRecordEmptyShellRules<T>(record: T): T {
+  if (!isRecord(record)) return record
+  let out = record
+  for (const [name, entry] of Object.entries(record)) {
+    if (!isRecord(entry)) continue
+    const permission = ConfigPermissionV1.stripEmptyShellRules(entry.permission)
+    if (permission === entry.permission) continue
+    if (out === record) out = { ...record }
+    ;(out as Record<string, unknown>)[name] = { ...entry, permission }
+  }
+  return out
+}
+
+function stripConfigEmptyShellRules(config: Info): Info {
+  const permission = ConfigPermissionV1.stripEmptyShellRules(config.permission)
+  const agent = stripRecordEmptyShellRules(config.agent)
+  const mode = stripRecordEmptyShellRules(config.mode)
+  if (permission === config.permission && agent === config.agent && mode === config.mode) return config
+  return { ...config, permission, agent, mode }
+}
+
+// Permission layering keeps the base mergeDeep contract (an overridden key
+// or pattern keeps its first-written position). The one adjustment is
+// #780's: `bash`/`shell` are two spellings of one permission, so their
+// relative order follows last write — see
+// ConfigPermissionV1.orderShellRename.
+function orderRecordPermissions<T>(merged: T, source: T, target?: T): T {
+  if (!isRecord(merged)) return merged
+  let out = merged
+  for (const [name, entry] of Object.entries(merged)) {
+    if (!isRecord(entry) || !isRecord(entry.permission)) continue
+    const sourcePermission = isRecord(source) && isRecord(source[name]) ? source[name].permission : undefined
+    const targetPermission = isRecord(target) && isRecord(target[name]) ? target[name].permission : undefined
+    const permission = ConfigPermissionV1.carryDerivedShellDeny(
+      ConfigPermissionV1.orderShellRename(entry.permission, sourcePermission),
+      targetPermission,
+      sourcePermission,
+    )
+    if (permission === entry.permission) continue
+    if (out === merged) out = { ...merged }
+    ;(out as Record<string, unknown>)[name] = { ...entry, permission }
+  }
+  return out
+}
+
+function orderConfigPermissions<T>(merged: T, source: T, target?: T): T {
+  if (!isRecord(merged)) return merged
+  let out = merged as Record<string, unknown>
+  const copy = () => {
+    if (out === (merged as Record<string, unknown>)) out = { ...(merged as Record<string, unknown>) }
+  }
+  if (isRecord(merged.permission)) {
+    const sourcePermission = isRecord(source) ? source.permission : undefined
+    const permission = ConfigPermissionV1.carryDerivedShellDeny(
+      ConfigPermissionV1.orderShellRename(merged.permission, sourcePermission),
+      isRecord(target) ? target.permission : undefined,
+      sourcePermission,
+    )
+    if (permission !== merged.permission) {
+      copy()
+      out.permission = permission
+    }
+  }
+  for (const field of ["agent", "mode"] as const) {
+    const records = orderRecordPermissions(
+      merged[field],
+      isRecord(source) ? source[field] : undefined,
+      isRecord(target) ? target[field] : undefined,
+    )
+    if (records !== merged[field]) {
+      copy()
+      out[field] = records
+    }
+  }
+  return out as T
+}
+
+function mergeAgentRecords<T extends object>(current: T, next: T): T {
+  const source = stripRecordEmptyShellRules(next)
+  return orderRecordPermissions(mergeDeep(foldRecordTools(current), foldRecordTools(source)) as T, source, current)
+}
+
 function mergeConfig(target: Info, source: Info): Info {
-  return mergeDeep(target, source) as Info
+  const next = stripConfigEmptyShellRules(source)
+  const merged = mergeDeep(foldConfigTools(target), foldConfigTools(next)) as Info
+  return orderConfigPermissions(carryToolsProvenance(merged, target, next), next, target)
 }
 
 function mergeConfigConcatArrays(target: Info, source: Info): Info {
@@ -159,6 +361,46 @@ function patchJsonc(input: string, patch: unknown, path: string[] = []): string 
   return Object.entries(patch).reduce((result, [key, value]) => patchJsonc(result, value, [...path, key]), input)
 }
 
+// JSONC edits keep existing key positions, so applying the ordered object as a
+// patch is not enough: modify() updates values in place. Swap the rename
+// spellings' property text inside their existing slots, leaving other bytes alone.
+function orderJsoncPermissions(input: string, source: unknown, file: string): string {
+  const parsed = ConfigParse.jsonc(input, file)
+  const ordered = orderConfigPermissions(parsed, source)
+  if (ordered === parsed) return input
+  const root = parseTree(input)
+  if (!root) return input
+  const edits: Edit[] = []
+  const order = (path: string[]) => {
+    const before = path.reduce<unknown>((value, key) => (isRecord(value) ? value[key] : undefined), parsed)
+    const after = path.reduce<unknown>((value, key) => (isRecord(value) ? value[key] : undefined), ordered)
+    if (!isRecord(before) || !isRecord(after) || before === after) return
+    const spellings = (record: Record<string, unknown>) =>
+      Object.keys(record).filter((key) => key === "bash" || key === "shell")
+    const beforeKeys = spellings(before)
+    const afterKeys = spellings(after)
+    for (const [index, key] of beforeKeys.entries()) {
+      const desired = afterKeys[index]
+      if (key === desired) continue
+      const target = findNodeAtLocation(root, [...path, key])?.parent
+      const donor = findNodeAtLocation(root, [...path, desired])?.parent
+      if (!target || !donor) continue
+      edits.push({
+        offset: target.offset,
+        length: target.length,
+        content: input.slice(donor.offset, donor.offset + donor.length),
+      })
+    }
+  }
+  order(["permission"])
+  for (const field of ["agent", "mode"] as const) {
+    const records = isRecord(parsed) ? parsed[field] : undefined
+    if (!isRecord(records)) continue
+    for (const name of Object.keys(records)) order([field, name, "permission"])
+  }
+  return applyEdits(input, edits)
+}
+
 function writable(info: Info) {
   const { plugin_origins: _plugin_origins, ...next } = info
   return next
@@ -223,7 +465,7 @@ const layer = Layer.effect(
         ),
       )
       const parsed = ConfigParse.jsonc(expanded, source)
-      const data = ConfigParse.schema(ConfigV1.Info, normalizeLoadedConfig(parsed), source)
+      const data = decodeConfig(parsed, source)
       if (!("path" in options)) return data
 
       yield* Effect.promise(() => resolveLoadedPlugins(data, options.path))
@@ -513,8 +755,8 @@ const layer = Layer.effect(
           }
 
           result.command = mergeDeep(result.command ?? {}, yield* Effect.promise(() => ConfigCommand.load(dir)))
-          result.agent = mergeDeep(result.agent ?? {}, yield* Effect.promise(() => ConfigAgent.load(dir)))
-          result.agent = mergeDeep(result.agent ?? {}, yield* Effect.promise(() => ConfigAgent.loadMode(dir)))
+          result.agent = mergeAgentRecords(result.agent ?? {}, yield* Effect.promise(() => ConfigAgent.load(dir)))
+          result.agent = mergeAgentRecords(result.agent ?? {}, yield* Effect.promise(() => ConfigAgent.loadMode(dir)))
           // Auto-discovered plugins under `.opencode/plugin(s)` are already local files, so ConfigPlugin.load
           // returns normalized Specs and we only need to attach origin metadata here.
           const list = yield* Effect.promise(() => ConfigPlugin.load(dir))
@@ -590,7 +832,7 @@ const layer = Layer.effect(
         }
 
         for (const [name, mode] of Object.entries(result.mode ?? {})) {
-          result.agent = mergeDeep(result.agent ?? {}, {
+          result.agent = mergeAgentRecords(result.agent ?? {}, {
             [name]: {
               ...mode,
               mode: "primary" as const,
@@ -600,7 +842,14 @@ const layer = Layer.effect(
 
         if (Flag.OPENCODE_PERMISSION) {
           try {
-            result.permission = mergeDeep(result.permission ?? {}, JSON.parse(Flag.OPENCODE_PERMISSION))
+            const envPermission = ConfigPermissionV1.stripEmptyShellRules(JSON.parse(Flag.OPENCODE_PERMISSION))
+            result.permission = mergeDeep(result.permission ?? {}, envPermission)
+            if (isRecord(result.permission)) {
+              result.permission = ConfigPermissionV1.orderShellRename(
+                result.permission,
+                envPermission,
+              ) as Info["permission"]
+            }
           } catch (err) {
             yield* Effect.logWarning("OPENCODE_PERMISSION contains invalid JSON, skipping", { err })
           }
@@ -614,9 +863,24 @@ const layer = Layer.effect(
               perms.edit = action
               continue
             }
-            perms[tool] = action
+            // #780: `tools: { bash: ... }` is the pre-rename spelling of the shell tool.
+            perms[tool === "bash" ? "shell" : tool] = action
           }
-          result.permission = mergeDeep(perms, result.permission ?? {})
+          // The tools-derived `shell` slot must not park an explicit entry:
+          // clear it so the base merge appends explicit entries in order.
+          // An empty explicit pattern map writes no rule and must not replace
+          // the derived deny.
+          const explicit = ConfigPermissionV1.stripEmptyShellRules(result.permission)
+          ConfigPermissionV1.clearDerivedShellRename(perms, explicit)
+          // A legacy `tools: { bash: false }` deny keeps internal provenance
+          // even though the map is canonical `shell`, so the ruleset builder
+          // can protect it from a rename-recruited wildcard.
+          const inheritedShellDeny = legacyShellToolDeny(result.tools) && perms.shell === "deny"
+          const merged = mergeDeep(perms, explicit ?? {})
+          result.permission =
+            inheritedShellDeny && merged.shell === "deny"
+              ? ConfigPermissionV1.markDerivedShellDeny(merged)
+              : merged
         }
 
         if (!result.username) {
@@ -681,9 +945,9 @@ const layer = Layer.effect(
       const dir = yield* InstanceState.directory
       const file = path.join(dir, "config.json")
       const existing = yield* loadFile(file)
-      yield* fs
-        .writeFileString(file, JSON.stringify(mergeDeep(writable(existing), writable(config)), null, 2))
-        .pipe(Effect.orDie)
+      const patch = stripConfigEmptyShellRules(writable(config))
+      const merged = orderConfigPermissions(mergeDeep(writable(existing), patch), patch)
+      yield* fs.writeFileString(file, JSON.stringify(merged, null, 2)).pipe(Effect.orDie)
     })
 
     const invalidate = Effect.fn("Config.invalidate")(function* () {
@@ -693,20 +957,20 @@ const layer = Layer.effect(
     const updateGlobal = Effect.fn("Config.updateGlobal")(function* (config: Info) {
       const file = globalConfigFile()
       const before = (yield* readConfigFile(file)) ?? "{}"
-      const patch = writableGlobal(config)
+      const patch = stripConfigEmptyShellRules(writableGlobal(config))
 
       let next: Info
       let changed: boolean
       if (!file.endsWith(".jsonc")) {
-        const existing = ConfigParse.schema(ConfigV1.Info, ConfigParse.jsonc(before, file), file)
-        const merged = mergeDeep(writable(existing), patch)
+        const existing = decodeConfig(ConfigParse.jsonc(before, file), file)
+        const merged = orderConfigPermissions(mergeDeep(writable(existing), patch), patch)
         const serialized = JSON.stringify(merged, null, 2)
         changed = serialized !== before
         if (changed) yield* fs.writeFileString(file, serialized).pipe(Effect.orDie)
         next = merged
       } else {
-        const updated = patchJsonc(before, patch)
-        next = ConfigParse.schema(ConfigV1.Info, ConfigParse.jsonc(updated, file), file)
+        const updated = orderJsoncPermissions(patchJsonc(before, patch), patch, file)
+        next = decodeConfig(ConfigParse.jsonc(updated, file), file)
         changed = updated !== before
         if (changed) yield* fs.writeFileString(file, updated).pipe(Effect.orDie)
       }

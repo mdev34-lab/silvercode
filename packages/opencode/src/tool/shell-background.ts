@@ -16,7 +16,7 @@ const STATUS_OUTPUT_CHARS = 4_000
 export const Parameters = Schema.Struct({
   action: Schema.Literals(Actions).annotate({
     description:
-      'list: background shell commands of this session; status: current status plus partial output (never waits); output: output captured so far (never waits); cancel: kill the command\'s process tree',
+      "list: background shell commands of this session; status: current status plus partial output (never waits); output: output captured so far (never waits); cancel: kill the command's process tree",
   }),
   job_id: Schema.optional(Schema.String).annotate({
     description: "Background job id from the shell envelope. Required for status, output and cancel.",
@@ -63,11 +63,7 @@ function read(background: BackgroundJob.Interface, job: BackgroundJob.Info, fall
   return { text: job.output ?? snapshot?.output ?? job.error ?? "", snapshot, truncated, outputPath }
 }
 
-export const ShellBackgroundTool = Tool.define<
-  typeof Parameters,
-  Metadata,
-  BackgroundJob.Service | Truncate.Service
->(
+export const ShellBackgroundTool = Tool.define<typeof Parameters, Metadata, BackgroundJob.Service | Truncate.Service>(
   ShellBackground.ToolID,
   Effect.gen(function* () {
     const background = yield* BackgroundJob.Service

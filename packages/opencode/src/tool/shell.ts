@@ -708,9 +708,7 @@ export const ShellTool = Tool.define(
             abort.pipe(
               Effect.andThen(
                 Effect.suspend(() =>
-                  promoted
-                    ? Effect.never
-                    : Effect.succeed({ kind: "abort" as const, code: null, signal: undefined }),
+                  promoted ? Effect.never : Effect.succeed({ kind: "abort" as const, code: null, signal: undefined }),
                 ),
               ),
             ),
@@ -828,8 +826,7 @@ export const ShellTool = Tool.define(
           const result = yield* background.wait({ id: jobID })
           const info = result.info
           if (!info) return
-          const state =
-            info.status === "completed" ? "completed" : info.status === "cancelled" ? "cancelled" : "error"
+          const state = info.status === "completed" ? "completed" : info.status === "cancelled" ? "cancelled" : "error"
           // A teardown cancel is delivered silently: the row resolves without a
           // turn, so the session being torn down is not woken by it.
           const silent = info.cancelledByTeardown === true
@@ -861,9 +858,7 @@ export const ShellTool = Tool.define(
             ],
           })
         }).pipe(
-          Effect.catchCause((cause) =>
-            Effect.logWarning(`shell background notification failed: ${String(cause)}`),
-          ),
+          Effect.catchCause((cause) => Effect.logWarning(`shell background notification failed: ${String(cause)}`)),
         )
         yield* Effect.sync(() => {
           bridge.fork(deliver)
@@ -979,9 +974,7 @@ export const ShellTool = Tool.define(
         return started
       })
       return yield* supervised.pipe(
-        Effect.onInterrupt(() =>
-          handedOff ? Effect.void : Scope.close(childScope, Exit.void).pipe(Effect.ignore),
-        ),
+        Effect.onInterrupt(() => (handedOff ? Effect.void : Scope.close(childScope, Exit.void).pipe(Effect.ignore))),
       )
     })
 

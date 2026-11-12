@@ -440,11 +440,13 @@ it.instance(
       expect(body).toContain("instruction to act, not an acknowledgment")
       expect(body).toContain("correct the record")
 
-      // The task tool teaches the review handoff and lists the review agent in
-      // its roster with proactive-use wording.
+      // Both task-tool descriptions share the active-policy-aware review guidance.
       expect(body).toContain("Review handoffs")
       expect(body).toContain("- review: Code reviewer")
-      expect(body).toContain("Use this proactively, without being asked")
+      const reviewGuidance =
+        "Use this proactively when the active effort/review-loop policy requires review after file changes, or whenever the user explicitly asks for a review."
+      expect(body.split(reviewGuidance).length - 1).toBe(2)
+      expect(body).not.toContain("Use this proactively, without being asked")
 
       yield* prompt.cancel(chat.id)
       yield* Fiber.await(fiber)
@@ -608,7 +610,7 @@ it.instance(
       const reviewTools = toolNames(reviewHits[0])
       expect(reviewTools).toContain("finish")
       expect(reviewTools).toContain("read")
-      expect(reviewTools).toContain("bash")
+      expect(reviewTools).toContain("shell")
       expect(reviewTools).toContain("task")
 
       // The script's delegation branch fired: a synchronous review-agent

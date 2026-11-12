@@ -43,6 +43,7 @@ import type {
   TextPart,
   ReasoningPart,
   SessionStatus,
+  Message,
 } from "@opencode-ai/sdk/v2"
 import { ReviewReport } from "@opencode-ai/core/review-report"
 import { useLocal } from "../../context/local"
@@ -64,6 +65,8 @@ import { DialogForkFromTimeline } from "./dialog-fork-from-timeline"
 import { DialogSessionRename } from "../../component/dialog-session-rename"
 import { Sidebar } from "./sidebar"
 import { SubagentFooter } from "./subagent-footer.tsx"
+import { backgroundReview, reviewPresentationAnalysis, reviewText, subagentReview } from "./review-text"
+import { createExecutionReviewIndex } from "./review-execution"
 import { filetype } from "../../util/filetype"
 import parsers from "../../parsers-config"
 import { errorMessage } from "../../util/error"
@@ -79,7 +82,7 @@ import { DialogExportOptions } from "../../ui/dialog-export-options"
 import * as Model from "../../util/model"
 import { pauseMarker } from "../../util/pause"
 import { elapsed, useClock } from "../../util/clock"
-import { formatTranscript } from "../../util/transcript"
+import { formatTranscriptPaged } from "../../util/transcript"
 import { formatGenerationMetrics } from "../../util/generation-metrics"
 import { sessionEpilogue } from "../../util/presentation"
 import { setPreLayoutSiblingMargin } from "../../util/layout"
@@ -105,7 +108,7 @@ import { collapseDiff } from "../../util/collapse-diff"
 import { usePluginRuntime } from "../../plugin/runtime"
 import { DialogRetryAction } from "../../component/dialog-retry-action"
 import { getRevertDiffFiles } from "../../util/revert-diff"
-import { parseBackgroundResult, type BackgroundResult } from "../../util/background-task"
+import { parseBackgroundResult } from "../../util/background-task"
 import { OPENCODE_BASE_MODE, useBindings, useCommandShortcut, useOpencodeKeymap } from "../../keymap"
 import { usePathFormatter } from "../../context/path-format"
 import { LocationProvider } from "../../context/location"
@@ -120,6 +123,26 @@ const GO_UPSELL_WINDOW = 86_400_000 // 24 hrs
 const GO_UPSELL_PROVIDERS = new Set(["opencode", "opencode-go"])
 
 export const alwaysSeparate = new WeakSet<BoxRenderable>()
+
+// Rows rendered inside an expanded activity block sit one column closer than
+// the same row at transcript level: the block owns the indent, so every detail
+// line (native tool row, nested reasoning) shares one two-column inner indent.
+const activityDetail = createContext(false)
+
+// A renderable that already draws its own blank row below its content: at
+// transcript level tool panels pad their top and bottom by one row. A block
+// boundary consults this so the shared blank row is drawn once, by whichever
+// side already owns it.
+const selfPadded = new WeakSet<BoxRenderable>()
+
+// A tool panel's own spacing: one row of padding above and below, and one blank
+// row between the rows it stacks. Inside an activity block those rows would be
+// blank rows inside the block, and the block owns all of its spacing, so the
+// detail panel draws none of it. At transcript level the panel keeps its
+// anatomy exactly as before.
+function usePanelSpacing() {
+  return useContext(activityDetail) ? 0 : 1
+}
 
 type RetryAction = Extract<SessionStatus, { type: "retry" }>["action"]
 
@@ -196,6 +219,7 @@ const context = createContext<{
   sync: ReturnType<typeof useSync>
   tui: ReturnType<typeof useTuiConfig>
   activity: () => ActivityGroups
+  reviewExecution?: () => ReturnType<typeof createExecutionReviewIndex>
   activityAllExpanded: () => boolean
   activityExpanded: (groupID: string) => boolean
   toggleActivity: (groupID: string) => void
@@ -247,6 +271,9 @@ export function Session() {
       .toSorted((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
   })
   const messages = createMemo(() => sync.data.message[route.sessionID] ?? [])
+  // The transcript is shared by every assistant row: discover its execution
+  // boundaries once per reactive change, not once per rendered message.
+  const reviewExecution = createMemo(() => createExecutionReviewIndex(messages(), sync.data.part))
   const messagesBeforeRevert = () => {
     const messageID = session()?.revert?.messageID
     if (!messageID) return messages()
@@ -369,7 +396,19 @@ export function Session() {
       }
       editor.reconnect(result.data.directory)
       await sync.session.sync(sessionID)
-      if (route.sessionID === sessionID && scroll) scroll.scrollBy(100_000)
+      if (route.sessionID !== sessionID) return
+      // The mount read failed quietly (`sync()` resolves on a messages error,
+      // #26560). Say so instead of leaving an empty timeline without a reason;
+      // nothing was marked complete, so the next visit retries the read (#815).
+      const failure = sync.session.syncError(sessionID)
+      if (failure !== undefined) {
+        toast.show({
+          message: `Failed to load messages: ${errorMessage(failure)}`,
+          variant: "error",
+          duration: 5000,
+        })
+      }
+      if (scroll) scroll.scrollBy(100_000)
     })().catch((error) => {
       if (route.sessionID !== sessionID) return
       toast.show({
@@ -409,6 +448,70 @@ export function Session() {
   // stays put while new output lands under a reader who scrolled up.
   const [scrolledAway, setScrolledAway] = createSignal(false)
   const lastShortcut = useCommandShortcut("session.last")
+  const renderer = useRenderer()
+  // Older history arrives on demand (#815): the store holds the newest page on
+  // mount, the previous page is fetched with the endpoint's `before` cursor
+  // when the reader approaches the top, and the viewport is re-anchored on the
+  // message it was showing so a prepend never scrolls the transcript.
+  // One older page at a time, but every caller shares that page: a prefetch
+  // that is already running must not report "nothing older" to `session.first`.
+  let olderInFlight: Promise<{ added: number; cursor?: string }> | undefined
+  // Chained rAF callbacks outlive an unmount; capture the generation at
+  // schedule time and stop at the first stale frame (same guard as the
+  // diff-viewer's scroll restore).
+  let anchorGeneration = 0
+  onCleanup(() => {
+    anchorGeneration++
+  })
+  const restoreAnchor = (top: number, height: number, attempt = 0) => {
+    const generation = anchorGeneration
+    renderer.requestAnimationFrame(() => {
+      if (generation !== anchorGeneration || !scroll || scroll.isDestroyed) return
+      const grown = scroll.scrollHeight - height
+      // The prepended rows may not be laid out yet; retry a frame or two
+      // instead of leaving the reader shifted.
+      if (grown <= 0 && attempt < 3) return restoreAnchor(top, height, attempt + 1)
+      scroll.scrollTo(top + Math.max(0, grown))
+    })
+  }
+  type OlderPage = Awaited<ReturnType<typeof sync.session.more>>
+  // A failed page must not read as "the timeline ended here": the cursor stays
+  // where it was (the store only advances it on a successful page), so the next
+  // attempt retries the same page. The failure is reported to the reader instead
+  // of being turned into an empty result.
+  let olderFailureShown = false
+  const reportOlderFailure = () => {
+    if (olderFailureShown) return
+    olderFailureShown = true
+    toast.show({ message: "Failed to load older messages", variant: "error" })
+  }
+  const loadOlder = (anchor = true): Promise<OlderPage> => {
+    // A read that is already running is shared, not skipped: callers waiting in
+    // `session.first` must still see the page land, and the reader's scroll
+    // must still be anchored when it does.
+    if (olderInFlight) return olderInFlight
+    const box = scroll
+    if (!box || box.isDestroyed || !sync.session.hasOlder(route.sessionID)) return Promise.resolve({ added: 0 })
+    const top = box.scrollTop
+    const height = box.scrollHeight
+    const task = (async () => {
+      try {
+        const page = await sync.session.more(route.sessionID)
+        if (page.added > 0 && anchor) restoreAnchor(top, height)
+        olderFailureShown = false
+        return page
+      } catch (error) {
+        // The loaded window is left as it is (nothing on screen is dropped) and
+        // the failure reaches the caller.
+        reportOlderFailure()
+        throw error
+      } finally {
+        olderInFlight = undefined
+      }
+    })()
+    olderInFlight = task
+    return task
+  }
   function watchScroll(r: ScrollBoxRenderable) {
     scroll = r
     const update = () =>
@@ -417,6 +520,9 @@ export function Session() {
         const max = Math.max(0, r.scrollHeight - r.viewport.height)
         // Same threshold the scrollbox uses to re-engage sticky scrolling.
         setScrolledAway(max > 1 && r.scrollTop < max - 1)
+        // Prefetch one viewport ahead of the top so older history is there
+        // before the reader reaches a dead end.
+        if (r.scrollTop <= r.viewport.height) void loadOlder().catch(() => undefined)
       })
     r.verticalScrollBar.on("change", update)
     onCleanup(() => r.verticalScrollBar.off("change", update))
@@ -431,7 +537,6 @@ export function Session() {
   }
   const keymap = useOpencodeKeymap()
   const dialog = useDialog()
-  const renderer = useRenderer()
 
   const offSessionStatus = event.on("session.status", (evt) => {
     if (evt.properties.sessionID !== route.sessionID) return
@@ -911,7 +1016,35 @@ export function Session() {
       category: "Session",
       hidden: true,
       run: () => {
-        scroll.scrollTo(0)
+        // "First message" means the oldest persisted message, not the oldest
+        // one the mount window loaded: drain every remaining page first. A
+        // prefetch that is already in flight is awaited through `loadOlder`
+        // instead of reading as "nothing older".
+        void (async () => {
+          let cursor: string | undefined
+          try {
+            for (;;) {
+              if (!sync.session.hasOlder(route.sessionID)) break
+              const page = await loadOlder(false)
+              // A page that adds nothing but moves the cursor is still progress:
+              // its rows were already loaded or were removed live. Only no rows
+              // *and* no cursor movement means the drain cannot get further.
+              if (page.added === 0 && (page.cursor === undefined || page.cursor === cursor)) break
+              cursor = page.cursor
+            }
+          } catch {
+            // Older history is still out there and unreachable right now. Leave
+            // the reader where they are rather than jumping to the oldest
+            // *loaded* message as if it were the first one; the retry is another
+            // Home (or a scroll), and the cursor was never advanced past it.
+            return
+          }
+          // An anchor restore scheduled by the page that was in flight would
+          // land after this scroll and pull the reader off the first message;
+          // an explicit jump to the top wins over pending restores.
+          anchorGeneration++
+          if (scroll && !scroll.isDestroyed) scroll.scrollTo(0)
+        })()
         dialog.clear()
       },
     },
@@ -1021,16 +1154,18 @@ export function Session() {
         try {
           const sessionData = session()
           if (!sessionData) return
-          const sessionMessages = messages()
-          const transcript = formatTranscript(
+          // The transcript is the complete history, never just the rendered
+          // window: read every persisted page instead of the bounded store
+          // (#815).
+          const transcript = await formatTranscriptPaged(
             sessionData,
-            sessionMessages.map((msg) => ({ info: msg, parts: sync.data.part[msg.id] ?? [] })),
             {
               thinking: showThinking(),
               toolDetails: showDetails(),
               assistantMetadata: showAssistantMetadata(),
               providers: sync.data.provider,
             },
+            (before) => sync.session.historyPage(sessionData.id, before),
           )
           await clipboard.write?.(transcript)
           toast.show({ message: "Session transcript copied to clipboard!", variant: "success" })
@@ -1051,9 +1186,12 @@ export function Session() {
         try {
           const sessionData = session()
           if (!sessionData) return
-          const sessionMessages = messages()
+          // Bind the session this command was launched from: the options dialog
+          // awaits the user, and the route can move to another session while it
+          // is open. Metadata and history must both come from the bound session.
+          const sessionID = sessionData.id
 
-          const defaultFilename = `session-${sessionData.id.slice(0, 8)}.md`
+          const defaultFilename = `session-${sessionID.slice(0, 8)}.md`
 
           const options = await DialogExportOptions.show(
             dialog,
@@ -1066,15 +1204,18 @@ export function Session() {
 
           if (options === null) return
 
-          const transcript = formatTranscript(
+          // Export reads every persisted page rather than the bounded store (or
+          // the session's mount window), so an export never truncates the
+          // transcript (#815).
+          const transcript = await formatTranscriptPaged(
             sessionData,
-            sessionMessages.map((msg) => ({ info: msg, parts: sync.data.part[msg.id] ?? [] })),
             {
               thinking: options.thinking,
               toolDetails: options.toolDetails,
               assistantMetadata: options.assistantMetadata,
               providers: sync.data.provider,
             },
+            (before) => sync.session.historyPage(sessionID, before),
           )
 
           if (options.openWithoutSaving) {
@@ -1270,6 +1411,7 @@ export function Session() {
           sync,
           tui: tuiConfig,
           activity,
+          reviewExecution,
           activityAllExpanded,
           activityExpanded,
           toggleActivity,
@@ -1387,7 +1529,7 @@ export function Session() {
                         <></>
                       </Match>
                       <Match when={message.role === "user"}>
-                        <UserMessage
+                        <UserMessageRow
                           index={index()}
                           onMouseUp={() => {
                             if (renderer.getSelection()?.getSelectedText()) return
@@ -1496,7 +1638,7 @@ export function Session() {
   )
 }
 
-function UserMessage(props: {
+function UserMessageRow(props: {
   message: UserMessage
   parts: Part[]
   onMouseUp: () => void
@@ -1521,12 +1663,64 @@ function UserMessage(props: {
   // task delivery markup. The user text above hides synthetic parts, so each
   // delivered result gets its own history indicator instead of rendering
   // nothing and letting the main agent resume from an unexplained gap.
-  const backgroundResults = createMemo(() =>
-    props.parts
-      .filter((part): part is TextPart => part.type === "text" && part.synthetic === true)
-      .map((part) => parseBackgroundResult(part.text))
-      .filter((result): result is BackgroundResult => result !== undefined),
+  const backgroundParts = createMemo(() =>
+    props.parts.filter((part): part is TextPart => part.type === "text" && part.synthetic === true),
   )
+  const backgroundResults = createMemo(() =>
+    backgroundParts().flatMap((part) => {
+      const result = parseBackgroundResult(part.text)
+      return result ? [{ part, result }] : []
+    }),
+  )
+  const sdk = useSDK()
+  const sync = useSync()
+  const [history, setHistory] = createSignal<{ info: Message; parts: Part[] }[]>()
+  const [historyRevision, setHistoryRevision] = createSignal(0)
+  // A removal can affect a launch or duplicate outside this row. Invalidate
+  // immediately and refetch the full history; the effect cleanup also rejects
+  // any older in-flight response.
+  const offHistoryRemoval = sdk.event.on("event", (event) => {
+    const payload = event.payload
+    if ((payload.type !== "message.removed" && payload.type !== "message.part.removed") ||
+        payload.properties.sessionID !== props.message.sessionID) return
+    setHistory(undefined)
+    setHistoryRevision((revision) => revision + 1)
+  })
+  onCleanup(offHistoryRemoval)
+  // Read the complete persisted history before treating a launch/receipt pair
+  // as unique, including rows the live store may not hold. While loading or on
+  // failure the receipt remains visible on the ordinary fallback path.
+  createEffect(on(
+    () => ({ key: backgroundParts().filter((part) => ReviewReport.TAGS.some((tag) => part.text.includes(`<${tag}`))).map((part) => `${part.id}\n${part.text}`).join("\n"), revision: historyRevision() }),
+    ({ key }) => {
+      setHistory(undefined)
+      if (!key) return
+      let active = true
+      void sdk.client.session.messages({ sessionID: props.message.sessionID }, { throwOnError: true })
+        .then((response) => { if (active && response.data) setHistory(response.data) })
+        .catch(() => {})
+      onCleanup(() => { active = false })
+    },
+  ))
+  const backgroundCandidate = (receipt: TextPart) => {
+    const snapshot = history()
+    if (!snapshot) return undefined
+    const rows = new Map(snapshot.map((entry) => [entry.info.id, entry.info]))
+    const parts: Record<string, readonly Part[]> = Object.fromEntries(snapshot.map((entry) => [entry.info.id, entry.parts]))
+    // Overlay the live window so a receipt or launch updated during the fetch
+    // cannot be hidden by an older persisted snapshot.
+    for (const message of sync.data.message[props.message.sessionID] ?? []) {
+      rows.set(message.id, message)
+      const current = sync.data.part[message.id]
+      if (current) {
+        const merged = new Map((parts[message.id] ?? []).map((part) => [part.id, part]))
+        for (const part of current) merged.set(part.id, part)
+        parts[message.id] = [...merged.values()]
+      }
+    }
+    return backgroundReview({ receipt, messages: [...rows.values()], parts, sessions: sync.data.session, complete: true })
+  }
+  const hasReviewCandidate = (part: TextPart) => ReviewReport.TAGS.some((tag) => part.text.includes(`<${tag}`) || part.text.includes(`</${tag}`))
   const { theme } = useTheme()
   const [hover, setHover] = createSignal(false)
   const queued = createMemo(() => props.pending !== undefined && props.index > props.pending)
@@ -1599,7 +1793,8 @@ function UserMessage(props: {
         </box>
       </Show>
       <For each={backgroundResults()}>
-        {(result) => {
+        {(entry) => {
+          const result = entry.result
           const completed = () => result.state === "completed"
           const cancelled = () => result.state === "cancelled"
           return (
@@ -1623,9 +1818,17 @@ function UserMessage(props: {
                 </span>{" "}
                 {result.summary} — {cancelled() ? "cancellation" : "result"} delivered to the main agent
               </text>
+              <Show when={hasReviewCandidate(entry.part)}>
+                <Show when={backgroundCandidate(entry.part)} fallback={<box paddingLeft={3}><text fg={theme.text}>{entry.part.text}</text></box>}>
+                  {(review) => <ReviewFinish review={review()} />}
+                </Show>
+              </Show>
             </>
           )
         }}
+      </For>
+      <For each={backgroundParts().filter((part) => !parseBackgroundResult(part.text) && hasReviewCandidate(part))}>
+        {(part) => <box paddingLeft={3}><text fg={theme.text}>{part.text}</text></box>}
       </For>
       <Show when={compaction()}>
         <box
@@ -1640,6 +1843,9 @@ function UserMessage(props: {
   )
 }
 
+// Export the real user row for synthetic live-render transcript captures.
+export { UserMessageRow as CaptureUserMessage }
+
 // Exported so tests can render the assistant transcript row directly.
 export function AssistantMessageRow(props: { message: AssistantMessage; parts: Part[]; last: boolean }) {
   const ctx = use()
@@ -1648,6 +1854,60 @@ export function AssistantMessageRow(props: { message: AssistantMessage; parts: P
   const sync = useSync()
   const messages = createMemo(() => sync.data.message[props.message.sessionID] ?? [])
   const model = createMemo(() => Model.name(ctx.providers(), props.message.providerID, props.message.modelID))
+  // Standalone row fixtures may omit the session index; the route supplies one
+  // shared instance for all rows.
+  const localReviewExecution = createMemo(() => ctx.reviewExecution ? undefined : createExecutionReviewIndex(messages(), sync.data.part))
+  const execution = createMemo(() => (ctx.reviewExecution ? ctx.reviewExecution() : localReviewExecution())?.get(props.message.id))
+  const textReview = createMemo(() => execution() ? undefined : reviewText(props.message, props.parts))
+  const matchingFinish = createMemo(() => {
+    const text = textReview()
+    if (!text) return undefined
+    for (const part of props.parts) {
+      if (part.type !== "tool" || part.tool !== "finish" || part.state.status !== "completed") continue
+      if (finishBlockView(part, part.state.input)?.tone !== "success") continue
+      const finish = parseReviewReport(finishResult(part.state.input, part.state.output))
+      if (!finish || JSON.stringify(finish.report) !== JSON.stringify(text.report)) continue
+      const analysis = reviewPresentationAnalysis(finish.analysis)
+      if (analysis === undefined) continue
+      return { part, analysis }
+    }
+    return undefined
+  })
+  const earlierReview = createMemo(() => {
+    const rows = messages()
+    const index = rows.findIndex((row) => row.id === props.message.id)
+    if (index < 0) return undefined
+    for (let i = index - 1; i >= 0; i--) {
+      const row = rows[i]
+      if (row.role !== "assistant" || row.parentID !== props.message.parentID || row.agent !== props.message.agent) break
+      const parts = sync.data.part[row.id]
+      if (!parts) return undefined
+      if (parts.some((part) => part.type === "tool" && part.tool === "finish" && part.state.status === "completed")) break
+      const review = reviewText(row, parts)
+      if (review) return review
+    }
+    return undefined
+  })
+  const repeatedFinish = createMemo(() => {
+    if (execution() || textReview()) return undefined
+    const earlier = earlierReview()
+    if (!earlier) return undefined
+    return props.parts.find((part): part is ToolPart => {
+      if (part.type !== "tool" || part.tool !== "finish" || part.state.status !== "completed") return false
+      if (finishBlockView(part, part.state.input)?.tone !== "success") return false
+      const finish = parseReviewReport(finishResult(part.state.input, part.state.output))
+      if (!finish || JSON.stringify(finish.report) !== JSON.stringify(earlier.report)) return false
+      const analysis = reviewPresentationAnalysis(finish.analysis)
+      return analysis !== undefined && (!analysis.trim() || earlier.analysis.includes(analysis.trim()))
+    })
+  })
+  const displayedTextReview = createMemo(() => {
+    const text = textReview()
+    if (!text) return undefined
+    const analysis = matchingFinish()?.analysis?.trim()
+    if (!analysis || text.analysis.includes(analysis)) return text
+    return { ...text, analysis: [text.analysis, analysis].filter(Boolean).join("\n\n") }
+  })
 
   const final = createMemo(() => {
     return props.message.finish && !["tool-calls", "unknown"].includes(props.message.finish)
@@ -1773,6 +2033,30 @@ export function AssistantMessageRow(props: { message: AssistantMessage; parts: P
               )}
             </Show>
             <Switch>
+              <Match when={part.type === "text" && execution()?.prose?.has(part.id)}>
+                <TextPart last={index() === props.parts.length - 1} part={{ ...(part as TextPart), text: execution()!.prose!.get(part.id)! }} message={props.message} />
+              </Match>
+              <Match when={part.type === "tool" && part.tool === "finish" && execution()?.report && part.id === execution()?.finishID}>
+                <Show when={execution()?.finishProse?.trim()}>
+                  <box paddingLeft={3} marginTop={1}><text fg={theme.text}>{execution()!.finishProse}</text></box>
+                </Show>
+              </Match>
+              <Match when={part.type === "tool" && part.tool === "finish" && execution() && !execution()?.report}>
+                <ToolPart last={index() === props.parts.length - 1} part={part as ToolPart} message={props.message} suppressReview />
+              </Match>
+              <Match when={part.type === "text" && textReview()?.textPartIDs.includes(part.id)}>
+                <Show when={textReview()?.textPartIDs[0] === part.id && displayedTextReview()}>
+                  {(review) => <ReviewFinish review={review()} part={matchingFinish()?.part} />}
+                </Show>
+              </Match>
+              <Match when={part.id === matchingFinish()?.part.id}>
+                <></>
+              </Match>
+              <Match when={part.id === repeatedFinish()?.id}>
+                <InlineTool icon="✓" pending="Completing task..." complete={true} part={repeatedFinish()!} separate={true}>
+                  Task completed
+                </InlineTool>
+              </Match>
               <Match when={group()?.owner === true}>
                 <ActivityGroup groupID={group()!.groupID} />
               </Match>
@@ -1794,6 +2078,9 @@ export function AssistantMessageRow(props: { message: AssistantMessage; parts: P
           )
         }}
       </For>
+      <Show when={execution()?.owner === props.message.id && execution()?.report}>
+        {(report) => <ReviewFinish review={{ report: report(), analysis: "", raw: execution()?.raw }} />}
+      </Show>
       <Show when={props.parts.some((x) => x.type === "tool" && x.tool === "task")}>
         <box paddingTop={1} paddingLeft={3}>
           <text fg={theme.text}>
@@ -1905,7 +2192,13 @@ const PART_MAPPING = {
 
 const INLINE_TOOL_ICON_WIDTH = 2
 
-// Default content lines shown in a collapsed bash/write/edit block before "Click to expand".
+// Inner indent of an expanded activity block's detail rows, measured from the
+// block header. Tool panels keep their border on the header column and put
+// their content on this same column, so header, rows and panel content share
+// one indent instead of drifting by tool.
+const ACTIVITY_DETAIL_INDENT = 2
+
+// Default content lines shown in a collapsed shell/write/edit block before "Click to expand".
 const COLLAPSED_TOOL_PREVIEW_LINES = 3
 
 function ReasoningPart(props: { last: boolean; part: ReasoningPart; message: AssistantMessage }) {
@@ -1941,12 +2234,17 @@ function ReasoningPart(props: { last: boolean; part: ReasoningPart; message: Ass
     setExpanded((prev) => !prev)
   }
 
+  const detail = useContext(activityDetail)
+
   return (
     <Show when={content() || opaque()}>
       <box
         ref={(el: BoxRenderable) => alwaysSeparate.add(el)}
-        paddingLeft={3}
-        marginTop={1}
+        paddingLeft={detail ? ACTIVITY_DETAIL_INDENT : 3}
+        // Inside a block a nested reasoning row is one more compact detail row
+        // under the header, so it drops the transcript-level blank row; the
+        // panel above it already pads its own bottom.
+        marginTop={detail ? 0 : 1}
         flexDirection="column"
         flexShrink={0}
       >
@@ -1961,7 +2259,12 @@ function ReasoningPart(props: { last: boolean; part: ReasoningPart; message: Ass
           />
         </box>
         <Show when={!opaque() && open() && summary().body}>
-          <box paddingLeft={inMinimal() ? 2 : 0} marginTop={1}>
+          {/* The body's top margin is the transcript's row between a reasoning
+              header and the text under it. Inside an activity block that row
+              would be a blank row inside the block, so the body starts on the
+              row after the header; the body's own markdown blank lines are
+              content and stay. */}
+          <box paddingLeft={inMinimal() ? 2 : 0} marginTop={detail ? 0 : 1}>
             <code
               filetype="markdown"
               drawUnstyledText={false}
@@ -2087,6 +2390,13 @@ function ActivitySubGroupBlock(props: { groupID: string; subID: string }) {
   const kind = createMemo(() => sub()?.kind ?? "misc")
   const items = createMemo(() => sub()?.items ?? [])
   const parts = createMemo(() => sub()?.parts ?? [])
+  // Tool-only blocks remain compact. When a block interleaves reasoning and
+  // tool calls, each rendered part is a separate semantic unit, so leave one
+  // readable row between units without changing their internal anatomy.
+  const mixedDetails = createMemo(() => {
+    const detail = parts()
+    return detail.some((item) => item.part.type === "reasoning") && detail.some((item) => item.part.type === "tool")
+  })
   const summary = createMemo(() => summarizeActivity(items().map((item) => item.part)))
   const targets = createMemo(() => countActivityTargets(items()))
   const expanded = createMemo(() => ctx.activityExpanded(props.subID))
@@ -2125,7 +2435,18 @@ function ActivitySubGroupBlock(props: { groupID: string; subID: string }) {
   }
 
   return (
-    <box>
+    <box
+      ref={(el: BoxRenderable) =>
+        // One blank terminal row between blocks. A block whose last detail row
+        // already ends with its own bottom padding (a tool panel) draws that
+        // row itself, so adding the margin here would double the gap.
+        setPreLayoutSiblingMargin(el, (previous) => {
+          if (!previous) return 0
+          const last = previous.getChildren().at(-1)
+          return last instanceof BoxRenderable && selfPadded.has(last) ? 0 : 1
+        })
+      }
+    >
       <box onMouseOver={() => setHover(true)} onMouseOut={() => setHover(false)} onMouseUp={toggle}>
         <Switch>
           <Match when={summary().working}>
@@ -2156,20 +2477,27 @@ function ActivitySubGroupBlock(props: { groupID: string; subID: string }) {
         </Switch>
       </box>
       <Show when={expanded()}>
-        <For each={parts()}>{(item) => <ActivityGroupPartRow item={item} />}</For>
+        <activityDetail.Provider value={true}>
+          <For each={parts()}>
+            {(item, index) => <ActivityGroupPartRow item={item} separate={mixedDetails() && index() > 0} />}
+          </For>
+        </activityDetail.Provider>
       </Show>
     </box>
   )
 }
 
-function ActivityGroupPartRow(props: { item: ActivityGroupPart }) {
-  if (props.item.part.type === "reasoning") {
-    return <ReasoningPart last={false} part={props.item.part} message={props.item.message} />
-  }
-  return <ToolPart last={false} part={props.item.part} message={props.item.message} />
+function ActivityGroupPartRow(props: { item: ActivityGroupPart; separate: boolean }) {
+  const row =
+    props.item.part.type === "reasoning" ? (
+      <ReasoningPart last={false} part={props.item.part} message={props.item.message} />
+    ) : (
+      <ToolPart last={false} part={props.item.part} message={props.item.message} />
+    )
+  return <box marginTop={props.separate ? 1 : 0}>{row}</box>
 }
 
-function ToolPart(props: { last: boolean; part: ToolPart; message: AssistantMessage }) {
+function ToolPart(props: { last: boolean; part: ToolPart; message: AssistantMessage; suppressReview?: boolean }) {
   const ctx = use()
   const renderer = createMemo(() => toolRenderer(props.part.tool))
 
@@ -2192,6 +2520,9 @@ function ToolPart(props: { last: boolean; part: ToolPart; message: AssistantMess
     get part() {
       return props.part
     },
+    get suppressReview() {
+      return props.suppressReview
+    },
   }
 
   return (
@@ -2210,6 +2541,7 @@ type ToolProps = {
 }
 function GenericTool(props: ToolProps) {
   const { theme } = useTheme()
+  const spacing = usePanelSpacing()
   const ctx = use()
   const output = createMemo(() => stripAnsi(props.output?.trim() ?? ""))
   const args = createMemo(() => Locale.truncate(input(props.input), Math.max(20, ctx.width - 12)))
@@ -2236,7 +2568,7 @@ function GenericTool(props: ToolProps) {
         part={props.part}
         onClick={collapsed().overflow ? () => setExpanded((prev) => !prev) : undefined}
       >
-        <box gap={1}>
+        <box gap={spacing}>
           <text fg={theme.text}>{limited()}</text>
           <Show when={collapsed().overflow}>
             <text fg={theme.textMuted}>{expanded() ? "Click to collapse" : "Click to expand"}</text>
@@ -2331,7 +2663,7 @@ function Invalid(props: ToolProps) {
   )
 }
 
-function Finish(props: ToolProps) {
+function Finish(props: ToolProps & { suppressReview?: boolean }) {
   const ctx = use()
   const { theme } = useTheme()
   const result = createMemo(() => finishResult(props.input, props.output))
@@ -2340,7 +2672,11 @@ function Finish(props: ToolProps) {
   // structurally instead of dumping the raw JSON; only a completed part
   // qualifies, since a running finish can still be declined by the review
   // gate and must not pre-announce its verdict.
-  const review = createMemo(() => (props.part.state.status === "completed" ? parseReviewReport(result()) : undefined))
+  const review = createMemo(() =>
+    !props.suppressReview && props.part.state.status === "completed" && finishBlockView(props.part, props.input)?.tone === "success"
+      ? parseReviewReport(result())
+      : undefined,
+  )
   const [expanded, setExpanded] = createSignal(false)
   const [errorExpanded, setErrorExpanded] = createSignal(false)
   // The block shows the agent's own summary; the tool output also carries
@@ -2584,8 +2920,9 @@ export function reviewFindingLocation(finding: ReviewReport.Finding): string | u
   return file + line
 }
 
-function ReviewFinish(props: { review: { report: ReviewReport.Info; analysis: string }; part: ToolPart }) {
+function ReviewFinish(props: { review: { report: ReviewReport.Info; analysis: string; raw?: string }; part?: ToolPart }) {
   const { theme } = useTheme()
+  const spacing = usePanelSpacing()
   const ctx = use()
   const [expanded, setExpanded] = createSignal(false)
   const [rawOpen, setRawOpen] = createSignal(false)
@@ -2608,10 +2945,9 @@ function ReviewFinish(props: { review: { report: ReviewReport.Info; analysis: st
   const expandable = createMemo(() =>
     analysisCollapsed().overflow || findings().some((finding) => (finding.detail ?? "").trim() !== ""),
   )
-  // The envelope is stripped from the default view; the exact canonical
-  // JSON stays reachable on demand, re-serialized the same way the runtime
-  // delivers it to the parent agent.
-  const rawReport = createMemo(() => capOutputLines(ReviewReport.envelope(report())))
+  // Keep the original receipt reachable when supplied; the legacy fallback
+  // applies only when the delivery has no original raw text.
+  const rawReport = createMemo(() => props.review.raw ?? capOutputLines(ReviewReport.envelope(report())))
   const revision = createMemo(() => (report().revision ? Locale.truncateMiddle(report().revision, 24) : undefined))
 
   const severityColor = (severity: ReviewReport.Finding["severity"]) =>
@@ -2624,7 +2960,7 @@ function ReviewFinish(props: { review: { report: ReviewReport.Info; analysis: st
         part={props.part}
         onClick={expandable() ? () => setExpanded((prev) => !prev) : undefined}
       >
-        <box gap={1}>
+        <box gap={spacing}>
           <text fg={theme.text}>
             <span style={{ fg: approved() ? theme.success : theme.error, bold: true }}>
               {approved() ? "✓ Approved" : "✗ Needs fixes"}
@@ -2670,15 +3006,32 @@ function ReviewFinish(props: { review: { report: ReviewReport.Info; analysis: st
           </Show>
         </box>
       </BlockTool>
-      <InlineTool
-        icon="⚙"
-        pending="Preparing review report..."
-        complete={true}
-        part={props.part}
-        onClick={() => setRawOpen((prev) => !prev)}
+      <Show
+        when={props.part}
+        fallback={
+          <InlineToolRow
+            icon="⚙"
+            color={theme.textMuted}
+            pending=""
+            complete={true}
+            onMouseUp={() => setRawOpen((prev) => !prev)}
+          >
+            {rawOpen() ? "Click to hide the raw report" : "Raw review report"}
+          </InlineToolRow>
+        }
       >
-        {rawOpen() ? "Click to hide the raw report" : "Raw review report"}
-      </InlineTool>
+        {(part) => (
+          <InlineTool
+            icon="⚙"
+            pending="Preparing review report..."
+            complete={true}
+            part={part()}
+            onClick={() => setRawOpen((prev) => !prev)}
+          >
+            {rawOpen() ? "Click to hide the raw report" : "Raw review report"}
+          </InlineTool>
+        )}
+      </Show>
       <Show when={rawOpen()}>
         <box paddingLeft={5}>
           <text fg={theme.textMuted}>{rawReport()}</text>
@@ -2789,19 +3142,24 @@ export function InlineToolRow(props: {
   onMouseOut?: () => void
   onMouseUp?: () => void
 }) {
+  const detail = useContext(activityDetail)
   return (
     <box
-      paddingLeft={3}
+      paddingLeft={detail ? ACTIVITY_DETAIL_INDENT : 3}
       onMouseOver={props.onMouseOver}
       onMouseOut={props.onMouseOut}
       onMouseUp={props.onMouseUp}
       ref={(el: BoxRenderable) => {
         if (props.separate) alwaysSeparate.add(el)
         setPreLayoutSiblingMargin(el, (previous) => {
-          return props.separate ||
-            (previous instanceof BoxRenderable && (previous.height > 1 || alwaysSeparate.has(previous)))
-            ? 1
-            : 0
+          if (props.separate) return 1
+          if (!(previous instanceof BoxRenderable)) return 0
+          // Inside an expanded activity block the detail rows are one compact
+          // list directly under their header: the block's own margin owns the
+          // spacing between blocks, and a tool panel's own bottom padding owns
+          // the row below it, so a detail row never draws a blank row itself.
+          if (detail) return 0
+          return previous.height > 1 || alwaysSeparate.has(previous) ? 1 : 0
         })
       }}
     >
@@ -2812,8 +3170,13 @@ export function InlineToolRow(props: {
         <Match when={true}>
           <Show
             fallback={
+              // The pending row's `~` stands where a completed row's icon
+              // stands, so the two share a marker column. Inside an activity
+              // block that column is the shared detail indent, which the row's
+              // wrapper already applies, so the text contributes no extra
+              // indent there; at transcript level it keeps its own.
               <text
-                paddingLeft={3}
+                paddingLeft={detail ? 0 : 3}
                 fg={props.color}
                 attributes={props.denied || props.interrupted ? TextAttributes.STRIKETHROUGH : undefined}
               >
@@ -2862,15 +3225,27 @@ function BlockTool(props: {
   const renderer = useRenderer()
   const [hover, setHover] = createSignal(false)
   const error = createMemo(() => (props.part?.state.status === "error" ? props.part.state.error : undefined))
+  // Inside an expanded activity block the panel is one of the block's detail
+  // rows: it draws no padding or gap rows of its own, so the block holds no
+  // blank row inside it, and it keeps its left border on the block header's
+  // column so its content lands on the shared detail column. Only the block's
+  // boundary margin draws a blank row. At transcript level the panel keeps its
+  // padding and gaps, and registers as self-padded so the shared blank row is
+  // drawn once.
+  const detail = useContext(activityDetail)
+  const spacing = usePanelSpacing()
   return (
     <box
-      ref={(el: BoxRenderable) => alwaysSeparate.add(el)}
+      ref={(el: BoxRenderable) => {
+        alwaysSeparate.add(el)
+        if (!detail) selfPadded.add(el)
+      }}
       border={["left"]}
-      paddingTop={1}
-      paddingBottom={1}
-      paddingLeft={2}
-      marginTop={1}
-      gap={1}
+      paddingTop={spacing}
+      paddingBottom={spacing}
+      paddingLeft={detail ? ACTIVITY_DETAIL_INDENT - 1 : 2}
+      marginTop={detail ? 0 : 1}
+      gap={spacing}
       backgroundColor={hover() ? theme.backgroundMenu : theme.backgroundPanel}
       customBorderChars={SplitBorder.customBorderChars}
       borderColor={theme.background}
@@ -2905,6 +3280,7 @@ function BlockTool(props: {
 
 function Shell(props: ToolProps) {
   const { theme } = useTheme()
+  const spacing = usePanelSpacing()
   const pathFormatter = usePathFormatter()
   const ctx = use()
   const isRunning = createMemo(() => props.part.state.status === "running")
@@ -2945,7 +3321,7 @@ function Shell(props: ToolProps) {
           part={props.part}
           onClick={collapsed().overflow ? () => setExpanded((prev) => !prev) : undefined}
         >
-          <box gap={1}>
+          <box gap={spacing}>
             <Show when={isRunning()} fallback={<text fg={theme.text}>$ {stringValue(props.input.command)}</text>}>
               <Spinner color={theme.text}>{stringValue(props.input.command)}</Spinner>
             </Show>
@@ -3033,6 +3409,7 @@ function Glob(props: ToolProps) {
 function Read(props: ToolProps) {
   const { theme } = useTheme()
   const pathFormatter = usePathFormatter()
+  const detail = useContext(activityDetail)
   const isRunning = createMemo(() => props.part.state.status === "running")
   const loaded = createMemo(() => {
     if (props.part.state.status !== "completed") return []
@@ -3054,8 +3431,13 @@ function Read(props: ToolProps) {
       </InlineTool>
       <For each={loaded()}>
         {(filepath) => (
-          <box paddingLeft={3}>
-            <text paddingLeft={3} fg={theme.textMuted}>
+          // At transcript level the row and its loaded files share one column:
+          // the row's own indent, then the row's indent again for the nested
+          // line. Inside an activity block the shared detail indent is that
+          // first indent, so the nested line lands on the same column as the
+          // read row instead of being pushed past it by a second one.
+          <box paddingLeft={detail ? ACTIVITY_DETAIL_INDENT : 3}>
+            <text paddingLeft={detail ? 0 : 3} fg={theme.textMuted}>
               ↳ Loaded {pathFormatter.format(filepath)}
             </text>
           </box>
@@ -3147,6 +3529,7 @@ function Task(props: ToolProps) {
     if (sessionID && !sync.data.message[sessionID]?.length) void sync.session.sync(sessionID)
   })
 
+  const review = createMemo(() => subagentReview(props.part))
   const sessionID = createMemo(() => stringValue(props.metadata.sessionId))
   const messages = createMemo(() => sync.data.message[sessionID() ?? ""] ?? [])
 
@@ -3219,6 +3602,7 @@ function Task(props: ToolProps) {
   })
 
   return (
+    <>
     <InlineTool
       icon={
         props.part.state.status !== "completed"
@@ -3245,6 +3629,21 @@ function Task(props: ToolProps) {
     >
       {content()}
     </InlineTool>
+    <Show
+      when={review()}
+      fallback={
+        <Show when={props.part.state.status === "completed" && Boolean(props.metadata.review) && props.output}>
+          {(output) => (
+            <box paddingLeft={3} marginTop={1} flexShrink={0}>
+              <text fg={theme.text}>{output()}</text>
+            </box>
+          )}
+        </Show>
+      }
+    >
+      {(value) => <ReviewFinish review={value()} />}
+    </Show>
+    </>
   )
 }
 
@@ -3615,6 +4014,7 @@ function TodoWrite(props: ToolProps) {
 
 function Question(props: ToolProps) {
   const { theme } = useTheme()
+  const spacing = usePanelSpacing()
   const questions = createMemo(() => parseQuestions(props.input.questions))
   const answers = createMemo(() => parseQuestionAnswers(props.metadata.answers))
   const count = createMemo(() => questions().length)
@@ -3629,7 +4029,7 @@ function Question(props: ToolProps) {
       <Match when={answers()}>
         <BlockTool title="# Questions" part={props.part}>
           <Show when={questions().length > 0} fallback={<text fg={theme.textMuted}>No questions</text>}>
-            <box gap={1}>
+            <box gap={spacing}>
               <For each={questions()}>
                 {(q, i) => (
                   <box flexDirection="column">
@@ -3716,6 +4116,8 @@ const nativeToolRenderers = {
   list_mcp_resources: McpResource,
   list_mcp_resource_templates: McpResource,
   read_mcp_resource: McpResource,
+  shell: Shell,
+  // Legacy persisted parts from before the #780 rename still say "bash".
   bash: Shell,
   glob: Glob,
   read: Read,

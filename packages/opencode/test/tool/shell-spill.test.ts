@@ -78,10 +78,7 @@ describe("tool.shell output spill failure", () => {
       const commandline = command('for(let i=0;i<200;i++)console.log("x".repeat(64))')
       const info = yield* ShellTool
       const bash = yield* info.init()
-      const result = yield* bash.execute(
-        { command: commandline } as Tool.InferParameters<typeof ShellTool>,
-        ctx,
-      )
+      const result = yield* bash.execute({ command: commandline } as Tool.InferParameters<typeof ShellTool>, ctx)
 
       expect(result.metadata.exit).toBe(0)
       expect(result.metadata.truncated).toBe(true)

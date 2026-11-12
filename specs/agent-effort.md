@@ -20,11 +20,26 @@ delivered. There are exactly three levels and two switches — no other knobs.
   force another pass; after two passes the result is delivered with an honest
   exhausted/open-findings status instead of looping forever.
 - **`thorough`** keeps requiring a clean, current independent review until one
-  exists. When the reviewer genuinely cannot run (permission, missing agent, or
+  exists. Every known finding, including Minor, must be corrected and followed
+  by a fresh clean review before successful finish; an Approved envelope with
+  open Minor findings is not clean. This uses the current session effort, so
+  switching effort reevaluates the same persisted report without rewriting it.
+  A missing or stale review with no known findings keeps the warning-only
+  delivery behavior. When the reviewer genuinely cannot run (permission, missing agent, or
   the subagent depth limit), a successful finish remains blocked. Only a
   declared failure can deliver as `review-blocked`; a depth-limited child hands
   its unreviewed writes to its parent as `review-pending`. Neither status is
   approval.
+
+## Efficient work at every level
+
+Fast, quick, direct execution matters at every effort level. Depth may vary,
+but effort never justifies inefficient work. Scope searches first, then read
+the needed ranges in batches; include whole files or wider context when needed.
+Make useful independent read, grep, and glob tool calls in parallel; dependent
+calls remain sequential. Avoid redundant exploration fronts and duplicate checks.
+Review evaluates and reports findings and coverage gaps rather than writing tests
+or taking over implementation; existing non-destructive checks remain available.
 
 ## Configuration
 
@@ -63,6 +78,29 @@ selection) and siblings stay independent: one child's level never leaks into
 another. A task dispatched by a parent that does not own the child (for
 example, a `task_id` from another parent) neither reads nor writes that child's
 selection, and no effort is published for it in the task metadata.
+
+## Changing the level in an existing session
+
+The persisted selection is read at execution time, not captured when a session
+or a run starts, so changing it in an existing session changes what runs next:
+
+- Each generation step resolves the level from the session row when it builds
+  its request. A change made while a request is already in flight applies to the
+  next step built after it; the request already sent keeps the system prompt it
+  was sent with, because a provider call cannot be rewritten retroactively.
+- `finish` resolves the level from the same row when it is called. A change that
+  lands before the call is therefore enforced by that call. On an upgrade made
+  mid-generation this can make the `finish` stricter than the prompt the model
+  saw for the generation that requested it; the level in effect at the call is
+  the one enforced, and the delivery is labelled with it.
+- A new `task` child dispatched after the change inherits the parent's updated
+  selection; an already-created child keeps its own persisted selection under
+  the precedence order above.
+- The next user turn in the same session resolves the current level again; the
+  selection is not cached per session or per run.
+
+Switching needs no cancellation, restart, new session or replay: completed tool
+effects and the transcript are preserved, and the run continues in place.
 
 ## TUI default for new sessions
 

@@ -130,7 +130,7 @@ Every field is optional.
 
   "permission": {
     "edit": "deny",
-    "bash": { "git *": "allow", "*": "ask" }
+    "shell": { "git *": "allow", "*": "ask" }
   },
 
   "formatter": false,
@@ -237,7 +237,7 @@ Two ways to define an agent. Use the file form for anything non-trivial.
       "description": "Reviews PRs for style violations.",
       "mode": "subagent",
       "model": "anthropic/claude-sonnet-4-6",
-      "permission": { "edit": "deny", "bash": "ask" },
+      "permission": { "edit": "deny", "shell": "ask" },
       "background": false,
       "prompt": "You are a strict PR reviewer..."
     }
@@ -258,7 +258,7 @@ mode: subagent
 model: anthropic/claude-sonnet-4-6
 permission:
   edit: deny
-  bash: ask
+  shell: ask
 ---
 
 You are a strict PR reviewer. Focus on...
@@ -435,7 +435,7 @@ tokens support `{env:VAR}` interpolation (and `{file:path}`); the shell-style
 ```json
 "permission": {
   "edit": "deny",
-  "bash": { "git *": "allow", "rm *": "deny", "*": "ask" },
+  "shell": { "git *": "allow", "rm *": "deny", "*": "ask" },
   "external_directory": { "~/secrets/**": "deny", "*": "allow" }
 }
 ```
@@ -450,9 +450,9 @@ rules last.
 `permission: "allow"` (a string at the top level) is shorthand for "allow
 everything" and is rarely what the user wants.
 
-Known permission keys: `read, edit, glob, grep, list, bash, task,
+Known permission keys: `read, edit, glob, grep, list, shell, task,
 external_directory, todowrite, question, webfetch, websearch, lsp, doom_loop,
-skill`. Some of these (`todowrite,
+skill`. (The shell tool was named `bash` before #780; the legacy `bash` permission key is still honored as an alias, but new config should say `shell`.) Some of these (`todowrite,
 question, webfetch, websearch, doom_loop`) only accept a flat
 action, not a per-pattern object.
 
