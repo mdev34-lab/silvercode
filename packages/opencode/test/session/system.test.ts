@@ -17,6 +17,7 @@ import { InstanceRef } from "../../src/effect/instance-ref"
 import type { InstanceContext } from "../../src/project/instance-context"
 import { Config } from "../../src/config/config"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
+import { AgentEffort } from "@opencode-ai/schema/agent-effort"
 
 const desktopDirectory = "C:\\Users\\Camila\\OneDrive - Contoso\\Área de Trabalho"
 const shellFixture =
@@ -56,6 +57,8 @@ const build: Agent.Info = {
   permission: Permission.fromConfig({ "*": "allow" }),
   options: {},
 }
+
+const nativeWork: Agent.Info = { ...build, native: true }
 
 const think: Agent.Info = {
   name: "think",
@@ -118,8 +121,14 @@ const testInstance = {
   project: {},
 } as unknown as InstanceContext
 
-const delegation = (prompt: SystemPrompt.Interface, agent: Agent.Info, ruleset?: PermissionV1.Ruleset) =>
-  prompt.delegation(agent, ruleset).pipe(Effect.provideService(InstanceRef, testInstance))
+const delegation = (
+  prompt: SystemPrompt.Interface,
+  agent: Agent.Info,
+  ruleset?: PermissionV1.Ruleset,
+  effort?: AgentEffort.Level,
+) => prompt.delegation(agent, ruleset, effort).pipe(Effect.provideService(InstanceRef, testInstance))
+
+const testAgents = [nativeWork, think, code, scout, engineerReviewer, hiddenPlanner]
 
 const it = testEffect(
   LayerNode.compile(SystemPrompt.node, [
@@ -145,8 +154,8 @@ const it = testEffect(
     [
       Agent.node,
       Layer.mock(Agent.Service, {
-        list: () => Effect.succeed([build, think, code, scout, engineerReviewer, hiddenPlanner]),
-        get: (name) => Effect.succeed([build, think, code, scout, engineerReviewer, hiddenPlanner].find(agent=>agent.name===name)!),
+        list: () => Effect.succeed(testAgents),
+        get: (name) => Effect.succeed(testAgents.find((agent) => agent.name === name)!),
       }),
     ],
     [
@@ -193,8 +202,8 @@ const itPrimaryTools = testEffect(
     [
       Agent.node,
       Layer.mock(Agent.Service, {
-        list: () => Effect.succeed([build, think, code, scout, engineerReviewer, hiddenPlanner]),
-        get: (name) => Effect.succeed([build, think, code, scout, engineerReviewer, hiddenPlanner].find(agent=>agent.name===name)!),
+        list: () => Effect.succeed(testAgents),
+        get: (name) => Effect.succeed(testAgents.find((agent) => agent.name === name)!),
       }),
     ],
     [
@@ -357,6 +366,36 @@ describe("session.system", () => {
       expect(output).not.toContain("architect-planner")
       expect(output).not.toContain("`scout`")
       expect(output).not.toContain("engineer-review")
+    }),
+  )
+
+  it.effect("native Work delegation favors direct fast implementation without changing other efforts", () =>
+    Effect.gen(function* () {
+      const prompt = yield* SystemPrompt.Service
+      const fast =
+        (yield* delegation(prompt, nativeWork, undefined, "fast")) ??
+        (yield* Effect.fail(new NamedError.Unknown({ message: "missing fast delegation output" })))
+
+      expect(fast).toContain(
+        "At fast effort, handle straightforward programming directly when Think/Code handoffs add no value.",
+      )
+      expect(fast).toContain("When they materially help, use Think for planning and Code for implementation.")
+      expect(fast).toContain(
+        "An independent clean Review is not required at fast; honor explicit user review requests.",
+      )
+      expect(fast).not.toContain(
+        "Programming requests are best done as Think planning, then Code implementation, then a clean Review.",
+      )
+
+      for (const effort of ["medium", "thorough"] as const) {
+        const standard =
+          (yield* delegation(prompt, nativeWork, undefined, effort)) ??
+          (yield* Effect.fail(new NamedError.Unknown({ message: `missing ${effort} delegation output` })))
+        expect(standard).toContain(
+          "Programming requests are best done as Think planning, then Code implementation, then a clean Review.",
+        )
+        expect(standard).not.toContain("At fast effort, handle straightforward programming directly")
+      }
     }),
   )
 

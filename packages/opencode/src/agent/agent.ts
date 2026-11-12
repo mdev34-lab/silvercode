@@ -288,7 +288,7 @@ const layer = Layer.effect(
           review: {
             name: "review",
             permission: Permission.merge(defaults, reviewPermissions, user),
-            description: `Code reviewer. Use this proactively, without being asked, after any unit of work that changed files and when the user asks for a review.`,
+            description: `Code reviewer. Use this proactively when the active effort/review-loop policy requires review after file changes, or whenever the user explicitly asks for a review.`,
             prompt: PROMPT_REVIEW,
             options: {},
             // Mandatory review must deliver its verdict before the parent can finish.

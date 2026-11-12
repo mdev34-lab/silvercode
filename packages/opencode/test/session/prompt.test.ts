@@ -886,6 +886,249 @@ it.instance(
   15_000,
 )
 
+it.instance(
+  "fast effort guides a new Work request before any file writes",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({
+        title: "Fast first request",
+        metadata: withAgentEffort({}, "fast"),
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      yield* llm.hang
+      yield* user(chat.id, "Implement a small bug fix.")
+
+      const fiber = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+      yield* awaitWithTimeout(llm.wait(1), "timed out waiting for the first fast request", "10 seconds")
+
+      const hit = (yield* llm.hits)[0]
+      const body = JSON.stringify(hit?.body)
+      expect(body).toContain("## Agent effort: fast (review passes: off, validation gate: minimal)")
+      expect(body).toContain("Start straightforward implementation from the user's first request")
+      expect(body).toContain("Minimal evidence is one applicable syntax or smoke check")
+      expect(body).toContain("At fast effort, handle straightforward programming directly")
+      expect(body).toContain("when the current effort/review-loop policy requires a review")
+      expect(body).not.toContain("Use this proactively, without being asked")
+      expect(body).not.toContain(
+        "Programming requests are best done as Think planning, then Code implementation, then a clean Review",
+      )
+      expect(body).not.toContain("## Review Loop")
+      expect(body.match(/## Agent effort: fast/g)).toHaveLength(1)
+      expect(toolNames(hit?.body)).toContain("edit")
+      expect(toolNames(hit?.body)).toContain("write")
+
+      const messages = yield* sessions.messages({ sessionID: chat.id })
+      expect(
+        messages
+          .flatMap((message) => message.parts)
+          .some((part) => part.type === "tool" && (part.tool === "edit" || part.tool === "write")),
+      ).toBe(false)
+      yield* Fiber.interrupt(fiber)
+    }),
+  15_000,
+)
+
+it.instance(
+  "fast effort keeps Think's planning-only contract and bare effort level",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({
+        title: "Fast Think",
+        agent: "think",
+        metadata: withAgentEffort({}, "fast"),
+      })
+      yield* llm.hang
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "think",
+        model: ref,
+        noReply: true,
+        parts: [{ type: "text", text: "Plan a small code change." }],
+      })
+
+      const fiber = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+      yield* awaitWithTimeout(llm.wait(1), "timed out waiting for the Think request", "10 seconds")
+
+      const body = JSON.stringify((yield* llm.hits)[0]?.body)
+      expect(body).toContain("You are Think, the planning specialist.")
+      expect(body).toContain("## Agent effort: fast")
+      expect(body).not.toContain("## Agent effort: fast (review passes: off, validation gate: minimal)")
+      expect(body).not.toContain("Start straightforward implementation from the user's first request.")
+      yield* Fiber.interrupt(fiber)
+    }),
+  15_000,
+)
+
+it.instance(
+  "fast Think preserves its bare effort label after a plan-file write",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({
+        title: "Fast Think after plan write",
+        metadata: withAgentEffort({}, "fast"),
+      })
+      const earlier = yield* user(chat.id, "Draft an implementation plan.")
+      const assistant: SessionV1.Assistant = {
+        id: MessageID.ascending(),
+        role: "assistant",
+        parentID: earlier.id,
+        sessionID: chat.id,
+        mode: "think",
+        agent: "think",
+        cost: 0,
+        path: { cwd: "/tmp", root: "/tmp" },
+        tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+        modelID: ref.modelID,
+        providerID: ref.providerID,
+        time: { created: Date.now() },
+      }
+      yield* sessions.updateMessage(assistant)
+      yield* sessions.updatePart({
+        id: PartID.ascending(),
+        messageID: assistant.id,
+        sessionID: chat.id,
+        type: "tool",
+        callID: "call-seed-think-plan-write",
+        tool: "write",
+        state: {
+          status: "completed",
+          input: { filePath: ".opencode/plans/implementation.md", content: "Plan" },
+          output: "ok",
+          title: "write",
+          metadata: { reviewLoop: { writesFiles: true } },
+          time: { start: Date.now(), end: Date.now() },
+        },
+      } as SessionV1.ToolPart)
+
+      yield* llm.hang
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "think",
+        model: ref,
+        noReply: true,
+        parts: [{ type: "text", text: "Refine the implementation plan." }],
+      })
+      const fiber = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+      yield* awaitWithTimeout(llm.wait(1), "timed out waiting for Think after a plan-file write", "10 seconds")
+
+      const body = JSON.stringify((yield* llm.hits)[0]?.body)
+      expect(body).toContain("You are Think, the planning specialist.")
+      expect(body.match(/## Agent effort: fast/g)).toHaveLength(1)
+      expect(body).not.toContain("## Agent effort: fast (review passes: off, validation gate: minimal)")
+      expect(body).not.toContain("Start straightforward implementation from the user's first request.")
+      yield* Fiber.interrupt(fiber)
+    }),
+  15_000,
+)
+
+it.instance(
+  "fast Think preserves its bare effort label after compaction",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({
+        title: "Fast Think after compaction",
+        metadata: withAgentEffort({}, "fast"),
+      })
+      const compacted = yield* user(chat.id, "Earlier plan work.")
+      yield* sessions.updatePart({
+        id: PartID.ascending(),
+        messageID: compacted.id,
+        sessionID: chat.id,
+        type: "compaction",
+        auto: false,
+      } as SessionV1.CompactionPart)
+      const summary: SessionV1.Assistant = {
+        id: MessageID.ascending(),
+        role: "assistant",
+        parentID: compacted.id,
+        sessionID: chat.id,
+        mode: "compaction",
+        agent: "compaction",
+        summary: true,
+        finish: "stop",
+        cost: 0,
+        path: { cwd: "/tmp", root: "/tmp" },
+        tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+        modelID: ref.modelID,
+        providerID: ref.providerID,
+        time: { created: Date.now() },
+      }
+      yield* sessions.updateMessage(summary)
+      yield* sessions.updatePart({
+        id: PartID.ascending(),
+        messageID: summary.id,
+        sessionID: chat.id,
+        type: "text",
+        text: "Summary of the earlier plan work.",
+      })
+
+      yield* llm.hang
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "think",
+        model: ref,
+        noReply: true,
+        parts: [{ type: "text", text: "Continue the implementation plan." }],
+      })
+      const fiber = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+      yield* awaitWithTimeout(llm.wait(1), "timed out waiting for Think after compaction", "10 seconds")
+
+      const body = JSON.stringify((yield* llm.hits)[0]?.body)
+      expect(body).toContain("You are Think, the planning specialist.")
+      expect(body.match(/## Agent effort: fast/g)).toHaveLength(1)
+      expect(body).not.toContain("## Agent effort: fast (review passes: off, validation gate: minimal)")
+      expect(body).not.toContain("Start straightforward implementation from the user's first request.")
+      yield* Fiber.interrupt(fiber)
+    }),
+  15_000,
+)
+
+it.instance(
+  "fast effort preserves the Review report contract without injecting Work process guidance",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({
+        title: "Fast Review",
+        agent: "review",
+        metadata: withAgentEffort({}, "fast"),
+      })
+      yield* llm.hang
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "review",
+        model: ref,
+        noReply: true,
+        parts: [{ type: "text", text: "Review the current changes." }],
+      })
+
+      const fiber = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+      yield* awaitWithTimeout(llm.wait(1), "timed out waiting for the Review request", "10 seconds")
+
+      const body = JSON.stringify((yield* llm.hits)[0]?.body)
+      expect(body).toContain("## Verify, Do Not Modify")
+      expect(body).toContain("## Final Report Envelope")
+      expect(body).not.toContain("## Agent effort: fast (review passes: off, validation gate: minimal)")
+      expect(body).not.toContain("Start straightforward implementation from the user's first request.")
+      yield* Fiber.interrupt(fiber)
+    }),
+  15_000,
+)
+
 it.instance("legacy prompt emits message events without session.next events", () =>
   Effect.gen(function* () {
     const events = yield* EventV2Bridge.Service
@@ -6966,6 +7209,11 @@ for (const scenario of ["completed", "missing", "bound", "abort"] as const) {
 // flight therefore applies to the next step (and to the finish call made from
 // it), never retroactively to the request that was already sent, and it never
 // restarts the run or replays completed tool effects.
+const FAST_WORK_ROUTE =
+  "At fast effort, handle straightforward programming directly when Think/Code handoffs add no value."
+const STANDARD_WORK_ROUTE =
+  "Programming requests are best done as Think planning, then Code implementation, then a clean Review."
+
 for (const [initial, changed] of [
   ["thorough", "fast"],
   ["fast", "thorough"],
@@ -7003,10 +7251,19 @@ for (const [initial, changed] of [
         yield* awaitWithTimeout(llm.wait(1), "timed out waiting for step 1", "10 seconds")
         yield* awaitWithTimeout(llm.wait(2), "timed out waiting for step 2", "10 seconds")
 
+        const hits = yield* llm.hits
+        const firstRequest = JSON.stringify(hits[0]?.body)
+        expect(firstRequest).toContain(initial === "fast" ? FAST_WORK_ROUTE : STANDARD_WORK_ROUTE)
+        expect(firstRequest).not.toContain(initial === "fast" ? STANDARD_WORK_ROUTE : FAST_WORK_ROUTE)
+        if (initial === "fast")
+          expect(firstRequest).toContain("## Agent effort: fast (review passes: off, validation gate: minimal)")
+        else expect(firstRequest).not.toContain(`## Agent effort: ${initial}`)
+
         // The request already on the wire keeps the effort it was built with.
-        const inFlight = JSON.stringify((yield* llm.hits)[1]?.body)
+        const inFlight = JSON.stringify(hits[1]?.body)
         expect(inFlight).toContain(`## Agent effort: ${initial}`)
         expect(inFlight).not.toContain(`## Agent effort: ${changed}`)
+        expect(inFlight).toContain(initial === "fast" ? FAST_WORK_ROUTE : STANDARD_WORK_ROUTE)
 
         // Change the persisted selection in the same session, mid-run.
         yield* sessions.setMetadata({ sessionID: session.id, metadata: withAgentEffort({}, changed) })
@@ -7016,6 +7273,8 @@ for (const [initial, changed] of [
         const next = JSON.stringify((yield* llm.hits)[2]?.body)
         expect(next).toContain(`## Agent effort: ${changed}`)
         expect(next).not.toContain(`## Agent effort: ${initial}`)
+        expect(next).toContain(changed === "fast" ? FAST_WORK_ROUTE : STANDARD_WORK_ROUTE)
+        expect(next).not.toContain(changed === "fast" ? STANDARD_WORK_ROUTE : FAST_WORK_ROUTE)
 
         const exit = yield* Fiber.await(fiber)
         expect(Exit.isSuccess(exit)).toBe(true)

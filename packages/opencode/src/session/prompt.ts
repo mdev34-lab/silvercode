@@ -74,10 +74,10 @@ import { FinishTool, readTermination } from "@/tool/finish"
 import PROMPT_REVIEW_LOOP from "./prompt/review-loop.txt"
 import { declaresFileWrites } from "@opencode-ai/core/review-loop"
 
-// The todo scope contract is always sent. The Review Loop policy and the effort
-// block are a nudge that appears once the session has written files; before
-// that, `finish` (the enforcement checkpoint) carries the same requirement in
-// its description and decline feedback, so the gate is unchanged.
+// The todo scope contract is always sent. The Review Loop policy and non-fast
+// effort blocks wait until the session has written files; fast work guidance is
+// included on the first non-review, non-Think request. `finish` remains the
+// enforcement checkpoint.
 const REVIEW_LOOP_SPLIT = PROMPT_REVIEW_LOOP.indexOf("## Review Loop")
 const PROMPT_SCOPE_CONTRACT = PROMPT_REVIEW_LOOP.slice(0, REVIEW_LOOP_SPLIT).trimEnd()
 const PROMPT_REVIEW_POLICY = PROMPT_REVIEW_LOOP.slice(REVIEW_LOOP_SPLIT)
@@ -478,13 +478,19 @@ const SUPPORTED_MCP_RESOURCE_ATTACHMENT_MIMES = new Set([
 ])
 
 // The resolved two-switch process instructions (effort → review passes and
-// validation gate) injected alongside the review-loop prompt. The text mirrors
-// what finish enforces: no unconditional mandatory review, no configurable
-// extra knobs, and honest delivery labels at every level.
+// validation gate) composed into ordinary requests. Fast work guidance is
+// surfaced before writes; other process prompts keep their existing write gate.
 const EFFORT_PROCESS: Record<AgentEffort.Level, string> = {
   fast: [
     "## Agent effort: fast (review passes: off, validation gate: minimal)",
-    "No independent review is required: self-check inline and finish. Declare minimal validation evidence on finish. The result is delivered as unreviewed unless a review actually happened; finish never upgrades it to approved.",
+    "Start straightforward implementation from the user's first request.",
+    "Skip separate planning or delegation unless either materially helps.",
+    "No independent clean Review is required at fast, but honor explicit user review requests.",
+    "Match validation to the change; fast does not imply broad tests, typecheck, or parity runs.",
+    "Minimal evidence is one applicable syntax or smoke check that passed.",
+    "Mark both not-applicable only when neither fits.",
+    "Disclose failed and not-run checks, and do not skip verification the change needs.",
+    "The result is unreviewed unless a review actually happened; finish never upgrades it to approved.",
   ].join("\n\n"),
   medium: [
     "## Agent effort: medium (review passes: at most 2, validation gate: standard)",
@@ -2357,35 +2363,39 @@ const layer = Layer.effect(
 
             yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: request })
 
-            const [skills, env, instructions, mcpInstructions, toolOverview, delegation] = yield* Effect.all([
+            const [skills, env, instructions, mcpInstructions, toolOverview, effortContext] = yield* Effect.all([
               sys.skills(agent),
               sys.environment(model),
               instruction.system().pipe(Effect.orDie),
               sys.mcp(agent, session.permission),
               catalog.overview(session.id),
-              sys.delegation(agent, session.permission),
+              Effect.gen(function* () {
+                // Resolve like finish (session, config, then medium) from the
+                // current row on every step; updates affect the next request,
+                // while this one stays fixed. A missing row falls back to the
+                // session snapshot before building effort-sensitive guidance.
+                const effortConfig = yield* config.get()
+                const configEffort =
+                  typeof effortConfig.agent?.effort === "string" ? effortConfig.agent.effort : undefined
+                const effortSession = yield* sessions
+                  .get(sessionID)
+                  .pipe(Effect.catchIf(NotFoundError.isInstance, () => Effect.succeed(session)))
+                const effort = AgentEffort.resolve(
+                  readAgentEffort(effortSession.metadata),
+                  AgentEffort.resolve(configEffort),
+                )
+                return {
+                  effortConfig,
+                  effort,
+                  delegation: yield* sys.delegation(agent, session.permission, effort),
+                }
+              }),
             ])
+            const { effortConfig, effort, delegation } = effortContext
             const isDefaultPrimary = yield* agents
               .defaultInfo()
               .pipe(Effect.map((info) => info.name === agent.name && agent.mode !== "subagent"))
               .pipe(Effect.catchCause(() => Effect.succeed(false)))
-            // Resolve the effective effort exactly like finish does:
-            // session-persisted selection, then configuration, then medium.
-            // The selection is read from the persisted session row for every
-            // step, never from the run's opening snapshot: a level changed in
-            // the same session applies to the next step built after it (the
-            // request already in flight keeps the prompt it was sent with), and
-            // finish reads that same row at its own execution point. A row that
-            // disappears mid-run falls back to the snapshot instead of dying.
-            const effortConfig = yield* config.get()
-            const configEffort = typeof effortConfig.agent?.effort === "string" ? effortConfig.agent.effort : undefined
-            const effortSession = yield* sessions
-              .get(sessionID)
-              .pipe(Effect.catchIf(NotFoundError.isInstance, () => Effect.succeed(session)))
-            const effort = AgentEffort.resolve(
-              readAgentEffort(effortSession.metadata),
-              AgentEffort.resolve(configEffort),
-            )
             // Compaction can drop the write markers from the visible history, so a
             // compacted session keeps the policy on: it was long enough to compact.
             const sessionWroteFiles = request.some(
@@ -2396,6 +2406,10 @@ const layer = Layer.effect(
                     part.type === "compaction" || declaresFileWrites(part as Parameters<typeof declaresFileWrites>[0]),
                 ),
             )
+            const showEffortProcess =
+              agent.name !== "think" &&
+              !isReviewAgent(agent.name) &&
+              (sessionWroteFiles || effort === "fast")
             const system = [
               ...env,
               ...instructions,
@@ -2406,14 +2420,11 @@ const layer = Layer.effect(
               ...(isDefaultPrimary ? [PROMPT_SCOPE_CONTRACT] : []),
               ...(isDefaultPrimary && sessionWroteFiles ? [PROMPT_REVIEW_POLICY] : []),
               // Reviewer sessions keep their own structured-report contract and
-              // must not recursively review themselves.
-              ...(isReviewAgent(agent.name) || !sessionWroteFiles ? [] : [EFFORT_PROCESS[effort]]),
-              // Think scales research depth and candidate count by effort, but it does
-              // not write code, so the write-gated process line above rarely reaches
-              // it. Surface the bare level whenever the process line did not fire.
-              ...(agent.name === "think" && (isReviewAgent(agent.name) || !sessionWroteFiles)
-                ? [`## Agent effort: ${effort}`]
-                : []),
+              // must not recursively review themselves. Think keeps its own
+              // effort-scaled research guidance instead of the Work process block.
+              ...(showEffortProcess ? [EFFORT_PROCESS[effort]] : []),
+              // Think always receives its effective level for research depth.
+              ...(agent.name === "think" ? [`## Agent effort: ${effort}`] : []),
             ]
             const format = lastUser.format ?? { type: "text" as const }
             if (format.type === "json_schema") system.push(STRUCTURED_OUTPUT_SYSTEM_PROMPT)

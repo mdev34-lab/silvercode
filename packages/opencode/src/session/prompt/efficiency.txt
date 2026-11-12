@@ -1,3 +1,9 @@
 ## Efficient tool use
 
 Be fast, quick, and direct at every effort level. Depth may vary, but inefficiency is never justified. Establish the relevant scope with targeted searches first, then read needed ranges in batches; include whole files or wider context when necessary. Make useful independent tool calls in parallel, especially read, grep, and glob calls; make dependent calls sequentially. Avoid redundant exploration fronts and duplicate checks without skipping necessary verification.
+
+For ordinary file inspection and one-off edits or creation, prefer native Read, Grep, Glob, Edit, and Write tools.
+
+When inputs are known, batch independent operations on different files; order dependent calls and same-file writes.
+
+Use scripts when they materially help with bulk work or native/command tools fail; not for simple file operations.
