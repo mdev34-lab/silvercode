@@ -60,13 +60,24 @@ import * as TestClock from "effect/testing/TestClock"
 import { LLMEvent } from "@opencode-ai/llm"
 import { ProviderError } from "@/provider/error"
 import { SessionRetry } from "@/session/retry"
+import { TaskTool } from "@/tool/task"
 import { provideTmpdirInstance, TestInstance } from "../fixture/fixture"
+import { RepetitionGuard } from "../../src/session/llm/repetition-guard"
+import {
+  continuesPrompt,
+  finishContinuationPromptID,
+  renderTextResult,
+  resultChunks,
+  textResult,
+} from "../../src/session/subagent-result"
 import { awaitWithTimeout, pollWithTimeout, testEffect } from "../lib/effect"
-import { reply, TestLLMServer } from "../lib/llm-server"
+import { httpError, raw, reply, TestLLMServer } from "../lib/llm-server"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { LocationServiceMap, locationServiceMapLayer } from "@opencode-ai/core/location-services"
+
+const FINISH_NUDGE_MARKER = "[WARNING] The turn ended without a successful finish call."
 
 const summary = Layer.succeed(
   SessionSummary.Service,
@@ -875,6 +886,249 @@ it.instance(
   15_000,
 )
 
+it.instance(
+  "fast effort guides a new Work request before any file writes",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({
+        title: "Fast first request",
+        metadata: withAgentEffort({}, "fast"),
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      yield* llm.hang
+      yield* user(chat.id, "Implement a small bug fix.")
+
+      const fiber = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+      yield* awaitWithTimeout(llm.wait(1), "timed out waiting for the first fast request", "10 seconds")
+
+      const hit = (yield* llm.hits)[0]
+      const body = JSON.stringify(hit?.body)
+      expect(body).toContain("## Agent effort: fast (review passes: off, validation gate: minimal)")
+      expect(body).toContain("Start straightforward implementation from the user's first request")
+      expect(body).toContain("Minimal evidence is one applicable syntax or smoke check")
+      expect(body).toContain("At fast effort, handle straightforward programming directly")
+      expect(body).toContain("when the current effort/review-loop policy requires a review")
+      expect(body).not.toContain("Use this proactively, without being asked")
+      expect(body).not.toContain(
+        "Programming requests are best done as Think planning, then Code implementation, then a clean Review",
+      )
+      expect(body).not.toContain("## Review Loop")
+      expect(body.match(/## Agent effort: fast/g)).toHaveLength(1)
+      expect(toolNames(hit?.body)).toContain("edit")
+      expect(toolNames(hit?.body)).toContain("write")
+
+      const messages = yield* sessions.messages({ sessionID: chat.id })
+      expect(
+        messages
+          .flatMap((message) => message.parts)
+          .some((part) => part.type === "tool" && (part.tool === "edit" || part.tool === "write")),
+      ).toBe(false)
+      yield* Fiber.interrupt(fiber)
+    }),
+  15_000,
+)
+
+it.instance(
+  "fast effort keeps Think's planning-only contract and bare effort level",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({
+        title: "Fast Think",
+        agent: "think",
+        metadata: withAgentEffort({}, "fast"),
+      })
+      yield* llm.hang
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "think",
+        model: ref,
+        noReply: true,
+        parts: [{ type: "text", text: "Plan a small code change." }],
+      })
+
+      const fiber = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+      yield* awaitWithTimeout(llm.wait(1), "timed out waiting for the Think request", "10 seconds")
+
+      const body = JSON.stringify((yield* llm.hits)[0]?.body)
+      expect(body).toContain("You are Think, the planning specialist.")
+      expect(body).toContain("## Agent effort: fast")
+      expect(body).not.toContain("## Agent effort: fast (review passes: off, validation gate: minimal)")
+      expect(body).not.toContain("Start straightforward implementation from the user's first request.")
+      yield* Fiber.interrupt(fiber)
+    }),
+  15_000,
+)
+
+it.instance(
+  "fast Think preserves its bare effort label after a plan-file write",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({
+        title: "Fast Think after plan write",
+        metadata: withAgentEffort({}, "fast"),
+      })
+      const earlier = yield* user(chat.id, "Draft an implementation plan.")
+      const assistant: SessionV1.Assistant = {
+        id: MessageID.ascending(),
+        role: "assistant",
+        parentID: earlier.id,
+        sessionID: chat.id,
+        mode: "think",
+        agent: "think",
+        cost: 0,
+        path: { cwd: "/tmp", root: "/tmp" },
+        tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+        modelID: ref.modelID,
+        providerID: ref.providerID,
+        time: { created: Date.now() },
+      }
+      yield* sessions.updateMessage(assistant)
+      yield* sessions.updatePart({
+        id: PartID.ascending(),
+        messageID: assistant.id,
+        sessionID: chat.id,
+        type: "tool",
+        callID: "call-seed-think-plan-write",
+        tool: "write",
+        state: {
+          status: "completed",
+          input: { filePath: ".opencode/plans/implementation.md", content: "Plan" },
+          output: "ok",
+          title: "write",
+          metadata: { reviewLoop: { writesFiles: true } },
+          time: { start: Date.now(), end: Date.now() },
+        },
+      } as SessionV1.ToolPart)
+
+      yield* llm.hang
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "think",
+        model: ref,
+        noReply: true,
+        parts: [{ type: "text", text: "Refine the implementation plan." }],
+      })
+      const fiber = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+      yield* awaitWithTimeout(llm.wait(1), "timed out waiting for Think after a plan-file write", "10 seconds")
+
+      const body = JSON.stringify((yield* llm.hits)[0]?.body)
+      expect(body).toContain("You are Think, the planning specialist.")
+      expect(body.match(/## Agent effort: fast/g)).toHaveLength(1)
+      expect(body).not.toContain("## Agent effort: fast (review passes: off, validation gate: minimal)")
+      expect(body).not.toContain("Start straightforward implementation from the user's first request.")
+      yield* Fiber.interrupt(fiber)
+    }),
+  15_000,
+)
+
+it.instance(
+  "fast Think preserves its bare effort label after compaction",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({
+        title: "Fast Think after compaction",
+        metadata: withAgentEffort({}, "fast"),
+      })
+      const compacted = yield* user(chat.id, "Earlier plan work.")
+      yield* sessions.updatePart({
+        id: PartID.ascending(),
+        messageID: compacted.id,
+        sessionID: chat.id,
+        type: "compaction",
+        auto: false,
+      } as SessionV1.CompactionPart)
+      const summary: SessionV1.Assistant = {
+        id: MessageID.ascending(),
+        role: "assistant",
+        parentID: compacted.id,
+        sessionID: chat.id,
+        mode: "compaction",
+        agent: "compaction",
+        summary: true,
+        finish: "stop",
+        cost: 0,
+        path: { cwd: "/tmp", root: "/tmp" },
+        tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+        modelID: ref.modelID,
+        providerID: ref.providerID,
+        time: { created: Date.now() },
+      }
+      yield* sessions.updateMessage(summary)
+      yield* sessions.updatePart({
+        id: PartID.ascending(),
+        messageID: summary.id,
+        sessionID: chat.id,
+        type: "text",
+        text: "Summary of the earlier plan work.",
+      })
+
+      yield* llm.hang
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "think",
+        model: ref,
+        noReply: true,
+        parts: [{ type: "text", text: "Continue the implementation plan." }],
+      })
+      const fiber = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+      yield* awaitWithTimeout(llm.wait(1), "timed out waiting for Think after compaction", "10 seconds")
+
+      const body = JSON.stringify((yield* llm.hits)[0]?.body)
+      expect(body).toContain("You are Think, the planning specialist.")
+      expect(body.match(/## Agent effort: fast/g)).toHaveLength(1)
+      expect(body).not.toContain("## Agent effort: fast (review passes: off, validation gate: minimal)")
+      expect(body).not.toContain("Start straightforward implementation from the user's first request.")
+      yield* Fiber.interrupt(fiber)
+    }),
+  15_000,
+)
+
+it.instance(
+  "fast effort preserves the Review report contract without injecting Work process guidance",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({
+        title: "Fast Review",
+        agent: "review",
+        metadata: withAgentEffort({}, "fast"),
+      })
+      yield* llm.hang
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "review",
+        model: ref,
+        noReply: true,
+        parts: [{ type: "text", text: "Review the current changes." }],
+      })
+
+      const fiber = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+      yield* awaitWithTimeout(llm.wait(1), "timed out waiting for the Review request", "10 seconds")
+
+      const body = JSON.stringify((yield* llm.hits)[0]?.body)
+      expect(body).toContain("## Verify, Do Not Modify")
+      expect(body).toContain("## Final Report Envelope")
+      expect(body).not.toContain("## Agent effort: fast (review passes: off, validation gate: minimal)")
+      expect(body).not.toContain("Start straightforward implementation from the user's first request.")
+      yield* Fiber.interrupt(fiber)
+    }),
+  15_000,
+)
+
 it.instance("legacy prompt emits message events without session.next events", () =>
   Effect.gen(function* () {
     const events = yield* EventV2Bridge.Service
@@ -1555,7 +1809,13 @@ it.instance(
         filename: "historical.txt",
         url: "data:text/plain;base64,aGlzdG9yaWNhbCBjb250ZW50",
       })
-      yield* sessions.updatePart({id:PartID.ascending(),messageID,sessionID:session.id,type:"text",text:"Save this attachment"})
+      yield* sessions.updatePart({
+        id: PartID.ascending(),
+        messageID,
+        sessionID: session.id,
+        type: "text",
+        text: "Save this attachment",
+      })
       const target = path.join(dir, "historical.txt")
 
       yield* llm.tool("attachment", { action: "list" })
@@ -1713,7 +1973,7 @@ withMcpTools.instance(
 )
 
 it.instance(
-  "three identical calls in one assistant message reach the denied doom-loop permission",
+  "three identical shell failures across separate generation steps reach the denied doom-loop permission",
   () =>
     Effect.gen(function* () {
       const { dir, llm } = yield* useServerConfig((url) => ({
@@ -1725,33 +1985,96 @@ it.instance(
       const agents = yield* AgentSvc.Service
       const agent = yield* agents.get("build")
       expect(Permission.evaluate("doom_loop", "shell", agent.permission).action).toBe("deny")
-      const session = yield* sessions.create({ title: "Doom-loop positive control" })
+      const session = yield* sessions.create({ title: "Doom-loop sequential control" })
       yield* prompt.prompt({
         sessionID: session.id,
         agent: "build",
         noReply: true,
-        parts: [{ type: "text", text: "run the same harmless command three times" }],
+        parts: [{ type: "text", text: "run the same failing command three times" }],
       })
 
-      const input = { command: "echo SHOULD_NOT_RUN", description: "doom-loop positive control", workdir: dir }
-      // One provider response creates one assistant message with three real tool parts.
-      // A separate llm.tool() reply for each call would not exercise the per-message guard.
-      yield* llm.push(reply().tool("shell", input).tool("shell", input).tool("shell", input))
+      // `shell` reports a non-zero exit as a completed tool result, so this test uses a
+      // workdir that does not exist to produce genuine errored tool executions. Each
+      // provider reply is its own generation step; the identical call must fail in two
+      // separate steps before the third step's call triggers the guard.
+      const input = {
+        command: "printf 'doom-loop-attempt\\n' >> doom-loop-attempts.txt; exit 1",
+        description: "doom-loop sequential positive control",
+        workdir: path.join(dir, "missing-doom-loop-workdir"),
+      }
+      yield* llm.push(reply().tool("shell", input))
+      yield* llm.push(reply().tool("shell", input))
+      yield* llm.push(reply().tool("shell", input))
       const result = yield* prompt.loop({ sessionID: session.id })
       expect(result.info.role).toBe("assistant")
       if (result.info.role !== "assistant") throw new Error("expected an assistant result")
-      // The guard's denied ask interrupts this model step after tool calls were issued.
-      // That is the observable runtime signal (as opposed to an inferred structural window).
+      // The guard's denied ask interrupts the third model step after its tool call was
+      // issued but before the command ran. That interruption is the runtime signal.
       expect(result.info.error).toBeDefined()
       expect(JSON.stringify(result.info.error)).toContain("ProviderStreamInterruptedAfterToolCallError")
 
       const messages = yield* sessions.messages({ sessionID: session.id })
-      const repeated = messages
-        .filter((message) => message.info.role === "assistant")
-        .map((message) => message.parts.filter((part) => part.type === "tool" && part.tool === "shell"))
-        .filter((parts) => parts.length === 3)
-      expect(repeated).toHaveLength(1)
-      expect(repeated[0]?.map((part) => part.type === "tool" && part.state.input)).toEqual([input, input, input])
+      const shellParts = messages
+        .flatMap((message) => message.parts)
+        .filter((part): part is SessionV1.ToolPart => part.type === "tool" && part.tool === "shell")
+      expect(shellParts.map((part) => part.state.input)).toEqual([input, input, input])
+
+      const realFailures = shellParts.filter(
+        (part) => part.state.status === "error" && part.state.metadata?.interrupted !== true,
+      )
+      const interrupted = shellParts.filter(
+        (part) => part.state.status === "error" && part.state.metadata?.interrupted === true,
+      )
+      // The first two steps executed and errored; the third never ran and was settled by
+      // the processor's cleanup as interrupted instead of producing another real error.
+      expect(realFailures).toHaveLength(2)
+      expect(interrupted).toHaveLength(1)
+      expect(interrupted[0]?.state.status === "error" && interrupted[0].state.error).toBe("Tool execution aborted")
+      expect(yield* Effect.promise(() => Bun.file(path.join(dir, "doom-loop-attempts.txt")).exists())).toBe(false)
+    }),
+  20_000,
+)
+
+it.instance(
+  "three identical successful shell calls in one assistant message do not reach the doom-loop permission",
+  () =>
+    Effect.gen(function* () {
+      // Keep `doom_loop` denied so any guard ask halts the turn; a clean result below is
+      // runtime evidence that a same-batch fan-out is not treated as a cross-step loop.
+      const { dir, llm } = yield* useServerConfig((url) => ({
+        ...providerCfg(url),
+        permission: { "*": "allow", doom_loop: "deny" },
+      }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({ title: "Doom-loop same-batch control" })
+      yield* prompt.prompt({
+        sessionID: session.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "run the same harmless command three times in one step" }],
+      })
+
+      const input = { command: "echo DOOM_LOOP_BATCH_OK", description: "doom-loop same-batch control", workdir: dir }
+      yield* llm.push(reply().tool("shell", input).tool("shell", input).tool("shell", input))
+      yield* llm.push(reply().text("done").stop())
+      const result = yield* prompt.loop({ sessionID: session.id })
+      expect(result.info.role).toBe("assistant")
+      if (result.info.role !== "assistant") throw new Error("expected an assistant result")
+      expect(result.info.error).toBeUndefined()
+      expect(result.info.finish).toBe("stop")
+      expect(result.parts.some((part) => part.type === "text" && part.text === "done")).toBe(true)
+
+      const messages = yield* sessions.messages({ sessionID: session.id })
+      const shellParts = messages
+        .flatMap((message) => message.parts)
+        .filter((part): part is SessionV1.ToolPart => part.type === "tool" && part.tool === "shell")
+      expect(shellParts.map((part) => part.state.input)).toEqual([input, input, input])
+      expect(shellParts.map((part) => part.state.status)).toEqual(["completed", "completed", "completed"])
+      for (const part of shellParts) {
+        if (part.state.status !== "completed") throw new Error("expected every batched call to complete")
+        expect(part.state.output).toContain("DOOM_LOOP_BATCH_OK")
+      }
     }),
   20_000,
 )
@@ -1908,7 +2231,8 @@ it.instance(
       const executionsOf = (name: string) => executions.filter((part) => part.tool === name)
       const repaired = parts.find((part) => part.type === "tool" && part.tool === "invalid")
       expect(repaired?.type).toBe("tool")
-      if (repaired?.type !== "tool" || repaired.state.status !== "completed") throw new Error("expected a completed repair")
+      if (repaired?.type !== "tool" || repaired.state.status !== "completed")
+        throw new Error("expected a completed repair")
       expect(repaired.state.input).toMatchObject({ tool: "write" })
       expect(repaired.state.output).toContain(target)
       expect(repaired.state.output).toContain("did not execute")
@@ -1919,7 +2243,9 @@ it.instance(
       expect(repaired.state.output).toContain("write replaces the entire file")
       // the fragment's unfinished body is never presented as recovered content: the
       // only echo of the raw text is the provider/parser error inside the parenthetical
-      const recovered = repaired.state.output.slice(repaired.state.output.indexOf("Recovered from the partial arguments:"))
+      const recovered = repaired.state.output.slice(
+        repaired.state.output.indexOf("Recovered from the partial arguments:"),
+      )
       expect(recovered).not.toContain("line two")
       expect(recovered).not.toContain("Report")
 
@@ -4435,7 +4761,7 @@ unixNoLLMServer(
         const code =
           'const cp=require("node:child_process");const fs=require("node:fs");' +
           'const d=cp.spawn(process.execPath,["-e","setTimeout(()=>{},60000)"],{detached:true,stdio:"inherit"});' +
-          "d.unref();fs.writeFileSync(Bun.argv[1],String(d.pid));process.stdout.write(\"STARTED\");process.exit(0)"
+          'd.unref();fs.writeFileSync(Bun.argv[1],String(d.pid));process.stdout.write("STARTED");process.exit(0)'
         const command = `${bin} -e ${squote(code)} ${squote(pidFile)}`
 
         const start = Date.now()
@@ -5846,11 +6172,7 @@ it.instance(
 
       yield* Deferred.succeed(releaseInterrupt, void 0)
 
-      const [exitCancel, exitA, exitB] = yield* Effect.all([
-        Fiber.await(cancelFiber),
-        Fiber.await(a),
-        Fiber.await(b),
-      ])
+      const [exitCancel, exitA, exitB] = yield* Effect.all([Fiber.await(cancelFiber), Fiber.await(a), Fiber.await(b)])
       expect(Exit.isSuccess(exitCancel)).toBe(true)
       expect(Exit.isSuccess(exitA)).toBe(true)
       expect(Exit.isSuccess(exitB)).toBe(true)
@@ -6104,11 +6426,15 @@ it.instance("loop sends a reduced context projection and keeps canonical history
       })
     }
     const canonical = () =>
-      sessions.messages({ sessionID: chat.id }).pipe(
-        Effect.map((msgs) =>
-          msgs.flatMap((m) => m.parts.flatMap((p) => (p.type === "tool" && p.state.status === "completed" ? [p.state.output] : []))),
-        ),
-      )
+      sessions
+        .messages({ sessionID: chat.id })
+        .pipe(
+          Effect.map((msgs) =>
+            msgs.flatMap((m) =>
+              m.parts.flatMap((p) => (p.type === "tool" && p.state.status === "completed" ? [p.state.output] : [])),
+            ),
+          ),
+        )
     const before = yield* canonical()
     expect(before).toHaveLength(10)
 
@@ -6187,7 +6513,12 @@ it.instance(
       // resolves. Whether or not the SDK already executed the call, a retry
       // would issue it again: the turn must end as a terminal interruption
       // instead, and the command must never run twice.
-      yield* llm.push(reply().tool("shell", { command: `printf 'replay\\n' >> ${JSON.stringify(target)}` }).cut().item())
+      yield* llm.push(
+        reply()
+          .tool("shell", { command: `printf 'replay\\n' >> ${JSON.stringify(target)}` })
+          .cut()
+          .item(),
+      )
       yield* user(chat.id, "hello")
 
       const result = yield* prompt.loop({ sessionID: chat.id })
@@ -6308,94 +6639,154 @@ it.instance(
   { timeout: 30_000 },
 )
 
-it.instance("cancel while edit permission is pending removes the request and prevents a late write", () =>
-  Effect.gen(function* () {
-    const { dir, llm } = yield* useServerConfig((url) => ({ ...providerCfg(url), permission: { "*": "allow", edit: "ask" }, permission_timeout: { enabled: false } }))
-    const file = path.join(dir, "abort-locked.txt")
-    yield* Effect.promise(() => Bun.write(file, "ORIGINAL_CONTENT\n"))
-    const prompt = yield* SessionPrompt.Service
-    const sessions = yield* Session.Service
-    const permission = yield* Permission.Service
-    const chat = yield* sessions.create({ title: "Pinned" })
-    yield* llm.push(reply().tool("read", { filePath: file }))
-    yield* llm.push(reply().tool("edit", { filePath: file, oldString: "ORIGINAL_CONTENT", newString: "ABORTED_TURN_OVERWRITE" }))
-    yield* user(chat.id, "Read and revise the report")
-    const first = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
-    const request = yield* pollWithTimeout(permission.list().pipe(Effect.map((items) => items.find((r) => r.sessionID === chat.id))), "edit permission did not arrive")
-    yield* prompt.cancel(chat.id)
-    yield* Fiber.await(first)
-    const remaining = yield* permission.list()
-    // Probe the stale UI reply even if it should now be rejected.
-    yield* permission.reply({ requestID: request.id, reply: "once" }).pipe(Effect.ignore)
-    yield* Effect.sleep("100 millis")
-    expect(yield* Effect.promise(() => Bun.file(file).text())).toBe("ORIGINAL_CONTENT\n")
-    expect(remaining.some((r) => r.id === request.id)).toBe(false)
-    // A fresh edit of the same path must acquire the prior turn's semaphore.
-    yield* llm.push(reply().tool("edit", { filePath: file, oldString: "ORIGINAL_CONTENT", newString: "FRESH_TURN_WRITE" }))
-    yield* llm.text("fresh done")
-    yield* user(chat.id, "Revise the report")
-    const fresh = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
-    const next = yield* pollWithTimeout(permission.list().pipe(Effect.map((items) => items.find((r) => r.sessionID === chat.id))), "fresh edit remained locked")
-    yield* permission.reply({ requestID: next.id, reply: "once" })
-    yield* Fiber.join(fresh).pipe(Effect.timeout("5 seconds"))
-    expect(yield* Effect.promise(() => Bun.file(file).text())).toBe("FRESH_TURN_WRITE\n")
-  }), { timeout: 20000 })
+it.instance(
+  "cancel while edit permission is pending removes the request and prevents a late write",
+  () =>
+    Effect.gen(function* () {
+      const { dir, llm } = yield* useServerConfig((url) => ({
+        ...providerCfg(url),
+        permission: { "*": "allow", edit: "ask" },
+        permission_timeout: { enabled: false },
+      }))
+      const file = path.join(dir, "abort-locked.txt")
+      yield* Effect.promise(() => Bun.write(file, "ORIGINAL_CONTENT\n"))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const permission = yield* Permission.Service
+      const chat = yield* sessions.create({ title: "Pinned" })
+      yield* llm.push(reply().tool("read", { filePath: file }))
+      yield* llm.push(
+        reply().tool("edit", { filePath: file, oldString: "ORIGINAL_CONTENT", newString: "ABORTED_TURN_OVERWRITE" }),
+      )
+      yield* user(chat.id, "Read and revise the report")
+      const first = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+      const request = yield* pollWithTimeout(
+        permission.list().pipe(Effect.map((items) => items.find((r) => r.sessionID === chat.id))),
+        "edit permission did not arrive",
+      )
+      yield* prompt.cancel(chat.id)
+      yield* Fiber.await(first)
+      const remaining = yield* permission.list()
+      // Probe the stale UI reply even if it should now be rejected.
+      yield* permission.reply({ requestID: request.id, reply: "once" }).pipe(Effect.ignore)
+      yield* Effect.sleep("100 millis")
+      expect(yield* Effect.promise(() => Bun.file(file).text())).toBe("ORIGINAL_CONTENT\n")
+      expect(remaining.some((r) => r.id === request.id)).toBe(false)
+      // A fresh edit of the same path must acquire the prior turn's semaphore.
+      yield* llm.push(
+        reply().tool("edit", { filePath: file, oldString: "ORIGINAL_CONTENT", newString: "FRESH_TURN_WRITE" }),
+      )
+      yield* llm.text("fresh done")
+      yield* user(chat.id, "Revise the report")
+      const fresh = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+      const next = yield* pollWithTimeout(
+        permission.list().pipe(Effect.map((items) => items.find((r) => r.sessionID === chat.id))),
+        "fresh edit remained locked",
+      )
+      yield* permission.reply({ requestID: next.id, reply: "once" })
+      yield* Fiber.join(fresh).pipe(Effect.timeout("5 seconds"))
+      expect(yield* Effect.promise(() => Bun.file(file).text())).toBe("FRESH_TURN_WRITE\n")
+    }),
+  { timeout: 20000 },
+)
 
-it.instance("cancel while a question is pending removes it before a stale answer can complete the tool", () =>
-  Effect.gen(function* () {
-    const { llm } = yield* useServerConfig(providerCfg)
-    const prompt = yield* SessionPrompt.Service
-    const sessions = yield* Session.Service
-    const questions = yield* Question.Service
-    const chat = yield* sessions.create({ title: "Pinned" })
-    yield* llm.push(reply().tool("question", { questions: [{ question: "Continue?", header: "Choice", options: [{ label: "Yes", description: "Continue" }] }] }))
-    yield* user(chat.id, "ask a question")
-    const first = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
-    const request = yield* pollWithTimeout(questions.list().pipe(Effect.map((items) => items.find((r) => r.sessionID === chat.id))), "question did not arrive")
-    yield* prompt.cancel(chat.id)
-    yield* Fiber.await(first)
-    expect((yield* questions.list()).some((r) => r.id === request.id)).toBe(false)
-    const late = yield* questions.reply({ requestID: request.id, answers: [["Yes"]] }).pipe(Effect.exit)
-    expect(Exit.isFailure(late)).toBe(true)
-  }), { timeout: 20000 })
+it.instance(
+  "cancel while a question is pending removes it before a stale answer can complete the tool",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const questions = yield* Question.Service
+      const chat = yield* sessions.create({ title: "Pinned" })
+      yield* llm.push(
+        reply().tool("question", {
+          questions: [
+            { question: "Continue?", header: "Choice", options: [{ label: "Yes", description: "Continue" }] },
+          ],
+        }),
+      )
+      yield* user(chat.id, "ask a question")
+      const first = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+      const request = yield* pollWithTimeout(
+        questions.list().pipe(Effect.map((items) => items.find((r) => r.sessionID === chat.id))),
+        "question did not arrive",
+      )
+      yield* prompt.cancel(chat.id)
+      yield* Fiber.await(first)
+      expect((yield* questions.list()).some((r) => r.id === request.id)).toBe(false)
+      const late = yield* questions.reply({ requestID: request.id, answers: [["Yes"]] }).pipe(Effect.exit)
+      expect(Exit.isFailure(late)).toBe(true)
+    }),
+  { timeout: 20000 },
+)
 
 const itAbortMcp = testEffect(makeHttp({ mcpTools: { probe_lookup: mcpTool("lookup", "Look up a note") } }))
-itAbortMcp.instance("cancel while an MCP permission is pending removes it before late approval", () =>
-  Effect.gen(function* () {
-    const { llm } = yield* useServerConfig((url) => ({ ...providerCfg(url), permission: { "*": "allow", probe_lookup: "ask" }, permission_timeout: { enabled: false }, tool_search: { enabled: false } }))
-    const prompt = yield* SessionPrompt.Service
-    const sessions = yield* Session.Service
-    const permissions = yield* Permission.Service
-    const chat = yield* sessions.create({ title: "Pinned" })
-    yield* llm.push(reply().tool("probe_lookup", { query: "milk" }))
-    yield* user(chat.id, "look up note")
-    const first = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
-    const request = yield* pollWithTimeout(permissions.list().pipe(Effect.map((items) => items.find((r) => r.sessionID === chat.id))), "MCP permission did not arrive")
-    yield* prompt.cancel(chat.id)
-    yield* Fiber.await(first)
-    expect((yield* permissions.list()).some((r) => r.id === request.id)).toBe(false)
-    const late = yield* permissions.reply({ requestID: request.id, reply: "once" }).pipe(Effect.exit)
-    expect(Exit.isFailure(late)).toBe(true)
-  }), { timeout: 20000 })
+itAbortMcp.instance(
+  "cancel while an MCP permission is pending removes it before late approval",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig((url) => ({
+        ...providerCfg(url),
+        permission: { "*": "allow", probe_lookup: "ask" },
+        permission_timeout: { enabled: false },
+        tool_search: { enabled: false },
+      }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const permissions = yield* Permission.Service
+      const chat = yield* sessions.create({ title: "Pinned" })
+      yield* llm.push(reply().tool("probe_lookup", { query: "milk" }))
+      yield* user(chat.id, "look up note")
+      const first = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+      const request = yield* pollWithTimeout(
+        permissions.list().pipe(Effect.map((items) => items.find((r) => r.sessionID === chat.id))),
+        "MCP permission did not arrive",
+      )
+      yield* prompt.cancel(chat.id)
+      yield* Fiber.await(first)
+      expect((yield* permissions.list()).some((r) => r.id === request.id)).toBe(false)
+      const late = yield* permissions.reply({ requestID: request.id, reply: "once" }).pipe(Effect.exit)
+      expect(Exit.isFailure(late)).toBe(true)
+    }),
+  { timeout: 20000 },
+)
 
-it.instance("cancel while bash permission is pending cannot run the command on late approval", () =>
-  Effect.gen(function* () {
-    const { dir, llm } = yield* useServerConfig((url) => ({ ...providerCfg(url), permission: { "*": "allow", bash: "ask" }, permission_timeout: { enabled: false } }))
-    const file = path.join(dir, "aborted-command.txt")
-    const prompt = yield* SessionPrompt.Service
-    const sessions = yield* Session.Service
-    const permissions = yield* Permission.Service
-    const chat = yield* sessions.create({ title: "Pinned" })
-    yield* llm.push(reply().tool("shell", { command: "echo SHOULD_NOT_RUN > aborted-command.txt", description: "write marker", workdir: dir }))
-    yield* user(chat.id, "Write a report marker")
-    const first = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
-    const request = yield* pollWithTimeout(permissions.list().pipe(Effect.map((items) => items.find((r) => r.sessionID === chat.id))), "bash permission did not arrive")
-    yield* prompt.cancel(chat.id)
-    yield* Fiber.await(first)
-    const late = yield* permissions.reply({ requestID: request.id, reply: "once" }).pipe(Effect.exit)
-    expect(Exit.isFailure(late)).toBe(true)
-    expect(yield* Effect.promise(() => Bun.file(file).exists())).toBe(false)
-  }), { timeout: 20000 })
+it.instance(
+  "cancel while bash permission is pending cannot run the command on late approval",
+  () =>
+    Effect.gen(function* () {
+      const { dir, llm } = yield* useServerConfig((url) => ({
+        ...providerCfg(url),
+        permission: { "*": "allow", bash: "ask" },
+        permission_timeout: { enabled: false },
+      }))
+      const file = path.join(dir, "aborted-command.txt")
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const permissions = yield* Permission.Service
+      const chat = yield* sessions.create({ title: "Pinned" })
+      yield* llm.push(
+        reply().tool("shell", {
+          command: "echo SHOULD_NOT_RUN > aborted-command.txt",
+          description: "write marker",
+          workdir: dir,
+        }),
+      )
+      yield* user(chat.id, "Write a report marker")
+      const first = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+      const request = yield* pollWithTimeout(
+        permissions.list().pipe(Effect.map((items) => items.find((r) => r.sessionID === chat.id))),
+        "bash permission did not arrive",
+      )
+      yield* prompt.cancel(chat.id)
+      yield* Fiber.await(first)
+      const late = yield* permissions.reply({ requestID: request.id, reply: "once" }).pipe(Effect.exit)
+      expect(Exit.isFailure(late)).toBe(true)
+      expect(yield* Effect.promise(() => Bun.file(file).exists())).toBe(false)
+    }),
+  { timeout: 20000 },
+)
 it.instance("a child can finish on the next generation after writing its result envelope", () =>
   Effect.gen(function* () {
     const { llm } = yield* useServerConfig((url) => ({
@@ -6406,116 +6797,196 @@ it.instance("a child can finish on the next generation after writing its result 
     const sessions = yield* Session.Service
     const parent = yield* sessions.create({ title: "Parent" })
     const child = yield* sessions.create({
-      title: "Child", parentID: parent.id,
+      title: "Child",
+      parentID: parent.id,
       permission: [{ permission: "*", pattern: "*", action: "allow" }],
     })
     const plan = "Create the scene, place the camera, then validate the HTML."
     yield* llm.push(reply().text(`<silvercode-result>${plan}</silvercode-result>`).tool("glob", { pattern: "*" }))
     yield* llm.push(reply().tool("finish", { reason: "success", result: "Task completed" }).stop())
     const result = yield* prompt.prompt({
-      sessionID: child.id, agent: "general", model: ref,
+      sessionID: child.id,
+      agent: "general",
+      model: ref,
       parts: [{ type: "text", text: "Plan the scene, inspect file names, then finish." }],
     })
     expect(yield* llm.calls).toBe(2)
     expectCompletedFinish(result)
     const history = yield* sessions.messages({ sessionID: child.id })
-    expect(history.some((message) => message.info.id !== result.info.id && message.parts.some(
-      (part) => part.type === "text" && part.text.includes(plan),
-    ))).toBe(true)
+    expect(
+      history.some(
+        (message) =>
+          message.info.id !== result.info.id &&
+          message.parts.some((part) => part.type === "text" && part.text.includes(plan)),
+      ),
+    ).toBe(true)
     expectNoFinishNudge(history)
   }),
 )
 
-
-it.instance("cancel registered custom tool permission prevents a late side effect", () =>
-  Effect.acquireUseRelease(
-    Effect.sync(() => {
-      const previous = process.env.OPENCODE_DISABLE_CONFIG_DEP_INSTALL
-      process.env.OPENCODE_DISABLE_CONFIG_DEP_INSTALL = "1"
-      return previous
-    }),
-    () => Effect.gen(function* () {
-    const dir = (yield* TestInstance).directory
-    const tools = path.join(dir, ".opencode", "tools")
-    const marker = path.join(dir, "plugin-late-write.txt")
-    yield* Effect.promise(() => Bun.write(path.join(tools, "plugin_write.ts"), `export default {
+it.instance(
+  "cancel registered custom tool permission prevents a late side effect",
+  () =>
+    Effect.acquireUseRelease(
+      Effect.sync(() => {
+        const previous = process.env.OPENCODE_DISABLE_CONFIG_DEP_INSTALL
+        process.env.OPENCODE_DISABLE_CONFIG_DEP_INSTALL = "1"
+        return previous
+      }),
+      () =>
+        Effect.gen(function* () {
+          const dir = (yield* TestInstance).directory
+          const tools = path.join(dir, ".opencode", "tools")
+          const marker = path.join(dir, "plugin-late-write.txt")
+          yield* Effect.promise(() =>
+            Bun.write(
+              path.join(tools, "plugin_write.ts"),
+              `export default {
       description: "Request permission then write a marker", args: {},
       async execute(args, ctx) {
         await ctx.ask({ permission: "plugin_write", patterns: ["*"], always: ["*"], metadata: {} })
         await Bun.write(${JSON.stringify(marker)}, "LATE_SIDE_EFFECT")
         return "written"
       }
-    }`))
-    const { llm } = yield* useServerConfig((url) => ({ ...providerCfg(url), permission: { "*": "allow", plugin_write: "ask" }, permission_timeout: { enabled: false }, tool_search: { enabled: false } }))
-    expect((yield* (yield* ToolRegistry.Service).all()).some((t) => t.id === "plugin_write")).toBe(true)
-    const prompt = yield* SessionPrompt.Service
+    }`,
+            ),
+          )
+          const { llm } = yield* useServerConfig((url) => ({
+            ...providerCfg(url),
+            permission: { "*": "allow", plugin_write: "ask" },
+            permission_timeout: { enabled: false },
+            tool_search: { enabled: false },
+          }))
+          expect((yield* (yield* ToolRegistry.Service).all()).some((t) => t.id === "plugin_write")).toBe(true)
+          const prompt = yield* SessionPrompt.Service
+          const sessions = yield* Session.Service
+          const permissions = yield* Permission.Service
+          const chat = yield* sessions.create({ title: "Pinned" })
+          yield* llm.push(reply().tool("plugin_write", {}))
+          yield* user(chat.id, "Generate a report with the custom tool")
+          const first = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+          const request = yield* pollWithTimeout(
+            permissions.list().pipe(Effect.map((items) => items.find((r) => r.sessionID === chat.id))),
+            "custom tool permission did not arrive",
+          )
+          yield* prompt.cancel(chat.id)
+          yield* Fiber.await(first)
+          const remaining = yield* permissions.list()
+          yield* permissions.reply({ requestID: request.id, reply: "once" }).pipe(Effect.ignore)
+          yield* Effect.sleep("100 millis")
+          expect(yield* Effect.promise(() => Bun.file(marker).exists())).toBe(false)
+          expect(remaining.some((r) => r.id === request.id)).toBe(false)
+          // Cancellation must not poison the next legitimate plugin invocation.
+          yield* llm.push(reply().tool("plugin_write", {}))
+          yield* llm.text("approved plugin invocation completed")
+          yield* user(chat.id, "Generate the report again with approval")
+          const fresh = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+          const next = yield* pollWithTimeout(
+            permissions.list().pipe(Effect.map((items) => items.find((r) => r.sessionID === chat.id))),
+            "fresh custom tool permission did not arrive",
+          )
+          yield* permissions.reply({ requestID: next.id, reply: "once" })
+          yield* Fiber.join(fresh).pipe(Effect.timeout("5 seconds"))
+          expect(yield* Effect.promise(() => Bun.file(marker).text())).toBe("LATE_SIDE_EFFECT")
+        }),
+      (previous) =>
+        Effect.sync(() => {
+          if (previous === undefined) delete process.env.OPENCODE_DISABLE_CONFIG_DEP_INSTALL
+          else process.env.OPENCODE_DISABLE_CONFIG_DEP_INSTALL = previous
+        }),
+    ),
+  { timeout: 20000 },
+)
+
+withMcpTools.instance(
+  "captured MCP executor still runs after the request becomes programming (advisory workflow)",
+  () =>
+    Effect.gen(function* () {
+      yield* useServerConfig((url) => ({
+        ...providerCfg(url),
+        tool_search: { enabled: false },
+        permission: { "*": "allow" },
+      }))
+      const sessions = yield* Session.Service
+      const agents = yield* AgentSvc.Service
+      const provider = yield* ProviderSvc.Service
+      const chat = yield* sessions.create({ title: "overlap" })
+      const seeded = yield* seed(chat.id)
+      yield* user(chat.id, "Research notes and write a report")
+      const { SessionTools } = yield* Effect.promise(() => import("../../src/session/tools"))
+      const tools = yield* SessionTools.resolve({
+        agent: yield* agents.get("work"),
+        model: yield* provider.getModel(ref.providerID, ref.modelID),
+        session: chat,
+        processor: {
+          message: seeded.assistant,
+          updateToolCall: () => Effect.succeed(undefined),
+          completeToolCall: () => Effect.void,
+          waitForOtherTools: () => Effect.void,
+        },
+        bypassAgentCheck: false,
+        messages: yield* sessions.messages({ sessionID: chat.id }),
+        promptOps: {
+          resolvePromptParts: () => Effect.succeed([]),
+          cancel: () => Effect.void,
+          prompt: () => Effect.die("No child expected"),
+        },
+      })
+      const execute = tools.notes_search_notes?.execute
+      expect(execute).toBeDefined()
+      yield* user(chat.id, "Implement API endpoint")
+      const exit = yield* Effect.tryPromise(() =>
+        execute!({ query: "private" }, { toolCallId: "old", messages: [], abortSignal: new AbortController().signal }),
+      ).pipe(Effect.exit)
+      // Classification is guidance, not a gate: the captured MCP call runs after the request turns into programming.
+      expect(Exit.isSuccess(exit)).toBe(true)
+      if (Exit.isFailure(exit)) expect(Cause.pretty(exit.cause)).not.toContain("Task scope changed")
+    }),
+)
+
+withMcpTools.instance("an explicit permission deny still removes the MCP tool whatever the classification", () =>
+  Effect.gen(function* () {
+    yield* useServerConfig((url) => ({
+      ...providerCfg(url),
+      tool_search: { enabled: false },
+      permission: { "*": "allow", notes_search_notes: "deny" },
+    }))
     const sessions = yield* Session.Service
-    const permissions = yield* Permission.Service
-    const chat = yield* sessions.create({ title: "Pinned" })
-    yield* llm.push(reply().tool("plugin_write", {}))
-    yield* user(chat.id, "Generate a report with the custom tool")
-    const first = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
-    const request = yield* pollWithTimeout(permissions.list().pipe(Effect.map((items) => items.find((r) => r.sessionID === chat.id))), "custom tool permission did not arrive")
-    yield* prompt.cancel(chat.id)
-    yield* Fiber.await(first)
-    const remaining = yield* permissions.list()
-    yield* permissions.reply({ requestID: request.id, reply: "once" }).pipe(Effect.ignore)
-    yield* Effect.sleep("100 millis")
-    expect(yield* Effect.promise(() => Bun.file(marker).exists())).toBe(false)
-    expect(remaining.some((r) => r.id === request.id)).toBe(false)
-    // Cancellation must not poison the next legitimate plugin invocation.
-    yield* llm.push(reply().tool("plugin_write", {}))
-    yield* llm.text("approved plugin invocation completed")
-    yield* user(chat.id, "Generate the report again with approval")
-    const fresh = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
-    const next = yield* pollWithTimeout(permissions.list().pipe(Effect.map((items) => items.find((r) => r.sessionID === chat.id))), "fresh custom tool permission did not arrive")
-    yield* permissions.reply({ requestID: next.id, reply: "once" })
-    yield* Fiber.join(fresh).pipe(Effect.timeout("5 seconds"))
-    expect(yield* Effect.promise(() => Bun.file(marker).text())).toBe("LATE_SIDE_EFFECT")
-    }),
-    (previous) => Effect.sync(() => {
-      if (previous === undefined) delete process.env.OPENCODE_DISABLE_CONFIG_DEP_INSTALL
-      else process.env.OPENCODE_DISABLE_CONFIG_DEP_INSTALL = previous
-    }),
-  ), { timeout: 20000 })
-
-withMcpTools.instance("captured MCP executor still runs after the request becomes programming (advisory workflow)",()=>Effect.gen(function*(){
- yield* useServerConfig(url=>({...providerCfg(url),tool_search:{enabled:false},permission:{"*":"allow"}}))
- const sessions=yield* Session.Service
- const agents=yield* AgentSvc.Service
- const provider=yield* ProviderSvc.Service
- const chat=yield* sessions.create({title:"overlap"})
- const seeded=yield* seed(chat.id)
- yield* user(chat.id,"Research notes and write a report")
- const {SessionTools}=yield* Effect.promise(()=>import("../../src/session/tools"))
- const tools=yield* SessionTools.resolve({agent:yield* agents.get("work"),model:yield* provider.getModel(ref.providerID,ref.modelID),session:chat,processor:{message:seeded.assistant,updateToolCall:()=>Effect.succeed(undefined),completeToolCall:()=>Effect.void,waitForOtherTools:()=>Effect.void},bypassAgentCheck:false,messages:yield* sessions.messages({sessionID:chat.id}),promptOps:{resolvePromptParts:()=>Effect.succeed([]),cancel:()=>Effect.void,prompt:()=>Effect.die("No child expected")}})
- const execute=tools.notes_search_notes?.execute
- expect(execute).toBeDefined()
- yield* user(chat.id,"Implement API endpoint")
- const exit=yield* Effect.tryPromise(()=>execute!({query:"private"},{toolCallId:"old",messages:[],abortSignal:new AbortController().signal})).pipe(Effect.exit)
- // Classification is guidance, not a gate: the captured MCP call runs after the request turns into programming.
- expect(Exit.isSuccess(exit)).toBe(true)
- if(Exit.isFailure(exit)) expect(Cause.pretty(exit.cause)).not.toContain("Task scope changed")
-}))
-
-withMcpTools.instance("an explicit permission deny still removes the MCP tool whatever the classification",()=>Effect.gen(function*(){
- yield* useServerConfig(url=>({...providerCfg(url),tool_search:{enabled:false},permission:{"*":"allow","notes_search_notes":"deny"}}))
- const sessions=yield* Session.Service
- const agents=yield* AgentSvc.Service
- const provider=yield* ProviderSvc.Service
- const chat=yield* sessions.create({title:"overlap"})
- const seeded=yield* seed(chat.id)
- yield* user(chat.id,"Research notes and write a report")
- const {SessionTools}=yield* Effect.promise(()=>import("../../src/session/tools"))
- const tools=yield* SessionTools.resolve({agent:yield* agents.get("work"),model:yield* provider.getModel(ref.providerID,ref.modelID),session:chat,processor:{message:seeded.assistant,updateToolCall:()=>Effect.succeed(undefined),completeToolCall:()=>Effect.void,waitForOtherTools:()=>Effect.void},bypassAgentCheck:false,messages:yield* sessions.messages({sessionID:chat.id}),promptOps:{resolvePromptParts:()=>Effect.succeed([]),cancel:()=>Effect.void,prompt:()=>Effect.die("No child expected")}})
- const execute=tools.notes_search_notes?.execute
- yield* user(chat.id,"Implement API endpoint")
- // The tool is offered; the deny is enforced at execution, whatever the classification.
- expect(execute).toBeDefined()
- const exit=yield* Effect.tryPromise(()=>execute!({query:"private"},{toolCallId:"deny",messages:[],abortSignal:new AbortController().signal})).pipe(Effect.exit)
- expect(Exit.isFailure(exit)).toBe(true)
- if(Exit.isFailure(exit)) expect(Cause.pretty(exit.cause).toLowerCase()).toMatch(/denied|deny|permission/)
-}))
+    const agents = yield* AgentSvc.Service
+    const provider = yield* ProviderSvc.Service
+    const chat = yield* sessions.create({ title: "overlap" })
+    const seeded = yield* seed(chat.id)
+    yield* user(chat.id, "Research notes and write a report")
+    const { SessionTools } = yield* Effect.promise(() => import("../../src/session/tools"))
+    const tools = yield* SessionTools.resolve({
+      agent: yield* agents.get("work"),
+      model: yield* provider.getModel(ref.providerID, ref.modelID),
+      session: chat,
+      processor: {
+        message: seeded.assistant,
+        updateToolCall: () => Effect.succeed(undefined),
+        completeToolCall: () => Effect.void,
+        waitForOtherTools: () => Effect.void,
+      },
+      bypassAgentCheck: false,
+      messages: yield* sessions.messages({ sessionID: chat.id }),
+      promptOps: {
+        resolvePromptParts: () => Effect.succeed([]),
+        cancel: () => Effect.void,
+        prompt: () => Effect.die("No child expected"),
+      },
+    })
+    const execute = tools.notes_search_notes?.execute
+    yield* user(chat.id, "Implement API endpoint")
+    // The tool is offered; the deny is enforced at execution, whatever the classification.
+    expect(execute).toBeDefined()
+    const exit = yield* Effect.tryPromise(() =>
+      execute!({ query: "private" }, { toolCallId: "deny", messages: [], abortSignal: new AbortController().signal }),
+    ).pipe(Effect.exit)
+    expect(Exit.isFailure(exit)).toBe(true)
+    if (Exit.isFailure(exit)) expect(Cause.pretty(exit.cause).toLowerCase()).toMatch(/denied|deny|permission/)
+  }),
+)
 
 // ---------------------------------------------------------------------------
 // Regression for #292: ESC interruption must not poison the next prompt.
@@ -6550,7 +7021,8 @@ it.instance(
       expect(Exit.isSuccess(exitFirst)).toBe(true)
       if (Exit.isSuccess(exitFirst)) {
         expect(exitFirst.value.info.role).toBe("assistant")
-        if (exitFirst.value.info.role === "assistant") expect(exitFirst.value.info.error?.name).toBe("MessageAbortedError")
+        if (exitFirst.value.info.role === "assistant")
+          expect(exitFirst.value.info.error?.name).toBe("MessageAbortedError")
       }
       yield* pollWithTimeout(
         Effect.gen(function* () {
@@ -6731,13 +7203,17 @@ for (const scenario of ["completed", "missing", "bound", "abort"] as const) {
   )
 }
 
-
 // Mid-session agent effort (#748): the selector persists a level on the
 // session row, and every generation step must consume the persisted level it
 // sees when it builds its request. A change made while a request is already in
 // flight therefore applies to the next step (and to the finish call made from
 // it), never retroactively to the request that was already sent, and it never
 // restarts the run or replays completed tool effects.
+const FAST_WORK_ROUTE =
+  "At fast effort, handle straightforward programming directly when Think/Code handoffs add no value."
+const STANDARD_WORK_ROUTE =
+  "Programming requests are best done as Think planning, then Code implementation, then a clean Review."
+
 for (const [initial, changed] of [
   ["thorough", "fast"],
   ["fast", "thorough"],
@@ -6775,10 +7251,19 @@ for (const [initial, changed] of [
         yield* awaitWithTimeout(llm.wait(1), "timed out waiting for step 1", "10 seconds")
         yield* awaitWithTimeout(llm.wait(2), "timed out waiting for step 2", "10 seconds")
 
+        const hits = yield* llm.hits
+        const firstRequest = JSON.stringify(hits[0]?.body)
+        expect(firstRequest).toContain(initial === "fast" ? FAST_WORK_ROUTE : STANDARD_WORK_ROUTE)
+        expect(firstRequest).not.toContain(initial === "fast" ? STANDARD_WORK_ROUTE : FAST_WORK_ROUTE)
+        if (initial === "fast")
+          expect(firstRequest).toContain("## Agent effort: fast (review passes: off, validation gate: minimal)")
+        else expect(firstRequest).not.toContain(`## Agent effort: ${initial}`)
+
         // The request already on the wire keeps the effort it was built with.
-        const inFlight = JSON.stringify((yield* llm.hits)[1]?.body)
+        const inFlight = JSON.stringify(hits[1]?.body)
         expect(inFlight).toContain(`## Agent effort: ${initial}`)
         expect(inFlight).not.toContain(`## Agent effort: ${changed}`)
+        expect(inFlight).toContain(initial === "fast" ? FAST_WORK_ROUTE : STANDARD_WORK_ROUTE)
 
         // Change the persisted selection in the same session, mid-run.
         yield* sessions.setMetadata({ sessionID: session.id, metadata: withAgentEffort({}, changed) })
@@ -6788,6 +7273,8 @@ for (const [initial, changed] of [
         const next = JSON.stringify((yield* llm.hits)[2]?.body)
         expect(next).toContain(`## Agent effort: ${changed}`)
         expect(next).not.toContain(`## Agent effort: ${initial}`)
+        expect(next).toContain(changed === "fast" ? FAST_WORK_ROUTE : STANDARD_WORK_ROUTE)
+        expect(next).not.toContain(changed === "fast" ? STANDARD_WORK_ROUTE : FAST_WORK_ROUTE)
 
         const exit = yield* Fiber.await(fiber)
         expect(Exit.isSuccess(exit)).toBe(true)
@@ -6857,7 +7344,9 @@ it.instance(
       const held = defer<void>()
       const extra = path.join(dir, "effort-finish-2.txt")
       yield* llm.push(reply().tool("write", { filePath: extra, content: "done" }).wait(held.promise))
-      yield* llm.push(reply().text("Delivered.").tool("finish", { reason: "success", result: "Wrote the file." }).stop())
+      yield* llm.push(
+        reply().text("Delivered.").tool("finish", { reason: "success", result: "Wrote the file." }).stop(),
+      )
 
       const fiber = yield* prompt.loop({ sessionID: session.id }).pipe(Effect.forkChild)
       yield* awaitWithTimeout(llm.wait(1), "timed out waiting for step 1", "10 seconds")
@@ -6921,7 +7410,9 @@ it.instance(
       const held = defer<void>()
       const extra = path.join(dir, "effort-finish-upgrade-2.txt")
       yield* llm.push(reply().tool("write", { filePath: extra, content: "done" }).wait(held.promise))
-      yield* llm.push(reply().text("Delivered.").tool("finish", { reason: "success", result: "Wrote the file." }).stop())
+      yield* llm.push(
+        reply().text("Delivered.").tool("finish", { reason: "success", result: "Wrote the file." }).stop(),
+      )
 
       const fiber = yield* prompt.loop({ sessionID: session.id }).pipe(Effect.forkChild)
       yield* awaitWithTimeout(llm.wait(1), "timed out waiting for step 1", "10 seconds")
@@ -7074,7 +7565,9 @@ it.instance(
       yield* llm.tool("task", { description: "Verify fix", subagent_type: "review", prompt: "Review v2." })
       yield* llm.push(reply().tool("finish", { reason: "success", result: approved }).stop())
       // Hit 9 (parent step 6): approved thorough finish.
-      yield* llm.push(reply().text("Fixed and verified.").tool("finish", { reason: "success", result: "Fixed and verified." }).stop())
+      yield* llm.push(
+        reply().text("Fixed and verified.").tool("finish", { reason: "success", result: "Fixed and verified." }).stop(),
+      )
 
       const fiber = yield* prompt.loop({ sessionID: session.id }).pipe(Effect.forkChild)
       yield* awaitWithTimeout(llm.wait(1), "timed out waiting for step 1", "10 seconds")
@@ -7141,7 +7634,9 @@ it.instance(
         .flatMap((message) => message.parts)
         .filter((part): part is SessionV1.ToolPart => part.type === "tool" && part.tool === "task")
       expect(tasks).toHaveLength(3)
-      const taskEfforts = tasks.map((part) => (part.state.status === "completed" ? part.state.metadata?.effort : undefined))
+      const taskEfforts = tasks.map((part) =>
+        part.state.status === "completed" ? part.state.metadata?.effort : undefined,
+      )
       expect(taskEfforts).toEqual(["fast", "thorough", "thorough"])
       for (const [idx, expected] of [
         [0, "fast"],
@@ -7168,5 +7663,3951 @@ it.instance(
       expect(yield* Effect.promise(() => readFile(file, "utf8"))).toBe("v2")
       expect((yield* sessions.get(session.id)).metadata?.agentEffort).toBe("thorough")
     }),
+  30_000,
+)
+
+// ---------------------------------------------------------------------------
+// Issue #738: repetition-guard recovery at the run-loop level
+// ---------------------------------------------------------------------------
+
+// A non-periodic fragment above MIN_UNIT_CHARS so the guard confirms it at its
+// full length; a small prefix streams first so some text is persisted before
+// the guard aborts.
+const RECOVERY_PREFIX = "Here is the persisted prefix: "
+const RECOVERY_FRAGMENT = "x".repeat(59) + "y"
+
+const loopingReply = () =>
+  reply()
+    .text(RECOVERY_PREFIX)
+    .text(RECOVERY_FRAGMENT)
+    .text(RECOVERY_FRAGMENT)
+    .text(RECOVERY_FRAGMENT)
+    .text(RECOVERY_FRAGMENT)
+
+// Recovery messages are identified by the runner's own lineage marker, not by
+// their text, so the tests cannot confuse them with other synthetic messages.
+const repetitionRecoveriesIn = (messages: SessionV1.WithParts[]) =>
+  messages.filter(
+    (message) =>
+      message.info.role === "user" &&
+      message.parts.some(
+        (part) => part.type === "text" && part.synthetic === true && part.metadata?.repetitionRecovery !== undefined,
+      ),
+  )
+
+it.instance(
+  "repetition-guard recovery injects one synthetic recovery message and continues the turn",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({
+        title: "Pinned",
+        agent: "work",
+        model: { providerID: ref.providerID, id: ref.modelID },
+      })
+
+      const normalReply = reply().text("The model recovered and continued with the task.").stop()
+
+      yield* llm.push(loopingReply(), normalReply)
+      const task = yield* user(chat.id, "please do the task")
+
+      const result = yield* prompt.loop({ sessionID: chat.id })
+      expect(result.info.role).toBe("assistant")
+
+      const messages = yield* sessions.messages({ sessionID: chat.id })
+      const assistantMessages = messages.filter((m) => m.info.role === "assistant")
+
+      // The aborted generation kept its persisted partial text and surfaced the error.
+      const first = assistantMessages[0]
+      expect(first).toBeDefined()
+      if (first && first.info.role === "assistant") {
+        const persisted = first.parts
+          .filter((p) => p.type === "text")
+          .map((p) => (typeof p.text === "string" ? p.text : ""))
+          .join("")
+        expect(persisted).toContain(RECOVERY_PREFIX)
+        expect(first.info.error).toBeDefined()
+      }
+
+      // Exactly one synthetic recovery user message, with the repeated-fragment
+      // detail and an honest account of what happened (never "nothing happened").
+      const recoveries = repetitionRecoveriesIn(messages)
+      expect(recoveries).toHaveLength(1)
+      const [recovery] = recoveries
+      const [recoveryPart] = recovery.parts
+      expect(recoveryPart.type).toBe("text")
+      if (recoveryPart.type === "text") {
+        expect(recoveryPart.text).toContain("cut off by the repetition guard")
+        expect(recoveryPart.text).toContain(`${RECOVERY_FRAGMENT.length}-character fragment`)
+        expect(recoveryPart.text).toContain("preserved in the transcript")
+        // The earlier copies of the fragment were already streamed and are
+        // still in the transcript; the recovery may not claim they vanished.
+        expect(recoveryPart.text).toContain("including the earlier copies of that fragment")
+        expect(recoveryPart.text).not.toContain("discarded")
+        expect(recoveryPart.text).toContain("Do not repeat that fragment again")
+        expect(recoveryPart.text).toContain("emit the pending tool call")
+        // Recognised continuation lineage: the recovery belongs to the prompt it
+        // resumes, so provenance/subagent success and the budget can follow it.
+        expect(recoveryPart.metadata?.repetitionRecovery).toEqual({
+          promptID: task.id,
+          attempt: 1,
+          sequence: 1,
+          assistantIDs: [first!.info.id],
+        })
+      }
+
+      // Exactly two model requests: the aborted generation and the one recovery.
+      expect(yield* llm.calls).toBe(2)
+      expect(yield* llm.pending).toBe(0)
+      expect(yield* llm.misses).toEqual([])
+
+      // The errored generation's persisted text stays visible to the recovery
+      // request instead of being erased by the errored-assistant conversion
+      // filter. Only transcript state is replayed; nothing is re-executed.
+      const inputs = turnInputs(yield* llm.inputs)
+      expect(inputs).toHaveLength(2)
+      expect(JSON.stringify(inputs[1])).toContain(RECOVERY_PREFIX)
+
+      // The recovery generation completed without a second guard trip and with no
+      // tool activity, so the doom-loop detector (3 identical completed tool calls)
+      // can never be satisfied by a single recovery.
+      const last = assistantMessages[assistantMessages.length - 1]
+      expect(last).toBeDefined()
+      if (last && last.info.role === "assistant") expect(last.info.error).toBeUndefined()
+      expect(assistantMessages.flatMap((m) => m.parts.filter((p) => p.type === "tool")).length).toBe(0)
+    }),
+  { config: cfg },
+)
+
+it.instance(
+  "repetition-guard recovery: a second guard trip terminates with the error surfaced",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({
+        title: "Pinned",
+        agent: "work",
+        model: { providerID: ref.providerID, id: ref.modelID },
+      })
+
+      // Both responses loop: one recovery is allowed, the second trip must stop.
+      yield* llm.push(loopingReply(), loopingReply())
+      const task = yield* user(chat.id, "please do the task")
+
+      const result = yield* prompt.loop({ sessionID: chat.id })
+      expect(result.info.role).toBe("assistant")
+
+      const messages = yield* sessions.messages({ sessionID: chat.id })
+      const assistantMessages = messages.filter((m) => m.info.role === "assistant")
+
+      // Exactly one recovery was attempted; the turn did not loop forever.
+      expect(assistantMessages).toHaveLength(2)
+      expect(repetitionRecoveriesIn(messages)).toHaveLength(1)
+      // The second trip surfaces the error and stops deterministically, without
+      // asking the model a third time.
+      expect(yield* llm.calls).toBe(2)
+      expect(yield* llm.pending).toBe(0)
+      const last = assistantMessages[assistantMessages.length - 1]
+      expect(last).toBeDefined()
+      if (last && last.info.role === "assistant") {
+        expect(last.info.error).toBeDefined()
+        expect(RepetitionGuard.isStoredError(last.info.error)).toBe(true)
+      }
+      // An idle resume of the same prompt returns its terminal result; it does
+      // not reset the recovery budget or spend a third provider request.
+      const resumed = yield* prompt.loop({ sessionID: chat.id, messageID: task.id })
+      expect(resumed.info.id).toBe(result.info.id)
+      expect(yield* llm.calls).toBe(2)
+      expect(yield* llm.misses).toEqual([])
+      const status = yield* SessionStatus.Service
+      expect(yield* status.get(chat.id)).toEqual({ type: "idle" })
+    }),
+  { config: cfg },
+)
+
+// OpenAI-compatible SSE chunk, matching the shape the provider adapter parses.
+const sseChunk = (delta: Record<string, unknown>, finish?: string) => ({
+  id: "chatcmpl-test",
+  object: "chat.completion.chunk",
+  choices: [{ delta, ...(finish ? { finish_reason: finish } : {}) }],
+})
+
+it.instance(
+  "repetition-guard recovery keeps a completed tool call visible in the recovery request",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({
+        title: "Pinned",
+        agent: "work",
+        model: { providerID: ref.providerID, id: ref.modelID },
+      })
+      const callID = "call_guard_tool"
+      const { directory } = yield* TestInstance
+      const markerFile = path.join(directory, "repetition-tool-executions.txt")
+      const toolDone = yield* Deferred.make<void>()
+      // Head: the tool call streams and completes. Tail (after the gate): the
+      // same generation loops and trips the guard.
+      yield* llm.push(
+        raw({
+          head: [
+            sseChunk({ role: "assistant" }),
+            sseChunk({
+              tool_calls: [{ index: 0, id: callID, type: "function", function: { name: "shell", arguments: "" } }],
+            }),
+            sseChunk({
+              tool_calls: [
+                {
+                  index: 0,
+                  function: {
+                    arguments: JSON.stringify({
+                      command:
+                        "printf 'executed\\n' >> repetition-tool-executions.txt; printf 'TOOL_MARKER_CONTENT\\n'",
+                      description: "write marker",
+                    }),
+                  },
+                },
+              ],
+            }),
+          ],
+          wait: deferredAsPromise(toolDone),
+          tail: [
+            sseChunk({ content: RECOVERY_PREFIX }),
+            sseChunk({ content: RECOVERY_FRAGMENT }),
+            sseChunk({ content: RECOVERY_FRAGMENT }),
+            sseChunk({ content: RECOVERY_FRAGMENT }),
+            sseChunk({ content: RECOVERY_FRAGMENT }),
+            sseChunk({}, "tool_calls"),
+          ],
+        }),
+        reply().text("The model recovered with the tool result in hand.").stop(),
+      )
+
+      yield* user(chat.id, "please run the marker command")
+      const fiber = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+      yield* llm.wait(1)
+
+      // Wait for the completed shell tool call before opening the gate, so the
+      // part is settled before the guard aborts the stream (the reported shape).
+      yield* pollWithTimeout(
+        sessions.messages({ sessionID: chat.id }).pipe(
+          Effect.map((msgs) => {
+            const part = msgs.flatMap((m) => m.parts).find((candidate) => candidate.type === "tool")
+            return part && part.type === "tool" && part.state.status === "completed" ? true : undefined
+          }),
+        ),
+        "timed out waiting for the guard-trip tool call to complete",
+      )
+      yield* Deferred.succeed(toolDone, void 0)
+      yield* Fiber.join(fiber)
+
+      // The aborted generation's tool call executed exactly once and stayed the
+      // only call in the transcript.
+      const messages = yield* sessions.messages({ sessionID: chat.id })
+      const toolParts = messages.flatMap((m) => m.parts.filter((p) => p.type === "tool"))
+      expect(toolParts).toHaveLength(1)
+      expect(toolParts[0]?.state.status).toBe("completed")
+
+      // The recovery request sees the completed call and its recorded output,
+      // instead of the errored-assistant filter erasing the generation and
+      // letting the model re-issue a finished call.
+      expect(yield* llm.calls).toBe(2)
+      const inputs = turnInputs(yield* llm.inputs)
+      expect(inputs).toHaveLength(2)
+      const recoveryRequest = JSON.stringify(inputs[1])
+      expect(recoveryRequest).toContain(callID)
+      // One output occurrence plus the command's literal marker in its input.
+      expect(recoveryRequest.match(/TOOL_MARKER_CONTENT/g)).toHaveLength(2)
+      expect(yield* Effect.promise(() => readFile(markerFile, "utf8"))).toBe("executed\n")
+      expect(yield* llm.pending).toBe(0)
+      expect(yield* llm.misses).toEqual([])
+    }),
+  { config: cfg },
+  20_000,
+)
+
+it.instance(
+  "reasoning repetition does not trip the text-only guard or replay a completed tool",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({
+        title: "Pinned",
+        agent: "work",
+        model: { providerID: ref.providerID, id: ref.modelID },
+      })
+      const callID = "call_guard_tool"
+      const { directory } = yield* TestInstance
+      const markerFile = path.join(directory, "repetition-tool-executions.txt")
+      const toolDone = yield* Deferred.make<void>()
+      // Head: the tool call streams and completes. Tail (after the gate): the
+      // same generation repeats reasoning; the text-only guard does not trip.
+      yield* llm.push(
+        raw({
+          head: [
+            sseChunk({ role: "assistant" }),
+            sseChunk({
+              tool_calls: [{ index: 0, id: callID, type: "function", function: { name: "shell", arguments: "" } }],
+            }),
+            sseChunk({
+              tool_calls: [
+                {
+                  index: 0,
+                  function: {
+                    arguments: JSON.stringify({
+                      command: `node -e "require('fs').appendFileSync('repetition-tool-executions.txt','executed\\n');console.log('TOOL_MARKER_CONTENT')"`,
+                      description: "write marker",
+                    }),
+                  },
+                },
+              ],
+            }),
+          ],
+          wait: deferredAsPromise(toolDone),
+          tail: [
+            sseChunk({ reasoning_content: RECOVERY_PREFIX }),
+            sseChunk({ reasoning_content: RECOVERY_FRAGMENT }),
+            sseChunk({ reasoning_content: RECOVERY_FRAGMENT }),
+            sseChunk({ reasoning_content: RECOVERY_FRAGMENT }),
+            sseChunk({ reasoning_content: RECOVERY_FRAGMENT }),
+            sseChunk({}, "tool_calls"),
+          ],
+        }),
+        reply().text("The model continued with the tool result in hand.").stop(),
+      )
+
+      yield* user(chat.id, "please run the marker command")
+      const fiber = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+      yield* llm.wait(1)
+
+      // Wait for the completed shell tool call before opening the gate, so the
+      // part is settled before the ordinary follow-up request.
+      yield* pollWithTimeout(
+        sessions.messages({ sessionID: chat.id }).pipe(
+          Effect.map((msgs) => {
+            const part = msgs.flatMap((m) => m.parts).find((candidate) => candidate.type === "tool")
+            return part && part.type === "tool" && part.state.status === "completed" ? true : undefined
+          }),
+        ),
+        "timed out waiting for the guard-trip tool call to complete",
+      )
+      yield* Deferred.succeed(toolDone, void 0)
+      yield* Fiber.join(fiber)
+
+      // The generation's tool call executed exactly once and stayed the
+      // only call in the transcript.
+      const messages = yield* sessions.messages({ sessionID: chat.id })
+      expect(repetitionRecoveriesIn(messages)).toHaveLength(0)
+      expect(
+        messages.some(
+          (message) => message.info.role === "assistant" && RepetitionGuard.isStoredError(message.info.error),
+        ),
+      ).toBe(false)
+      expect(
+        messages
+          .flatMap((message) => message.parts)
+          .some((part) => part.type === "reasoning" && part.text.includes(RECOVERY_PREFIX)),
+      ).toBe(true)
+      const toolParts = messages.flatMap((m) => m.parts.filter((p) => p.type === "tool"))
+      expect(toolParts).toHaveLength(1)
+      expect(toolParts[0]?.state.status).toBe("completed")
+      const followUp = messages.findLast((message) => message.info.role === "assistant")
+      expect(
+        followUp?.parts.some(
+          (part) => part.type === "text" && part.text === "The model continued with the tool result in hand.",
+        ),
+      ).toBe(true)
+
+      // The ordinary tool follow-up request sees the completed call and its output,
+      // so normal continuation does not re-issue a finished call.
+      expect(yield* llm.calls).toBe(2)
+      const inputs = turnInputs(yield* llm.inputs)
+      expect(inputs).toHaveLength(2)
+      const followUpRequest = JSON.stringify(inputs[1])
+      expect(followUpRequest).toContain(callID)
+      // One output occurrence plus the command's literal marker in its input.
+      expect(followUpRequest.match(/TOOL_MARKER_CONTENT/g)).toHaveLength(2)
+      expect(yield* Effect.promise(() => readFile(markerFile, "utf8"))).toBe("executed\n")
+      expect(yield* llm.pending).toBe(0)
+      expect(yield* llm.misses).toEqual([])
+    }),
+  { config: cfg },
+  20_000,
+)
+
+it.instance(
+  "repetition-guard recovery: an HTTP 400 that quotes the guard text is not a guard trip",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({
+        title: "Pinned",
+        agent: "work",
+        model: { providerID: ref.providerID, id: ref.modelID },
+      })
+
+      // A provider rejection whose message quotes the guard text must not be
+      // mistaken for the harness's own abort (typed identity, not text match).
+      yield* llm.push(
+        httpError(400, {
+          error: {
+            message: `${RepetitionGuard.REPETITION_MESSAGE}: the model streamed the same 96-character fragment 3 times in a row`,
+            type: "invalid_request_error",
+            code: "invalid_request_error",
+          },
+        }),
+      )
+      yield* user(chat.id, "please do the task")
+
+      const result = yield* prompt.loop({ sessionID: chat.id })
+      expect(result.info.role).toBe("assistant")
+      if (result.info.role === "assistant") {
+        expect(result.info.error?.name).toBe("APIError")
+        expect(RepetitionGuard.isStoredError(result.info.error)).toBe(false)
+      }
+
+      // No recovery request, no synthetic recovery message: the failure is
+      // surfaced once as the provider reported it.
+      const messages = yield* sessions.messages({ sessionID: chat.id })
+      expect(repetitionRecoveriesIn(messages)).toHaveLength(0)
+      expect(messages.filter((m) => m.info.role === "assistant")).toHaveLength(1)
+      expect(yield* llm.calls).toBe(1)
+    }),
+  { config: cfg },
+  20_000,
+)
+
+// ---------------------------------------------------------------------------
+// Issue #738 / #410: a prompt queued while a guard trip is being recovered is
+// a NEW prompt, not a retry. Each caller must settle on the response to its own
+// prompt, and the queued prompt must actually be answered exactly once.
+// ---------------------------------------------------------------------------
+
+const settled = <A>(fibers: readonly [Fiber.Fiber<A, unknown>, Fiber.Fiber<A, unknown>], message: string) =>
+  awaitWithTimeout(Effect.all([Fiber.await(fibers[0]), Fiber.await(fibers[1])]), message, "15 seconds")
+
+function assistantExit(exit: Exit.Exit<SessionV1.WithParts, unknown>) {
+  expect(Exit.isSuccess(exit)).toBe(true)
+  if (Exit.isFailure(exit)) throw new Error("prompt caller failed")
+  expect(exit.value.info.role).toBe("assistant")
+  if (exit.value.info.role !== "assistant") throw new Error("prompt caller did not receive an assistant")
+  return { ...exit.value, info: exit.value.info }
+}
+
+const textParts = (message: SessionV1.WithParts) =>
+  message.parts.flatMap((part) => (part.type === "text" ? [part.text] : []))
+
+it.instance(
+  "repetition-guard recovery: a prompt queued before the first trip keeps its own turn",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({
+        title: "Pinned",
+        agent: "work",
+        model: { providerID: ref.providerID, id: ref.modelID },
+      })
+
+      const gate = yield* Deferred.make<void>()
+      // Gen1 streams only after the gate opens, so the queued prompt lands
+      // before the guard can trip.
+      yield* llm.push(
+        loopingReply().wait(deferredAsPromise(gate)),
+        reply().text("Answered the queued request on its own turn.").stop(),
+      )
+
+      const primaryID = MessageID.ascending()
+      const primary = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          messageID: primaryID,
+          agent: "work",
+          model: ref,
+          parts: [{ type: "text", text: "please do the task" }],
+        })
+        .pipe(Effect.forkChild)
+      yield* llm.wait(1)
+      yield* waitForBusy(chat.id)
+
+      const queuedID = MessageID.ascending()
+      const queued = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          messageID: queuedID,
+          agent: "work",
+          model: ref,
+          parts: [{ type: "text", text: "queued before the guard tripped" }],
+        })
+        .pipe(Effect.forkChild)
+      yield* pollWithTimeout(
+        sessions
+          .messages({ sessionID: chat.id })
+          .pipe(
+            Effect.map((msgs) =>
+              msgs.some((msg) => msg.info.role === "user" && msg.info.id === queuedID) ? true : undefined,
+            ),
+          ),
+        "timed out waiting for the queued prompt to save",
+      )
+
+      yield* Deferred.succeed(gate, void 0)
+      const [exitPrimary, exitQueued] = yield* settled([primary, queued], "queued callers never settled")
+
+      const primaryResult = assistantExit(exitPrimary)
+      const queuedResult = assistantExit(exitQueued)
+      expect(primaryResult.info.parentID).toBe(primaryID)
+      expect(RepetitionGuard.isStoredError(primaryResult.info.error)).toBe(true)
+      expect(textParts(primaryResult).join("")).toContain(RECOVERY_PREFIX)
+      expect(queuedResult.info.parentID).toBe(queuedID)
+      expect(queuedResult.info.error).toBeUndefined()
+      expect(textParts(queuedResult)).toEqual(["Answered the queued request on its own turn."])
+
+      const messages = yield* sessions.messages({ sessionID: chat.id })
+      expect(messages.find((message) => message.info.id === primaryResult.info.id)).toEqual(primaryResult)
+      expect(messages.find((message) => message.info.id === queuedResult.info.id)).toEqual(queuedResult)
+      expect(continuesPrompt(messages, primaryResult, primaryID)).toBe(true)
+      expect(continuesPrompt(messages, queuedResult, queuedID)).toBe(true)
+      expect(continuesPrompt(messages, queuedResult, primaryID)).toBe(false)
+      // No synthetic continuation was injected after the newer real input.
+      expect(repetitionRecoveriesIn(messages)).toHaveLength(0)
+      const assistants = messages.filter((message) => message.info.role === "assistant")
+      expect(assistants).toHaveLength(2)
+      expect(assistants.flatMap((message) => message.parts.filter((part) => part.type === "tool"))).toHaveLength(0)
+      // The aborted prompt spends exactly one request: no recovery was granted
+      // to it once newer real input was waiting, and the queued prompt is a new
+      // turn rather than a second attempt at the aborted one.
+      expect(yield* llm.calls).toBe(2)
+      expect(yield* llm.pending).toBe(0)
+      expect(yield* llm.misses).toEqual([])
+      const status = yield* SessionStatus.Service
+      expect(yield* status.get(chat.id)).toEqual({ type: "idle" })
+
+      // The queued input was neither dropped nor answered with another prompt's
+      // continuation: its own request carries it and no recovery nudge.
+      const inputs = turnInputs(yield* llm.inputs)
+      expect(inputs).toHaveLength(2)
+      expect(JSON.stringify(inputs[0])).toContain("please do the task")
+      expect(JSON.stringify(inputs[0])).not.toContain("queued before the guard tripped")
+      expect(JSON.stringify(inputs[1])).toContain("queued before the guard tripped")
+      expect(JSON.stringify(inputs[1])).not.toContain("cut off by the repetition guard")
+      // It stays visible in the durable transcript with its exact text.
+      const queuedMessage = messages.find((message) => message.info.id === queuedID)!
+      expect(queuedMessage.parts.filter((part) => part.type === "text").map((part) => part.text)).toEqual([
+        "queued before the guard tripped",
+      ])
+    }),
+  { config: cfg },
+  30_000,
+)
+
+it.instance(
+  "repetition-guard recovery: a prompt queued during a recovery that trips again gets its own turn",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({
+        title: "Pinned",
+        agent: "work",
+        model: { providerID: ref.providerID, id: ref.modelID },
+      })
+
+      const gate = yield* Deferred.make<void>()
+      yield* llm.push(
+        loopingReply(),
+        // The single allowed recovery is gated so the queued prompt lands while
+        // it is generating, and this recovery trips too.
+        loopingReply().wait(deferredAsPromise(gate)),
+        reply().text("Answered the queued request on its own turn.").stop(),
+      )
+
+      const primaryID = MessageID.ascending()
+      const primary = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          messageID: primaryID,
+          agent: "work",
+          model: ref,
+          parts: [{ type: "text", text: "please do the task" }],
+        })
+        .pipe(Effect.forkChild)
+      yield* llm.wait(2)
+      yield* waitForBusy(chat.id)
+
+      const queuedID = MessageID.ascending()
+      const queued = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          messageID: queuedID,
+          agent: "work",
+          model: ref,
+          parts: [{ type: "text", text: "queued during the recovery" }],
+        })
+        .pipe(Effect.forkChild)
+      yield* pollWithTimeout(
+        sessions
+          .messages({ sessionID: chat.id })
+          .pipe(
+            Effect.map((msgs) =>
+              msgs.some((msg) => msg.info.role === "user" && msg.info.id === queuedID) ? true : undefined,
+            ),
+          ),
+        "timed out waiting for the queued prompt to save",
+      )
+
+      yield* Deferred.succeed(gate, void 0)
+      const [exitPrimary, exitQueued] = yield* settled([primary, queued], "queued callers never settled")
+
+      const primaryResult = assistantExit(exitPrimary)
+      const queuedResult = assistantExit(exitQueued)
+      const messages = yield* sessions.messages({ sessionID: chat.id })
+      const recoveries = repetitionRecoveriesIn(messages)
+      expect(recoveries).toHaveLength(1)
+      const [recovery] = recoveries
+      const recoveryID = recovery.info.id
+      // The exhausted lineage ends on its own surfaced error, and the caller
+      // waiting on it settles there instead of borrowing the newer answer.
+      expect(primaryResult.info.parentID).toBe(recoveryID)
+      expect(RepetitionGuard.isStoredError(primaryResult.info.error)).toBe(true)
+      expect(textParts(primaryResult).join("")).toContain(RECOVERY_PREFIX)
+      expect(queuedResult.info.parentID).toBe(queuedID)
+      expect(queuedResult.info.error).toBeUndefined()
+      expect(textParts(queuedResult)).toEqual(["Answered the queued request on its own turn."])
+      expect(messages.find((message) => message.info.id === primaryResult.info.id)).toEqual(primaryResult)
+      expect(messages.find((message) => message.info.id === queuedResult.info.id)).toEqual(queuedResult)
+      expect(continuesPrompt(messages, primaryResult, primaryID)).toBe(true)
+      expect(continuesPrompt(messages, queuedResult, queuedID)).toBe(true)
+      expect(continuesPrompt(messages, queuedResult, primaryID)).toBe(false)
+      const [recoveryPart] = recovery.parts
+      const aborted = messages.find(
+        (message) => message.info.role === "assistant" && message.info.parentID === primaryID,
+      )
+      expect(recoveryPart?.type === "text" ? recoveryPart.metadata?.repetitionRecovery : undefined).toEqual({
+        promptID: primaryID,
+        attempt: 1,
+        sequence: 1,
+        assistantIDs: [aborted!.info.id],
+      })
+
+      const assistants = messages.filter((message) => message.info.role === "assistant")
+      expect(assistants).toHaveLength(3)
+      expect(assistants.flatMap((message) => message.parts.filter((part) => part.type === "tool"))).toHaveLength(0)
+      // Two requests for the aborted lineage (trip plus its one recovery) and
+      // one new request that answers the queued prompt; nothing replayed, no
+      // manual follow-up needed, no unbounded re-entry.
+      expect(yield* llm.calls).toBe(3)
+      expect(yield* llm.pending).toBe(0)
+      expect(yield* llm.misses).toEqual([])
+      const status = yield* SessionStatus.Service
+      expect(yield* status.get(chat.id)).toEqual({ type: "idle" })
+      // The continuation was created before the queued input, never after it.
+      const order = messages.map((message) => message.info.id)
+      expect(order.indexOf(recoveryID)).toBeLessThan(order.indexOf(queuedID))
+      const inputs = turnInputs(yield* llm.inputs)
+      expect(inputs).toHaveLength(3)
+      expect(JSON.stringify(inputs[0])).toContain("please do the task")
+      expect(JSON.stringify(inputs[1])).toContain("cut off by the repetition guard")
+      expect(JSON.stringify(inputs[1])).not.toContain("queued during the recovery")
+      expect(JSON.stringify(inputs[2])).toContain("queued during the recovery")
+    }),
+  { config: cfg },
+  30_000,
+)
+
+it.instance(
+  "repetition-guard recovery: a successful recovery and a queued prompt each settle on their own answer",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({
+        title: "Pinned",
+        agent: "work",
+        model: { providerID: ref.providerID, id: ref.modelID },
+      })
+
+      const gate = yield* Deferred.make<void>()
+      yield* llm.push(
+        loopingReply(),
+        reply().text("Recovered and finished the task.").stop().wait(deferredAsPromise(gate)),
+        reply().text("Answered the queued request on its own turn.").stop(),
+      )
+
+      const primaryID = MessageID.ascending()
+      const primary = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          messageID: primaryID,
+          agent: "work",
+          model: ref,
+          parts: [{ type: "text", text: "please do the task" }],
+        })
+        .pipe(Effect.forkChild)
+      yield* llm.wait(2)
+      yield* waitForBusy(chat.id)
+
+      const queuedID = MessageID.ascending()
+      const queued = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          messageID: queuedID,
+          agent: "work",
+          model: ref,
+          parts: [{ type: "text", text: "queued during the recovery" }],
+        })
+        .pipe(Effect.forkChild)
+      yield* pollWithTimeout(
+        sessions
+          .messages({ sessionID: chat.id })
+          .pipe(
+            Effect.map((msgs) =>
+              msgs.some((msg) => msg.info.role === "user" && msg.info.id === queuedID) ? true : undefined,
+            ),
+          ),
+        "timed out waiting for the queued prompt to save",
+      )
+
+      yield* Deferred.succeed(gate, void 0)
+      const [exitPrimary, exitQueued] = yield* settled([primary, queued], "queued callers never settled")
+
+      const primaryResult = assistantExit(exitPrimary)
+      const queuedResult = assistantExit(exitQueued)
+
+      const messages = yield* sessions.messages({ sessionID: chat.id })
+      const recoveries = repetitionRecoveriesIn(messages)
+      expect(recoveries).toHaveLength(1)
+      const [recovery] = recoveries
+      const recoveryID = recovery.info.id
+
+      // Primary caller settles on the recovery that continued its prompt.
+      expect(primaryResult.info.parentID).toBe(recoveryID)
+      expect(primaryResult.info.error).toBeUndefined()
+      expect(textParts(primaryResult)).toEqual(["Recovered and finished the task."])
+      // Queued caller settles on the answer to its own prompt.
+      expect(queuedResult.info.parentID).toBe(queuedID)
+      expect(queuedResult.info.error).toBeUndefined()
+      expect(textParts(queuedResult)).toEqual(["Answered the queued request on its own turn."])
+      expect(messages.find((message) => message.info.id === primaryResult.info.id)).toEqual(primaryResult)
+      expect(messages.find((message) => message.info.id === queuedResult.info.id)).toEqual(queuedResult)
+      expect(continuesPrompt(messages, primaryResult, primaryID)).toBe(true)
+      expect(continuesPrompt(messages, queuedResult, queuedID)).toBe(true)
+      expect(continuesPrompt(messages, queuedResult, primaryID)).toBe(false)
+
+      const assistants = messages.filter((message) => message.info.role === "assistant")
+      expect(assistants).toHaveLength(3)
+      expect(assistants.flatMap((message) => message.parts.filter((part) => part.type === "tool"))).toHaveLength(0)
+      expect(yield* llm.calls).toBe(3)
+      expect(yield* llm.pending).toBe(0)
+      expect(yield* llm.misses).toEqual([])
+      const status = yield* SessionStatus.Service
+      expect(yield* status.get(chat.id)).toEqual({ type: "idle" })
+
+      // The queued prompt's own turn keeps the lineage it inherited: the
+      // original prompt, the synthetic continuation and the recovered answer are
+      // all still in its request, and it is asked once.
+      const queuedRequest = JSON.stringify(turnInputs(yield* llm.inputs)[2])
+      expect(queuedRequest).toContain("please do the task")
+      expect(queuedRequest).toContain("cut off by the repetition guard")
+      expect(queuedRequest).toContain("Recovered and finished the task.")
+      expect(queuedRequest).toContain("queued during the recovery")
+      // The one recovery declares the prompt it continued.
+      const [recoveryPart] = recovery.parts
+      const aborted = messages.find(
+        (message) => message.info.role === "assistant" && message.info.parentID === primaryID,
+      )
+      expect(recoveryPart?.type === "text" ? recoveryPart.metadata?.repetitionRecovery : undefined).toEqual({
+        promptID: primaryID,
+        attempt: 1,
+        sequence: 1,
+        assistantIDs: [aborted!.info.id],
+      })
+    }),
+  { config: cfg },
+  30_000,
+)
+
+// ---------------------------------------------------------------------------
+// Issue #738 countercontrols: the generation target is explicit, so a stored
+// recovery is answered before a later prompt, an older unanswered caller is
+// answered instead of a no-progress fallback, and a silent no-reply marker
+// cannot suppress the one recovery it has no caller to receive.
+// ---------------------------------------------------------------------------
+
+const seedUser = (sessionID: SessionID, text: string, created: number) =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const msg = yield* sessions.updateMessage({
+      id: MessageID.ascending(),
+      role: "user",
+      sessionID,
+      agent: "work",
+      model: ref,
+      time: { created },
+    })
+    yield* sessions.updatePart({
+      id: PartID.ascending(),
+      messageID: msg.id,
+      sessionID,
+      type: "text",
+      text,
+    })
+    return msg
+  })
+
+const seedAborted = (sessionID: SessionID, parentID: MessageID, created: number, text = "partial output") =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const msg: SessionV1.Assistant = {
+      id: MessageID.ascending(),
+      role: "assistant",
+      parentID,
+      sessionID,
+      mode: "work",
+      agent: "work",
+      cost: 0,
+      path: { cwd: "/tmp", root: "/tmp" },
+      tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+      modelID: ref.modelID,
+      providerID: ref.providerID,
+      time: { created, completed: created },
+      error: new NamedError.Unknown({
+        message: `${RepetitionGuard.REPETITION_MESSAGE}: the model streamed the same 60-character fragment 3 times in a row`,
+        ref: RepetitionGuard.ERROR_REF,
+      }).toObject(),
+    }
+    yield* sessions.updateMessage(msg)
+    yield* sessions.updatePart({
+      id: PartID.ascending(),
+      messageID: msg.id,
+      sessionID,
+      type: "text",
+      text,
+    })
+    return msg
+  })
+
+const seedRecovery = (sessionID: SessionID, promptID: MessageID, created: number, text = "recovery instruction") =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const msg = yield* sessions.updateMessage({
+      id: MessageID.ascending(),
+      role: "user",
+      sessionID,
+      agent: "work",
+      model: ref,
+      time: { created },
+    })
+    yield* sessions.updatePart({
+      id: PartID.ascending(),
+      messageID: msg.id,
+      sessionID,
+      type: "text",
+      synthetic: true,
+      text,
+      metadata: { repetitionRecovery: { promptID, attempt: 1 } },
+    })
+    return msg
+  })
+
+const seedAnswer = (sessionID: SessionID, parentID: MessageID, created: number, text: string) =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const msg: SessionV1.Assistant = {
+      id: MessageID.ascending(),
+      role: "assistant",
+      parentID,
+      sessionID,
+      mode: "work",
+      agent: "work",
+      cost: 0,
+      path: { cwd: "/tmp", root: "/tmp" },
+      tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+      modelID: ref.modelID,
+      providerID: ref.providerID,
+      time: { created, completed: created },
+      finish: "stop",
+    }
+    yield* sessions.updateMessage(msg)
+    yield* sessions.updatePart({
+      id: PartID.ascending(),
+      messageID: msg.id,
+      sessionID,
+      type: "text",
+      text,
+    })
+    return msg
+  })
+
+it.instance(
+  "repetition-guard recovery: an owed recovery is answered before a prompt stored after it",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Owed recovery" })
+      const base = Date.now()
+
+      // The historical shape: the first prompt tripped, its one recovery was
+      // stored, and a second prompt landed after it but was never answered.
+      const first = yield* seedUser(chat.id, "first prompt", base)
+      yield* seedAborted(chat.id, first.id, base + 1)
+      const recovery = yield* seedRecovery(chat.id, first.id, base + 2)
+      const second = yield* seedUser(chat.id, "second prompt", base + 3)
+
+      yield* llm.push(
+        reply().text("Recovered the first prompt.").stop(),
+        reply().text("Answered the second prompt.").stop(),
+      )
+
+      const result = yield* prompt.loop({ sessionID: chat.id, messageID: second.id })
+      expect(result.info.role).toBe("assistant")
+      if (result.info.role !== "assistant") throw new Error("expected an assistant result")
+      expect(result.info.parentID).toBe(second.id)
+      expect(result.info.error).toBeUndefined()
+      expect(textParts(result)).toEqual(["Answered the second prompt."])
+
+      // The stored recovery consumed the recovery request itself; the later
+      // prompt did not steal it, and the recovery no longer dangles.
+      const stored = yield* sessions.messages({ sessionID: chat.id })
+      const recoveryAnswer = stored.find(
+        (message) => message.info.role === "assistant" && message.info.parentID === recovery.id,
+      )
+      expect(recoveryAnswer).toBeDefined()
+      if (!recoveryAnswer || recoveryAnswer.info.role !== "assistant") throw new Error("missing recovery answer")
+      expect(recoveryAnswer.info.error).toBeUndefined()
+      expect(textParts(recoveryAnswer)).toEqual(["Recovered the first prompt."])
+      expect(repetitionRecoveriesIn(stored)).toHaveLength(1)
+
+      // The original caller settles on its own lineage's answer.
+      const original = yield* prompt.loop({ sessionID: chat.id, messageID: first.id })
+      expect(original.info.id).toBe(recoveryAnswer.info.id)
+
+      expect(yield* llm.calls).toBe(2)
+      expect(yield* llm.pending).toBe(0)
+      expect(yield* llm.misses).toEqual([])
+
+      // The recovery generation is scoped to its own history: the prompt that
+      // arrived after it is not quoted into that request, and the second
+      // generation carries both the recovery answer and its own prompt.
+      const inputs = turnInputs(yield* llm.inputs)
+      expect(inputs).toHaveLength(2)
+      expect(JSON.stringify(inputs[0])).toContain("first prompt")
+      expect(JSON.stringify(inputs[0])).toContain("recovery instruction")
+      expect(JSON.stringify(inputs[0])).not.toContain("second prompt")
+      expect(JSON.stringify(inputs[1])).toContain("second prompt")
+      // The second prompt predates the recovery's answer, so that answer is not
+      // quoted into its request either direction of the lineage.
+      expect(JSON.stringify(inputs[1])).not.toContain("Recovered the first prompt.")
+
+      const assistants = stored.filter((message) => message.info.role === "assistant")
+      expect(assistants).toHaveLength(3)
+      expect(assistants.flatMap((message) => message.parts.filter((part) => part.type === "tool"))).toHaveLength(0)
+      const status = yield* SessionStatus.Service
+      expect(yield* status.get(chat.id)).toEqual({ type: "idle" })
+    }),
+  { config: cfg },
+  20_000,
+)
+
+it.instance(
+  "repetition-guard recovery: an earlier-created prompt stored later is still answered, not failed",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Late persisted prompt" })
+      const base = Date.now()
+
+      const first = yield* seedUser(chat.id, "first prompt", base)
+      yield* seedAborted(chat.id, first.id, base + 1)
+      // The recovery belongs to the first prompt and carries an answer.
+      const recovery = yield* seedRecovery(chat.id, first.id, base + 2)
+      const firstAnswer = yield* seedAnswer(chat.id, recovery.id, base + 3, "Answer for the first prompt.")
+      // The second prompt was created before the recovery but stored after it
+      // (asynchronous parts), so the newest message by creation time is the
+      // already answered recovery while this caller is still waiting.
+      const second = yield* seedUser(chat.id, "second prompt", base + 1)
+      expect(second.id > recovery.id).toBe(true)
+
+      yield* llm.push(reply().text("Answered the second prompt.").stop())
+      const result = yield* prompt.loop({ sessionID: chat.id, messageID: second.id })
+      expect(result.info.role).toBe("assistant")
+      if (result.info.role !== "assistant") throw new Error("expected an assistant result")
+      expect(result.info.parentID).toBe(second.id)
+      expect(result.info.error).toBeUndefined()
+      expect(result.parts.filter((part) => part.type === "text").map((part) => part.text)).toEqual([
+        "Answered the second prompt.",
+      ])
+      expect(result.info.id).not.toBe(firstAnswer.id)
+      expect(result.info.id).not.toBe(recovery.id)
+
+      // The possible answer was generated: one request, no no-progress error,
+      // and the first lineage's stored answer is untouched.
+      expect(yield* llm.calls).toBe(1)
+      expect(yield* llm.pending).toBe(0)
+      expect(yield* llm.misses).toEqual([])
+      const stored = yield* sessions.messages({ sessionID: chat.id })
+      const storedFirst = stored.find((message) => message.info.id === firstAnswer.id)
+      expect(storedFirst?.info.role).toBe("assistant")
+      if (storedFirst?.info.role === "assistant") expect(storedFirst.info.error).toBeUndefined()
+      expect(storedFirst?.parts.flatMap((part) => (part.type === "text" ? [part.text] : []))).toEqual([
+        "Answer for the first prompt.",
+      ])
+      expect(stored.find((message) => message.info.id === result.info.id)).toEqual(result)
+      expect(repetitionRecoveriesIn(stored)).toHaveLength(1)
+      expect(continuesPrompt(stored, result, second.id)).toBe(true)
+      expect(continuesPrompt(stored, result, first.id)).toBe(false)
+      const status = yield* SessionStatus.Service
+      expect(yield* status.get(chat.id)).toEqual({ type: "idle" })
+    }),
+  { config: cfg },
+  20_000,
+)
+
+it.instance(
+  "repetition-guard recovery: a silent no-reply marker does not suppress the one recovery",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Silent marker" })
+      const gate = yield* Deferred.make<void>()
+
+      // The guard trip happens while a background task injects a silent marker
+      // (noReply) - a message with no caller waiting for it.
+      yield* llm.push(
+        loopingReply().wait(deferredAsPromise(gate)),
+        reply().text("Recovered after the silent marker.").stop(),
+      )
+      const primaryID = MessageID.ascending()
+      const primary = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          messageID: primaryID,
+          agent: "work",
+          model: ref,
+          parts: [{ type: "text", text: "please do the task" }],
+        })
+        .pipe(Effect.forkChild)
+      yield* llm.wait(1)
+      yield* waitForBusy(chat.id)
+
+      const marker = yield* prompt.prompt({
+        sessionID: chat.id,
+        noReply: true,
+        agent: "work",
+        model: ref,
+        parts: [{ type: "text", text: "Background task completed silently", synthetic: true }],
+      })
+      yield* Deferred.succeed(gate, void 0)
+      const result = assistantExit(yield* awaitWithTimeout(Fiber.await(primary), "primary never settled", "15 seconds"))
+
+      // The sole recovery still runs for the prompt that actually tripped.
+      const stored = yield* sessions.messages({ sessionID: chat.id })
+      const recoveries = repetitionRecoveriesIn(stored)
+      expect(recoveries).toHaveLength(1)
+      const [recovery] = recoveries
+      expect(result.info.parentID).toBe(recovery.info.id)
+      expect(result.info.error).toBeUndefined()
+      expect(textParts(result)).toEqual(["Recovered after the silent marker."])
+      expect(recovery.parts).toHaveLength(1)
+      const [recoveryPart] = recovery.parts
+      const aborted = stored.find((message) => message.info.role === "assistant" && message.info.parentID === primaryID)
+      expect(recoveryPart?.type === "text" ? recoveryPart.metadata?.repetitionRecovery : undefined).toEqual({
+        promptID: primaryID,
+        attempt: 1,
+        sequence: 1,
+        assistantIDs: [aborted!.info.id],
+      })
+
+      // The marker is persisted with its caller intent and text, has no answer,
+      // and did not take the recovery's generation.
+      const storedMarker = stored.find((message) => message.info.id === marker.info.id)
+      expect(storedMarker?.info.role === "user" ? storedMarker.info.noReply : undefined).toBe(true)
+      expect(
+        stored.find((message) => message.info.role === "assistant" && message.info.parentID === marker.info.id),
+      ).toBe(undefined)
+      expect(storedMarker?.parts.flatMap((part) => (part.type === "text" ? [part.text] : []))).toEqual([
+        "Background task completed silently",
+      ])
+
+      expect(yield* llm.calls).toBe(2)
+      expect(yield* llm.pending).toBe(0)
+      expect(yield* llm.misses).toEqual([])
+      // The silent marker is context for the recovery, not a caller to answer.
+      const inputs = turnInputs(yield* llm.inputs)
+      expect(inputs).toHaveLength(2)
+      expect(JSON.stringify(inputs[1])).toContain("cut off by the repetition guard")
+      expect(JSON.stringify(inputs[1])).toContain("Background task completed silently")
+
+      // Re-entering an answered lineage does not spend a third request or start
+      // a busy/idle churn loop.
+      const resumed = yield* prompt.loop({ sessionID: chat.id, messageID: primaryID })
+      expect(resumed.info.id).toBe(result.info.id)
+      expect(yield* llm.calls).toBe(2)
+      const status = yield* SessionStatus.Service
+      expect(yield* status.get(chat.id)).toEqual({ type: "idle" })
+    }),
+  { config: cfg },
+  20_000,
+)
+
+it.instance(
+  "repetition-guard recovery: a synthetic prompt with its own caller keeps priority",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Synthetic caller" })
+      const gate = yield* Deferred.make<void>()
+
+      // Synthetic parts do not mean "no caller": this prompt is awaited and
+      // must get its own turn instead of being dropped as if it were a marker.
+      yield* llm.push(
+        loopingReply().wait(deferredAsPromise(gate)),
+        reply().text("Answered the synthetic queued prompt.").stop(),
+      )
+      const primaryID = MessageID.ascending()
+      const primary = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          messageID: primaryID,
+          agent: "work",
+          model: ref,
+          parts: [{ type: "text", text: "please do the task" }],
+        })
+        .pipe(Effect.forkChild)
+      yield* llm.wait(1)
+      yield* waitForBusy(chat.id)
+
+      const queuedID = MessageID.ascending()
+      const queued = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          messageID: queuedID,
+          agent: "work",
+          model: ref,
+          parts: [{ type: "text", text: "synthetic queued prompt", synthetic: true }],
+        })
+        .pipe(Effect.forkChild)
+      yield* pollWithTimeout(
+        sessions
+          .messages({ sessionID: chat.id })
+          .pipe(
+            Effect.map((msgs) =>
+              msgs.some((msg) => msg.info.role === "user" && msg.info.id === queuedID) ? true : undefined,
+            ),
+          ),
+        "timed out waiting for the synthetic prompt to save",
+      )
+
+      yield* Deferred.succeed(gate, void 0)
+      const [exitPrimary, exitQueued] = yield* settled([primary, queued], "callers never settled")
+      const primaryResult = assistantExit(exitPrimary)
+      const queuedResult = assistantExit(exitQueued)
+
+      expect(primaryResult.info.parentID).toBe(primaryID)
+      expect(RepetitionGuard.isStoredError(primaryResult.info.error)).toBe(true)
+      expect(queuedResult.info.parentID).toBe(queuedID)
+      expect(queuedResult.info.error).toBeUndefined()
+      expect(textParts(queuedResult)).toEqual(["Answered the synthetic queued prompt."])
+
+      const stored = yield* sessions.messages({ sessionID: chat.id })
+      // No recovery was injected after awaited input, and the synthetic prompt
+      // is still present verbatim.
+      expect(repetitionRecoveriesIn(stored)).toHaveLength(0)
+      expect(
+        stored
+          .find((message) => message.info.id === queuedID)
+          ?.parts.flatMap((part) => (part.type === "text" ? [part.text] : [])),
+      ).toEqual(["synthetic queued prompt"])
+      expect(yield* llm.calls).toBe(2)
+      expect(yield* llm.pending).toBe(0)
+      expect(yield* llm.misses).toEqual([])
+      const inputs = turnInputs(yield* llm.inputs)
+      expect(inputs).toHaveLength(2)
+      expect(JSON.stringify(inputs[1])).toContain("synthetic queued prompt")
+      expect(JSON.stringify(inputs[1])).not.toContain("cut off by the repetition guard")
+      const status = yield* SessionStatus.Service
+      expect(yield* status.get(chat.id)).toEqual({ type: "idle" })
+    }),
+  { config: cfg },
+  20_000,
+)
+
+it.instance(
+  "repetition-guard recovery: a stored answer for another prompt is never returned to an unanswered caller",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const events = yield* EventV2Bridge.Service
+      const chat = yield* sessions.create({ title: "Historical recovery" })
+
+      // Older transcripts can contain the original bug: a recovery for the first
+      // prompt was saved after a second real prompt. Its answer belongs to the
+      // first prompt, and the second has no answer at all.
+      const primary = yield* user(chat.id, "first prompt")
+      const aborted: SessionV1.Assistant = {
+        id: MessageID.ascending(),
+        role: "assistant",
+        parentID: primary.id,
+        sessionID: chat.id,
+        mode: "work",
+        agent: "work",
+        cost: 0,
+        path: { cwd: "/tmp", root: "/tmp" },
+        tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+        modelID: ref.modelID,
+        providerID: ref.providerID,
+        time: { created: Date.now(), completed: Date.now() },
+        error: new NamedError.Unknown({
+          message: RepetitionGuard.REPETITION_MESSAGE,
+          ref: RepetitionGuard.ERROR_REF,
+        }).toObject(),
+      }
+      yield* sessions.updateMessage(aborted)
+      const queued = yield* user(chat.id, "second prompt")
+      const continuation = yield* sessions.updateMessage({
+        id: MessageID.ascending(),
+        role: "user",
+        sessionID: chat.id,
+        agent: "work",
+        model: ref,
+        time: { created: Date.now() },
+      })
+      yield* sessions.updatePart({
+        id: PartID.ascending(),
+        messageID: continuation.id,
+        sessionID: chat.id,
+        type: "text",
+        synthetic: true,
+        text: "Recovery for the first prompt",
+        metadata: { repetitionRecovery: { promptID: primary.id, attempt: 1 } },
+      })
+      const otherAnswer: SessionV1.Assistant = {
+        ...aborted,
+        id: MessageID.ascending(),
+        parentID: continuation.id,
+        error: undefined,
+        finish: "stop",
+        time: { created: Date.now(), completed: Date.now() },
+      }
+      yield* sessions.updateMessage(otherAnswer)
+      yield* sessions.updatePart({
+        id: PartID.ascending(),
+        messageID: otherAnswer.id,
+        sessionID: chat.id,
+        type: "text",
+        text: "This answer belongs to the first prompt.",
+      })
+
+      // The second prompt is unanswered, so the run must generate its answer
+      // instead of returning the first lineage's stored answer or failing the
+      // caller preemptively with a no-progress error.
+      yield* llm.push(reply().text("Answered the second prompt.").stop())
+
+      let idleRuns = 0
+      const off = yield* events.listen((event) =>
+        Effect.sync(() => {
+          if (event.type !== SessionStatus.Event.Idle.type) return
+          if (typeof event.data !== "object" || event.data === null || !("sessionID" in event.data)) return
+          if (event.data.sessionID === chat.id) idleRuns++
+        }),
+      )
+      yield* Effect.addFinalizer(() => off)
+
+      const result = yield* awaitWithTimeout(
+        prompt.loop({ sessionID: chat.id, messageID: queued.id }),
+        "unanswered caller never settled",
+        "10 seconds",
+      )
+      // Exactly one run settles the caller: no joined-run churn, no manual retry.
+      expect(idleRuns).toBe(1)
+      expect(yield* llm.calls).toBe(1)
+      expect(yield* llm.pending).toBe(0)
+      expect(yield* llm.misses).toEqual([])
+      expect(result.info.role).toBe("assistant")
+      if (result.info.role !== "assistant") throw new Error("expected an assistant result for the second prompt")
+      // The answer belongs to the caller that waited: never the first prompt's.
+      expect(result.info.id).not.toBe(otherAnswer.id)
+      expect(result.info.parentID).toBe(queued.id)
+      expect(result.info.error).toBeUndefined()
+      expect(result.parts.filter((part) => part.type === "text").map((part) => part.text)).toEqual([
+        "Answered the second prompt.",
+      ])
+      const stored = yield* sessions.messages({ sessionID: chat.id })
+      expect(stored.find((message) => message.info.id === result.info.id)).toEqual(result)
+      // The first lineage's stored answer is untouched and no extra recovery
+      // instruction was injected for it.
+      expect(
+        stored
+          .find((message) => message.info.id === otherAnswer.id)
+          ?.parts.flatMap((part) => (part.type === "text" ? [part.text] : [])),
+      ).toEqual(["This answer belongs to the first prompt."])
+      expect(repetitionRecoveriesIn(stored)).toHaveLength(1)
+      // Ownership is the parent link; the historical out-of-order recovery
+      // between the prompt and its answer is a boundary, so the safe direction
+      // is that the answer never continues the first prompt.
+      expect(continuesPrompt(stored, result, primary.id)).toBe(false)
+      const status = yield* SessionStatus.Service
+      expect(yield* status.get(chat.id)).toEqual({ type: "idle" })
+    }),
+  { config: cfg },
+  20_000,
+)
+
+// The guard budget must be spent on model turns, never on re-deriving the same
+// turn. The runner injects the nudge and then reads the transcript back to pick
+// the next generation target; if that read does not place the nudge after the
+// assistant that triggered it, the loop would select the same prompt again,
+// append another nudge, and burn all three nudges without a single request. A
+// stored timestamp can produce exactly that shape (a clock step between the
+// generation and the nudge), and it is the shape CI reported for the retry-wait
+// fixture: three nudges, the terminal guard error, and no request after the
+// first. The loop therefore keeps the continuation it injected in flight.
+it.instance(
+  "a finish nudge owns the next generation even when the stored transcript places it early",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig((url) => ({ ...providerCfg(url), agent: { work: { finishTool: true } } }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({
+        title: "Pinned",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      const seeded = yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "work",
+        noReply: true,
+        parts: [{ type: "text", text: "Bom dia" }],
+      })
+      const real = Date.now
+      let skew = 0
+      Date.now = () => real() + skew
+      yield* Effect.ensuring(
+        Effect.gen(function* () {
+          // Stepping the clock back once the first answer is on the wire stores
+          // every later message before the assistant it belongs to.
+          yield* llm.push(
+            reply()
+              .text("FIRST_ANSWER_TEXT")
+              .onSend(() => void (skew = -60_000)),
+          )
+          yield* llm.push(reply().text("b"))
+          yield* llm.push(reply().text("c"))
+          yield* llm.push(reply().text("d"))
+
+          const result = yield* prompt.loop({ sessionID: chat.id, messageID: seeded.info.id })
+          const hits = yield* llm.hits
+          const messages = yield* sessions.messages({ sessionID: chat.id })
+          const nudges = messages.filter(
+            (message) =>
+              message.info.role === "user" &&
+              message.parts.some((part) => part.type === "text" && part.text.includes(FINISH_NUDGE_MARKER)),
+          )
+          const bodies = hits.map((hit) => JSON.stringify(hit.body))
+
+          // One request for the prompt and one for each nudge: the guard asked the
+          // model every time it spent a nudge.
+          expect(hits).toHaveLength(4)
+          const nudgeBodies = bodies.filter((body) => body.includes(FINISH_NUDGE_MARKER))
+          expect(nudgeBodies).toHaveLength(3)
+          // Each nudge still continues the answer it follows: the injected
+          // continuation is where the run put it, not where the stored timestamp
+          // does.
+          for (const body of nudgeBodies) expect(body).toContain("FIRST_ANSWER_TEXT")
+          // The budget itself is unchanged, so the turn still stops, bounded.
+          expect(nudges).toHaveLength(3)
+          expect(result.info.role).toBe("assistant")
+          if (result.info.role === "assistant") {
+            expect(result.info.finish).toBe("error")
+            expect(result.info.error?.name).toBe("UnknownError")
+            if (result.info.error?.name === "UnknownError") {
+              expect(result.info.error.data.message).toContain(
+                "did not complete the required finish tool after 3 nudges",
+              )
+            }
+          }
+        }),
+        Effect.sync(() => void (Date.now = real)),
+      )
+    }),
+  { config: cfg },
+  30_000,
+)
+// Issue #783: the finish nudge is the runner's own continuation of the turn it
+// follows, and the run injects it only because the turn ended without finish.
+// The answer that obeys it answers the prompt the turn belongs to. Two things
+// used to go wrong once finish completed on that first nudge:
+//
+// - Ownership: the assistant that completed finish has the nudge as its parent,
+//   so `prompt()` settled the caller on the *pre-nudge* answer instead - an
+//   answer that ended without finish, i.e. the run returned an incomplete
+//   looking result while the finish it had completed sat on another message.
+// - Chronology: turn selection and the finish check read the transcript back by
+//   stored creation time. A clock step between the turn's first answer and the
+//   nudge stores the nudge (and the answer that completes finish) *before* the
+//   prompt, so the loop re-derived the spent prompt, spent the remaining nudge
+//   budget on new requests, and stamped the terminal guard error over the turn:
+//   three spurious generations after a finish that had already succeeded.
+//
+// Both are the same fix: the run keeps its own continuation and the answer it
+// made for it in flight and in the order it created them, ends on the generation
+// that completed finish, and names the prompt the continuation belongs to so the
+// caller settles on that answer. Only the ownership path (a real waiting caller)
+// can observe the first; the rollback below is the positive control for the
+// second.
+it.instance(
+  "a finish that completes on the first nudge settles the caller that asked the prompt",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig((url) => ({ ...providerCfg(url), agent: { work: { finishTool: true } } }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const status = yield* SessionStatus.Service
+      const chat = yield* sessions.create({
+        title: "Pinned",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      yield* llm.text("FIRST_ANSWER_TEXT")
+      yield* llm.tool("finish", { reason: "success", result: "all done" })
+
+      const result = yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "work",
+        parts: [{ type: "text", text: "hello" }],
+      })
+      const messages = yield* sessions.messages({ sessionID: chat.id })
+      const hits = yield* llm.hits
+      const nudges = messages.filter((message) => finishContinuationPromptID(message) !== undefined)
+
+      // One request for the prompt and exactly one generation for the nudge: the
+      // turn ends when finish completes, so there is no further request and no
+      // second nudge.
+      expect(hits).toHaveLength(2)
+      expect(hits[0]?.body && JSON.stringify(hits[0].body).includes(FINISH_NUDGE_MARKER)).toBe(false)
+      expect(JSON.stringify(hits[1]?.body)).toContain(FINISH_NUDGE_MARKER)
+      expect(JSON.stringify(hits[1]?.body)).toContain("FIRST_ANSWER_TEXT")
+      expect(nudges).toHaveLength(1)
+
+      // finish ran once, and the answer that carries it is the answer the caller
+      // got: the run completed the turn, so it must not hand back the pre-nudge
+      // stop that ended without finish.
+      const finishes = messages
+        .flatMap((message) => message.parts)
+        .filter((part): part is SessionV1.ToolPart => part.type === "tool" && part.tool === "finish")
+      expect(finishes).toHaveLength(1)
+      expect(finishes[0]?.state.status).toBe("completed")
+      expect(result.info.role).toBe("assistant")
+      expect(result.info.id).toBe(finishes[0]?.messageID)
+      if (result.info.role === "assistant") expect(result.info.finish).not.toBe("error")
+      expect(
+        result.parts.some(
+          (part) => part.type === "tool" && part.tool === "finish" && part.state.status === "completed",
+        ),
+      ).toBe(true)
+
+      // The continuation declares the prompt whose turn it extends, so ownership
+      // survives a later read of the persisted transcript.
+      const asked = messages.find((message) => message.info.role === "user")
+      expect(nudges[0] ? finishContinuationPromptID(nudges[0]) : undefined).toBe(asked?.info.id)
+      expect(yield* status.get(chat.id)).toEqual({ type: "idle" })
+    }),
+  { config: cfg },
+  30_000,
+)
+
+it.instance(
+  "a finish that completes on the first nudge stops the run when the stored order is rolled back",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig((url) => ({ ...providerCfg(url), agent: { work: { finishTool: true } } }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const status = yield* SessionStatus.Service
+      const chat = yield* sessions.create({
+        title: "Pinned",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      const real = Date.now
+      let skew = 0
+      Date.now = () => real() + skew
+      yield* Effect.ensuring(
+        Effect.gen(function* () {
+          // Stepping the clock back once the first answer is on the wire stores
+          // the nudge and the answer that completes finish before the prompt.
+          yield* llm.push(
+            reply()
+              .text("FIRST_ANSWER_TEXT")
+              .stop()
+              .onSend(() => void (skew = -60_000)),
+          )
+          yield* llm.push(reply().tool("finish", { reason: "success", result: "all done" }))
+          // Queued in case the run keeps generating: any request past the two the
+          // turn needs is the spurious work this control exists to catch.
+          yield* llm.text("EXTRA_GENERATION")
+          yield* llm.text("EXTRA_GENERATION")
+          yield* llm.text("EXTRA_GENERATION")
+
+          const result = yield* prompt.prompt({
+            sessionID: chat.id,
+            agent: "work",
+            parts: [{ type: "text", text: "hello" }],
+          })
+          const messages = yield* sessions.messages({ sessionID: chat.id })
+          const hits = yield* llm.hits
+          const nudges = messages.filter((message) => finishContinuationPromptID(message) !== undefined)
+          const asked = messages.find(
+            (message) => message.info.role === "user" && finishContinuationPromptID(message) === undefined,
+          )
+
+          // The rollback really did invert the stored order: the nudge sits before
+          // the prompt it continues, which is the shape that used to re-derive the
+          // spent prompt.
+          const nudgeAt = messages.findIndex((message) => finishContinuationPromptID(message) !== undefined)
+          const askedAt = messages.findIndex((message) => message.info.id === asked?.info.id)
+          expect(nudgeAt).toBeGreaterThanOrEqual(0)
+          expect(askedAt).toBeGreaterThan(nudgeAt)
+
+          // Two requests: the prompt and the one nudge generation. The successful
+          // finish ends the turn, so no budget is spent and no terminal error is
+          // stamped over it.
+          expect(hits).toHaveLength(2)
+          expect(nudges).toHaveLength(1)
+          const finishes = messages
+            .flatMap((message) => message.parts)
+            .filter((part): part is SessionV1.ToolPart => part.type === "tool" && part.tool === "finish")
+          expect(finishes).toHaveLength(1)
+          expect(finishes[0]?.state.status).toBe("completed")
+          expect(result.info.role).toBe("assistant")
+          expect(result.info.id).toBe(finishes[0]?.messageID)
+          if (result.info.role === "assistant") {
+            expect(result.info.finish).not.toBe("error")
+            expect(result.info.error).toBeUndefined()
+          }
+          expect(
+            messages.some((message) => message.info.role === "assistant" && message.info.error !== undefined),
+          ).toBe(false)
+          expect(yield* status.get(chat.id)).toEqual({ type: "idle" })
+        }),
+        Effect.sync(() => void (Date.now = real)),
+      )
+    }),
+  { config: cfg },
+  30_000,
+)
+
+// Fresh #790 controls: real callers, persisted runner markers, finish execution,
+// and idle re-entry. These deliberately do not reuse the older marker-less fixtures.
+it.instance(
+  "lineage: a silent marker does not steal a finish continuation",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig((url) => ({ ...providerCfg(url), agent: { work: { finishTool: true } } }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const status = yield* SessionStatus.Service
+      const chat = yield* sessions.create({ title: "silent continuation" })
+      const gate = yield* Deferred.make<void>()
+      yield* llm.push(
+        reply().text("P1 progress").stop(),
+        reply().text("P1 done").tool("finish", { reason: "success", result: "P1 done" }).wait(deferredAsPromise(gate)),
+      )
+      const p1 = yield* prompt
+        .prompt({ sessionID: chat.id, agent: "work", parts: [{ type: "text", text: "P1" }] })
+        .pipe(Effect.forkChild)
+      yield* llm.wait(2)
+      const marker = yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "work",
+        noReply: true,
+        parts: [{ type: "text", text: "SILENT_CONTEXT", synthetic: true }],
+      })
+      yield* Deferred.succeed(gate, void 0)
+      const result = assistantExit(yield* awaitWithTimeout(Fiber.await(p1), "P1 never settled", "15 seconds"))
+      const stored = yield* sessions.messages({ sessionID: chat.id })
+      expect(yield* llm.calls).toBe(2)
+      expect(result.info.finish).not.toBe("error")
+      expectCompletedFinish(result)
+      expect(
+        stored.some((message) => message.info.role === "assistant" && message.info.parentID === marker.info.id),
+      ).toBe(false)
+      expect(JSON.stringify(turnInputs(yield* llm.inputs))).not.toContain("finishContinuation")
+      expect(yield* status.get(chat.id)).toEqual({ type: "idle" })
+    }),
+  { config: cfg },
+  30_000,
+)
+
+it.instance(
+  "lineage: mixed recovery and finish nudges cannot reset the recovery budget",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig((url) => ({ ...providerCfg(url), agent: { work: { finishTool: true } } }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const status = yield* SessionStatus.Service
+      const chat = yield* sessions.create({ title: "mixed recovery" })
+      yield* llm.push(
+        loopingReply(),
+        reply().text("recovered but no finish").stop(),
+        loopingReply(),
+        reply().text("EXTRA_RECOVERY"),
+      )
+      const result = yield* prompt.prompt({ sessionID: chat.id, agent: "work", parts: [{ type: "text", text: "P1" }] })
+      const stored = yield* sessions.messages({ sessionID: chat.id })
+      expect(yield* llm.calls).toBe(3)
+      expect(repetitionRecoveriesIn(stored)).toHaveLength(1)
+      expect(result.info.role).toBe("assistant")
+      if (result.info.role === "assistant") expect(RepetitionGuard.isStoredError(result.info.error)).toBe(true)
+      expect(yield* llm.pending).toBe(1)
+      if (result.info.role !== "assistant") throw new Error("expected an assistant result")
+      const resumed = yield* prompt.loop({ sessionID: chat.id, messageID: result.info.parentID })
+      expect(resumed.info.id).toBe(result.info.id)
+      expect(yield* llm.calls).toBe(3)
+      expect(yield* status.get(chat.id)).toEqual({ type: "idle" })
+    }),
+  { config: cfg },
+  30_000,
+)
+
+it.instance(
+  "lineage: queued P2 gets its own three finish nudges after P1 spends its budget",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig((url) => ({ ...providerCfg(url), agent: { work: { finishTool: true } } }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const status = yield* SessionStatus.Service
+      const chat = yield* sessions.create({ title: "per prompt budget" })
+      const gate = yield* Deferred.make<void>()
+      for (let i = 0; i < 4; i++)
+        yield* llm.push(
+          reply()
+            .text("P1 no finish")
+            .stop()
+            .wait(i === 3 ? deferredAsPromise(gate) : Promise.resolve()),
+        )
+      for (let i = 0; i < 4; i++) yield* llm.push(reply().text("P2 no finish").stop())
+      const p1ID = MessageID.ascending()
+      const p1 = yield* prompt
+        .prompt({ sessionID: chat.id, messageID: p1ID, agent: "work", parts: [{ type: "text", text: "P1" }] })
+        .pipe(Effect.forkChild)
+      yield* llm.wait(4)
+      const p2ID = MessageID.ascending()
+      const p2 = yield* prompt
+        .prompt({ sessionID: chat.id, messageID: p2ID, agent: "work", parts: [{ type: "text", text: "P2" }] })
+        .pipe(Effect.forkChild)
+      yield* pollWithTimeout(
+        sessions
+          .messages({ sessionID: chat.id })
+          .pipe(Effect.map((msgs) => (msgs.some((msg) => msg.info.id === p2ID) ? true : undefined))),
+        "P2 never persisted",
+      )
+      yield* Deferred.succeed(gate, void 0)
+      const [r1, r2] = yield* settled([p1, p2], "budget callers never settled")
+      const a1 = assistantExit(r1),
+        a2 = assistantExit(r2)
+      const stored = yield* sessions.messages({ sessionID: chat.id })
+      const nudges = stored.filter((message) => finishContinuationPromptID(message) !== undefined)
+      expect(yield* llm.calls).toBe(8)
+      expect(nudges.filter((message) => finishContinuationPromptID(message) === p1ID)).toHaveLength(3)
+      expect(nudges.filter((message) => finishContinuationPromptID(message) === p2ID)).toHaveLength(3)
+      expect(a1.info.error?.name).toBe("UnknownError")
+      expect(a2.info.error?.name).toBe("UnknownError")
+      expect(continuesPrompt(stored, a1, p1ID)).toBe(true)
+      expect(continuesPrompt(stored, a2, p2ID)).toBe(true)
+      expect(continuesPrompt(stored, a2, p1ID)).toBe(false)
+      expect((yield* prompt.loop({ sessionID: chat.id, messageID: p1ID })).info.id).toBe(a1.info.id)
+      expect((yield* prompt.loop({ sessionID: chat.id, messageID: p2ID })).info.id).toBe(a2.info.id)
+      expect(yield* llm.calls).toBe(8)
+      expect(yield* status.get(chat.id)).toEqual({ type: "idle" })
+    }),
+  { config: cfg },
+  30_000,
+)
+
+it.instance(
+  "lineage: async P2 cannot settle on P1 finish after a clock rollback",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig((url) => ({ ...providerCfg(url), agent: { work: { finishTool: true } } }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const status = yield* SessionStatus.Service
+      const chat = yield* sessions.create({ title: "async finish ownership" })
+      const gate = yield* Deferred.make<void>()
+      const real = Date.now
+      let skew = 0
+      Date.now = () => real() + skew
+      yield* Effect.ensuring(
+        Effect.gen(function* () {
+          yield* llm.push(
+            reply().text("P1 progress").stop(),
+            reply()
+              .text("P1 done")
+              .tool("finish", { reason: "success", result: "P1 done" })
+              .wait(deferredAsPromise(gate)),
+            reply().text("P2 progress").stop(),
+            reply().text("P2 done").tool("finish", { reason: "success", result: "P2 done" }),
+          )
+          const p1ID = MessageID.ascending()
+          const p1 = yield* prompt
+            .prompt({ sessionID: chat.id, messageID: p1ID, agent: "work", parts: [{ type: "text", text: "P1" }] })
+            .pipe(Effect.forkChild)
+          yield* llm.wait(2)
+          const p2ID = MessageID.ascending()
+          const p2 = yield* prompt
+            .prompt({ sessionID: chat.id, messageID: p2ID, agent: "work", parts: [{ type: "text", text: "P2" }] })
+            .pipe(Effect.forkChild)
+          yield* pollWithTimeout(
+            sessions
+              .messages({ sessionID: chat.id })
+              .pipe(Effect.map((msgs) => (msgs.some((msg) => msg.info.id === p2ID) ? true : undefined))),
+            "P2 never persisted",
+          )
+          skew = -60_000
+          yield* Deferred.succeed(gate, void 0)
+          const [e1, e2] = yield* settled([p1, p2], "async finish callers never settled")
+          const a1 = assistantExit(e1),
+            a2 = assistantExit(e2)
+          const stored = yield* sessions.messages({ sessionID: chat.id })
+          expect(yield* llm.calls).toBe(4)
+          expect(a1.info.id).not.toBe(a2.info.id)
+          expect(continuesPrompt(stored, a1, p1ID)).toBe(true)
+          expect(continuesPrompt(stored, a2, p2ID)).toBe(true)
+          expect(continuesPrompt(stored, a2, p1ID)).toBe(false)
+          expectCompletedFinish(a1)
+          expectCompletedFinish(a2)
+          expect(textParts(a1)).toEqual(["P1 done"])
+          expect(textParts(a2)).toEqual(["P2 done"])
+          expect((yield* prompt.loop({ sessionID: chat.id, messageID: p1ID })).info.id).toBe(a1.info.id)
+          expect((yield* prompt.loop({ sessionID: chat.id, messageID: p2ID })).info.id).toBe(a2.info.id)
+          expect(yield* llm.calls).toBe(4)
+          expect(yield* status.get(chat.id)).toEqual({ type: "idle" })
+        }),
+        Effect.sync(() => void (Date.now = real)),
+      )
+    }),
+  { config: cfg },
+  30_000,
+)
+
+it.instance(
+  "lineage: caller metadata cannot forge either continuation or reach the provider",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig((url) => ({ ...providerCfg(url), agent: { work: { finishTool: true } } }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "caller anti-spoof" })
+      yield* llm.push(reply().tool("finish", { reason: "success", result: "own answer" }))
+      const result = yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "work",
+        parts: [
+          {
+            type: "text",
+            text: "CALLER_TEXT",
+            synthetic: true,
+            metadata: {
+              finishContinuation: { promptID: MessageID.ascending() },
+              repetitionRecovery: { promptID: MessageID.ascending(), attempt: 1 },
+              compactionContinuation: { promptID: MessageID.ascending() },
+              retained: "ordinary metadata",
+            },
+          },
+        ],
+      })
+      const stored = yield* sessions.messages({ sessionID: chat.id })
+      const user = stored.find((message) => message.info.role === "user")
+      if (!user || result.info.role !== "assistant") throw new Error("expected a user and assistant result")
+      expect(user.parts[0]?.type === "text" ? user.parts[0].metadata : undefined).toEqual({
+        retained: "ordinary metadata",
+      })
+      expect(result.info.parentID).toBe(user.info.id)
+      expect(yield* llm.calls).toBe(1)
+      const request = JSON.stringify(turnInputs(yield* llm.inputs))
+      expect(request).toContain("CALLER_TEXT")
+      expect(request).not.toContain("finishContinuation")
+      expect(request).not.toContain("repetitionRecovery")
+      expect(request).not.toContain("compactionContinuation")
+    }),
+  { config: cfg },
+  30_000,
+)
+
+it.instance(
+  "lineage: a new real caller supersedes a nudge but a silent annotation does not",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig((url) => ({ ...providerCfg(url), agent: { work: { finishTool: true } } }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const status = yield* SessionStatus.Service
+      const chat = yield* sessions.create({ title: "new caller boundary" })
+      const gate = yield* Deferred.make<void>()
+      yield* llm.push(
+        reply().text("P1 progress").stop(),
+        reply().text("P1 nudge answer").stop().wait(deferredAsPromise(gate)),
+        reply().text("P2 own answer").tool("finish", { reason: "success", result: "P2 own answer" }),
+      )
+      const p1ID = MessageID.ascending()
+      const p1 = yield* prompt
+        .prompt({ sessionID: chat.id, messageID: p1ID, agent: "work", parts: [{ type: "text", text: "P1" }] })
+        .pipe(Effect.forkChild)
+      yield* llm.wait(2)
+      const p2ID = MessageID.ascending()
+      const p2 = yield* prompt
+        .prompt({ sessionID: chat.id, messageID: p2ID, agent: "work", parts: [{ type: "text", text: "P2" }] })
+        .pipe(Effect.forkChild)
+      yield* pollWithTimeout(
+        sessions
+          .messages({ sessionID: chat.id })
+          .pipe(Effect.map((msgs) => (msgs.some((msg) => msg.info.id === p2ID) ? true : undefined))),
+        "P2 never persisted",
+      )
+      yield* Deferred.succeed(gate, void 0)
+      const [r1, r2] = yield* settled([p1, p2], "new-caller owners never settled")
+      const a1 = assistantExit(r1),
+        a2 = assistantExit(r2)
+      const stored = yield* sessions.messages({ sessionID: chat.id })
+      expect(yield* llm.calls).toBe(3)
+      expect(textParts(a1)).toEqual(["P1 nudge answer"])
+      expect(textParts(a2)).toEqual(["P2 own answer"])
+      expect(continuesPrompt(stored, a1, p1ID)).toBe(true)
+      expect(continuesPrompt(stored, a2, p2ID)).toBe(true)
+      expect(stored.filter((message) => finishContinuationPromptID(message) === p1ID)).toHaveLength(1)
+      expect(stored.filter((message) => finishContinuationPromptID(message) === p2ID)).toHaveLength(0)
+      expect(yield* status.get(chat.id)).toEqual({ type: "idle" })
+    }),
+  { config: cfg },
+  30_000,
+)
+
+it.instance(
+  "lineage: multi-tool work and result text survive three nudges without replay",
+  () =>
+    Effect.gen(function* () {
+      const { llm, dir } = yield* useServerConfig((url) => ({
+        ...providerCfg(url),
+        agent: { general: { finishTool: true } },
+      }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const status = yield* SessionStatus.Service
+      const parent = yield* sessions.create({ title: "parent" })
+      const child = yield* sessions.create({
+        title: "multi-tool child",
+        parentID: parent.id,
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      const plan = "The side effect ran once and this is the delivered plan."
+      yield* llm.push(
+        reply()
+          .text(`<silvercode-result>${plan}</silvercode-result>`)
+          .tool("shell", {
+            command: "printf 'executed\\n' >> tool-once.txt; printf done",
+            description: "record one execution",
+          })
+          .tool("glob", { pattern: "tool-once.txt" }),
+        reply().text("first continuation").stop(),
+        reply().text("second continuation").stop(),
+        reply().text("third continuation").stop(),
+        reply().text("OWN_FINAL_TEXT").tool("finish", { reason: "success", result: "finished" }),
+      )
+      const result = yield* prompt.prompt({
+        sessionID: child.id,
+        agent: "general",
+        parts: [{ type: "text", text: "run the tools and deliver the plan" }],
+      })
+      const stored = yield* sessions.messages({ sessionID: child.id })
+      const root = stored.find((message) => message.info.role === "user")!
+      const tools = result.parts.filter((part) => part.type === "tool")
+      const earlierTools = stored
+        .flatMap((message) => message.parts)
+        .filter((part) => part.type === "tool" && part.tool !== "finish")
+      expect(yield* llm.calls).toBe(5)
+      expect(stored.filter((message) => finishContinuationPromptID(message) === root.info.id)).toHaveLength(3)
+      expect(earlierTools).toHaveLength(2)
+      expect(earlierTools.every((part) => part.type === "tool" && part.state.status === "completed")).toBe(true)
+      expect(yield* Effect.promise(() => readFile(path.join(dir, "tool-once.txt"), "utf8"))).toBe("executed\n")
+      expect(tools).toHaveLength(1)
+      expectCompletedFinish(result)
+      expect(continuesPrompt(stored, result, root.info.id)).toBe(true)
+      expect(textParts(result)).toEqual(["OWN_FINAL_TEXT"])
+      expect(textResult(resultChunks(stored, result))).toEqual({ ok: true, text: plan })
+      expect((yield* prompt.loop({ sessionID: child.id, messageID: root.info.id })).info.id).toBe(result.info.id)
+      expect(yield* llm.calls).toBe(5)
+      expect(yield* status.get(child.id)).toEqual({ type: "idle" })
+      expect(yield* status.get(parent.id)).toEqual({ type: "idle" })
+    }),
+  { config: cfg },
+  30_000,
+)
+
+it.instance(
+  "lineage: cancellation during a nudge settles its own caller without a replacement request",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig((url) => ({ ...providerCfg(url), agent: { work: { finishTool: true } } }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const status = yield* SessionStatus.Service
+      const chat = yield* sessions.create({ title: "cancel nudged turn" })
+      yield* llm.push(
+        reply().text("before nudge").stop(),
+        reply()
+          .text("must not settle")
+          .wait(new Promise<void>(() => {})),
+      )
+      const p1ID = MessageID.ascending()
+      const p1 = yield* prompt
+        .prompt({ sessionID: chat.id, messageID: p1ID, agent: "work", parts: [{ type: "text", text: "P1" }] })
+        .pipe(Effect.forkChild)
+      yield* llm.wait(2)
+      yield* prompt.cancel(chat.id)
+      const result = assistantExit(
+        yield* awaitWithTimeout(Fiber.await(p1), "cancelled caller never settled", "15 seconds"),
+      )
+      const stored = yield* sessions.messages({ sessionID: chat.id })
+      const nudges = stored.filter((message) => finishContinuationPromptID(message) === p1ID)
+      expect(yield* llm.calls).toBe(2)
+      expect(nudges).toHaveLength(1)
+      if (result.info.role !== "assistant") throw new Error("expected an assistant result")
+      expect(result.info.parentID).toBe(nudges[0]!.info.id)
+      expect(result.info.error?.name).toBe("MessageAbortedError")
+      expect(continuesPrompt(stored, result, p1ID)).toBe(true)
+      expect(yield* status.get(chat.id)).toEqual({ type: "idle" })
+    }),
+  { config: cfg },
+  30_000,
+)
+
+// ---------------------------------------------------------------------------
+// Independent REQUEST-CHANGES repair controls (silent notes, mid-tool ownership,
+// compaction continuation settlement). These assert the causal transcript, not
+// just the returned terminal message.
+
+it.instance(
+  "a silent note before the first assistant preserves result chunks and continuation",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig((url) => ({ ...providerCfg(url), agent: { work: { finishTool: true } } }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "silent chunks" })
+      const gate = defer<void>()
+      const envelope = renderTextResult("pre-nudge result")
+      yield* llm.push(
+        reply().text(envelope).stop().wait(gate.promise),
+        reply().text("final").tool("finish", { reason: "success", result: "done" }),
+      )
+      const p1 = yield* prompt
+        .prompt({ sessionID: chat.id, agent: "work", parts: [{ type: "text", text: "P1" }] })
+        .pipe(Effect.forkChild)
+      yield* llm.wait(1)
+      yield* prompt
+        .prompt({ sessionID: chat.id, agent: "work", noReply: true, parts: [{ type: "text", text: "silent note" }] })
+        .pipe(Effect.forkChild)
+      yield* pollWithTimeout(
+        Effect.gen(function* () {
+          const msgs = yield* sessions.messages({ sessionID: chat.id })
+          return (
+            msgs.some((m) => m.parts.some((part) => part.type === "text" && part.text === "silent note")) || undefined
+          )
+        }),
+        "silent note was not persisted",
+      )
+      gate.resolve(undefined)
+      const result = assistantExit(yield* awaitWithTimeout(Fiber.await(p1), "P1 never settled", "15 seconds"))
+      const stored = yield* sessions.messages({ sessionID: chat.id })
+      const p1ID = stored.find(
+        (m) => m.info.role === "user" && m.parts.some((part) => part.type === "text" && part.text === "P1"),
+      )!.info.id
+      expect(yield* llm.calls).toBe(2)
+      expect(continuesPrompt(stored, result, p1ID)).toBe(true)
+      expect(resultChunks(stored, result)).toEqual([envelope, "final"])
+      expect(textResult(resultChunks(stored, result))).toEqual({ ok: true, text: "pre-nudge result" })
+      expect(stored.filter((m) => finishContinuationPromptID(m) !== undefined)).toHaveLength(1)
+    }),
+  { config: cfg },
+  30_000,
+)
+
+it.instance(
+  "a queued background completion cannot preempt an unfinished parent tool step",
+  () =>
+    Effect.gen(function* () {
+      const { llm, dir } = yield* useServerConfig((url) => ({
+        ...providerCfg(url),
+        agent: { work: { finishTool: true } },
+      }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({
+        title: "mid-tool ownership",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      const gate = path.join(dir, "release")
+      const marker = path.join(dir, "ran")
+      yield* llm.push(
+        reply().tool("shell", {
+          // Use a real gated process without assuming either POSIX shell syntax
+          // or that a native Windows path can be interpreted by Git Bash.
+          command: `node -e "const fs=require('fs');const t=setInterval(()=>{if(fs.existsSync('release')){fs.appendFileSync('ran','ran');clearInterval(t)}},50)"`,
+          description: "gated tool",
+        }),
+        reply().text("P1 done").tool("finish", { reason: "success", result: "P1 done" }),
+        reply().text("P2 done").tool("finish", { reason: "success", result: "P2 done" }),
+      )
+      const p1 = yield* prompt
+        .prompt({ sessionID: chat.id, agent: "work", parts: [{ type: "text", text: "P1" }] })
+        .pipe(Effect.forkChild)
+      yield* pollWithTimeout(
+        Effect.gen(function* () {
+          const msgs = yield* sessions.messages({ sessionID: chat.id })
+          return (
+            msgs.some((m) =>
+              m.parts.some((part) => part.type === "tool" && part.tool === "shell" && part.state.status === "running"),
+            ) || undefined
+          )
+        }),
+        "P1 shell tool never started",
+      )
+      const p2 = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          agent: "work",
+          parts: [
+            {
+              type: "text",
+              synthetic: true,
+              text: '<task id="child" state="completed"><summary>Background task completed</summary><task_result>child result</task_result></task>',
+            },
+          ],
+        })
+        .pipe(Effect.forkChild)
+      yield* pollWithTimeout(
+        Effect.gen(function* () {
+          const msgs = yield* sessions.messages({ sessionID: chat.id })
+          return (
+            msgs.some((m) =>
+              m.parts.some((part) => part.type === "text" && part.text.includes("Background task completed")),
+            ) || undefined
+          )
+        }),
+        "P2 was not persisted while P1 tool was running",
+      )
+      yield* writeText(gate, "release")
+      const a1 = assistantExit(yield* awaitWithTimeout(Fiber.await(p1), "P1 never settled", "20 seconds"))
+      const a2 = assistantExit(yield* awaitWithTimeout(Fiber.await(p2), "P2 never settled", "20 seconds"))
+      const stored = yield* sessions.messages({ sessionID: chat.id })
+      const p1ID = stored.find(
+        (m) => m.info.role === "user" && m.parts.some((part) => part.type === "text" && part.text === "P1"),
+      )!.info.id
+      const p2ID = stored.find(
+        (m) =>
+          m.info.role === "user" &&
+          m.parts.some((part) => part.type === "text" && part.text.includes("Background task completed")),
+      )!.info.id
+      expect(yield* llm.calls).toBe(3)
+      const inputs = turnInputs(yield* llm.inputs)
+      expect(JSON.stringify(inputs[1])).not.toContain("Background task completed")
+      expect(JSON.stringify(inputs[2])).toContain("Background task completed")
+      expect(a1.info.parentID).toBe(p1ID)
+      expect(a2.info.parentID).toBe(p2ID)
+      expectCompletedFinish(a1)
+      expectCompletedFinish(a2)
+      expect(continuesPrompt(stored, a1, p1ID)).toBe(true)
+      expect(continuesPrompt(stored, a2, p2ID)).toBe(true)
+      const ran = yield* Effect.promise(() => readFile(marker, "utf8"))
+      expect(ran).toBe("ran")
+    }),
+  { config: cfg },
+  40_000,
+)
+
+it.instance(
+  "overflow after a finish nudge settles the original prompt through compaction continuation",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig((url) => ({ ...providerCfg(url), agent: { work: { finishTool: true } } }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({
+        title: "overflow continuation",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      yield* llm.push(
+        reply().text("pre-nudge").stop(),
+        reply()
+          .tool("shell", { command: "printf ok", description: "overflow tool" })
+          .usage({ input: 200_000, output: 100 }),
+        reply().text("summary").stop(),
+        reply().text("post-compaction").tool("finish", { reason: "success", result: "done" }),
+      )
+      const result = yield* prompt.prompt({ sessionID: chat.id, agent: "work", parts: [{ type: "text", text: "P1" }] })
+      const stored = yield* sessions.messages({ sessionID: chat.id })
+      const p1 = stored.find(
+        (m) => m.info.role === "user" && m.parts.some((part) => part.type === "text" && part.text === "P1"),
+      )!
+      const continuation = stored.find((m) =>
+        m.parts.some((part) => part.type === "text" && part.metadata?.compaction_continue === true),
+      )
+      expect(yield* llm.calls).toBe(4)
+      expectCompletedFinish(result)
+      expect(continuation).toBeDefined()
+      const part = continuation!.parts.find(
+        (part) => part.type === "text" && part.metadata?.compaction_continue === true,
+      )
+      expect(part?.type === "text" ? part.metadata?.compactionContinuation : undefined).toEqual({
+        promptID: p1.info.id,
+      })
+      expect(result.info.role).toBe("assistant")
+      if (result.info.role === "assistant") expect(result.info.parentID).toBe(continuation!.info.id)
+      expect(continuesPrompt(stored, result, p1.info.id)).toBe(true)
+    }),
+  { config: cfg },
+  40_000,
+)
+
+it.instance(
+  "step-0 compaction settles the caller instead of returning the stale seed generation",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig((url) => ({ ...providerCfg(url), agent: { work: { finishTool: true } } }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const compaction = yield* SessionCompaction.Service
+      const chat = yield* sessions.create({ title: "step-0 compaction" })
+      const seeded = yield* seed(chat.id, { finish: "stop" })
+      yield* compaction.create({ sessionID: chat.id, agent: "work", model: ref, auto: true })
+      yield* llm.push(
+        reply().text("summary").stop(),
+        reply().text("continued").tool("finish", { reason: "success", result: "done" }),
+      )
+      const result = yield* prompt.loop({ sessionID: chat.id, messageID: seeded.user.id })
+      const stored = yield* sessions.messages({ sessionID: chat.id })
+      const continuation = stored.find((m) =>
+        m.parts.some((part) => part.type === "text" && part.metadata?.compaction_continue === true),
+      )
+      expect(yield* llm.calls).toBe(2)
+      expectCompletedFinish(result)
+      expect(result.info.role).toBe("assistant")
+      if (result.info.role === "assistant") expect(result.info.parentID).toBe(continuation!.info.id)
+      expect(continuesPrompt(stored, result, seeded.user.id)).toBe(true)
+    }),
+  { config: cfg },
+  40_000,
+)
+
+it.instance(
+  "resume does not spend a request on a trailing silent marker after a completed finish",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig((url) => ({ ...providerCfg(url), agent: { work: { finishTool: true } } }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "silent resume" })
+      yield* llm.push(reply().text("done").tool("finish", { reason: "success", result: "done" }))
+      const first = yield* prompt.prompt({ sessionID: chat.id, agent: "work", parts: [{ type: "text", text: "P1" }] })
+      yield* prompt
+        .prompt({ sessionID: chat.id, agent: "work", noReply: true, parts: [{ type: "text", text: "silent" }] })
+        .pipe(Effect.forkChild)
+      const resumed = yield* prompt.loop({ sessionID: chat.id })
+      expect(yield* llm.calls).toBe(1)
+      expect(resumed.info.id).toBe(first.info.id)
+      expectCompletedFinish(resumed)
+    }),
+  { config: cfg },
+  30_000,
+)
+
+it.instance(
+  "queued overflow preserves prompt lineage",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig((url) => ({ ...providerCfg(url), agent: { work: { finishTool: true } } }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "queued overflow diagnostic" })
+      const gate = yield* Deferred.make<void>()
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "work",
+        model: ref,
+        noReply: true,
+        parts: [{ type: "text", text: "earlier context" }],
+      })
+      const lastUser = (body: Record<string, unknown>) => {
+        const messages = body.messages
+        if (!Array.isArray(messages)) return undefined
+        return messages.findLast((message) => message.role === "user")?.content
+      }
+      yield* llm.pushMatch(({ body }) => lastUser(body) === "P1 controlled", {
+        ...httpError(413, { error: { message: "request entity too large" } }),
+        wait: deferredAsPromise(gate),
+      })
+      yield* llm.pushMatch(
+        ({ body }) => String(lastUser(body)).includes("Create a new anchored summary"),
+        reply().text("summary").stop(),
+      )
+      yield* llm.pushMatch(
+        ({ body }) => lastUser(body) === "P1 controlled",
+        reply().text("P1 answer").tool("finish", { reason: "success", result: "P1 answer" }),
+      )
+      yield* llm.pushMatch(
+        ({ body }) => lastUser(body) === "P2 queued controlled",
+        reply().text("P2 answer").tool("finish", { reason: "success", result: "P2 answer" }),
+      )
+      const p1id = MessageID.ascending()
+      const p1 = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          messageID: p1id,
+          agent: "work",
+          model: ref,
+          parts: [{ type: "text", text: "P1 controlled" }],
+        })
+        .pipe(Effect.forkChild)
+      yield* llm.wait(1)
+      yield* waitForBusy(chat.id)
+      const p2id = MessageID.ascending()
+      const p2 = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          messageID: p2id,
+          agent: "work",
+          model: ref,
+          parts: [{ type: "text", text: "P2 queued controlled" }],
+        })
+        .pipe(Effect.forkChild)
+      yield* pollWithTimeout(
+        sessions
+          .messages({ sessionID: chat.id })
+          .pipe(Effect.map((msgs) => (msgs.some((m) => m.info.id === p2id) ? true : undefined))),
+        "queued message not persisted",
+      )
+      yield* Deferred.succeed(gate, void 0)
+      yield* pollWithTimeout(
+        sessions
+          .messages({ sessionID: chat.id })
+          .pipe(
+            Effect.map((msgs) =>
+              msgs.some((m) =>
+                m.parts.some((p) => p.type === "text" && p.metadata?.compactionContinuation !== undefined),
+              )
+                ? true
+                : undefined,
+            ),
+          ),
+        "no persisted compaction continuation",
+        "10 seconds",
+      ).pipe(
+        Effect.tapError(() =>
+          Effect.gen(function* () {
+            console.log(
+              "prompt test failure",
+              JSON.stringify({
+                messages: yield* sessions.messages({ sessionID: chat.id }),
+                calls: yield* llm.calls,
+                misses: yield* llm.misses,
+                pending: yield* llm.pending,
+                inputs: yield* llm.inputs,
+              }),
+            )
+          }),
+        ),
+      )
+      const stored = yield* sessions.messages({ sessionID: chat.id })
+      const continuation = stored.find((m) =>
+        m.parts.some((p) => p.type === "text" && p.metadata?.compactionContinuation !== undefined),
+      )!
+      const exits = yield* settled([p1, p2], "queued overflow callers never settled").pipe(
+        Effect.tapError(() =>
+          Effect.gen(function* () {
+            console.log(
+              "prompt test failure",
+              JSON.stringify({
+                messages: yield* sessions.messages({ sessionID: chat.id }),
+                calls: yield* llm.calls,
+                misses: yield* llm.misses,
+                pending: yield* llm.pending,
+                inputs: yield* llm.inputs,
+              }),
+            )
+          }),
+        ),
+      )
+      const answer1 = assistantExit(exits[0])
+      const answer2 = assistantExit(exits[1])
+      expect(yield* llm.calls).toBe(4)
+      expect(yield* llm.misses).toEqual([])
+      expect(yield* llm.pending).toBe(0)
+      expect(continuesPrompt(stored, answer1, p1id)).toBe(true)
+      expect(continuesPrompt(stored, answer2, p2id)).toBe(true)
+      expect(JSON.stringify(answer1.parts)).toContain("P1 answer")
+      expect(JSON.stringify(answer2.parts)).toContain("P2 answer")
+      expectCompletedFinish(answer1)
+      expectCompletedFinish(answer2)
+      expect(answer1.info.id).not.toBe(answer2.info.id)
+      const inputs = yield* llm.inputs
+      expect(inputs.filter((body) => lastUser(body) === "P1 controlled")).toHaveLength(2)
+      expect(inputs.filter((body) => lastUser(body) === "P2 queued controlled")).toHaveLength(1)
+      const p1Replay = inputs.findLast((body) => lastUser(body) === "P1 controlled")
+      const p2Request = inputs.find((body) => lastUser(body) === "P2 queued controlled")
+      const includesSummary = (body: Record<string, unknown> | undefined) =>
+        Array.isArray(body?.messages) &&
+        body.messages.some(
+          (message) => message.role === "assistant" && JSON.stringify(message.content).includes("summary"),
+        )
+      expect(includesSummary(p1Replay)).toBe(true)
+      expect(includesSummary(p2Request)).toBe(true)
+      expect(JSON.stringify(p2Request)).toContain("P1 answer")
+      expect(continuation.parts.some((p) => p.type === "text" && p.text === "P1 controlled")).toBe(true)
+      const part = continuation.parts.find((p) => p.type === "text" && p.metadata?.compactionContinuation !== undefined)
+      expect(part?.type === "text" ? part.metadata?.compactionContinuation : undefined).toEqual({ promptID: p1id })
+    }),
+  { config: cfg },
+  40_000,
+)
+
+noLLMServer.instance(
+  "repeated result rejects unfinished own assistant",
+  () =>
+    Effect.gen(function* () {
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const run = yield* SessionRunState.Service
+      const chat = yield* sessions.create({ title: "repeated result ownership" })
+      const p1 = yield* user(chat.id, "first")
+      const stale: SessionV1.Assistant = {
+        id: MessageID.ascending(),
+        role: "assistant",
+        parentID: p1.id,
+        sessionID: chat.id,
+        mode: "work",
+        agent: "work",
+        path: { cwd: "/tmp", root: "/tmp" },
+        cost: 0,
+        tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+        modelID: ref.modelID,
+        providerID: ref.providerID,
+        time: { created: Date.now(), completed: Date.now() },
+      }
+      yield* sessions.updateMessage(stale)
+      const p2 = yield* user(chat.id, "second")
+      const other: SessionV1.Assistant = { ...stale, id: MessageID.ascending(), parentID: p2.id, finish: "stop" }
+      yield* sessions.updateMessage(other)
+      let joins = 0
+      const original = run.ensureRunning
+      Object.assign(run, {
+        ensureRunning: () => {
+          joins++
+          return Effect.succeed({ info: other, parts: [] })
+        },
+      })
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          Object.assign(run, { ensureRunning: original })
+        }),
+      )
+      const result = yield* prompt.loop({ sessionID: chat.id, messageID: p1.id })
+      expect(joins).toBe(2)
+      expect(result.info.role).toBe("assistant")
+      if (result.info.role !== "assistant") throw new Error("expected assistant")
+      expect(result.info.parentID).toBe(p1.id)
+      expect(result.info.id).not.toBe(stale.id)
+      expect(result.info.error?.name).toBe("UnknownError")
+      expect(result.info.time.completed).toBeDefined()
+    }),
+  { config: cfg },
+  10_000,
+)
+
+it.instance(
+  "held queued finish nudge preserves downstream control",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig((url) => ({ ...providerCfg(url), agent: { work: { finishTool: true } } }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "queued overflow diagnostic" })
+      const gate = yield* Deferred.make<void>()
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "work",
+        model: ref,
+        noReply: true,
+        parts: [{ type: "text", text: "earlier context" }],
+      })
+      const lastUser = (body: Record<string, unknown>) => {
+        const messages = body.messages
+        if (!Array.isArray(messages)) return undefined
+        return messages.findLast((message) => message.role === "user")?.content
+      }
+      yield* llm.pushMatch(({ body }) => lastUser(body) === "P1 controlled", {
+        ...httpError(413, { error: { message: "request entity too large" } }),
+        wait: deferredAsPromise(gate),
+      })
+      yield* llm.pushMatch(
+        ({ body }) => String(lastUser(body)).includes("Create a new anchored summary"),
+        reply().text("summary").stop(),
+      )
+      yield* llm.pushMatch(({ body }) => lastUser(body) === "P1 controlled", reply().text("P1 draft").stop())
+      yield* llm.pushMatch(
+        ({ body }) => String(lastUser(body)).includes("The turn ended without a successful finish call"),
+        reply().text("P1 answer").tool("finish", { reason: "success", result: "P1 answer" }),
+      )
+      yield* llm.pushMatch(
+        ({ body }) => lastUser(body) === "P2 queued controlled",
+        reply().text("P2 answer").tool("finish", { reason: "success", result: "P2 answer" }),
+      )
+      const p1id = MessageID.ascending()
+      const p1 = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          messageID: p1id,
+          agent: "work",
+          model: ref,
+          parts: [{ type: "text", text: "P1 controlled" }],
+        })
+        .pipe(Effect.forkChild)
+      yield* llm.wait(1)
+      yield* waitForBusy(chat.id)
+      const p2id = MessageID.ascending()
+      const p2 = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          messageID: p2id,
+          agent: "work",
+          model: ref,
+          parts: [{ type: "text", text: "P2 queued controlled" }],
+        })
+        .pipe(Effect.forkChild)
+      yield* pollWithTimeout(
+        sessions
+          .messages({ sessionID: chat.id })
+          .pipe(Effect.map((msgs) => (msgs.some((m) => m.info.id === p2id) ? true : undefined))),
+        "queued message not persisted",
+      )
+      yield* Deferred.succeed(gate, void 0)
+      yield* pollWithTimeout(
+        sessions
+          .messages({ sessionID: chat.id })
+          .pipe(
+            Effect.map((msgs) =>
+              msgs.some((m) =>
+                m.parts.some((p) => p.type === "text" && p.metadata?.compactionContinuation !== undefined),
+              )
+                ? true
+                : undefined,
+            ),
+          ),
+        "no persisted compaction continuation",
+        "10 seconds",
+      ).pipe(
+        Effect.tapError(() =>
+          Effect.gen(function* () {
+            console.log(
+              "prompt test failure",
+              JSON.stringify({
+                messages: yield* sessions.messages({ sessionID: chat.id }),
+                calls: yield* llm.calls,
+                misses: yield* llm.misses,
+                pending: yield* llm.pending,
+                inputs: yield* llm.inputs,
+              }),
+            )
+          }),
+        ),
+      )
+      const stored = yield* sessions.messages({ sessionID: chat.id })
+      const continuation = stored.find((m) =>
+        m.parts.some((p) => p.type === "text" && p.metadata?.compactionContinuation !== undefined),
+      )!
+      const exits = yield* settled([p1, p2], "queued overflow callers never settled").pipe(
+        Effect.tapError(() =>
+          Effect.gen(function* () {
+            console.log(
+              "prompt test failure",
+              JSON.stringify({
+                messages: yield* sessions.messages({ sessionID: chat.id }),
+                calls: yield* llm.calls,
+                misses: yield* llm.misses,
+                pending: yield* llm.pending,
+                inputs: yield* llm.inputs,
+              }),
+            )
+          }),
+        ),
+      )
+      const answer1 = assistantExit(exits[0])
+      const answer2 = assistantExit(exits[1])
+      expect(yield* llm.calls).toBe(5)
+      expect(yield* llm.misses).toEqual([])
+      expect(yield* llm.pending).toBe(0)
+      const completedHistory = yield* sessions.messages({ sessionID: chat.id })
+      expect(continuesPrompt(completedHistory, answer1, p1id)).toBe(true)
+      expect(resultChunks(completedHistory, answer1).join("\n")).toContain("P1 answer")
+      expect(continuesPrompt(completedHistory, answer2, p2id)).toBe(true)
+      expect(JSON.stringify(answer1.parts)).toContain("P1 answer")
+      expect(JSON.stringify(answer2.parts)).toContain("P2 answer")
+      expectCompletedFinish(answer1)
+      expectCompletedFinish(answer2)
+      expect(answer1.info.id).not.toBe(answer2.info.id)
+      const inputs = yield* llm.inputs
+      expect(inputs.filter((body) => lastUser(body) === "P1 controlled")).toHaveLength(2)
+      expect(inputs.filter((body) => lastUser(body) === "P2 queued controlled")).toHaveLength(1)
+      const p1Replay = inputs.findLast((body) => lastUser(body) === "P1 controlled")
+      const p2Request = inputs.find((body) => lastUser(body) === "P2 queued controlled")
+      const includesSummary = (body: Record<string, unknown> | undefined) =>
+        Array.isArray(body?.messages) &&
+        body.messages.some(
+          (message) => message.role === "assistant" && JSON.stringify(message.content).includes("summary"),
+        )
+      expect(includesSummary(p1Replay)).toBe(true)
+      expect(includesSummary(p2Request)).toBe(true)
+      expect(JSON.stringify(p2Request)).toContain("P1 answer")
+      expect(continuation.parts.some((p) => p.type === "text" && p.text === "P1 controlled")).toBe(true)
+      const part = continuation.parts.find((p) => p.type === "text" && p.metadata?.compactionContinuation !== undefined)
+      expect(part?.type === "text" ? part.metadata?.compactionContinuation : undefined).toEqual({ promptID: p1id })
+    }),
+  { config: cfg },
+  40_000,
+)
+
+it.instance(
+  "held 413 queued finish nudge reaches task explicit success",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig((url) => ({
+        ...providerCfg(url),
+        agent: { work: { finishTool: false }, think: { finishTool: true } },
+      }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const parent = yield* sessions.create({
+        title: "task nudge integration",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      const seeded = yield* seed(parent.id)
+      yield* sessions.updatePart({
+        id: PartID.ascending(),
+        sessionID: parent.id,
+        messageID: seeded.user.id,
+        type: "text",
+        text: "Fix the Python software bug",
+      })
+      const gate = yield* Deferred.make<void>()
+      const last = (body: Record<string, unknown>) => {
+        if (!Array.isArray(body.messages)) return ""
+        const texts = body.messages
+          .filter((m) => m.role === "user")
+          .map((m) =>
+            Array.isArray(m.content)
+              ? m.content.filter((p: { text?: string }) => !p.text?.includes("<system-reminder>"))
+              : m.content,
+          )
+          .filter((c) => c && (!Array.isArray(c) || c.length))
+        return JSON.stringify(texts.at(-1))
+      }
+      yield* llm.pushMatch(({ body }) => last(body).includes("Plan controlled"), {
+        ...httpError(413, { error: { message: "request entity too large" } }),
+        wait: deferredAsPromise(gate),
+      })
+      yield* llm.pushMatch(
+        ({ body }) => last(body).includes("Create a new anchored summary"),
+        reply().text("summary").stop(),
+      )
+      yield* llm.pushMatch(
+        ({ body }) => last(body).includes("Plan controlled"),
+        reply().text("<silvercode-result>Plan prepared.</silvercode-result>").stop(),
+      )
+      yield* llm.pushMatch(
+        ({ body }) => last(body).includes("The turn ended without a successful finish call"),
+        reply().text("Plan complete").tool("finish", { reason: "success", result: "Plan prepared" }),
+      )
+      yield* llm.pushMatch(
+        ({ body }) => last(body).includes("P2 task queued"),
+        reply()
+          .text("<silvercode-result>P2 done</silvercode-result>")
+          .tool("finish", { reason: "success", result: "P2 done" }),
+      )
+      let p2answer: SessionV1.WithParts | undefined
+      const def = yield* (yield* TaskTool).init()
+      const planned = yield* def.execute(
+        { description: "plan", prompt: "Plan controlled", subagent_type: "think", background: false },
+        {
+          sessionID: parent.id,
+          messageID: seeded.assistant.id,
+          agent: "work",
+          abort: new AbortController().signal,
+          messages: [],
+          metadata: () => Effect.void,
+          ask: () => Effect.void,
+          extra: {
+            promptOps: {
+              cancel: (sessionID: SessionID) => prompt.cancel(sessionID),
+              resolvePromptParts: (template: string) => Effect.succeed([{ type: "text" as const, text: template }]),
+              prompt: (input: Parameters<typeof prompt.prompt>[0]) =>
+                Effect.gen(function* () {
+                  const earlier = MessageID.make("msg_00000000000000000000000000")
+                  yield* sessions.updateMessage({
+                    id: earlier,
+                    sessionID: input.sessionID,
+                    role: "user",
+                    agent: input.agent!,
+                    model: ref,
+                    noReply: true,
+                    time: { created: 1 },
+                  })
+                  yield* sessions.updatePart({
+                    id: PartID.ascending(),
+                    sessionID: input.sessionID,
+                    messageID: earlier,
+                    type: "text",
+                    text: "earlier context",
+                  })
+                  const first = yield* prompt.prompt(input).pipe(Effect.forkChild)
+                  yield* llm.wait(1)
+                  yield* waitForBusy(input.sessionID)
+                  const p2id = MessageID.ascending()
+                  const second = yield* prompt
+                    .prompt({
+                      sessionID: input.sessionID,
+                      messageID: p2id,
+                      agent: input.agent,
+                      model: ref,
+                      parts: [{ type: "text", text: "P2 task queued" }],
+                    })
+                    .pipe(Effect.forkChild)
+                  yield* pollWithTimeout(
+                    sessions
+                      .messages({ sessionID: input.sessionID })
+                      .pipe(Effect.map((msgs) => (msgs.some((m) => m.info.id === p2id) ? true : undefined))),
+                    "queued task message not persisted",
+                  )
+                  yield* Deferred.succeed(gate, void 0)
+                  const exits = yield* settled([first, second], "task child callers never settled").pipe(
+                    Effect.tapError(() =>
+                      Effect.gen(function* () {
+                        console.log(
+                          "prompt test failure",
+                          JSON.stringify({
+                            calls: yield* llm.calls,
+                            misses: yield* llm.misses,
+                            pending: yield* llm.pending,
+                            inputs: yield* llm.inputs,
+                            messages: yield* sessions.messages({ sessionID: input.sessionID }),
+                          }),
+                        )
+                      }),
+                    ),
+                  )
+                  const a1 = assistantExit(exits[0])
+                  p2answer = assistantExit(exits[1])
+                  return a1
+                }),
+            },
+          },
+        },
+      )
+      expect(yield* llm.calls).toBe(5)
+      expect(yield* llm.misses).toEqual([])
+      expect(yield* llm.pending).toBe(0)
+      expect(p2answer).toBeDefined()
+      expectCompletedFinish(p2answer!)
+      expect(JSON.stringify(p2answer!.parts)).toContain("P2 done")
+      expect(planned.output).toContain("Plan prepared")
+      expect(planned.metadata.workFlow?.agent).toBe("think")
+      expect(planned.metadata.workFlow?.terminal).toBe("success")
+    }),
+  { config: cfg },
+  40_000,
+)
+
+it.instance(
+  "queued cancellation settles each caller on its own abort without reentry",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "queued cancellation ownership" })
+      yield* llm.hang
+      const p1id = MessageID.ascending()
+      const first = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          messageID: p1id,
+          agent: "work",
+          model: ref,
+          parts: [{ type: "text", text: "P1 cancel" }],
+        })
+        .pipe(Effect.forkChild)
+      yield* llm.wait(1)
+      yield* waitForBusy(chat.id)
+      const p2id = MessageID.ascending()
+      const second = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          messageID: p2id,
+          agent: "work",
+          model: ref,
+          parts: [{ type: "text", text: "P2 cancel" }],
+        })
+        .pipe(Effect.forkChild)
+      yield* pollWithTimeout(
+        sessions
+          .messages({ sessionID: chat.id })
+          .pipe(Effect.map((msgs) => (msgs.some((m) => m.info.id === p2id) ? true : undefined))),
+        "queued cancel message not persisted",
+      )
+      yield* prompt.cancel(chat.id)
+      const exits = yield* settled([first, second], "cancelled callers never settled")
+      const a1 = assistantExit(exits[0])
+      const a2 = assistantExit(exits[1])
+      expect(yield* llm.calls).toBe(1)
+      expect(yield* llm.misses).toEqual([])
+      expect(a1.info.role).toBe("assistant")
+      expect(a2.info.role).toBe("assistant")
+      if (a1.info.role !== "assistant" || a2.info.role !== "assistant") throw new Error("expected assistants")
+      expect(a1.info.parentID).toBe(p1id)
+      expect(a2.info.parentID).toBe(p2id)
+      expect(a1.info.error?.name).toBe("MessageAbortedError")
+      expect(a2.info.error?.name).toBe("MessageAbortedError")
+    }),
+  { config: cfg },
+  30_000,
+)
+
+noLLMServer.instance(
+  "read failure cannot return another caller's completed answer",
+  () =>
+    Effect.gen(function* () {
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const run = yield* SessionRunState.Service
+      const chat = yield* sessions.create({ title: "read failure ownership" })
+      const p1 = yield* user(chat.id, "P1 read failure")
+      const p2 = yield* user(chat.id, "P2 other answer")
+      const other: SessionV1.Assistant = {
+        id: MessageID.ascending(),
+        role: "assistant",
+        parentID: p2.id,
+        sessionID: chat.id,
+        mode: "work",
+        agent: "work",
+        path: { cwd: "/tmp", root: "/tmp" },
+        cost: 0,
+        tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+        modelID: ref.modelID,
+        providerID: ref.providerID,
+        finish: "stop",
+        time: { created: Date.now(), completed: Date.now() },
+      }
+      yield* sessions.updateMessage(other)
+      let joins = 0
+      let failedReads = 0
+      const originalRun = run.ensureRunning
+      const originalMessages = sessions.messages
+      Object.assign(run, {
+        ensureRunning: () => {
+          joins++
+          return Effect.succeed({ info: other, parts: [] })
+        },
+      })
+      Object.assign(sessions, {
+        messages: () => {
+          failedReads++
+          return Effect.fail(new Error("injected transcript read failure"))
+        },
+      })
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          Object.assign(run, { ensureRunning: originalRun })
+          Object.assign(sessions, { messages: originalMessages })
+        }),
+      )
+      const result = yield* prompt.loop({ sessionID: chat.id, messageID: p1.id })
+      expect(joins).toBe(1)
+      expect(failedReads).toBe(1)
+      expect(result.info.role).toBe("assistant")
+      if (result.info.role !== "assistant") throw new Error("expected assistant")
+      expect(result.info.id).not.toBe(other.id)
+      expect(result.info.parentID).toBe(p1.id)
+      expect(result.info.error).toBeDefined()
+      expect(result.info.finish).toBeUndefined()
+    }),
+  { config: cfg },
+  30_000,
+)
+
+it.instance(
+  "held overflow twice preserves two queued caller answers and history",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig((url) => ({ ...providerCfg(url), agent: { work: { finishTool: true } } }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "repeated overflow multi queue" })
+      const gate = yield* Deferred.make<void>()
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "work",
+        model: ref,
+        noReply: true,
+        parts: [{ type: "text", text: "prior context" }],
+      })
+      const last = (body: Record<string, unknown>) =>
+        Array.isArray(body.messages) ? body.messages.findLast((m) => m.role === "user")?.content : undefined
+      const overflow = httpError(413, { error: { message: "request entity too large" } })
+      yield* llm.pushMatch(({ body }) => last(body) === "P1 twice", { ...overflow, wait: deferredAsPromise(gate) })
+      yield* llm.pushMatch(
+        ({ body }) => String(last(body)).includes("Create a new anchored summary"),
+        reply().text("summary one").stop(),
+      )
+      yield* llm.pushMatch(({ body }) => last(body) === "P1 twice", overflow)
+      yield* llm.pushMatch(
+        ({ body }) =>
+          String(last(body)).includes("Here is the conversation so far:") &&
+          String(last(body)).includes("Here is the summary of the conversation before"),
+        reply().text("summary two").stop(),
+      )
+      yield* llm.pushMatchRepeat(
+        ({ body }) => String(last(body)).startsWith("The previous request exceeded the provider's size limit"),
+        httpError(400, { error: { message: "unexpected size-limit fallback instead of P1 replay" } }),
+        1,
+      )
+      yield* llm.pushMatch(
+        ({ body }) => last(body) === "P1 twice",
+        reply().text("P1 done").tool("finish", { reason: "success", result: "P1 done" }),
+      )
+      yield* llm.pushMatch(
+        ({ body }) => last(body) === "P2 twice",
+        reply().text("P2 done").tool("finish", { reason: "success", result: "P2 done" }),
+      )
+      yield* llm.pushMatch(
+        ({ body }) => last(body) === "P3 twice",
+        reply().text("P3 done").tool("finish", { reason: "success", result: "P3 done" }),
+      )
+      const ids = [MessageID.ascending(), MessageID.ascending(), MessageID.ascending()]
+      const first = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          messageID: ids[0],
+          agent: "work",
+          model: ref,
+          parts: [{ type: "text", text: "P1 twice" }],
+        })
+        .pipe(Effect.forkChild)
+      yield* llm.wait(1)
+      yield* waitForBusy(chat.id)
+      const second = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          messageID: ids[1],
+          agent: "work",
+          model: ref,
+          parts: [{ type: "text", text: "P2 twice" }],
+        })
+        .pipe(Effect.forkChild)
+      yield* pollWithTimeout(
+        sessions
+          .messages({ sessionID: chat.id })
+          .pipe(Effect.map((m) => (m.some((v) => v.info.id === ids[1]) ? true : undefined))),
+        "P2 missing",
+      )
+      const third = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          messageID: ids[2],
+          agent: "work",
+          model: ref,
+          parts: [{ type: "text", text: "P3 twice" }],
+        })
+        .pipe(Effect.forkChild)
+      yield* pollWithTimeout(
+        sessions
+          .messages({ sessionID: chat.id })
+          .pipe(Effect.map((m) => (m.some((v) => v.info.id === ids[2]) ? true : undefined))),
+        "P3 missing",
+      )
+      yield* Deferred.succeed(gate, void 0)
+      const exits = yield* awaitWithTimeout(
+        Effect.all([Fiber.await(first), Fiber.await(second), Fiber.await(third)]),
+        "repeated overflow callers never settled",
+        "15 seconds",
+      ).pipe(
+        Effect.tapError(() =>
+          Effect.gen(function* () {
+            console.log(
+              "prompt test failure",
+              JSON.stringify({
+                ids,
+                calls: yield* llm.calls,
+                misses: yield* llm.misses,
+                pending: yield* llm.pending,
+                messages: yield* sessions.messages({ sessionID: chat.id }),
+                inputs: yield* llm.inputs,
+              }),
+            )
+          }),
+        ),
+      )
+      const stored = yield* sessions.messages({ sessionID: chat.id })
+      const inputs = yield* llm.inputs
+      expect(yield* llm.calls).toBe(7)
+      expect(yield* llm.misses).toEqual([])
+      expect(yield* llm.pending).toBe(0)
+      for (let i = 0; i < 3; i++) {
+        const answer = assistantExit(exits[i])
+        expect(continuesPrompt(stored, answer, ids[i])).toBe(true)
+        expectCompletedFinish(answer)
+        expect(JSON.stringify(answer.parts)).toContain(`P${i + 1} done`)
+      }
+      expect(inputs.filter((b) => last(b) === "P2 twice")).toHaveLength(1)
+      expect(inputs.filter((b) => last(b) === "P3 twice")).toHaveLength(1)
+      expect(JSON.stringify(inputs.find((b) => last(b) === "P3 twice"))).toContain("P1 done")
+      expect(JSON.stringify(inputs.find((b) => last(b) === "P3 twice"))).toContain("P2 done")
+    }),
+  { config: cfg },
+  60_000,
+)
+
+it.instance(
+  "held overflow preserves two queued caller answers and history",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig((url) => ({ ...providerCfg(url), agent: { work: { finishTool: true } } }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "single overflow multi queue" })
+      const gate = yield* Deferred.make<void>()
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "work",
+        model: ref,
+        noReply: true,
+        parts: [{ type: "text", text: "prior context" }],
+      })
+      const last = (body: Record<string, unknown>) =>
+        Array.isArray(body.messages) ? body.messages.findLast((m) => m.role === "user")?.content : undefined
+      const overflow = httpError(413, { error: { message: "request entity too large" } })
+      yield* llm.pushMatch(({ body }) => last(body) === "P1 twice", { ...overflow, wait: deferredAsPromise(gate) })
+      yield* llm.pushMatch(
+        ({ body }) => String(last(body)).includes("Create a new anchored summary"),
+        reply().text("summary one").stop(),
+      )
+      yield* llm.pushMatch(
+        ({ body }) => last(body) === "P1 twice",
+        reply().text("P1 done").tool("finish", { reason: "success", result: "P1 done" }),
+      )
+      yield* llm.pushMatch(
+        ({ body }) => last(body) === "P2 twice",
+        reply().text("P2 done").tool("finish", { reason: "success", result: "P2 done" }),
+      )
+      yield* llm.pushMatch(
+        ({ body }) => last(body) === "P3 twice",
+        reply().text("P3 done").tool("finish", { reason: "success", result: "P3 done" }),
+      )
+      const ids = [MessageID.ascending(), MessageID.ascending(), MessageID.ascending()]
+      const first = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          messageID: ids[0],
+          agent: "work",
+          model: ref,
+          parts: [{ type: "text", text: "P1 twice" }],
+        })
+        .pipe(Effect.forkChild)
+      yield* llm.wait(1)
+      yield* waitForBusy(chat.id)
+      const second = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          messageID: ids[1],
+          agent: "work",
+          model: ref,
+          parts: [{ type: "text", text: "P2 twice" }],
+        })
+        .pipe(Effect.forkChild)
+      yield* pollWithTimeout(
+        sessions
+          .messages({ sessionID: chat.id })
+          .pipe(Effect.map((m) => (m.some((v) => v.info.id === ids[1]) ? true : undefined))),
+        "P2 missing",
+      )
+      const third = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          messageID: ids[2],
+          agent: "work",
+          model: ref,
+          parts: [{ type: "text", text: "P3 twice" }],
+        })
+        .pipe(Effect.forkChild)
+      yield* pollWithTimeout(
+        sessions
+          .messages({ sessionID: chat.id })
+          .pipe(Effect.map((m) => (m.some((v) => v.info.id === ids[2]) ? true : undefined))),
+        "P3 missing",
+      )
+      yield* Deferred.succeed(gate, void 0)
+      const exits = yield* awaitWithTimeout(
+        Effect.all([Fiber.await(first), Fiber.await(second), Fiber.await(third)]),
+        "single overflow callers never settled",
+        "15 seconds",
+      ).pipe(
+        Effect.tapError(() =>
+          Effect.gen(function* () {
+            console.log(
+              "prompt test failure",
+              JSON.stringify({
+                ids,
+                calls: yield* llm.calls,
+                misses: yield* llm.misses,
+                pending: yield* llm.pending,
+                messages: yield* sessions.messages({ sessionID: chat.id }),
+                inputs: yield* llm.inputs,
+              }),
+            )
+          }),
+        ),
+      )
+      const stored = yield* sessions.messages({ sessionID: chat.id })
+      const inputs = yield* llm.inputs
+      expect(yield* llm.calls).toBe(5)
+      expect(yield* llm.misses).toEqual([])
+      expect(yield* llm.pending).toBe(0)
+      for (let i = 0; i < 3; i++) {
+        const answer = assistantExit(exits[i])
+        expect(continuesPrompt(stored, answer, ids[i])).toBe(true)
+        expectCompletedFinish(answer)
+        expect(JSON.stringify(answer.parts)).toContain(`P${i + 1} done`)
+      }
+      expect(inputs.filter((b) => last(b) === "P2 twice")).toHaveLength(1)
+      expect(inputs.filter((b) => last(b) === "P3 twice")).toHaveLength(1)
+      expect(JSON.stringify(inputs.find((b) => last(b) === "P3 twice"))).toContain("P1 done")
+      expect(JSON.stringify(inputs.find((b) => last(b) === "P3 twice"))).toContain("P2 done")
+    }),
+  { config: cfg },
+  60_000,
+)
+
+it.instance(
+  "held overflow twice returns a truthful size-limit failure and drains queued callers",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig((url) => ({ ...providerCfg(url), agent: { work: { finishTool: true } } }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "repeated overflow multi queue" })
+      const gate = yield* Deferred.make<void>()
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "work",
+        model: ref,
+        noReply: true,
+        parts: [{ type: "text", text: "prior context" }],
+      })
+      const last = (body: Record<string, unknown>) =>
+        Array.isArray(body.messages) ? body.messages.findLast((m) => m.role === "user")?.content : undefined
+      const overflow = httpError(413, { error: { message: "request entity too large" } })
+      yield* llm.pushMatch(({ body }) => last(body) === "P1 twice", { ...overflow, wait: deferredAsPromise(gate) })
+      // Prior context permits the first replay. Once that history is compacted,
+      // an empty summary leaves the second overflow with no replayable content.
+      yield* llm.pushMatch(
+        ({ body }) => String(last(body)).includes("Create a new anchored summary"),
+        reply().text("   ").stop(),
+      )
+      yield* llm.pushMatch(({ body }) => last(body) === "P1 twice", overflow)
+      yield* llm.pushMatch(
+        ({ body }) =>
+          String(last(body)).includes("Create a new anchored summary") &&
+          String(last(body)).includes("[User]: P1 twice"),
+        reply().text("summary two").stop(),
+      )
+      yield* llm.pushMatch(
+        ({ body }) => String(last(body)).startsWith("The previous request exceeded the provider's size limit"),
+        reply()
+          .text("Provider size limit exceeded")
+          .tool("finish", { reason: "failure", result: "Provider size limit exceeded" }),
+      )
+      yield* llm.pushMatch(
+        ({ body }) => last(body) === "P2 twice",
+        reply().text("P2 done").tool("finish", { reason: "success", result: "P2 done" }),
+      )
+      yield* llm.pushMatch(
+        ({ body }) => last(body) === "P3 twice",
+        reply().text("P3 done").tool("finish", { reason: "success", result: "P3 done" }),
+      )
+      const ids = [MessageID.ascending(), MessageID.ascending(), MessageID.ascending()]
+      const first = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          messageID: ids[0],
+          agent: "work",
+          model: ref,
+          parts: [{ type: "text", text: "P1 twice" }],
+        })
+        .pipe(Effect.forkChild)
+      yield* llm.wait(1)
+      yield* waitForBusy(chat.id)
+      const second = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          messageID: ids[1],
+          agent: "work",
+          model: ref,
+          parts: [{ type: "text", text: "P2 twice" }],
+        })
+        .pipe(Effect.forkChild)
+      yield* pollWithTimeout(
+        sessions
+          .messages({ sessionID: chat.id })
+          .pipe(Effect.map((m) => (m.some((v) => v.info.id === ids[1]) ? true : undefined))),
+        "P2 missing",
+      )
+      const third = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          messageID: ids[2],
+          agent: "work",
+          model: ref,
+          parts: [{ type: "text", text: "P3 twice" }],
+        })
+        .pipe(Effect.forkChild)
+      yield* pollWithTimeout(
+        sessions
+          .messages({ sessionID: chat.id })
+          .pipe(Effect.map((m) => (m.some((v) => v.info.id === ids[2]) ? true : undefined))),
+        "P3 missing",
+      )
+      yield* Deferred.succeed(gate, void 0)
+      const exits = yield* awaitWithTimeout(
+        Effect.all([Fiber.await(first), Fiber.await(second), Fiber.await(third)]),
+        "repeated overflow callers never settled",
+        "15 seconds",
+      ).pipe(
+        Effect.tapError(() =>
+          Effect.gen(function* () {
+            console.log(
+              "prompt test failure",
+              JSON.stringify({
+                ids,
+                calls: yield* llm.calls,
+                misses: yield* llm.misses,
+                pending: yield* llm.pending,
+                messages: yield* sessions.messages({ sessionID: chat.id }),
+                inputs: yield* llm.inputs,
+              }),
+            )
+          }),
+        ),
+      )
+      const stored = yield* sessions.messages({ sessionID: chat.id })
+      const inputs = yield* llm.inputs
+      expect(yield* llm.calls).toBe(7)
+      expect(yield* llm.misses).toEqual([])
+      expect(yield* llm.pending).toBe(0)
+      const summaryRequests = inputs.filter((body) => String(last(body)).includes("Create a new anchored summary"))
+      expect(summaryRequests).toHaveLength(2)
+      const secondSummary = summaryRequests[1]
+      expect(secondSummary).toBeDefined()
+      expect(JSON.stringify(secondSummary)).toContain("[User]: P1 twice")
+      expect(JSON.stringify(secondSummary)).not.toContain("P2 twice")
+      expect(JSON.stringify(secondSummary)).not.toContain("P3 twice")
+      for (let i = 0; i < 3; i++) {
+        const answer = assistantExit(exits[i])
+        expect(continuesPrompt(stored, answer, ids[i])).toBe(true)
+        expectCompletedFinish(answer)
+        expect(JSON.stringify(answer.parts)).toContain(i === 0 ? "Provider size limit exceeded" : `P${i + 1} done`)
+        if (i === 0) expect(JSON.stringify(answer.parts)).toContain("failure")
+      }
+      expect(inputs.filter((b) => last(b) === "P2 twice")).toHaveLength(1)
+      expect(inputs.filter((b) => last(b) === "P3 twice")).toHaveLength(1)
+      expect(JSON.stringify(inputs.find((b) => last(b) === "P3 twice"))).toContain("Provider size limit exceeded")
+      expect(JSON.stringify(inputs.find((b) => last(b) === "P3 twice"))).toContain("P2 done")
+    }),
+  { config: cfg },
+  60_000,
+)
+
+it.instance(
+  "boundary: later caller arrives during held summary after retained queue",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig((url) => ({ ...providerCfg(url), agent: { work: { finishTool: true } } }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "single overflow multi queue" })
+      const gate = yield* Deferred.make<void>()
+      const laterGate = yield* Deferred.make<void>()
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "work",
+        model: ref,
+        noReply: true,
+        parts: [{ type: "text", text: "prior context" }],
+      })
+      const last = (body: Record<string, unknown>) =>
+        Array.isArray(body.messages) ? body.messages.findLast((m) => m.role === "user")?.content : undefined
+      const overflow = httpError(413, { error: { message: "request entity too large" } })
+      yield* llm.pushMatch(({ body }) => last(body) === "P1 twice", { ...overflow, wait: deferredAsPromise(gate) })
+      yield* llm.pushMatch(
+        ({ body }) => String(last(body)).includes("Create a new anchored summary"),
+        reply().text("summary one").stop().wait(deferredAsPromise(laterGate)),
+      )
+      yield* llm.pushMatch(
+        ({ body }) => last(body) === "P1 twice",
+        reply().text("P1 done").tool("finish", { reason: "success", result: "P1 done" }),
+      )
+      yield* llm.pushMatch(
+        ({ body }) => last(body) === "P2 twice",
+        reply().text("P2 done").tool("finish", { reason: "success", result: "P2 done" }),
+      )
+      yield* llm.pushMatch(
+        ({ body }) => last(body) === "P3 twice",
+        reply().text("P3 done").tool("finish", { reason: "success", result: "P3 done" }),
+      )
+      const ids = [MessageID.ascending(), MessageID.ascending(), MessageID.ascending()]
+      const first = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          messageID: ids[0],
+          agent: "work",
+          model: ref,
+          parts: [{ type: "text", text: "P1 twice" }],
+        })
+        .pipe(Effect.forkChild)
+      yield* llm.wait(1)
+      yield* waitForBusy(chat.id)
+      const second = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          messageID: ids[1],
+          agent: "work",
+          model: ref,
+          parts: [{ type: "text", text: "P2 twice" }],
+        })
+        .pipe(Effect.forkChild)
+      yield* pollWithTimeout(
+        sessions
+          .messages({ sessionID: chat.id })
+          .pipe(Effect.map((m) => (m.some((v) => v.info.id === ids[1]) ? true : undefined))),
+        "P2 missing",
+      )
+      yield* Deferred.succeed(gate, void 0)
+      yield* llm.wait(2)
+      const third = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          messageID: ids[2],
+          agent: "work",
+          model: ref,
+          parts: [{ type: "text", text: "P3 twice" }],
+        })
+        .pipe(Effect.forkChild)
+      yield* pollWithTimeout(
+        sessions
+          .messages({ sessionID: chat.id })
+          .pipe(Effect.map((m) => (m.some((v) => v.info.id === ids[2]) ? true : undefined))),
+        "P3 missing",
+      )
+      yield* Deferred.succeed(laterGate, void 0)
+      const exits = yield* awaitWithTimeout(
+        Effect.all([Fiber.await(first), Fiber.await(second), Fiber.await(third)]),
+        "single overflow callers never settled",
+        "15 seconds",
+      ).pipe(
+        Effect.tapError(() =>
+          Effect.gen(function* () {
+            console.log(
+              "prompt test failure",
+              JSON.stringify({
+                ids,
+                calls: yield* llm.calls,
+                misses: yield* llm.misses,
+                pending: yield* llm.pending,
+                messages: yield* sessions.messages({ sessionID: chat.id }),
+                inputs: yield* llm.inputs,
+              }),
+            )
+          }),
+        ),
+      )
+      const stored = yield* sessions.messages({ sessionID: chat.id })
+      const inputs = yield* llm.inputs
+      expect(yield* llm.calls).toBe(5)
+      expect(yield* llm.misses).toEqual([])
+      expect(yield* llm.pending).toBe(0)
+      for (let i = 0; i < 3; i++) {
+        const answer = assistantExit(exits[i])
+        expect(continuesPrompt(stored, answer, ids[i])).toBe(true)
+        expectCompletedFinish(answer)
+        expect(JSON.stringify(answer.parts)).toContain(`P${i + 1} done`)
+      }
+      expect(inputs.filter((b) => last(b) === "P2 twice")).toHaveLength(1)
+      expect(inputs.filter((b) => last(b) === "P3 twice")).toHaveLength(1)
+      expect(JSON.stringify(inputs.find((b) => last(b) === "P3 twice"))).toContain("P1 done")
+      expect(JSON.stringify(inputs.find((b) => last(b) === "P3 twice"))).toContain("P2 done")
+    }),
+  { config: cfg },
+  60_000,
+)
+
+it.instance(
+  "boundary: later caller arrives during held replay after retained queue",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig((url) => ({ ...providerCfg(url), agent: { work: { finishTool: true } } }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "single overflow multi queue" })
+      const gate = yield* Deferred.make<void>()
+      const laterGate = yield* Deferred.make<void>()
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "work",
+        model: ref,
+        noReply: true,
+        parts: [{ type: "text", text: "prior context" }],
+      })
+      const last = (body: Record<string, unknown>) =>
+        Array.isArray(body.messages) ? body.messages.findLast((m) => m.role === "user")?.content : undefined
+      const overflow = httpError(413, { error: { message: "request entity too large" } })
+      yield* llm.pushMatch(({ body }) => last(body) === "P1 twice", { ...overflow, wait: deferredAsPromise(gate) })
+      yield* llm.pushMatch(
+        ({ body }) => String(last(body)).includes("Create a new anchored summary"),
+        reply().text("summary one").stop(),
+      )
+      yield* llm.pushMatch(
+        ({ body }) => last(body) === "P1 twice",
+        reply()
+          .text("P1 done")
+          .tool("finish", { reason: "success", result: "P1 done" })
+          .wait(deferredAsPromise(laterGate)),
+      )
+      yield* llm.pushMatch(
+        ({ body }) => last(body) === "P2 twice",
+        reply().text("P2 done").tool("finish", { reason: "success", result: "P2 done" }),
+      )
+      yield* llm.pushMatch(
+        ({ body }) => last(body) === "P3 twice",
+        reply().text("P3 done").tool("finish", { reason: "success", result: "P3 done" }),
+      )
+      const ids = [MessageID.ascending(), MessageID.ascending(), MessageID.ascending()]
+      const first = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          messageID: ids[0],
+          agent: "work",
+          model: ref,
+          parts: [{ type: "text", text: "P1 twice" }],
+        })
+        .pipe(Effect.forkChild)
+      yield* llm.wait(1)
+      yield* waitForBusy(chat.id)
+      const second = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          messageID: ids[1],
+          agent: "work",
+          model: ref,
+          parts: [{ type: "text", text: "P2 twice" }],
+        })
+        .pipe(Effect.forkChild)
+      yield* pollWithTimeout(
+        sessions
+          .messages({ sessionID: chat.id })
+          .pipe(Effect.map((m) => (m.some((v) => v.info.id === ids[1]) ? true : undefined))),
+        "P2 missing",
+      )
+      yield* Deferred.succeed(gate, void 0)
+      yield* llm.wait(3)
+      const third = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          messageID: ids[2],
+          agent: "work",
+          model: ref,
+          parts: [{ type: "text", text: "P3 twice" }],
+        })
+        .pipe(Effect.forkChild)
+      yield* pollWithTimeout(
+        sessions
+          .messages({ sessionID: chat.id })
+          .pipe(Effect.map((m) => (m.some((v) => v.info.id === ids[2]) ? true : undefined))),
+        "P3 missing",
+      )
+      yield* Deferred.succeed(laterGate, void 0)
+      const exits = yield* awaitWithTimeout(
+        Effect.all([Fiber.await(first), Fiber.await(second), Fiber.await(third)]),
+        "single overflow callers never settled",
+        "15 seconds",
+      ).pipe(
+        Effect.tapError(() =>
+          Effect.gen(function* () {
+            console.log(
+              "prompt test failure",
+              JSON.stringify({
+                ids,
+                calls: yield* llm.calls,
+                misses: yield* llm.misses,
+                pending: yield* llm.pending,
+                messages: yield* sessions.messages({ sessionID: chat.id }),
+                inputs: yield* llm.inputs,
+              }),
+            )
+          }),
+        ),
+      )
+      const stored = yield* sessions.messages({ sessionID: chat.id })
+      const inputs = yield* llm.inputs
+      expect(yield* llm.calls).toBe(5)
+      expect(yield* llm.misses).toEqual([])
+      expect(yield* llm.pending).toBe(0)
+      for (let i = 0; i < 3; i++) {
+        const answer = assistantExit(exits[i])
+        expect(continuesPrompt(stored, answer, ids[i])).toBe(true)
+        expectCompletedFinish(answer)
+        expect(JSON.stringify(answer.parts)).toContain(`P${i + 1} done`)
+      }
+      expect(inputs.filter((b) => last(b) === "P2 twice")).toHaveLength(1)
+      expect(inputs.filter((b) => last(b) === "P3 twice")).toHaveLength(1)
+      expect(JSON.stringify(inputs.find((b) => last(b) === "P3 twice"))).toContain("P1 done")
+      expect(JSON.stringify(inputs.find((b) => last(b) === "P3 twice"))).toContain("P2 done")
+    }),
+  { config: cfg },
+  60_000,
+)
+
+it.instance(
+  "first overflow with no prior user keeps queued caller out of P1 summary",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig((url) => ({ ...providerCfg(url), agent: { work: { finishTool: true } } }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "first overflow no earlier user" })
+      const gate = yield* Deferred.make<void>()
+      const last = (body: Record<string, unknown>) =>
+        Array.isArray(body.messages) ? body.messages.findLast((m) => m.role === "user")?.content : undefined
+      yield* llm.pushMatch(({ body }) => last(body) === "first P1", {
+        ...httpError(413, { error: { message: "request entity too large" } }),
+        wait: deferredAsPromise(gate),
+      })
+      yield* llm.pushMatch(
+        ({ body }) => String(last(body)).includes("Create a new anchored summary"),
+        reply().text("first summary").stop(),
+      )
+      yield* llm.pushMatch(
+        ({ body }) => String(last(body)).startsWith("The previous request exceeded the provider's size limit"),
+        reply()
+          .text("Provider size limit exceeded")
+          .tool("finish", { reason: "failure", result: "Provider size limit exceeded" }),
+      )
+      yield* llm.pushMatch(
+        ({ body }) => last(body) === "queued P2",
+        reply().text("P2 done").tool("finish", { reason: "success", result: "P2 done" }),
+      )
+      const ids = [MessageID.ascending(), MessageID.ascending()]
+      const first = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          messageID: ids[0],
+          agent: "work",
+          model: ref,
+          parts: [{ type: "text", text: "first P1" }],
+        })
+        .pipe(Effect.forkChild)
+      yield* llm.wait(1)
+      yield* waitForBusy(chat.id)
+      const second = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          messageID: ids[1],
+          agent: "work",
+          model: ref,
+          parts: [{ type: "text", text: "queued P2" }],
+        })
+        .pipe(Effect.forkChild)
+      yield* pollWithTimeout(
+        sessions
+          .messages({ sessionID: chat.id })
+          .pipe(Effect.map((m) => (m.some((v) => v.info.id === ids[1]) ? true : undefined))),
+        "P2 missing",
+      )
+      yield* Deferred.succeed(gate, void 0)
+      const exits = yield* awaitWithTimeout(
+        Effect.all([Fiber.await(first), Fiber.await(second)]),
+        "first overflow callers never settled",
+        "15 seconds",
+      ).pipe(
+        Effect.tapError(() =>
+          Effect.gen(function* () {
+            console.log(
+              "prompt test failure",
+              JSON.stringify({
+                ids,
+                calls: yield* llm.calls,
+                misses: yield* llm.misses,
+                pending: yield* llm.pending,
+                messages: yield* sessions.messages({ sessionID: chat.id }),
+                inputs: yield* llm.inputs,
+              }),
+            )
+          }),
+        ),
+      )
+      const stored = yield* sessions.messages({ sessionID: chat.id })
+      const inputs = yield* llm.inputs
+      expect(yield* llm.calls).toBe(4)
+      expect(yield* llm.misses).toEqual([])
+      expect(yield* llm.pending).toBe(0)
+      const summary = inputs.find((body) => String(last(body)).includes("Create a new anchored summary"))
+      expect(summary).toBeDefined()
+      expect(JSON.stringify(summary)).toContain("first P1")
+      expect(JSON.stringify(summary)).not.toContain("queued P2")
+      const one = assistantExit(exits[0])
+      const two = assistantExit(exits[1])
+      expect(continuesPrompt(stored, one, ids[0])).toBe(true)
+      expect(continuesPrompt(stored, two, ids[1])).toBe(true)
+      expectCompletedFinish(one)
+      expectCompletedFinish(two)
+      expect(JSON.stringify(one.parts)).toContain("Provider size limit exceeded")
+      expect(JSON.stringify(two.parts)).toContain("P2 done")
+      expect(inputs.filter((body) => last(body) === "queued P2")).toHaveLength(1)
+      const p2Request = inputs.find((body) => last(body) === "queued P2")
+      expect(JSON.stringify(p2Request)).toContain("first summary")
+      expect(JSON.stringify(p2Request)).toContain("Provider size limit exceeded")
+    }),
+  { config: cfg },
+  60_000,
+)
+
+it.instance(
+  "first overflow no prior user keeps two queued callers and silent context",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig((url) => ({ ...providerCfg(url), agent: { work: { finishTool: true } } }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "first overflow no earlier user" })
+      const gate = yield* Deferred.make<void>()
+      const last = (body: Record<string, unknown>) =>
+        Array.isArray(body.messages) ? body.messages.findLast((m) => m.role === "user")?.content : undefined
+      yield* llm.pushMatch(({ body }) => last(body) === "first P1", {
+        ...httpError(413, { error: { message: "request entity too large" } }),
+        wait: deferredAsPromise(gate),
+      })
+      yield* llm.pushMatch(
+        ({ body }) => String(last(body)).includes("Create a new anchored summary"),
+        reply().text("first summary").stop(),
+      )
+      yield* llm.pushMatch(
+        ({ body }) => String(last(body)).startsWith("The previous request exceeded the provider's size limit"),
+        reply()
+          .text("Provider size limit exceeded")
+          .tool("finish", { reason: "failure", result: "Provider size limit exceeded" }),
+      )
+      yield* llm.pushMatch(
+        ({ body }) => last(body) === "queued P2",
+        reply().text("P2 done").tool("finish", { reason: "success", result: "P2 done" }),
+      )
+      yield* llm.pushMatch(
+        ({ body }) => last(body) === "queued P3",
+        reply().text("P3 done").tool("finish", { reason: "success", result: "P3 done" }),
+      )
+      const ids = [MessageID.ascending(), MessageID.ascending(), MessageID.ascending()]
+      const first = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          messageID: ids[0],
+          agent: "work",
+          model: ref,
+          parts: [{ type: "text", text: "first P1" }],
+        })
+        .pipe(Effect.forkChild)
+      yield* llm.wait(1)
+      yield* waitForBusy(chat.id)
+      const second = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          messageID: ids[1],
+          agent: "work",
+          model: ref,
+          parts: [{ type: "text", text: "queued P2" }],
+        })
+        .pipe(Effect.forkChild)
+      yield* pollWithTimeout(
+        sessions
+          .messages({ sessionID: chat.id })
+          .pipe(Effect.map((m) => (m.some((v) => v.info.id === ids[1]) ? true : undefined))),
+        "P2 missing",
+      )
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "work",
+        model: ref,
+        noReply: true,
+        parts: [{ type: "text", text: "silent annotation" }],
+      })
+      const third = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          messageID: ids[2],
+          agent: "work",
+          model: ref,
+          parts: [{ type: "text", text: "queued P3" }],
+        })
+        .pipe(Effect.forkChild)
+      yield* pollWithTimeout(
+        sessions
+          .messages({ sessionID: chat.id })
+          .pipe(Effect.map((m) => (m.some((v) => v.info.id === ids[2]) ? true : undefined))),
+        "P3 missing",
+      )
+      yield* Deferred.succeed(gate, void 0)
+      const exits = yield* awaitWithTimeout(
+        Effect.all([Fiber.await(first), Fiber.await(second), Fiber.await(third)]),
+        "first overflow callers never settled",
+        "15 seconds",
+      ).pipe(
+        Effect.tapError(() =>
+          Effect.gen(function* () {
+            console.log(
+              "prompt test failure",
+              JSON.stringify({
+                ids,
+                calls: yield* llm.calls,
+                misses: yield* llm.misses,
+                pending: yield* llm.pending,
+                messages: yield* sessions.messages({ sessionID: chat.id }),
+                inputs: yield* llm.inputs,
+              }),
+            )
+          }),
+        ),
+      )
+      const stored = yield* sessions.messages({ sessionID: chat.id })
+      const inputs = yield* llm.inputs
+      expect(yield* llm.calls).toBe(5)
+      expect(yield* llm.misses).toEqual([])
+      expect(yield* llm.pending).toBe(0)
+      const summary = inputs.find((body) => String(last(body)).includes("Create a new anchored summary"))
+      expect(summary).toBeDefined()
+      expect(JSON.stringify(summary)).toContain("first P1")
+      expect(JSON.stringify(summary)).not.toContain("queued P2")
+      expect(JSON.stringify(summary)).not.toContain("queued P3")
+      expect(JSON.stringify(summary)).toContain("silent annotation")
+      const one = assistantExit(exits[0])
+      const two = assistantExit(exits[1])
+      const three = assistantExit(exits[2])
+      expect(continuesPrompt(stored, one, ids[0])).toBe(true)
+      expect(continuesPrompt(stored, two, ids[1])).toBe(true)
+      expect(continuesPrompt(stored, three, ids[2])).toBe(true)
+      expectCompletedFinish(three)
+      expect(JSON.stringify(three.parts)).toContain("P3 done")
+      expect(JSON.stringify(inputs.find((body) => last(body) === "queued P3"))).toContain("P2 done")
+      expectCompletedFinish(one)
+      expectCompletedFinish(two)
+      expect(JSON.stringify(one.parts)).toContain("Provider size limit exceeded")
+      expect(JSON.stringify(two.parts)).toContain("P2 done")
+      expect(inputs.filter((body) => last(body) === "queued P2")).toHaveLength(1)
+      const p2Request = inputs.find((body) => last(body) === "queued P2")
+      expect(JSON.stringify(p2Request)).toContain("first summary")
+      expect(JSON.stringify(p2Request)).toContain("Provider size limit exceeded")
+    }),
+  { config: cfg },
+  60_000,
+)
+
+const seedDeclinedWaitScenario = Effect.fn("test.seedDeclinedWaitScenario")(function* (input: {
+  sessionID: SessionID
+  notification: boolean
+  mixed: boolean
+  providerExecutedMixed?: boolean
+  reason: string
+  error: string
+}) {
+  const sessions = yield* Session.Service
+  const rootUser = yield* seedUser(input.sessionID, "root actual text", Date.now())
+  const assistant = yield* sessions.updateMessage({
+    id: MessageID.ascending(),
+    sessionID: input.sessionID,
+    role: "assistant",
+    parentID: rootUser.id,
+    mode: "work",
+    agent: "work",
+    cost: 0,
+    path: { cwd: "/tmp", root: "/tmp" },
+    tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+    modelID: ref.modelID,
+    providerID: ref.providerID,
+    time: { created: Date.now(), completed: Date.now() },
+    finish: "tool-calls",
+  } satisfies SessionV1.Assistant)
+  yield* sessions.updatePart({
+    id: PartID.ascending(),
+    messageID: assistant.id,
+    sessionID: input.sessionID,
+    type: "tool",
+    callID: "declined-wait",
+    tool: "finish",
+    state: {
+      status: "error",
+      input: { reason: input.reason, result: "Root awaits child" },
+      error: input.error,
+      metadata: {},
+      time: { start: 1, end: 2 },
+    },
+  } satisfies SessionV1.ToolPart)
+  if (input.mixed) {
+    yield* sessions.updatePart({
+      id: PartID.ascending(),
+      messageID: assistant.id,
+      sessionID: input.sessionID,
+      type: "tool",
+      callID: "real-tool",
+      tool: "shell",
+      state: {
+        status: "completed",
+        input: { command: "printf ok" },
+        output: "ok",
+        title: "shell",
+        metadata: {},
+        time: { start: 1, end: 2 },
+      },
+    } satisfies SessionV1.ToolPart)
+  }
+  if (input.providerExecutedMixed) {
+    yield* sessions.updatePart({
+      id: PartID.ascending(),
+      messageID: assistant.id,
+      sessionID: input.sessionID,
+      type: "tool",
+      callID: "provider-tool",
+      tool: "shell",
+      state: {
+        status: "completed",
+        input: { command: "provider-side" },
+        output: "ok",
+        title: "shell",
+        metadata: {},
+        time: { start: 1, end: 2 },
+      },
+      metadata: { providerExecuted: true },
+    } satisfies SessionV1.ToolPart)
+  }
+  let notification: SessionV1.User | undefined
+  if (input.notification) {
+    notification = yield* sessions.updateMessage({
+      id: MessageID.ascending(),
+      sessionID: input.sessionID,
+      role: "user",
+      agent: "work",
+      model: ref,
+      time: { created: Date.now() + 1 },
+    } satisfies SessionV1.User)
+    yield* sessions.updatePart({
+      id: PartID.ascending(),
+      messageID: notification.id,
+      sessionID: input.sessionID,
+      type: "text",
+      synthetic: true,
+      text: '<task id="child" state="error"><summary>Background task failed</summary><task_result>TERMINAL_CHILD_QUOTA</task_result></task>',
+    } satisfies SessionV1.TextPart)
+  }
+  return { rootUser, notification }
+})
+
+const declinedWaitRefusal =
+  "Cannot wait: no running background subagents found for this session. " +
+  "Wait only for a task you launched that is still running — a subagent whose run " +
+  "already ended will not report again. " +
+  'If your work is complete, call finish with reason: "success".'
+const declinedWaitCases = [
+  {
+    name: "declined wait owns terminal child notification",
+    notification: true,
+    mixed: false,
+    reason: "waiting_for_subagent",
+    error: declinedWaitRefusal,
+    expectsNotification: true,
+  },
+  {
+    name: "rejected wait without terminal notification",
+    notification: false,
+    mixed: false,
+    reason: "waiting_for_subagent",
+    error: declinedWaitRefusal,
+    expectsNotification: false,
+  },
+  {
+    name: "mixed declined wait and real tool is not preempted",
+    notification: true,
+    mixed: true,
+    reason: "waiting_for_subagent",
+    error: declinedWaitRefusal,
+    expectsNotification: false,
+  },
+  {
+    name: "wrong reason keeps declined-wait pinning",
+    notification: true,
+    mixed: false,
+    reason: "success",
+    error: declinedWaitRefusal,
+    expectsNotification: false,
+  },
+  {
+    name: "unrelated error keeps declined-wait pinning",
+    notification: true,
+    mixed: false,
+    reason: "waiting_for_subagent",
+    error: "boom",
+    expectsNotification: false,
+  },
+  {
+    name: "embedded prefix refusal keeps declined-wait pinning",
+    notification: true,
+    mixed: false,
+    reason: "waiting_for_subagent",
+    error: `prefix ${declinedWaitRefusal}`,
+    expectsNotification: false,
+  },
+  {
+    name: "providerExecuted mixed declined wait keeps pinning",
+    notification: true,
+    mixed: false,
+    providerExecutedMixed: true,
+    reason: "waiting_for_subagent",
+    error: declinedWaitRefusal,
+    expectsNotification: false,
+  },
+] as const
+
+for (const testCase of declinedWaitCases) {
+  it.instance(
+    testCase.name,
+    () =>
+      Effect.gen(function* () {
+        const { llm } = yield* useServerConfig(providerCfg)
+        const prompt = yield* SessionPrompt.Service
+        const sessions = yield* Session.Service
+        const chat = yield* sessions.create({ title: testCase.name })
+        const scenario = yield* seedDeclinedWaitScenario({
+          sessionID: chat.id,
+          notification: testCase.notification,
+          mixed: testCase.mixed,
+          providerExecutedMixed: "providerExecutedMixed" in testCase ? testCase.providerExecutedMixed : undefined,
+          reason: testCase.reason,
+          error: testCase.error,
+        })
+        yield* llm.push(reply().text("FOLLOWUP").stop())
+        const result = yield* prompt.loop({ sessionID: chat.id, messageID: scenario.rootUser.id })
+        const inputs = yield* llm.inputs
+        expect(yield* llm.calls).toBe(1)
+        const requestText = JSON.stringify(inputs[0])
+        expect(result.info.role).toBe("assistant")
+        if (result.info.role === "assistant") {
+          if (testCase.expectsNotification) {
+            expect(requestText).toContain("TERMINAL_CHILD_QUOTA")
+            expect(result.info.parentID).toBe(scenario.notification!.id)
+          } else {
+            if (testCase.notification) expect(requestText).not.toContain("TERMINAL_CHILD_QUOTA")
+            if (!testCase.notification) expect(requestText).toContain(JSON.stringify(declinedWaitRefusal))
+            expect(result.info.parentID).toBe(scenario.rootUser.id)
+          }
+        }
+      }),
+    { config: cfg },
+    30_000,
+  )
+}
+
+it.instance(
+  "declined wait terminal notification owns the original live prompt caller",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig((url) => ({
+        ...providerCfg(url),
+        agent: { work: { finishTool: true }, general: { finishTool: true }, plan: { finishTool: true } },
+      }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "declined wait live caller" })
+      const gate = yield* Deferred.make<void>()
+      yield* llm.push(
+        reply()
+          .tool("finish", { reason: "waiting_for_subagent", result: "Root awaits child" })
+          .wait(deferredAsPromise(gate)),
+        reply().text("FOLLOWUP").tool("finish", { reason: "success", result: "FOLLOWUP" }),
+      )
+
+      const caller = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          agent: "work",
+          model: ref,
+          parts: [{ type: "text", text: "root actual text" }],
+        })
+        .pipe(Effect.forkChild)
+
+      yield* llm.wait(1)
+
+      const notification = yield* sessions.updateMessage({
+        id: MessageID.ascending(),
+        sessionID: chat.id,
+        role: "user",
+        agent: "work",
+        model: ref,
+        time: { created: Date.now() + 1 },
+      } satisfies SessionV1.User)
+      yield* sessions.updatePart({
+        id: PartID.ascending(),
+        messageID: notification.id,
+        sessionID: chat.id,
+        type: "text",
+        synthetic: true,
+        text: '<task id="child" state="error"><summary>Background task failed</summary><task_result>TERMINAL_CHILD_QUOTA</task_result></task>',
+      } satisfies SessionV1.TextPart)
+
+      yield* Deferred.succeed(gate, void 0)
+
+      const exit = yield* Fiber.await(caller)
+      const result = assistantExit(exit)
+      const inputs = yield* llm.inputs
+      expect(yield* llm.calls).toBe(2)
+      const followupRequest = JSON.stringify(inputs[1])
+      expect(followupRequest).toContain("TERMINAL_CHILD_QUOTA")
+      expect(result.info.parentID).toBe(notification.id)
+      expect(textParts(result)).toEqual(["FOLLOWUP"])
+    }),
+  { config: cfg },
   30_000,
 )

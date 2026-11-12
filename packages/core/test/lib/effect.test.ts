@@ -53,7 +53,45 @@ describe("runScopedEffect", () => {
       const caught = await handle.cancel().catch((err: unknown) => err)
       expect(caught).toBeInstanceOf(Error)
       expect(String(caught)).toContain("finalizer boom")
+      if (!stderrLines.some((line) => line.includes("[owned-deadline] abandoned finalizer defect:"))) {
+        try {
+          originalError(
+            "[diag]",
+            JSON.stringify({
+              count: stderrLines.length,
+              lines: stderrLines.slice(0, 50).map((line) => line.slice(0, 1000)),
+              caught:
+                caught instanceof Error
+                  ? { name: caught.name, message: caught.message, stack: String(caught.stack).slice(0, 1000) }
+                  : String(caught),
+            }),
+          )
+        } catch {
+          try {
+            originalError("[diag] serialization failed")
+          } catch {}
+        }
+      }
       expect(stderrLines.some((line) => line.includes("[owned-deadline] abandoned finalizer defect:"))).toBe(true)
+      if (!stderrLines.some((line) => line.includes("finalizer boom"))) {
+        try {
+          originalError(
+            "[diag]",
+            JSON.stringify({
+              count: stderrLines.length,
+              lines: stderrLines.slice(0, 50).map((line) => line.slice(0, 1000)),
+              caught:
+                caught instanceof Error
+                  ? { name: caught.name, message: caught.message, stack: String(caught.stack).slice(0, 1000) }
+                  : String(caught),
+            }),
+          )
+        } catch {
+          try {
+            originalError("[diag] serialization failed")
+          } catch {}
+        }
+      }
       expect(stderrLines.some((line) => line.includes("finalizer boom"))).toBe(true)
     } finally {
       console.error = originalError

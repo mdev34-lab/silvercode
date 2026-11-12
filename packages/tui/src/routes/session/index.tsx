@@ -2390,6 +2390,13 @@ function ActivitySubGroupBlock(props: { groupID: string; subID: string }) {
   const kind = createMemo(() => sub()?.kind ?? "misc")
   const items = createMemo(() => sub()?.items ?? [])
   const parts = createMemo(() => sub()?.parts ?? [])
+  // Tool-only blocks remain compact. When a block interleaves reasoning and
+  // tool calls, each rendered part is a separate semantic unit, so leave one
+  // readable row between units without changing their internal anatomy.
+  const mixedDetails = createMemo(() => {
+    const detail = parts()
+    return detail.some((item) => item.part.type === "reasoning") && detail.some((item) => item.part.type === "tool")
+  })
   const summary = createMemo(() => summarizeActivity(items().map((item) => item.part)))
   const targets = createMemo(() => countActivityTargets(items()))
   const expanded = createMemo(() => ctx.activityExpanded(props.subID))
@@ -2471,18 +2478,23 @@ function ActivitySubGroupBlock(props: { groupID: string; subID: string }) {
       </box>
       <Show when={expanded()}>
         <activityDetail.Provider value={true}>
-          <For each={parts()}>{(item) => <ActivityGroupPartRow item={item} />}</For>
+          <For each={parts()}>
+            {(item, index) => <ActivityGroupPartRow item={item} separate={mixedDetails() && index() > 0} />}
+          </For>
         </activityDetail.Provider>
       </Show>
     </box>
   )
 }
 
-function ActivityGroupPartRow(props: { item: ActivityGroupPart }) {
-  if (props.item.part.type === "reasoning") {
-    return <ReasoningPart last={false} part={props.item.part} message={props.item.message} />
-  }
-  return <ToolPart last={false} part={props.item.part} message={props.item.message} />
+function ActivityGroupPartRow(props: { item: ActivityGroupPart; separate: boolean }) {
+  const row =
+    props.item.part.type === "reasoning" ? (
+      <ReasoningPart last={false} part={props.item.part} message={props.item.message} />
+    ) : (
+      <ToolPart last={false} part={props.item.part} message={props.item.message} />
+    )
+  return <box marginTop={props.separate ? 1 : 0}>{row}</box>
 }
 
 function ToolPart(props: { last: boolean; part: ToolPart; message: AssistantMessage; suppressReview?: boolean }) {

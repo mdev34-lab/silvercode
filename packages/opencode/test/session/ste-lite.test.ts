@@ -127,6 +127,12 @@ describe("efficient tool use and Review prompt", () => {
         expect(system).toContain("Make useful independent tool calls in parallel")
         expect(system).toContain("make dependent calls sequentially")
         expect(system).toContain("include whole files or wider context when necessary")
+        expect(system).toContain(
+          "For ordinary file inspection and one-off edits or creation, prefer native Read, Grep, Glob, Edit, and Write tools.",
+        )
+        expect(system).toContain("batch independent operations on different files")
+        expect(system).toContain("order dependent calls and same-file writes")
+        expect(system).toContain("Use scripts when they materially help with bulk work or native/command tools fail")
         if (prompt) expect(system).toContain("Your final message is the report itself")
       }
     }

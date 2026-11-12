@@ -274,4 +274,98 @@ describe("AppProcess run timeout partial output", () => {
       expect(error.partialStderrTruncated).toBeUndefined()
     }),
   )
+
+  it.effect("omits partial text and truncation flags when zero-byte caps consumed nonempty output", () =>
+    Effect.gen(function* () {
+      const spawned = yield* Deferred.make<boolean>()
+      const outDone = yield* Deferred.make<boolean>()
+      const errDone = yield* Deferred.make<boolean>()
+      // Both streams produce bytes that are consumed but none may be retained.
+      const handle = fakeHandle({
+        stdout: consumed([enc("out-marker\n")], outDone),
+        stderr: consumed([enc("err-marker\n")], errDone),
+        exitCode: Effect.never,
+      })
+      const exit = yield* Effect.gen(function* () {
+        const svc = yield* AppProcess.Service
+        const fiber = yield* Effect.exit(
+          svc.run(cmd, { timeout: "30 seconds", maxOutputBytes: 0, maxErrorBytes: 0 }),
+        ).pipe(Effect.forkChild)
+        yield* Deferred.await(spawned)
+        yield* Deferred.await(outDone)
+        yield* Deferred.await(errDone)
+        yield* TestClock.adjust("30 seconds")
+        return yield* Fiber.join(fiber)
+      }).pipe(Effect.provide(fakeLayer(handle, spawned)))
+
+      const error = failure(exit)
+      expectPreservedTimeout(error)
+      expect(error.partialStdout).toBeUndefined()
+      expect(error.partialStderr).toBeUndefined()
+      expect(error.partialStdoutTruncated).toBeUndefined()
+      expect(error.partialStderrTruncated).toBeUndefined()
+    }),
+  )
+
+  it.effect("keeps an uncapped opposite stream while a zero-byte stdout cap omits its text", () =>
+    Effect.gen(function* () {
+      const spawned = yield* Deferred.make<boolean>()
+      const outDone = yield* Deferred.make<boolean>()
+      const errDone = yield* Deferred.make<boolean>()
+      const handle = fakeHandle({
+        stdout: consumed([enc("out-marker\n")], outDone),
+        stderr: consumed([enc("err-marker\n")], errDone),
+        exitCode: Effect.never,
+      })
+      const exit = yield* Effect.gen(function* () {
+        const svc = yield* AppProcess.Service
+        const fiber = yield* Effect.exit(svc.run(cmd, { timeout: "30 seconds", maxOutputBytes: 0 })).pipe(
+          Effect.forkChild,
+        )
+        yield* Deferred.await(spawned)
+        yield* Deferred.await(outDone)
+        yield* Deferred.await(errDone)
+        yield* TestClock.adjust("30 seconds")
+        return yield* Fiber.join(fiber)
+      }).pipe(Effect.provide(fakeLayer(handle, spawned)))
+
+      const error = failure(exit)
+      expectPreservedTimeout(error)
+      expect(error.partialStdout).toBeUndefined()
+      expect(error.partialStdoutTruncated).toBeUndefined()
+      expect(error.partialStderr).toBe("err-marker\n")
+      expect(error.partialStderrTruncated).toBe(false)
+    }),
+  )
+
+  it.effect("keeps a finite-truncated opposite stream while a zero-byte stderr cap omits its text", () =>
+    Effect.gen(function* () {
+      const spawned = yield* Deferred.make<boolean>()
+      const outDone = yield* Deferred.make<boolean>()
+      const errDone = yield* Deferred.make<boolean>()
+      const handle = fakeHandle({
+        stdout: consumed([enc("0123456789ABCDEF")], outDone),
+        stderr: consumed([enc("err-marker\n")], errDone),
+        exitCode: Effect.never,
+      })
+      const exit = yield* Effect.gen(function* () {
+        const svc = yield* AppProcess.Service
+        const fiber = yield* Effect.exit(
+          svc.run(cmd, { timeout: "30 seconds", maxOutputBytes: 8, maxErrorBytes: 0 }),
+        ).pipe(Effect.forkChild)
+        yield* Deferred.await(spawned)
+        yield* Deferred.await(outDone)
+        yield* Deferred.await(errDone)
+        yield* TestClock.adjust("30 seconds")
+        return yield* Fiber.join(fiber)
+      }).pipe(Effect.provide(fakeLayer(handle, spawned)))
+
+      const error = failure(exit)
+      expectPreservedTimeout(error)
+      expect(error.partialStdout).toBe("01234567")
+      expect(error.partialStdoutTruncated).toBe(true)
+      expect(error.partialStderr).toBeUndefined()
+      expect(error.partialStderrTruncated).toBeUndefined()
+    }),
+  )
 })

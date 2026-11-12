@@ -172,8 +172,12 @@ const timeoutError = (
   stderr: CollectedOutput,
   combineOutput: boolean | undefined,
 ) => {
-  const text = (acc: CollectedOutput) =>
-    acc.bytes > 0 ? { text: Buffer.concat(acc.chunks).toString("utf8"), truncated: acc.truncated } : undefined
+  // Gate on retained bytes, not consumed `acc.bytes`: a zero cap still counts
+  // consumed bytes but keeps none, so no text or truncation flag may surface.
+  const text = (acc: CollectedOutput) => {
+    const retained = Buffer.concat(acc.chunks)
+    return retained.length > 0 ? { text: retained.toString("utf8"), truncated: acc.truncated } : undefined
+  }
   const out = combineOutput ? undefined : text(stdout)
   const err = combineOutput ? undefined : text(stderr)
   return new AppProcessError({
