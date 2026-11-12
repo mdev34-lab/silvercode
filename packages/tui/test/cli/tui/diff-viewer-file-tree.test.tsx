@@ -2,11 +2,11 @@
 import { describe, expect, test } from "bun:test"
 import { RGBA } from "@opentui/core"
 import { testRender } from "@opentui/solid"
-import type { JSX } from "solid-js"
 import { captureFrame } from "../../fixture/frame"
+import { onMount, type JSX } from "solid-js"
 import { createTuiResolvedConfig } from "../../fixture/tui-runtime"
 import { KVProvider } from "../../../src/context/kv"
-import { ThemeProvider } from "../../../src/context/theme"
+import { ThemeProvider, type ThemeSource } from "../../../src/context/theme"
 import { TuiConfigProvider } from "../../../src/config"
 import { DiffViewerFileTree } from "../../../src/feature-plugins/system/diff-viewer-file-tree"
 import { TestTuiContexts } from "../../fixture/tui-environment"
@@ -14,6 +14,8 @@ import {
   allExpandedFileTreeDirectories,
   buildFileTree,
 } from "../../../src/feature-plugins/system/diff-viewer-file-tree-utils"
+
+const RENDER_BUDGET_MS = 25 + 40 * 25
 
 const theme = {
   background: RGBA.fromHex("#000000"),
@@ -151,13 +153,136 @@ describe("DiffViewerFileTree", () => {
       ),
     ).toEqual(["▾ src/config", "│  └─ tui.ts                 ?"])
   })
+
+  test("holds the file tree unmounted until deferred theme discovery resolves", async () => {
+    let startedResolve!: () => void
+    const started = new Promise<void>((resolve) => {
+      startedResolve = resolve
+    })
+    let resolveDiscover!: (value: Record<string, unknown>) => void
+    const discoverGate = new Promise<Record<string, unknown>>((resolve) => {
+      resolveDiscover = resolve
+    })
+    const source: ThemeSource = {
+      discover: async () => {
+        startedResolve()
+        return discoverGate
+      },
+    }
+
+    let mounted = false
+    let captureCount = 0
+    const capture = (app: Awaited<ReturnType<typeof testRender>>, deadline: number) => {
+      captureCount += 1
+      return captureFrameWithin(app, deadline)
+    }
+    const component = () => <DiffViewerFileTree width={32} files={[]} loading={false} error={undefined} theme={theme} />
+
+    const framePromise = renderFrame(component, {
+      source,
+      onMount: () => {
+        mounted = true
+      },
+      capture,
+    })
+
+    await started
+    expect(mounted).toBe(false)
+    expect(captureCount).toBe(0)
+
+    resolveDiscover({})
+    const frame = await framePromise
+    expect(mounted).toBe(true)
+    expect(captureCount).toBeGreaterThan(0)
+    expect(frame).toContain("No files")
+  })
+
+  test("fails closed when theme discovery never resolves", async () => {
+    const source: ThemeSource = { discover: () => new Promise<Record<string, unknown>>(() => {}) }
+    let mounted = false
+    const component = () => <DiffViewerFileTree width={32} files={[]} loading={false} error={undefined} theme={theme} />
+
+    const app = await testRender(
+      () =>
+        withTheme(component, {
+          source,
+          onMount: () => {
+            mounted = true
+          },
+        }),
+      {
+        width: 40,
+        height: 10,
+      },
+    )
+    const deadline = performance.now() + RENDER_BUDGET_MS
+    const start = performance.now()
+    let thrown: unknown
+
+    try {
+      await waitForFileTreeMount(app, () => mounted, deadline)
+      await captureSettledFrame(app, deadline)
+    } catch (error) {
+      thrown = error
+    } finally {
+      app.renderer.destroy()
+    }
+
+    expect(thrown).toEqual(new Error("Timed out waiting for DiffViewerFileTree to mount"))
+    expect(app.renderer.isDestroyed).toBe(true)
+    expect(performance.now() - start).toBeLessThan(RENDER_BUDGET_MS + 250)
+  })
 })
 
-async function renderFrame(component: () => JSX.Element) {
-  const app = await testRender(() => withTheme(component), { width: 40, height: 10 })
+async function waitForFileTreeMount(
+  app: Awaited<ReturnType<typeof testRender>>,
+  mounted: () => boolean,
+  deadline: number,
+) {
+  while (!mounted()) {
+    await renderWithin(app, deadline)
+    if (mounted()) break
+    const remaining = deadline - performance.now()
+    if (remaining <= 0) throw new Error("Timed out waiting for DiffViewerFileTree to mount")
+    await new Promise((resolve) => setTimeout(resolve, Math.min(25, remaining)))
+  }
+  if (!mounted()) throw new Error("Timed out waiting for DiffViewerFileTree to mount")
+}
+
+async function renderWithin(app: Awaited<ReturnType<typeof testRender>>, deadline: number) {
+  if (performance.now() > deadline) throw new Error("Timed out waiting for DiffViewerFileTree to mount")
+  await app.renderOnce()
+  if (performance.now() > deadline) throw new Error("Timed out waiting for DiffViewerFileTree to mount")
+}
+
+async function renderFrame(
+  component: () => JSX.Element,
+  options?: {
+    source?: ThemeSource
+    onMount?: () => void
+    capture?: (app: Awaited<ReturnType<typeof testRender>>, deadline: number) => Promise<string>
+  },
+) {
+  let mounted = false
+  const app = await testRender(
+    () =>
+      withTheme(component, {
+        ...options,
+        onMount: () => {
+          mounted = true
+          options?.onMount?.()
+        },
+      }),
+    {
+      width: 40,
+      height: 10,
+    },
+  )
+  const deadline = performance.now() + RENDER_BUDGET_MS
+
   try {
-    await renderOnceSettled(app)
-    return await captureSettledFrame(app)
+    await waitForFileTreeMount(app, () => mounted, deadline)
+    return await captureSettledFrame(app, deadline, options?.capture ?? captureFrameWithin)
   } finally {
     app.renderer.destroy()
   }
@@ -169,23 +294,49 @@ async function renderOnceSettled(app: Awaited<ReturnType<typeof testRender>>) {
   await app.renderOnce()
 }
 
-async function captureSettledFrame(app: Awaited<ReturnType<typeof testRender>>) {
-  for (let attempt = 0; attempt < 40; attempt++) {
-    const frame = await captureFrame(app)
-    if (frame.trim().length > 0) return frame
-    await new Promise((resolve) => setTimeout(resolve, 25))
-    await app.renderOnce()
+async function captureFrameWithin(app: Awaited<ReturnType<typeof testRender>>, deadline: number) {
+  for (;;) {
+    try {
+      return app.captureCharFrame()
+    } catch (error) {
+      if (!(error instanceof Error) || !error.message.includes("OutputBusy")) throw error
+      const remaining = deadline - performance.now()
+      if (remaining <= 0) throw new Error("Timed out waiting for DiffViewerFileTree frame to settle")
+      await new Promise((resolve) => setTimeout(resolve, Math.min(5, remaining)))
+    }
   }
-  return await captureFrame(app)
 }
 
-function withTheme(component: () => JSX.Element) {
+async function captureSettledFrame(
+  app: Awaited<ReturnType<typeof testRender>>,
+  deadline: number,
+  capture: (app: Awaited<ReturnType<typeof testRender>>, deadline: number) => Promise<string> = captureFrameWithin,
+) {
+  for (;;) {
+    const beforeCapture = deadline - performance.now()
+    if (beforeCapture <= 0) throw new Error("Timed out waiting for DiffViewerFileTree frame to settle")
+    const frame = await capture(app, deadline)
+    if (performance.now() > deadline) throw new Error("Timed out waiting for DiffViewerFileTree frame to settle")
+    if (frame.trim().length > 0) return frame
+    await renderWithin(app, deadline)
+    const remaining = deadline - performance.now()
+    if (remaining <= 0) throw new Error("Timed out waiting for DiffViewerFileTree frame to settle")
+    await new Promise((resolve) => setTimeout(resolve, Math.min(25, remaining)))
+  }
+}
+
+function Mounted(props: { onMount?: () => void; children: JSX.Element }) {
+  onMount(() => props.onMount?.())
+  return props.children
+}
+
+function withTheme(component: () => JSX.Element, options?: { source?: ThemeSource; onMount?: () => void }) {
   return (
     <TestTuiContexts>
       <TuiConfigProvider config={createTuiResolvedConfig()}>
         <KVProvider>
-          <ThemeProvider mode="dark" source={{ discover: async () => ({}) }}>
-            {component()}
+          <ThemeProvider mode="dark" source={options?.source ?? { discover: async () => ({}) }}>
+            <Mounted onMount={options?.onMount}>{component()}</Mounted>
           </ThemeProvider>
         </KVProvider>
       </TuiConfigProvider>
