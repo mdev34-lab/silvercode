@@ -15,6 +15,7 @@ import { Plugin } from "../../src/plugin"
 import { testEffect } from "../lib/effect"
 import { Tool } from "@/tool/tool"
 import { RuntimeFlags } from "@/effect/runtime-flags"
+import { BackgroundJob } from "@/background/job"
 
 const shellLayer = Layer.mergeAll(
   LayerNode.compile(
@@ -25,6 +26,7 @@ const shellLayer = Layer.mergeAll(
       Truncate.node,
       Config.node,
       Agent.node,
+      BackgroundJob.node,
       RuntimeFlags.node,
     ]),
   ),

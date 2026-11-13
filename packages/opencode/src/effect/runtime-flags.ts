@@ -74,6 +74,10 @@ export class Service extends ConfigService.Service<Service>()("@opencode/Runtime
   // (see ReviewStagnation.resolveRepeats); values below 2 disable the nudge.
   reviewStagnationRepeats: nonNegativeInteger("OPENCODE_EXPERIMENTAL_REVIEW_STAGNATION_REPEATS"),
   bashDefaultTimeoutMs: positiveInteger("OPENCODE_EXPERIMENTAL_BASH_DEFAULT_TIMEOUT_MS"),
+  // How long a shell command without an explicit timeout may occupy the tool
+  // call before it is promoted to a background job (issue #726). Unset by
+  // default: the shell tool promotes at 5 minutes (see ShellTool).
+  bashBackgroundThresholdMs: positiveInteger("OPENCODE_EXPERIMENTAL_BASH_BACKGROUND_THRESHOLD_MS"),
   // Overrides SessionRetry.RETRY_HEADLESS_MAX_DELAY inside headless non-interactive
   // runs (HeadlessRunRef; issue #555). Ignored outside headless runs so TUI,
   // --mini, and non-headless serve sessions keep retry status and model switching.
