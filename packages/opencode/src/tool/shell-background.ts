@@ -12,6 +12,8 @@ const Actions = ["list", "status", "output", "cancel"] as const
 // A status check is a glance, not a dump: it stays short enough to read on every
 // poll, and `output` is the action that returns the whole captured tail.
 const STATUS_OUTPUT_CHARS = 4_000
+const LIST_MAX_JOBS = 20
+const LIST_COMMAND_CHARS = 512
 
 export const Parameters = Schema.Struct({
   action: Schema.Literals(Actions).annotate({
@@ -90,19 +92,44 @@ export const ShellBackgroundTool = Tool.define<typeof Parameters, Metadata, Back
         Effect.gen(function* () {
           if (params.action === "list") {
             const jobs = yield* owned(ctx.sessionID)
+            const shown = jobs.slice(0, LIST_MAX_JOBS)
+            let truncatedCommands = 0
             const body =
               jobs.length === 0
                 ? "No background shell commands in this session."
-                : jobs
-                    .map(
-                      (job) =>
-                        `<job id="${job.id}" state="${job.status}"${attributes(job)} elapsed_ms="${elapsed(job)}">${command(job)}</job>`,
-                    )
+                : shown
+                    .map((job) => {
+                      const fullCommand = command(job)
+                      const commandTruncated = fullCommand.length > LIST_COMMAND_CHARS
+                      if (commandTruncated) truncatedCommands++
+                      const listedCommand = commandTruncated
+                        ? `${fullCommand.slice(0, LIST_COMMAND_CHARS)}… [command truncated]`
+                        : fullCommand
+                      return `<job id="${job.id}" state="${job.status}"${attributes(job)}${commandTruncated ? ' command_truncated="true"' : ""} elapsed_ms="${elapsed(job)}">${listedCommand}</job>`
+                    })
                     .join("\n")
+            const omitted = jobs.length - shown.length
+            const notes = [
+              ...(omitted > 0
+                ? [
+                    `${omitted} older job${omitted === 1 ? " was" : "s were"} omitted; showing the ${shown.length} most recent.`,
+                  ]
+                : []),
+              ...(truncatedCommands > 0
+                ? [
+                    `${truncatedCommands} command string${truncatedCommands === 1 ? " was" : "s were"} truncated to ${LIST_COMMAND_CHARS} characters.`,
+                  ]
+                : []),
+            ]
             return {
-              title: `${jobs.length} background command${jobs.length === 1 ? "" : "s"}`,
-              metadata: { truncated: false },
-              output: [`<shell_backgrounds count="${jobs.length}">`, body, "</shell_backgrounds>"].join("\n"),
+              title: `${jobs.length} background command${jobs.length === 1 ? "" : "s"}${omitted > 0 ? ` (showing ${shown.length})` : ""}`,
+              metadata: { truncated: omitted > 0 || truncatedCommands > 0 },
+              output: [
+                `<shell_backgrounds count="${jobs.length}" shown="${shown.length}" omitted="${omitted}" truncated_commands="${truncatedCommands}">`,
+                body,
+                ...notes.map((note) => `<note>${note}</note>`),
+                "</shell_backgrounds>",
+              ].join("\n"),
             }
           }
 

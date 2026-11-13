@@ -105,6 +105,17 @@ const manage = Effect.fn("ShellBackgroundTest.manage")(function* (
 type RunResult = Effect.Success<ReturnType<typeof run>>
 const jobID = (result: RunResult) => String((result.metadata as { jobId?: string }).jobId)
 
+const seedShellJob = Effect.fn("ShellBackgroundTest.seedShellJob")(function* (id: string, command: string) {
+  const jobs = yield* BackgroundJob.Service
+  yield* jobs.start({
+    id,
+    type: ShellBackground.TYPE,
+    metadata: { sessionId: sessionID, command, background: true },
+    run: Effect.succeed("finished"),
+  })
+  yield* jobs.wait({ id })
+})
+
 /** Liveness of the whole process group the shell tool spawned for a job. */
 const groupAlive = (pid: number) => {
   try {
@@ -555,6 +566,44 @@ describe("tool.shell automatic backgrounding", () => {
         provideInstance(path.join(__dirname, "../..")),
       ),
     40_000,
+  )
+})
+
+describe("tool.shell background list bounds", () => {
+  it.live(
+    "bounds a long command string in list output and marks it truncated",
+    () =>
+      Effect.gen(function* () {
+        const command = "x".repeat(10_000)
+        yield* seedShellJob("job_long_list_command", command)
+        const result = yield* manage({ action: "list" }, context(undefined, "call_long_list"))
+
+        expect(result.metadata.truncated).toBe(true)
+        expect(result.output).toContain('truncated_commands="1"')
+        expect(result.output).toContain('command_truncated="true"')
+        expect(result.output).toContain("[command truncated]")
+        expect(result.output).not.toContain(command)
+        expect(result.output.length).toBeLessThan(2_000)
+      }).pipe(provideInstance(path.join(__dirname, "../.."))),
+    20_000,
+  )
+
+  it.live(
+    "limits accumulated history to the newest jobs and reports omitted entries",
+    () =>
+      Effect.gen(function* () {
+        for (let index = 0; index < 24; index++) {
+          yield* seedShellJob(`job_list_history_${index}`, `echo ${index}`)
+        }
+        const result = yield* manage({ action: "list" }, context(undefined, "call_list_history"))
+
+        expect(result.metadata.truncated).toBe(true)
+        expect(result.output).toContain('<shell_backgrounds count="24" shown="20" omitted="4"')
+        expect(result.output).toContain("4 older jobs were omitted; showing the 20 most recent.")
+        expect(result.output).toContain("job_list_history_23")
+        expect(result.output).not.toContain('job_list_history_0"')
+      }).pipe(provideInstance(path.join(__dirname, "../.."))),
+    20_000,
   )
 })
 
