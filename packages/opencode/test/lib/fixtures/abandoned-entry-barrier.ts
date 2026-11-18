@@ -1,11 +1,14 @@
-
 // No elapsed-time assertions or cleanup sleeps: the finalizer cannot finish until
-// the parent sees Bun report the hook cutoff and opens the gate over stdin.
+// the child preload reaches the hook-cutoff beforeEach and opens the gate.
 import { afterAll, expect, test } from "bun:test"
 import { Effect, Layer } from "effect"
 import { testEffect } from "../effect"
 import { inflightOwnedRunCount } from "../owned-deadline"
-import { hangWithLiveHandle } from "./abandoned-keepalive"
+import { gate } from "./abandoned-entry-barrier-gate"
+import { hangWithLiveHandle, startLiveHandle, stopLiveHandle } from "./abandoned-keepalive"
+import { phase } from "./abandoned-entry-barrier-phase"
+
+phase("fixture:body")
 
 // In-memory bounded trace. Written to stderr only when an unexpected assertion fails.
 const TRACE_MAX_RECORDS = 16
@@ -42,7 +45,6 @@ capture("C0", 0)
 const envKey = "SILVERCODE_TEST_ABANDONED_ENTRY_ENV"
 const previousEnv = process.env[envKey]
 const events: string[] = []
-const gate = new Response(Bun.stdin.stream()).text()
 
 const restoreEnv = () => {
   if (previousEnv === undefined) delete process.env[envKey]
@@ -53,27 +55,36 @@ afterAll(restoreEnv)
 const it = testEffect(Layer.empty)
 it.live("host timeout interrupts a scope whose finalizer outlives the cleanup hook", () =>
   Effect.gen(function* () {
+    phase("test1:body")
     yield* Effect.acquireRelease(
       Effect.sync(() => {
         process.env[envKey] = "active"
         events.push("acquired")
       }),
       () =>
-        Effect.promise(async () => {
-          events.push("finalizer-start")
-          capture("C1", performance.now() - c0)
-          const gateText = await gate
-          capture("C2", performance.now() - c0, `bytes=${new TextEncoder().encode(gateText).byteLength}`)
-          try {
-            expect(gateText).toBe("release\n")
-          } catch (error) {
-            flushTrace()
-            throw error
-          }
-          restoreEnv()
-          events.push("finalizer-end")
-          capture("C3", performance.now() - c0)
-        }),
+        Effect.acquireUseRelease(
+          Effect.sync(() => startLiveHandle()),
+          () =>
+            Effect.promise(async () => {
+              events.push("finalizer-start")
+              phase("test1:finalizer-start")
+              capture("C1", performance.now() - c0)
+              const gateText = await gate
+              phase("test1:gate-resolved")
+              capture("C2", performance.now() - c0, `bytes=${new TextEncoder().encode(gateText).byteLength}`)
+              try {
+                expect(gateText).toBe("release\n")
+              } catch (error) {
+                flushTrace()
+                throw error
+              }
+              restoreEnv()
+              events.push("finalizer-end")
+              phase("test1:finalizer-end")
+              capture("C3", performance.now() - c0)
+            }),
+          (handle) => Effect.sync(() => stopLiveHandle(handle)),
+        ),
     )
     yield* Effect.never.pipe(
       Effect.ensuring(
@@ -91,7 +102,12 @@ it.live("host timeout interrupts a scope whose finalizer outlives the cleanup ho
 )
 
 test("next plain test enters only after abandoned scope and child are joined", () => {
-  capture("C4", performance.now() - c0, `inflightOwnedRunCount=${ownedCount()}`)
+  phase("test2:body")
+  capture(
+    "C4",
+    performance.now() - c0,
+    `env=${process.env[envKey] ?? "undefined"} inflightOwnedRunCount=${ownedCount()}`,
+  )
   try {
     expect(process.env[envKey]).toBe(previousEnv)
     expect(events).toEqual(["acquired", "finalizer-start", "finalizer-end", "child-interrupted"])
@@ -105,6 +121,7 @@ test("next plain test enters only after abandoned scope and child are joined", (
 })
 
 test("no abandoned work or late finalizer overwrites the newer test state", async () => {
+  phase("test3:body")
   capture("C5", performance.now() - c0)
   await new Promise<void>((resolve) => setImmediate(resolve))
   try {
