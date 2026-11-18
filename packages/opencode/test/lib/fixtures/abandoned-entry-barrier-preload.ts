@@ -1,7 +1,8 @@
 import { beforeEach } from "bun:test"
 import { releaseGate } from "./abandoned-entry-barrier-gate"
 
-await import("@opentui/solid/preload")
+const solidPreload = import.meta.resolve("@opentui/solid/preload")
+await import(solidPreload)
 
 // Registered before the original preload so this hook runs first. By the second
 // test Bun has cut off the cleanup hook but the real takeActiveOwnedScope barrier
