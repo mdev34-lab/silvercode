@@ -1,4 +1,4 @@
-import { test, expect } from "bun:test"
+import { spyOn, test, expect } from "bun:test"
 import { Cause, Effect, Exit } from "effect"
 import * as TestClock from "effect/testing/TestClock"
 import { inflightOwnedRunCount, ownedDeadlineTest, runOwned, runWithOwnedDeadline, validateOwnedDeadline } from "./owned-deadline"
@@ -22,6 +22,23 @@ test("owner deadline interrupts and joins asynchronous finalizer before callback
   expect(events).toEqual(["acquired","finalizer-start","finalizer-end","settled"])
 }, budget.hostTimeoutMs)
 test("next test observes restoration", () => expect(flag).toBe("original"))
+
+test("owned deadline is armed before synchronous execution begins", async () => {
+  const timerSpy = spyOn(globalThis, "setTimeout")
+  let armedBeforeExecution = false
+  try {
+    await runOwned(
+      Effect.sync(() => {
+        armedBeforeExecution = timerSpy.mock.calls.some((call) => call[1] === budget.deadlineMs)
+      }),
+      budget,
+    )
+    expect(armedBeforeExecution).toBe(true)
+    expect(timerSpy.mock.calls.some((call) => call[1] === budget.deadlineMs)).toBe(true)
+  } finally {
+    timerSpy.mockRestore()
+  }
+}, budget.hostTimeoutMs)
 test("wall deadline interrupts TestClock sleep without advancing it", async () => {
   const result = await runWithOwnedDeadline(Effect.sleep("1 hour").pipe(Effect.provide(TestClock.layer())),budget)
   expect(Exit.isFailure(result) && Cause.hasInterruptsOnly(result.cause)).toBe(true)
