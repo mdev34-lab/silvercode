@@ -1,10 +1,10 @@
-
 // No elapsed-time assertions or cleanup sleeps: the finalizer cannot finish until
-// the parent sees Bun report the hook cutoff and opens the gate over stdin.
+// the child preload reaches the hook-cutoff beforeEach and opens the gate.
 import { afterAll, expect, test } from "bun:test"
 import { Effect, Layer } from "effect"
 import { testEffect } from "../effect"
 import { inflightOwnedRunCount } from "../owned-deadline"
+import { gate } from "./abandoned-entry-barrier-gate"
 import { hangWithLiveHandle } from "./abandoned-keepalive"
 
 // In-memory bounded trace. Written to stderr only when an unexpected assertion fails.
@@ -42,7 +42,6 @@ capture("C0", 0)
 const envKey = "SILVERCODE_TEST_ABANDONED_ENTRY_ENV"
 const previousEnv = process.env[envKey]
 const events: string[] = []
-const gate = new Response(Bun.stdin.stream()).text()
 
 const restoreEnv = () => {
   if (previousEnv === undefined) delete process.env[envKey]
@@ -91,7 +90,11 @@ it.live("host timeout interrupts a scope whose finalizer outlives the cleanup ho
 )
 
 test("next plain test enters only after abandoned scope and child are joined", () => {
-  capture("C4", performance.now() - c0, `inflightOwnedRunCount=${ownedCount()}`)
+  capture(
+    "C4",
+    performance.now() - c0,
+    `env=${process.env[envKey] ?? "undefined"} inflightOwnedRunCount=${ownedCount()}`,
+  )
   try {
     expect(process.env[envKey]).toBe(previousEnv)
     expect(events).toEqual(["acquired", "finalizer-start", "finalizer-end", "child-interrupted"])
