@@ -6,6 +6,9 @@ import { testEffect } from "../effect"
 import { inflightOwnedRunCount } from "../owned-deadline"
 import { gate } from "./abandoned-entry-barrier-gate"
 import { hangWithLiveHandle } from "./abandoned-keepalive"
+import { phase } from "./abandoned-entry-barrier-phase"
+
+phase("fixture:body")
 
 // In-memory bounded trace. Written to stderr only when an unexpected assertion fails.
 const TRACE_MAX_RECORDS = 16
@@ -52,6 +55,7 @@ afterAll(restoreEnv)
 const it = testEffect(Layer.empty)
 it.live("host timeout interrupts a scope whose finalizer outlives the cleanup hook", () =>
   Effect.gen(function* () {
+    phase("test1:body")
     yield* Effect.acquireRelease(
       Effect.sync(() => {
         process.env[envKey] = "active"
@@ -60,8 +64,10 @@ it.live("host timeout interrupts a scope whose finalizer outlives the cleanup ho
       () =>
         Effect.promise(async () => {
           events.push("finalizer-start")
+          phase("test1:finalizer-start")
           capture("C1", performance.now() - c0)
           const gateText = await gate
+          phase("test1:gate-resolved")
           capture("C2", performance.now() - c0, `bytes=${new TextEncoder().encode(gateText).byteLength}`)
           try {
             expect(gateText).toBe("release\n")
@@ -71,6 +77,7 @@ it.live("host timeout interrupts a scope whose finalizer outlives the cleanup ho
           }
           restoreEnv()
           events.push("finalizer-end")
+          phase("test1:finalizer-end")
           capture("C3", performance.now() - c0)
         }),
     )
@@ -90,6 +97,7 @@ it.live("host timeout interrupts a scope whose finalizer outlives the cleanup ho
 )
 
 test("next plain test enters only after abandoned scope and child are joined", () => {
+  phase("test2:body")
   capture(
     "C4",
     performance.now() - c0,
@@ -108,6 +116,7 @@ test("next plain test enters only after abandoned scope and child are joined", (
 })
 
 test("no abandoned work or late finalizer overwrites the newer test state", async () => {
+  phase("test3:body")
   capture("C5", performance.now() - c0)
   await new Promise<void>((resolve) => setImmediate(resolve))
   try {

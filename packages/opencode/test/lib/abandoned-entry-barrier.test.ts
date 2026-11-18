@@ -2,6 +2,7 @@ import { expect, test } from "bun:test"
 import fs from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
+import { PHASE_ENV } from "./fixtures/abandoned-entry-barrier-phase"
 
 const CHILD_GUARD_MS = 15000
 
@@ -53,12 +54,23 @@ function flushTrace() {
   } catch {}
 }
 
+async function flushPhases(phasePath: string) {
+  try {
+    const text = await fs.readFile(phasePath, "utf8")
+    for (const line of text.trim().split("\n").slice(0, 24)) {
+      if (line) process.stderr.write(`[845-phase] ${line}\n`)
+    }
+  } catch {}
+}
+
 test(
   "host timeout and hook cutoff cannot let the next test enter an unfinalized Effect scope",
   async () => {
     await withIsolatedCwd(async (cwd) => {
+      const phasePath = path.join(cwd, "phase.log")
       const child = Bun.spawn([process.execPath, "test", "--timeout", "800", "--preload", barrierPreload, fixture], {
         cwd,
+        env: { ...process.env, [PHASE_ENV]: phasePath },
         stdout: "pipe",
         stderr: "pipe",
       })
@@ -113,6 +125,7 @@ test(
           expect(output).not.toMatch(/^\s*\d+\s+errors?\b/m)
         } catch (error) {
           flushTrace()
+          await flushPhases(phasePath)
           throw error
         }
       } finally {
@@ -129,8 +142,10 @@ test(
   "negative control: without the real barrier the plain test enters unfinalized",
   async () => {
     await withIsolatedCwd(async (cwd) => {
+      const phasePath = path.join(cwd, "phase.log")
       const child = Bun.spawn([process.execPath, "test", "--timeout", "800", "--preload", noBarrierPreload, fixture], {
         cwd,
+        env: { ...process.env, [PHASE_ENV]: phasePath },
         stdout: "pipe",
         stderr: "pipe",
       })
@@ -155,6 +170,7 @@ test(
           expect(output).toMatch(/\[845-trace\] phase=C3/)
         } catch (error) {
           flushTrace()
+          await flushPhases(phasePath)
           throw error
         }
       } finally {
