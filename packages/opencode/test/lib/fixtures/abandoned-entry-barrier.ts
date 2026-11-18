@@ -5,7 +5,7 @@ import { Effect, Layer } from "effect"
 import { testEffect } from "../effect"
 import { inflightOwnedRunCount } from "../owned-deadline"
 import { gate } from "./abandoned-entry-barrier-gate"
-import { hangWithLiveHandle } from "./abandoned-keepalive"
+import { hangWithLiveHandle, startLiveHandle, stopLiveHandle } from "./abandoned-keepalive"
 import { phase } from "./abandoned-entry-barrier-phase"
 
 phase("fixture:body")
@@ -62,24 +62,29 @@ it.live("host timeout interrupts a scope whose finalizer outlives the cleanup ho
         events.push("acquired")
       }),
       () =>
-        Effect.promise(async () => {
-          events.push("finalizer-start")
-          phase("test1:finalizer-start")
-          capture("C1", performance.now() - c0)
-          const gateText = await gate
-          phase("test1:gate-resolved")
-          capture("C2", performance.now() - c0, `bytes=${new TextEncoder().encode(gateText).byteLength}`)
-          try {
-            expect(gateText).toBe("release\n")
-          } catch (error) {
-            flushTrace()
-            throw error
-          }
-          restoreEnv()
-          events.push("finalizer-end")
-          phase("test1:finalizer-end")
-          capture("C3", performance.now() - c0)
-        }),
+        Effect.acquireUseRelease(
+          Effect.sync(() => startLiveHandle()),
+          () =>
+            Effect.promise(async () => {
+              events.push("finalizer-start")
+              phase("test1:finalizer-start")
+              capture("C1", performance.now() - c0)
+              const gateText = await gate
+              phase("test1:gate-resolved")
+              capture("C2", performance.now() - c0, `bytes=${new TextEncoder().encode(gateText).byteLength}`)
+              try {
+                expect(gateText).toBe("release\n")
+              } catch (error) {
+                flushTrace()
+                throw error
+              }
+              restoreEnv()
+              events.push("finalizer-end")
+              phase("test1:finalizer-end")
+              capture("C3", performance.now() - c0)
+            }),
+          (handle) => Effect.sync(() => stopLiveHandle(handle)),
+        ),
     )
     yield* Effect.never.pipe(
       Effect.ensuring(
