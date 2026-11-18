@@ -22,12 +22,16 @@ const stopAll = () => {
 
 afterAll(stopAll)
 
+export const startLiveHandle = () => {
+  const handle = setInterval(() => {}, 100)
+  intervals.add(handle)
+  return handle
+}
+
+export const stopLiveHandle = (handle: ReturnType<typeof setInterval>) => stopOne(handle)
+
 export const hangWithLiveHandle = Effect.acquireUseRelease(
-  Effect.sync(() => {
-    const handle = setInterval(() => {}, 100)
-    intervals.add(handle)
-    return handle
-  }),
+  Effect.sync(() => startLiveHandle()),
   () => Effect.never,
-  (handle) => Effect.sync(() => stopOne(handle)),
+  (handle) => Effect.sync(() => stopLiveHandle(handle)),
 )
