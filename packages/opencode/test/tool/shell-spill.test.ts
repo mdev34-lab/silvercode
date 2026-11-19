@@ -15,6 +15,7 @@ import { Plugin } from "../../src/plugin"
 import { testEffect } from "../lib/effect"
 import { Tool } from "@/tool/tool"
 import { RuntimeFlags } from "@/effect/runtime-flags"
+import { BackgroundJob } from "@/background/job"
 
 // A Truncate service whose spill file can never be opened: write() "succeeds"
 // with a path inside a directory that does not exist, so the shell tool's
@@ -32,7 +33,15 @@ const brokenTruncate = Layer.succeed(
 
 const shellLayer = Layer.mergeAll(
   LayerNode.compile(
-    LayerNode.group([CrossSpawnSpawner.node, FSUtil.node, Plugin.node, Config.node, Agent.node, RuntimeFlags.node]),
+    LayerNode.group([
+      CrossSpawnSpawner.node,
+      FSUtil.node,
+      Plugin.node,
+      Config.node,
+      Agent.node,
+      BackgroundJob.node,
+      RuntimeFlags.node,
+    ]),
   ),
   testInstanceStoreLayer,
   brokenTruncate,
@@ -69,10 +78,7 @@ describe("tool.shell output spill failure", () => {
       const commandline = command('for(let i=0;i<200;i++)console.log("x".repeat(64))')
       const info = yield* ShellTool
       const bash = yield* info.init()
-      const result = yield* bash.execute(
-        { command: commandline } as Tool.InferParameters<typeof ShellTool>,
-        ctx,
-      )
+      const result = yield* bash.execute({ command: commandline } as Tool.InferParameters<typeof ShellTool>, ctx)
 
       expect(result.metadata.exit).toBe(0)
       expect(result.metadata.truncated).toBe(true)

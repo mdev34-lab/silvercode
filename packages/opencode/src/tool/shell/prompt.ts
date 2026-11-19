@@ -3,6 +3,7 @@ import DESCRIPTION from "./shell.txt"
 import { PositiveInt } from "@opencode-ai/core/schema"
 import { Global } from "@opencode-ai/core/global"
 import { ShellID } from "./id"
+import { ShellBackground } from "./background"
 
 const PS = new Set(["powershell", "pwsh"])
 const CMD = new Set(["cmd"])
@@ -75,10 +76,10 @@ function chainGuidance(name: string) {
   return "Chain dependent commands in a single shell tool call with '&&' (e.g., `mkdir out && cp a out/`)."
 }
 
-function posixCommandSection(chain: string, limits: Limits, defaultTimeoutMs: number) {
+function posixCommandSection(chain: string, limits: Limits, backgroundThresholdMs: number) {
   return `Usage notes:
   - Quote file paths containing spaces with double quotes. Verify a parent directory exists (\`ls\`) before creating files in it.
-  - Optional timeout in milliseconds; commands will time out after ${defaultTimeoutMs}ms if not specified.
+  - Optional timeout in milliseconds. An explicit timeout is a hard deadline: the command is killed when it is reached. Without one the command is never killed for taking long - after ${backgroundThresholdMs}ms it moves to the background automatically, keeps running, and you are notified when it finishes. Use the ${ShellBackground.ToolID} tool (action \"status\", \"output\" or \"cancel\" with the job id) to check or stop it.
   - Output beyond ${limits.maxLines} lines or ${limits.maxBytes} bytes is truncated and saved to a file; read it with Read offset/limit or Grep. Do NOT pipe through \`head\`, \`tail\` or similar to limit output.
   - Independent commands: make multiple shell tool calls in one message. ${chain} Use ';' when later commands should run even if earlier ones fail. Do not separate commands with newlines.`
 }
@@ -88,18 +89,18 @@ function powershellCommandSection(
   chain: string,
   pathSep: string,
   limits: Limits,
-  defaultTimeoutMs: number,
+  backgroundThresholdMs: number,
 ) {
   return `${powershellNotes(name)}
 
 Usage notes:
   - Quote file paths containing spaces with double quotes. Verify a parent directory exists (\`Test-Path -LiteralPath <parent>\`) before creating files in it.
-  - Optional timeout in milliseconds; commands will time out after ${defaultTimeoutMs}ms if not specified.
+  - Optional timeout in milliseconds. An explicit timeout is a hard deadline: the command is killed when it is reached. Without one the command is never killed for taking long - after ${backgroundThresholdMs}ms it moves to the background automatically, keeps running, and you are notified when it finishes. Use the ${ShellBackground.ToolID} tool (action \"status\", \"output\" or \"cancel\" with the job id) to check or stop it.
   - Output beyond ${limits.maxLines} lines or ${limits.maxBytes} bytes is truncated and saved to a file; read it with Read offset/limit or Grep. Do NOT use \`Select-Object -First/-Last\` or similar to limit output.
   - Independent commands: make multiple shell tool calls in one message. ${chain} Use \`;\` when later commands should run even if earlier ones fail. Do not separate commands with newlines.`
 }
 
-function cmdCommandSection(chain: string, limits: Limits, defaultTimeoutMs: number) {
+function cmdCommandSection(chain: string, limits: Limits, backgroundThresholdMs: number) {
   return `# cmd.exe shell notes
 - Use double quotes for paths with spaces.
 - Use %VAR% for environment variables.
@@ -108,7 +109,7 @@ function cmdCommandSection(chain: string, limits: Limits, defaultTimeoutMs: numb
 
 Usage notes:
   - Quote file paths containing spaces with double quotes. Verify a parent directory exists (\`if exist\`) before creating files in it.
-  - Optional timeout in milliseconds; commands will time out after ${defaultTimeoutMs}ms if not specified.
+  - Optional timeout in milliseconds. An explicit timeout is a hard deadline: the command is killed when it is reached. Without one the command is never killed for taking long - after ${backgroundThresholdMs}ms it moves to the background automatically, keeps running, and you are notified when it finishes. Use the ${ShellBackground.ToolID} tool (action \"status\", \"output\" or \"cancel\" with the job id) to check or stop it.
   - Output beyond ${limits.maxLines} lines or ${limits.maxBytes} bytes is truncated and saved to a file; read it with Read offset/limit or Grep. Do NOT use \`more\` or similar to limit output.
   - Independent commands: make multiple shell tool calls in one message. ${chain} Use \`&\` when later commands should run even if earlier ones fail. Do not separate commands with newlines.`
 }
@@ -135,15 +136,14 @@ ${NO_RETRY_RULE}
 - If a POSIX-shaped command ever produces a parse error, treat it as a shell-family mismatch rather than a typo and switch strategy instead of re-sending the same construct.`
 }
 
-function profile(name: string, platform: NodeJS.Platform, limits: Limits, defaultTimeoutMs: number) {
+function profile(name: string, platform: NodeJS.Platform, limits: Limits, backgroundThresholdMs: number) {
   const isPowerShell = PS.has(name)
   const chain = chainGuidance(name)
   if (CMD.has(name)) {
     return {
       intro: `Executes a given ${shellDisplayName(name)} command with optional timeout, ensuring proper handling and security measures.`,
-      workdirSection:
-        "Commands run in the working directory by default; use `workdir` to run elsewhere.",
-      commandSection: cmdCommandSection(chain, limits, defaultTimeoutMs),
+      workdirSection: "Commands run in the working directory by default; use `workdir` to run elsewhere.",
+      commandSection: cmdCommandSection(chain, limits, backgroundThresholdMs),
       gitCommands: "git commands",
       gitCommandRestriction: "git commands",
       createPrInstruction: "Create PR using a temporary body file so cmd.exe quoting stays simple.",
@@ -153,14 +153,13 @@ function profile(name: string, platform: NodeJS.Platform, limits: Limits, defaul
   if (isPowerShell) {
     return {
       intro: `Executes a given ${shellDisplayName(name)} command with optional timeout, ensuring proper handling and security measures.`,
-      workdirSection:
-        "Commands run in the working directory by default; use `workdir` to run elsewhere.",
+      workdirSection: "Commands run in the working directory by default; use `workdir` to run elsewhere.",
       commandSection: powershellCommandSection(
         name,
         chain,
         platform === "win32" ? "\\" : "/",
         limits,
-        defaultTimeoutMs,
+        backgroundThresholdMs,
       ),
       gitCommands: "git commands",
       gitCommandRestriction: "git commands",
@@ -174,9 +173,8 @@ function profile(name: string, platform: NodeJS.Platform, limits: Limits, defaul
   return {
     intro:
       "Executes a given shell command in a fresh shell process with optional timeout, ensuring proper handling and security measures. Each call starts a new process; shell state such as exported variables does not persist between calls.",
-    workdirSection:
-      "Commands run in the working directory by default; use `workdir` to run elsewhere.",
-    commandSection: posixCommandSection(chain, limits, defaultTimeoutMs),
+    workdirSection: "Commands run in the working directory by default; use `workdir` to run elsewhere.",
+    commandSection: posixCommandSection(chain, limits, backgroundThresholdMs),
     gitCommands: "shell commands",
     gitCommandRestriction: "git shell commands",
     createPrInstruction:
@@ -187,8 +185,12 @@ function profile(name: string, platform: NodeJS.Platform, limits: Limits, defaul
   }
 }
 
-export function render(name: string, platform: NodeJS.Platform, limits: Limits, defaultTimeoutMs: number) {
-  const selected = profile(name, platform, limits, defaultTimeoutMs)
+/**
+ * `backgroundThresholdMs` is the inline window: past it a command without an
+ * explicit timeout is promoted to a background job instead of being killed.
+ */
+export function render(name: string, platform: NodeJS.Platform, limits: Limits, backgroundThresholdMs: number) {
+  const selected = profile(name, platform, limits, backgroundThresholdMs)
   return {
     description: renderPrompt(DESCRIPTION, {
       intro: selected.intro,

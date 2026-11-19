@@ -23,6 +23,7 @@ import { Plugin } from "../../src/plugin"
 import { testEffect } from "../lib/effect"
 import { Tool } from "@/tool/tool"
 import { RuntimeFlags } from "@/effect/runtime-flags"
+import { BackgroundJob } from "@/background/job"
 import { InstanceStore } from "@/project/instance-store"
 
 const shellLayer = Layer.mergeAll(
@@ -34,6 +35,7 @@ const shellLayer = Layer.mergeAll(
       Truncate.node,
       Config.node,
       Agent.node,
+      BackgroundJob.node,
       RuntimeFlags.node,
     ]),
   ),
@@ -1204,20 +1206,28 @@ describe("tool.shell abort", () => {
   )
 
   it.live(
-    "uses RuntimeFlags bashDefaultTimeoutMs when timeout is omitted",
+    "promotes instead of killing when only the default window is set",
     () =>
       runIn(
         projectRoot,
         Effect.gen(function* () {
+          const jobs = yield* BackgroundJob.Service
           const tool = yield* initShell()
-          expect(tool.description).toContain("commands will time out after 500ms")
+          // The default window is the inline budget for a command the caller
+          // did not bound: reaching it moves the command to the background
+          // instead of killing the long-running work.
+          expect(tool.description).toContain("after 500ms it moves to the background")
           const result = yield* tool.execute(
             {
               command: `sleep 60`,
             },
             ctx,
           )
-          expect(result.output).toContain("exceeding timeout 500 ms")
+          expect(result.output).toContain("moved to the background after 500ms")
+          const id = (result.metadata as { jobId?: string }).jobId
+          expect(id).toBeTruthy()
+          expect((yield* jobs.get(String(id)))?.status).toBe("running")
+          yield* jobs.cancel(String(id))
         }),
       ).pipe(Effect.provide(RuntimeFlags.layer({ bashDefaultTimeoutMs: 500 }))),
     15_000,
