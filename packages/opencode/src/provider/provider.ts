@@ -40,6 +40,13 @@ import {
   TOKENHARBOR_PROVIDER_ID,
 } from "./tokenharbor"
 import {
+  discoverModels as discoverPollinationsModels,
+  POLLINATIONS_BASE_URL,
+  POLLINATIONS_ENV,
+  POLLINATIONS_PROVIDER_ID,
+  providerInfo as pollinationsProviderInfo,
+} from "./pollinations"
+import {
   createQwenWebModel,
   providerInfo as qwenWebProviderInfo,
   QWEN_WEB_PROVIDER_ID,
@@ -1004,11 +1011,25 @@ function custom(dep: CustomDep): Record<string, CustomLoader> {
     tokenharbor: Effect.fnUntraced(function* (input: Info) {
       const auth = yield* dep.auth(input.id)
       const apiKey = auth?.type === "api" ? auth.key : yield* dep.get(TOKENHARBOR_ENV)
-      const baseURL = ((yield* dep.config()).provider?.[TOKENHARBOR_PROVIDER_ID]?.options?.baseURL as string | undefined) ?? TOKENHARBOR_BASE_URL
+      const baseURL =
+        ((yield* dep.config()).provider?.[TOKENHARBOR_PROVIDER_ID]?.options?.baseURL as string | undefined) ??
+        TOKENHARBOR_BASE_URL
       return {
         autoload: false,
         options: { baseURL },
         discoverModels: () => discoverTokenHarborModels(apiKey, baseURL),
+      }
+    }),
+    pollinations: Effect.fnUntraced(function* (input: Info) {
+      const auth = yield* dep.auth(input.id)
+      const apiKey = auth?.type === "api" ? auth.key : yield* dep.get(POLLINATIONS_ENV)
+      const baseURL =
+        ((yield* dep.config()).provider?.[POLLINATIONS_PROVIDER_ID]?.options?.baseURL as string | undefined) ??
+        POLLINATIONS_BASE_URL
+      return {
+        autoload: false,
+        options: { baseURL },
+        discoverModels: () => discoverPollinationsModels(apiKey, baseURL),
       }
     }),
     "qwen-web": Effect.fnUntraced(function* (input: Info) {
@@ -1712,6 +1733,7 @@ const layer = Layer.effect(
         // login, authenticated browser profile, or explicit user config).
         catalog[ProviderV2.ID.make(QWEN_WEB_PROVIDER_ID)] = qwenWebProviderInfo()
         catalog[ProviderV2.ID.make(TOKENHARBOR_PROVIDER_ID)] = tokenHarborProviderInfo()
+        catalog[ProviderV2.ID.make(POLLINATIONS_PROVIDER_ID)] = pollinationsProviderInfo()
         const database = mapValues(catalog, toPublicInfo)
 
         const providers: Record<ProviderV2.ID, Info> = {} as Record<ProviderV2.ID, Info>

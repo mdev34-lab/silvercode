@@ -4,6 +4,7 @@ import { ModelsDev } from "@opencode-ai/core/models-dev"
 import { Provider } from "@/provider/provider"
 import { providerInfo as qwenWebProviderInfo, QWEN_WEB_PROVIDER_ID } from "@/provider/qwen-web"
 import { providerInfo as tokenHarborProviderInfo, TOKENHARBOR_PROVIDER_ID } from "@/provider/tokenharbor"
+import { providerInfo as pollinationsProviderInfo, POLLINATIONS_PROVIDER_ID } from "@/provider/pollinations"
 import { Auth } from "@/auth"
 
 import { APICallError, generateText } from "ai"
@@ -61,6 +62,7 @@ export const providerHandlers = HttpApiBuilder.group(InstanceHttpApi, "provider"
       const builtins: Record<string, () => Parameters<typeof Provider.toPublicInfo>[0]> = {
         [QWEN_WEB_PROVIDER_ID]: qwenWebProviderInfo,
         [TOKENHARBOR_PROVIDER_ID]: tokenHarborProviderInfo,
+        [POLLINATIONS_PROVIDER_ID]: pollinationsProviderInfo,
       }
       const allowedBuiltins = Object.fromEntries(
         Object.entries(builtins)
@@ -133,7 +135,9 @@ export const providerHandlers = HttpApiBuilder.group(InstanceHttpApi, "provider"
             (status !== undefined && status >= 500) ||
             (APICallError.isInstance(error) && error.isRetryable) ||
             Cause.isTimeoutError(error) ||
-            (!APICallError.isInstance(error) && error instanceof Error && /fetch failed|ECONN|ENOTFOUND|ETIMEDOUT|network/i.test(error.message))
+            (!APICallError.isInstance(error) &&
+              error instanceof Error &&
+              /fetch failed|ECONN|ENOTFOUND|ETIMEDOUT|network/i.test(error.message))
           return Effect.succeed((transient ? "transient" : "error") as "transient" | "error")
         }),
       )
