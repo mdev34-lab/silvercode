@@ -223,10 +223,20 @@ describe("pollinations model list", () => {
     expect(model.cost.cache.write).toBe(0)
   })
 
+  test("preserves the catalog alpha flag for provider-level experimental gating", () => {
+    const entries = parseModelList({ data: [gpt, { ...gpt, id: "experimental/alpha-chat", alpha: true }] })
+    const [stable, alpha] = entries
+    if (!stable || !alpha) throw new Error("expected both stable and experimental entries")
+    expect(stable.status).toBe("active")
+    expect(alpha.status).toBe("alpha")
+    expect(toModel(alpha).status).toBe("alpha")
+  })
+
   test("maps an entry onto an openai-compatible model with declared capabilities", () => {
     const [entry] = parseModelList({ data: [gpt] })
     if (!entry) throw new Error("entry missing")
     const model = toModel(entry)
+    expect(model.status).toBe("active")
     expect(String(model.providerID)).toBe("pollinations")
     expect(model.api).toEqual({
       id: "openai/gpt-5.4-nano",

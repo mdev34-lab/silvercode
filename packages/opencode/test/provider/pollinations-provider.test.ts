@@ -35,6 +35,17 @@ const catalog = {
       pricing: { promptTextTokens: "0", completionTextTokens: "0" },
     },
     {
+      id: "experimental/alpha-chat",
+      category: "text",
+      community: false,
+      title: "Experimental Alpha Chat",
+      input_modalities: ["text"],
+      output_modalities: ["text"],
+      supported_endpoints: ["/v1/chat/completions"],
+      paid_only: false,
+      alpha: true,
+    },
+    {
       id: "liquid/d1",
       category: "text",
       community: false,
@@ -95,6 +106,7 @@ it.instance(
         expect(Object.keys(models).sort()).toEqual(["community/open-chat", "openai/gpt-5.4-nano"])
         expect(models["community/open-chat"].name).toBe("Open Chat (community, free)")
         expect(models["openai/gpt-5.4-nano"].api.npm).toBe("@ai-sdk/openai-compatible")
+        expect(models["experimental/alpha-chat"]).toBeUndefined()
       }),
     ),
   { config },

@@ -43,6 +43,7 @@ export type ModelEntry = {
   name: string
   inputModalities: string[]
   outputModalities: string[]
+  status: Model["status"]
   tools: boolean
   reasoning: boolean
   temperature: boolean
@@ -73,7 +74,7 @@ export function toModel(entry: ModelEntry): Model {
     name: entry.name,
     family: "",
     api: { id: entry.id, url: POLLINATIONS_BASE_URL, npm: "@ai-sdk/openai-compatible" },
-    status: "active",
+    status: entry.status,
     headers: {},
     options: {},
     cost: {
@@ -134,6 +135,7 @@ function toEntry(record: Record<string, unknown>, id: string): ModelEntry {
     name: labels.length ? `${title} (${labels.join(", ")})` : title,
     inputModalities: strings(record.input_modalities),
     outputModalities: strings(record.output_modalities),
+    status: record.alpha === true ? "alpha" : "active",
     tools: record.tools === true || capabilities.includes("tool_calling"),
     reasoning: record.reasoning === true || capabilities.includes("reasoning"),
     temperature: strings(record.supported_parameters).includes("temperature"),
