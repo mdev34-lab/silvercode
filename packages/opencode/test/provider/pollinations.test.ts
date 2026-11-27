@@ -213,6 +213,30 @@ describe("pollinations model list", () => {
     expect(entry?.name).toBe("Open Chat (community)")
   })
 
+  test("uses the highest token rate per side and ignores non-token billed units", () => {
+    const [entry] = parseModelList({
+      data: [
+        {
+          ...gpt,
+          pricing: {
+            ...gpt.pricing,
+            promptImageTokens: "0.0000004",
+            completionReasoningTokens: "0.000002",
+            completionImageTokens: "0.00000099",
+          },
+          pricing_units: {
+            completionImageTokens: { unit: "megapixel", quantity: 1_000_000 },
+          },
+        },
+      ],
+    })
+    if (!entry) throw new Error("entry missing")
+    const model = toModel(entry)
+    expect(model.cost.input).toBeCloseTo(0.4, 10)
+    expect(model.cost.output).toBeCloseTo(2, 10)
+    expect(model.cost.cache.read).toBeCloseTo(0.015, 10)
+  })
+
   test("converts per-token Pollen prices into per-million cost figures", () => {
     const [entry] = parseModelList({ data: [gpt] })
     if (!entry) throw new Error("entry missing")
