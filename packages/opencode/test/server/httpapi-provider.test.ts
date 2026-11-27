@@ -414,6 +414,8 @@ describe("provider HttpApi", () => {
       expect(isRecord(tokenharbor)).toBe(true)
       expect(isRecord(tokenharbor) && tokenharbor.name).toBe("Token Harbor")
       expect(isRecord(providerByID(body, "all", "qwen-web"))).toBe(true)
+      const pollinations = providerByID(body, "all", "pollinations")
+      expect(isRecord(pollinations) && pollinations.name).toBe("Pollinations")
     }),
     projectOptions,
   )
