@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { age, due, next, PROBE_TTL_MS, STALE_MS, status } from "../src/util/model-health"
+import { age, due, next, PROBE_TTL_MS, sortByStatus, STALE_MS, status } from "../src/util/model-health"
 
 describe("model health", () => {
   test("missing or stale evidence is unknown, never working", () => {
@@ -7,6 +7,37 @@ describe("model health", () => {
     const ok = next(undefined, "ok", 0)
     expect(status(ok, 1000)).toBe("working")
     expect(status(ok, STALE_MS + 1)).toBe("unknown")
+  })
+
+  test("sorts models by health and preserves their order within each status", () => {
+    const models = [
+      { id: "degraded-first", status: "degraded" as const },
+      { id: "unknown", status: "unknown" as const },
+      { id: "working-first", status: "working" as const },
+      { id: "failing", status: "failing" as const },
+      { id: "working-second", status: "working" as const },
+      { id: "degraded-second", status: "degraded" as const },
+    ]
+
+    const sorted = sortByStatus(models, (model) => model.status)
+
+    expect(sorted.map((model) => model.id)).toEqual([
+      "working-first",
+      "working-second",
+      "degraded-first",
+      "degraded-second",
+      "unknown",
+      "failing",
+    ])
+    expect(models.map((model) => model.id)).toEqual([
+      "degraded-first",
+      "unknown",
+      "working-first",
+      "failing",
+      "working-second",
+      "degraded-second",
+    ])
+    expect(sorted).not.toBe(models)
   })
 
   test("one rate limit or network error is not a permanent failure", () => {

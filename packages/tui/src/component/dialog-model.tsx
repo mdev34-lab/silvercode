@@ -9,6 +9,7 @@ import * as fuzzysort from "fuzzysort"
 import { useConnected } from "./use-connected"
 import { useSync } from "../context/sync"
 import { useTheme } from "../context/theme"
+import * as ModelHealth from "../util/model-health"
 
 export function DialogModel(props: { providerID?: string }) {
   const local = useLocal()
@@ -46,6 +47,7 @@ export function DialogModel(props: { providerID?: string }) {
         if (!provider) return []
         const model = provider.models[item.modelID]
         if (!model) return []
+        const state = category === "Pinned" ? health({ providerID: provider.id, modelID: model.id }) : undefined
         return [
           {
             key: item,
@@ -54,23 +56,17 @@ export function DialogModel(props: { providerID?: string }) {
             description: category === "Pinned" ? undefined : provider.name,
             category,
             disabled: provider.id === "opencode" && model.id.includes("-nano"),
-            titleView:
-              category === "Pinned"
-                ? (() => {
-                    const state = health({ providerID: provider.id, modelID: model.id })
-                    return (
-                      <>
-                        {model.name ?? item.modelID} <span style={{ fg: state.color }}>● {state.status}</span>
-                      </>
-                    )
-                  })()
+            titleView: state ? (
+              <>
+                {model.name ?? item.modelID} <span style={{ fg: state.color }}>● {state.status}</span>
+              </>
+            ) : undefined,
+            footer: state
+              ? state.checked
+              : model.cost?.input === 0 && provider.id === "opencode"
+                ? "Free"
                 : undefined,
-            footer:
-              category === "Pinned"
-                ? health({ providerID: provider.id, modelID: model.id }).checked
-                : model.cost?.input === 0 && provider.id === "opencode"
-                  ? "Free"
-                  : undefined,
+            healthStatus: state?.status ?? "unknown",
             onSelect: () => {
               onSelect(provider.id, model.id)
             },
@@ -79,7 +75,7 @@ export function DialogModel(props: { providerID?: string }) {
       })
     }
 
-    const favoriteOptions = toOptions(favorites, "Pinned")
+    const favoriteOptions = ModelHealth.sortByStatus(toOptions(favorites, "Pinned"), (option) => option.healthStatus)
     const recentOptions = toOptions(
       recents.filter(
         (item) => !favorites.some((fav) => fav.providerID === item.providerID && fav.modelID === item.modelID),
