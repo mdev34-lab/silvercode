@@ -4,7 +4,7 @@ import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import fuzzysort from "fuzzysort"
 import { Config } from "@/config/config"
 import { mapValues, mergeDeep, omit, pickBy, sortBy } from "remeda"
-import { NoSuchModelError, type Provider as SDK } from "ai"
+import { NoSuchModelError, wrapLanguageModel, type Provider as SDK } from "ai"
 import { Npm } from "@opencode-ai/core/npm"
 import { Hash } from "@opencode-ai/core/util/hash"
 import { Plugin } from "../plugin"
@@ -46,6 +46,7 @@ import {
   POLLINATIONS_PROVIDER_ID,
   providerInfo as pollinationsProviderInfo,
 } from "./pollinations"
+import { pollinationsProtocolMiddleware } from "./pollinations-protocol"
 import {
   createQwenWebModel,
   providerInfo as qwenWebProviderInfo,
@@ -1030,6 +1031,13 @@ function custom(dep: CustomDep): Record<string, CustomLoader> {
         autoload: false,
         options: { baseURL },
         discoverModels: () => discoverPollinationsModels(apiKey, baseURL),
+        async getModel(sdk: SDK, modelID: string) {
+          const model = sdk.languageModel(modelID)
+          if (typeof model === "string" || model.specificationVersion !== "v3") {
+            throw new Error("Pollinations requires an AI SDK v3 language model")
+          }
+          return wrapLanguageModel({ model, middleware: pollinationsProtocolMiddleware })
+        },
       }
     }),
     "qwen-web": Effect.fnUntraced(function* (input: Info) {

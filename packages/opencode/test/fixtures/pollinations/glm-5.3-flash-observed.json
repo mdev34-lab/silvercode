@@ -1,0 +1,5 @@
+{
+  "source": "sanitized transcription of the response observed in issue #866; live HTTP capture unavailable",
+  "model": "GLM 5.3 Flash (FREE) (community, free)",
+  "content": "<think>The user only said hello.</think>\n{\"name\":null,\"message\":\"Hello! How can I help you today?\"}\n<think>I should finish after answering.</think>\n{\"name\":\"finish\",\"arguments\":{\"message\":\"Greeted the user.\"}}"
+}
