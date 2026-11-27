@@ -124,6 +124,15 @@ describe("TUI worker process integration", () => {
     })
     const client = Rpc.client<{ work(input: undefined): string; hang(input: undefined): string }>(worker)
 
+    // Rpc.client owns worker.onmessage, so chain to also observe the raw
+    // "ready" announcements (non-JSON, ignored by the RPC handler itself).
+    const messages: string[] = []
+    const rpcOnMessage = worker.onmessage
+    worker.onmessage = (event) => {
+      if (typeof event.data === "string") messages.push(event.data)
+      return rpcOnMessage?.call(worker as unknown as Worker, event)
+    }
+
     // A call issued while the replacement is still booting may be dropped;
     // retry with bounded attempts until the worker answers.
     async function callWorkSoon(): Promise<string> {
@@ -143,8 +152,14 @@ describe("TUI worker process integration", () => {
     }
 
     try {
+      // Restart completion is not readiness: gate both phases on the
+      // worker's own "ready" announcement so a slow replacement boot on a
+      // loaded runner cannot consume the call retry budget before the worker
+      // is actually serving (#873).
+      await waitForCount(messages, "ready", 1, "worker did not start")
       await expect(callWorkSoon()).resolves.toBe("done")
 
+      const readyBefore = messages.filter((message) => message === "ready").length
       const hanging = client.call("hang", undefined)
       let hangingSettled: string | undefined
       void hanging.then(
@@ -165,6 +180,7 @@ describe("TUI worker process integration", () => {
       )
       expect(hangingSettled).toBe("rejected")
       await bounded(restarted, "restart never settled")
+      await waitForCount(messages, "ready", readyBefore + 1, "replacement worker never became ready")
 
       await expect(callWorkSoon()).resolves.toBe("done")
     } finally {
