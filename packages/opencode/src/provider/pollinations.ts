@@ -54,8 +54,8 @@ export type ModelEntry = {
 /**
  * Keeps only chat LLMs from a `/v1/models` body (`{ data: [...] }`). Image,
  * video, audio, embedding, and decision entries are dropped. Community models
- * stay in the list, labelled with `community`, and `free` when they publish an
- * explicit zero price and are not paid-only.
+ * stay in the list, labelled with `community`, and `free` under the rule in
+ * `isFree`.
  */
 export function parseModelList(body: unknown): ModelEntry[] {
   const list = isRecord(body) ? body.data : undefined
@@ -125,8 +125,7 @@ function toEntry(record: Record<string, unknown>, id: string): ModelEntry {
   const pricing = isRecord(record.pricing) ? record.pricing : {}
   const capabilities = strings(record.capabilities)
   const community = record.community === true
-  const free =
-    record.paid_only !== true && price(pricing.promptTextTokens) === 0 && price(pricing.completionTextTokens) === 0
+  const free = record.paid_only !== true && isFree(record)
   const title = typeof record.title === "string" && record.title.trim() ? record.title : id
   const labels = [...(community ? ["community"] : []), ...(free ? ["free"] : [])]
   const topProvider = isRecord(record.top_provider) ? record.top_provider : {}
@@ -147,6 +146,31 @@ function toEntry(record: Record<string, unknown>, id: string): ModelEntry {
       cacheWrite: perMillion(pricing.promptCacheWriteTokens),
     },
   }
+}
+
+/**
+ * Mirrors the dashboard rule: a model is free when it declares pricing, no
+ * numeric price is positive (base, variant, or adjustment), and it is not an
+ * agent. Catalog entries for free models carry only `currency`, so a missing
+ * price is a zero price here, not an unknown one.
+ */
+function isFree(record: Record<string, unknown>) {
+  const pricing = record.pricing
+  if (record.agent === true || !isRecord(pricing)) return false
+  const variants = Array.isArray(record.pricing_variants) ? record.pricing_variants : []
+  const adjustments = Array.isArray(record.pricing_adjustments) ? record.pricing_adjustments : []
+  return (
+    !Object.values(pricing).some(isPositive) &&
+    !variants.some(
+      (variant) => isRecord(variant) && isRecord(variant.pricing) && Object.values(variant.pricing).some(isPositive),
+    ) &&
+    !adjustments.some((adjustment) => isRecord(adjustment) && isPositive(adjustment.price))
+  )
+}
+
+function isPositive(value: unknown) {
+  const number = price(value)
+  return number !== undefined && number > 0
 }
 
 function modalities(list: string[]) {

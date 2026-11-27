@@ -145,7 +145,7 @@ describe("pollinations model list", () => {
     expect(parseModelList(body).map((entry) => entry.id)).toEqual(["openai/gpt-5.4-nano", "google/gemini-4-neon"])
   })
 
-  test("keeps community LLMs, and labels them community and free only on explicit zero pricing", () => {
+  test("keeps community LLMs, labelling them community and free under the dashboard rule", () => {
     const names = Object.fromEntries(
       parseModelList({ data: [communityPriced, communityFree, communityUnpriced, paidOnly] }).map((entry) => [
         entry.id,
@@ -158,6 +158,54 @@ describe("pollinations model list", () => {
       "community/unpriced-chat": "Unpriced Chat (community)",
       "google/gemini-4-neon": "Gemini 4 Neon",
     })
+  })
+
+  test("labels free models that declare no positive price, as the dashboard does", () => {
+    const declaredFree = {
+      id: "community/scriptsnsenses-sys/minimax-m3.1-flash-free",
+      category: "text",
+      community: true,
+      title: "MiniMax M3.1 Flash (FREE)",
+      input_modalities: ["text"],
+      output_modalities: ["text"],
+      supported_endpoints: ["/v1/chat/completions"],
+      paid_only: false,
+      pricing: { currency: "pollen" },
+    }
+    const official = { ...declaredFree, id: "qwen/qwen3guard-gen-8b", community: false, title: "Qwen3Guard 8B" }
+    const names = Object.fromEntries(parseModelList({ data: [declaredFree, official] }).map((e) => [e.id, e.name]))
+    expect(names).toEqual({
+      "community/scriptsnsenses-sys/minimax-m3.1-flash-free": "MiniMax M3.1 Flash (FREE) (community, free)",
+      "qwen/qwen3guard-gen-8b": "Qwen3Guard 8B (free)",
+    })
+  })
+
+  test("does not label a model free when any declared price is positive", () => {
+    const base = { ...communityFree, pricing: { currency: "pollen", promptTextTokens: "0", completionTextTokens: "0" } }
+    const variant = {
+      ...communityFree,
+      id: "x/variant",
+      pricing: { currency: "pollen" },
+      pricing_variants: [{ name: "fast", pricing: { currency: "pollen", promptTextTokens: "0.000001" } }],
+    }
+    const adjustment = {
+      ...communityFree,
+      id: "x/adjustment",
+      pricing: { currency: "pollen" },
+      pricing_adjustments: [{ name: "search", price: "2.5", kind: "search_request" }],
+    }
+    const names = Object.fromEntries(parseModelList({ data: [base, variant, adjustment] }).map((e) => [e.id, e.name]))
+    expect(names).toEqual({
+      "community/open-chat": "Open Chat (community, free)",
+      "x/variant": "Open Chat (community)",
+      "x/adjustment": "Open Chat (community)",
+    })
+  })
+
+  test("never labels an agent free, even with currency-only pricing", () => {
+    const agent = { ...communityFree, id: "x/agent", agent: true, pricing: { currency: "pollen" } }
+    const [entry] = parseModelList({ data: [agent] })
+    expect(entry?.name).toBe("Open Chat (community)")
   })
 
   test("never labels a paid-only model free, even with zero prices", () => {

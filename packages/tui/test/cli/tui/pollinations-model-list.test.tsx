@@ -38,7 +38,8 @@ type Setup = Awaited<ReturnType<typeof testRender>>
 
 // Model rows mirror what `GET /config/providers` returns for the Pollinations
 // provider after `parseModelList`: names carry the `community` and `free`
-// labels, and prices are per million tokens. Chat-capable LLM entries sampled
+// labels, and prices are per million tokens. Free rows declare no positive
+// price, as the live catalog does. Chat-capable LLM entries sampled
 // from the live `gen.pollinations.ai/v1/models` catalog are used as the source.
 function pollinationsModel(input: {
   id: string
@@ -135,6 +136,28 @@ const pollinationsModels = Object.fromEntries(
       tools: true,
       reasoning: true,
       context: 1_048_576,
+    }),
+    pollinationsModel({
+      id: "qwen/qwen3guard-gen-8b",
+      name: "Qwen3Guard 8B (free)",
+      input: 0,
+      output: 0,
+      context: 128_000,
+    }),
+    pollinationsModel({
+      id: "community/YoannDev90/vercel-nemotron-3.5-lightning:free",
+      name: "Nemotron 3.5 Lightning (community, free)",
+      input: 0,
+      output: 0,
+      tools: true,
+      context: 128_000,
+    }),
+    pollinationsModel({
+      id: "community/vendouple/muse-glimmer-30b:free",
+      name: "Muse Glimmer (Free) (community, free)",
+      input: 0,
+      output: 0,
+      context: 128_000,
     }),
     pollinationsModel({
       id: "community/tomdacatto/llama-3.1-8B",
@@ -282,7 +305,7 @@ async function mountModelDialog(width: number, height: number): Promise<Harness>
 
 describe("pollinations model list in the TUI", () => {
   test("renders Pollinations LLMs with community labels in the model dialog", async () => {
-    const harness = await mountModelDialog(120, 40)
+    const harness = await mountModelDialog(140, 40)
     harness.dialog.replace(() => <DialogModel />)
     const frame = await waitFor(harness.app, () => {
       const text: string = harness.app.captureCharFrame()
