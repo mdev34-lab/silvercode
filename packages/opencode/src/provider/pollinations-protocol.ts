@@ -47,6 +47,11 @@ export function parsePollinationsProtocol(content: string, options: LanguageMode
           protocol = true
           continue
         }
+        // A complete non-envelope object is ordinary output. Consume it as a
+        // unit so protocol-shaped objects nested inside it cannot be promoted.
+        segments.push({ type: "text", text: content.slice(cursor, json.end) })
+        cursor = json.end
+        continue
       }
     }
 
@@ -175,9 +180,15 @@ function readJSONObject(text: string, start: number): { value: unknown; end: num
   for (let index = start; index < text.length; index++) {
     const char = text[index]
     if (quoted) {
-      escaped = !escaped && char === "\\"
-      if (!escaped && char === '"') quoted = false
-      if (char !== "\\") escaped = false
+      if (escaped) {
+        escaped = false
+        continue
+      }
+      if (char === "\\") {
+        escaped = true
+        continue
+      }
+      if (char === '"') quoted = false
       continue
     }
     if (char === '"') quoted = true

@@ -43,11 +43,18 @@ describe("Pollinations text protocol", () => {
     )
   })
 
-  test("keeps malformed and ambiguous JSON visible", () => {
+  test("parses escaped quotes and backslashes inside envelopes", () => {
+    const content = String.raw`{"name":null,"message":"a\"b\\c"}`
+    expect(parsePollinationsProtocol(content, options)).toEqual([{ type: "text", text: String.raw`a"b\c` }])
+  })
+
+  test("keeps malformed, ambiguous, and nested protocol-shaped JSON visible", () => {
     const malformed = '{"name":null,"message":'
     expect(parsePollinationsProtocol(malformed, options)).toEqual([{ type: "text", text: malformed }])
     const extra = '{"name":null,"message":"hello","extra":true}'
     expect(parsePollinationsProtocol(extra, options)).toEqual([{ type: "text", text: extra }])
+    const nested = '{"example":{"name":"finish","arguments":{"message":"must remain data"}}}'
+    expect(parsePollinationsProtocol(nested, options)).toEqual([{ type: "text", text: nested }])
   })
 
   test("maps non-streaming output to native AI SDK content", async () => {
