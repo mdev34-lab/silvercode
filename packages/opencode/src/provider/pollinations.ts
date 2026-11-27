@@ -123,6 +123,7 @@ function isChatLLM(record: Record<string, unknown>) {
 
 function toEntry(record: Record<string, unknown>, id: string): ModelEntry {
   const pricing = isRecord(record.pricing) ? record.pricing : {}
+  const pricingUnits = isRecord(record.pricing_units) ? record.pricing_units : {}
   const capabilities = strings(record.capabilities)
   const community = record.community === true
   const free = record.paid_only !== true && isFree(record)
@@ -140,10 +141,10 @@ function toEntry(record: Record<string, unknown>, id: string): ModelEntry {
     contextLength: positive(record.context_length),
     outputLimit: positive(topProvider.max_completion_tokens),
     cost: {
-      input: perMillion(pricing.promptTextTokens),
-      output: perMillion(pricing.completionTextTokens),
-      cacheRead: perMillion(pricing.promptCachedTokens),
-      cacheWrite: perMillion(pricing.promptCacheWriteTokens),
+      input: perMillion(maxTokenPrice(pricing, pricingUnits, "prompt", ["promptCachedTokens", "promptCacheWriteTokens"])),
+      output: perMillion(maxTokenPrice(pricing, pricingUnits, "completion")),
+      cacheRead: perMillionTokenPrice(pricing, pricingUnits, "promptCachedTokens"),
+      cacheWrite: perMillionTokenPrice(pricing, pricingUnits, "promptCacheWriteTokens"),
     },
   }
 }
@@ -190,6 +191,37 @@ function strings(value: unknown): string[] {
 function price(value: unknown) {
   const number = typeof value === "string" && value.trim() ? Number(value) : value
   return typeof number === "number" && Number.isFinite(number) && number >= 0 ? number : undefined
+}
+
+/**
+ * Model.cost has one rate per input/output token. Use the highest published
+ * token-denominated rate for each side so reasoning and multimodal token usage
+ * is not priced at a lower text-only rate. Custom billed units (for example
+ * megapixels) and per-request pricing_adjustments cannot be represented by
+ * that schema and are therefore outside this conservative estimate.
+ */
+function maxTokenPrice(
+  pricing: Record<string, unknown>,
+  units: Record<string, unknown>,
+  prefix: "prompt" | "completion",
+  excluded: string[] = [],
+) {
+  return Math.max(
+    0,
+    ...Object.entries(pricing).flatMap(([field, value]) => {
+      if (!field.startsWith(prefix) || !field.endsWith("Tokens") || excluded.includes(field)) return []
+      return isTokenPriced(field, units) ? [price(value) ?? 0] : []
+    }),
+  )
+}
+
+function perMillionTokenPrice(pricing: Record<string, unknown>, units: Record<string, unknown>, field: string) {
+  return isTokenPriced(field, units) ? perMillion(pricing[field]) : 0
+}
+
+function isTokenPriced(field: string, units: Record<string, unknown>) {
+  const unit = isRecord(units[field]) && typeof units[field].unit === "string" ? units[field].unit : undefined
+  return unit === undefined || /token/i.test(unit)
 }
 
 function perMillion(value: unknown) {
