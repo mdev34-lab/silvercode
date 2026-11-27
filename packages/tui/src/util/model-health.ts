@@ -39,3 +39,15 @@ export function age(entry: HealthEntry, now: number): string {
   if (minutes < 60) return `${minutes}m ago`
   return `${Math.floor(minutes / 60)}h ago`
 }
+
+const STATUS_ORDER: Record<HealthStatus, number> = {
+  working: 0,
+  degraded: 1,
+  unknown: 2,
+  failing: 3,
+}
+
+/** Sorts a copy by health, preserving the input order within each status. */
+export function sortByStatus<T>(items: readonly T[], getStatus: (item: T) => HealthStatus): T[] {
+  return [...items].sort((a, b) => STATUS_ORDER[getStatus(a)] - STATUS_ORDER[getStatus(b)])
+}
