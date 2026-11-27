@@ -37,13 +37,22 @@ type Counter = { next: number }
 //   and protocol reasoning is emitted as soon as its think block closes.
 // - Both observed envelope dialects decode: parameters nested under
 //   "arguments" and the flat form {"name":"shell","command":"pwd"} seen
-//   when the real agent loop drives these backends.
+//   when the real agent loop drives these backends. Because the flat shape
+//   collides with ordinary JSON data, flat envelopes additionally qualify
+//   against the offered tool's input schema (see flatInputQualifies); a
+//   leading JSON object that names an offered tool but does not match its
+//   parameters stays visible text. Remaining ambiguity: JSON data that does
+//   carry the tool's declared parameters is indistinguishable from an
+//   intended call, on either dialect — that class is inherent to a
+//   text-envelope protocol and stays accepted.
 export function parsePollinationsProtocol(
   content: string,
   options: LanguageModelV3CallOptions,
   counter: Counter = { next: 0 },
 ): Segment[] {
-  const tools = new Set(options.tools?.filter((tool) => tool.type === "function").map((tool) => tool.name))
+  const tools = new Map(
+    options.tools?.filter((tool) => tool.type === "function").map((tool) => [tool.name, tool.inputSchema] as const),
+  )
   const start = content.search(/\S/)
   if (start < 0) return [{ type: "text", text: content }]
   if (!content.startsWith(THINK_OPEN, start)) {
@@ -138,7 +147,9 @@ export const pollinationsProtocolMiddleware: LanguageModelV3Middleware = {
 function transformStream(stream: ReadableStream<LanguageModelV3StreamPart>, options: LanguageModelV3CallOptions) {
   const reader = stream.getReader()
   const counter: Counter = { next: 0 }
-  const tools = new Set(options.tools?.filter((tool) => tool.type === "function").map((tool) => tool.name))
+  const tools = new Map(
+    options.tools?.filter((tool) => tool.type === "function").map((tool) => [tool.name, tool.inputSchema] as const),
+  )
   let partCounter = 0
   let sawToolCall = false
   let emitted = false
@@ -406,7 +417,7 @@ function isEnvelopeShape(value: unknown): boolean {
   return !("arguments" in value)
 }
 
-function decodeEnvelope(value: unknown, tools: Set<string>, counter: Counter): Segment | undefined {
+function decodeEnvelope(value: unknown, tools: Map<string, unknown>, counter: Counter): Segment | undefined {
   if (!isEnvelopeShape(value)) return undefined
   const record = value as { name: string | null; message?: string; arguments?: unknown }
   if (record.name === null) return { type: "text", text: record.message as string }
@@ -417,13 +428,45 @@ function decodeEnvelope(value: unknown, tools: Set<string>, counter: Counter): S
   }
   // Nested dialect passes "arguments" through; the flat dialect collects
   // every key except "name" as the call input.
-  const input = "arguments" in record ? JSON.stringify(record.arguments) : flatArgumentsInput(record)
+  if ("arguments" in record) {
+    return {
+      type: "tool-call",
+      toolCallId: `pollinations-call-${counter.next++}`,
+      toolName: record.name,
+      input: JSON.stringify(record.arguments),
+    }
+  }
+  // The flat shape {"name": string, ...params} also matches ordinary JSON
+  // data, so it promotes only when the collected keys are compatible with
+  // the offered tool's input schema. A mismatch demotes the envelope to
+  // visible text: it never executes and never becomes a tool error.
+  if (!flatInputQualifies(record, tools.get(record.name))) return undefined
   return {
     type: "tool-call",
     toolCallId: `pollinations-call-${counter.next++}`,
     toolName: record.name,
-    input,
+    input: flatArgumentsInput(record),
   }
+}
+
+// Flat-dialect qualification (a shape gate, not validation; the tool's own
+// schema decode still runs on promoted calls). The schema is treated like
+// the repo's tool layer treats it: object schemas with declared "properties"
+// are closed to extra keys unless they opt out with additionalProperties: true
+// or patternProperties, and every "required" key must be present. Schemas
+// that cannot discriminate (no properties object, or $ref/anyOf/oneOf/allOf
+// at the top level) accept, so demotion only happens on positive evidence of
+// a mismatch and open/zero-argument tools keep working.
+function flatInputQualifies(record: Record<string, unknown>, schema: unknown): boolean {
+  if (!isRecord(schema)) return true
+  if ("$ref" in schema || "anyOf" in schema || "oneOf" in schema || "allOf" in schema) return true
+  if (!isRecord(schema.properties)) return true
+  const properties = schema.properties as Record<string, unknown>
+  const open = schema.additionalProperties === true || isRecord(schema.patternProperties)
+  const keys = Object.keys(record).filter((key) => key !== "name")
+  if (!open && keys.some((key) => !(key in properties))) return false
+  const required = Array.isArray(schema.required) ? schema.required : []
+  return required.every((key) => typeof key !== "string" || key in record)
 }
 
 function flatArgumentsInput(record: Record<string, unknown>): string {

@@ -352,6 +352,52 @@ describe("Pollinations text protocol", () => {
     expect(parsePollinationsProtocol(unknown, options)).toEqual([{ type: "text", text: unknown }])
   })
 
+  test("qualifies flat envelopes against the offered tool's input schema", () => {
+    // Real converted tool shapes (effect Struct semantics: closed to extra
+    // keys unless additionalProperties/patternProperties opt out).
+    const shell = { type: "object", properties: { command: { type: "string" }, timeout: { type: "number" }, workdir: { type: "string" } }, required: ["command"] }
+    const read = { type: "object", properties: { filePath: { type: "string" }, offset: { type: "number" }, limit: { type: "number" } }, required: ["filePath"] }
+    const finish = { type: "object", properties: { reason: { type: "string" }, result: { type: "string" } }, required: ["reason", "result"] }
+    const list = { type: "object", properties: {}, required: [] }
+    const freeform = { type: "object" }
+    const opts = (tools: unknown[]): LanguageModelV3CallOptions => ({ prompt: [], tools: tools as LanguageModelV3CallOptions["tools"] })
+    const types = (doc: string, tools: unknown[]) =>
+      parsePollinationsProtocol(doc, opts(tools)).map((part) => (part.type === "tool-call" ? `call:${part.toolName}` : part.type))
+
+    const shellTool = { type: "function", name: "shell", inputSchema: shell }
+    const readTool = { type: "function", name: "read", inputSchema: read }
+    const finishTool = { type: "function", name: "finish", inputSchema: finish }
+
+    // Ordinary leading JSON that names an offered tool but does not match its
+    // parameters stays text (Kilo review case): wrong key for read, and
+    // package.json-like / config-like data.
+    expect(types('{"name":"read","path":"./env"}', [readTool])).toEqual(["text"])
+    expect(types('{"name":"read","version":"1.0.0","description":"x"}', [readTool])).toEqual(["text"])
+    expect(types('{"name":"shell","enabled":true,"timeout":30}', [shellTool])).toEqual(["text"])
+    // Required key missing, and metadata keys mixed into a real-looking call.
+    expect(types('{"name":"shell","timeout":30}', [shellTool])).toEqual(["text"])
+    expect(types('{"name":"shell","id":"x","command":"pwd"}', [shellTool])).toEqual(["text"])
+    expect(types('{"name":"read"}', [readTool])).toEqual(["text"])
+    // Legitimate calls with the real shapes still promote.
+    expect(types('{"name":"shell","command":"pwd"}', [shellTool])).toEqual(["call:shell"])
+    expect(types('{"name":"shell","command":"pwd","workdir":"/tmp"}', [shellTool])).toEqual(["call:shell"])
+    expect(types('{"name":"read","filePath":"/tmp/a.txt"}', [readTool])).toEqual(["call:read"])
+    expect(types('{"name":"finish","reason":"success","result":"done"}', [finishTool])).toEqual(["call:finish"])
+    // Zero-argument tools: a bare name promotes against a closed empty
+    // schema, but an unexpected key demotes.
+    expect(types('{"name":"list"}', [{ type: "function", name: "list", inputSchema: list }])).toEqual(["call:list"])
+    expect(types('{"name":"list","verbose":true}', [{ type: "function", name: "list", inputSchema: list }])).toEqual(["text"])
+    // Schemas that cannot discriminate (no properties object) accept.
+    expect(types('{"name":"freeform","anything":"goes"}', [{ type: "function", name: "freeform", inputSchema: freeform }])).toEqual([
+      "call:freeform",
+    ])
+    // The nested dialect is not gated by this rule (pre-existing behavior).
+    expect(types('{"name":"read","arguments":{"path":"./env"}}', [readTool])).toEqual(["call:read"])
+    // A demoted flat envelope keeps its raw text visible.
+    const raw = '{"name":"read","path":"./env"}'
+    expect(parsePollinationsProtocol(raw, opts([readTool]))).toEqual([{ type: "text", text: raw }])
+  })
+
   test("assigns unique tool call ids across content parts", async () => {
     const result = await pollinationsProtocolMiddleware.wrapGenerate!({
       params: options,
