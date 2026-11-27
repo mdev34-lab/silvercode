@@ -8,6 +8,7 @@ import {
   parseWindowsCmdCodePage,
   shellOutputDecoder,
   windowsCmdCodePage,
+  windowsConsoleCodePage,
   windowsPowerShellCommand,
 } from "../src/shell-encoding"
 
@@ -102,6 +103,22 @@ describe("shell output decoding (#543)", () => {
     expect(windowsCmdCodePage("cmd-cache-failure.exe", failed)).toBeUndefined()
     expect(windowsCmdCodePage("cmd-cache-failure.exe", failed)).toBeUndefined()
     expect(failures).toBe(1)
+  })
+
+  test("probes the codepage a new console starts with", () => {
+    let calls = 0
+    const options = {
+      platform: "win32" as const,
+      probe: (timeout: number) => {
+        calls++
+        expect(timeout).toBe(2_000)
+        return { status: 0, stdout: "Active code page: 850.\r\n" }
+      },
+    }
+    expect(windowsConsoleCodePage(options)).toBe(850)
+    expect(windowsConsoleCodePage(options)).toBe(850)
+    expect(calls).toBe(1)
+    expect(windowsConsoleCodePage({ platform: "linux" })).toBeUndefined()
   })
 
   test("retries only spurious early timeouts with the same bound", () => {
