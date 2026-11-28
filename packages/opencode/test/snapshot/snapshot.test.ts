@@ -1,9 +1,11 @@
-import { afterEach, expect } from "bun:test"
+import { afterEach, expect, test } from "bun:test"
 import { $ } from "bun"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
+import { Global } from "@opencode-ai/core/global"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import fs from "fs/promises"
+import os from "os"
 import path from "path"
 import { Effect, Fiber, Layer } from "effect"
 import { Snapshot } from "../../src/snapshot"
@@ -162,6 +164,97 @@ it.instance(
   ),
   { git: true },
 )
+
+it.instance(
+  "fresh gitdir persists the snapshot tuning config",
+  Effect.gen(function* () {
+    const tmp = yield* bootstrap()
+    const snapshot = yield* Snapshot.Service
+    const before = yield* snapshot.track()
+    expect(before).toBeTruthy()
+    const config = yield* Effect.promise(async () => {
+      const root = path.join(Global.Path.data, "snapshot")
+      const matches: string[] = []
+      const walk = async (dir: string): Promise<void> => {
+        for (const entry of await fs.readdir(dir, { withFileTypes: true })) {
+          const full = path.join(dir, entry.name)
+          if (entry.isDirectory()) await walk(full)
+          else if (entry.name === "config") {
+            const raw = await fs.readFile(full, "utf8")
+            if (raw.includes(path.basename(tmp.path))) matches.push(raw)
+          }
+        }
+      }
+      await walk(root)
+      expect(matches.length).toBe(1)
+      return matches[0]!
+    })
+    for (const line of [
+      "autocrlf = false",
+      "longpaths = true",
+      "symlinks = true",
+      "fsmonitor = false",
+      "untrackedCache = true",
+      "manyFiles = true",
+      "version = 4",
+      "threads = true",
+      "repositoryformatversion",
+      "worktree = ",
+    ]) {
+      expect(config).toContain(line)
+    }
+  }),
+  { git: true },
+)
+
+test("joinSnapshotConfig preserves a trailing unterminated continuation", async () => {
+  // A template/user config whose last line is an unterminated continuation
+  // must not swallow the appended [core] header into its value.
+  const file = path.join(await fs.mkdtemp(path.join(os.tmpdir(), "snapshot-config-")), "config")
+  await fs.writeFile(file, Snapshot.joinSnapshotConfig("[user]\n\tname = val\\"))
+  const out = await $`git config --file ${file} --list`.text()
+  const entries = out.trim().split("\n")
+  expect(entries).toContain("user.name=val")
+  for (const entry of [
+    "core.autocrlf=false",
+    "core.longpaths=true",
+    "core.symlinks=true",
+    "core.fsmonitor=false",
+    "core.untrackedcache=true",
+    "feature.manyfiles=true",
+    "index.version=4",
+    "index.threads=true",
+  ]) {
+    expect(entries).toContain(entry)
+  }
+})
+
+test("duplicatedSnapshotConfigKeys finds only multiply-assigned tuning keys", () => {
+  // Real `git config --list -z` output: "key\nvalue\0" per entry, "key\0"
+  // for bare keys, key names already lowercased by git, continuation and
+  // quoted values decoded (may contain newlines), subsections shown as
+  // "index.x.version" (a different key from index.version).
+  const listZ =
+    [
+      "core.repositoryformatversion\n0",
+      "core.symlinks\nfalse", // Windows init default
+      "core.symlinks\ntrue", // the appended assignment
+      "core.fsmonitor\nfirst  second", // continuation value from a template
+      "core.fsmonitor\nfalse",
+      "index.x.version\n3",
+      "core.bare", // bare key, not a tuning key
+      "feature.manyfiles\ntrue",
+      "index.version\n4",
+      "core.untrackedcache\ntrue",
+      "core.autocrlf\nline one\nline two", // quoted value with an embedded newline
+      "core.autocrlf\nfalse",
+    ].join("\0") + "\0"
+  expect(Snapshot.duplicatedSnapshotConfigKeys(listZ)).toEqual([
+    ["core.autocrlf", "false"],
+    ["core.symlinks", "true"],
+    ["core.fsmonitor", "false"],
+  ])
+})
 
 it.instance(
   "empty directory handling",

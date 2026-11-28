@@ -25,6 +25,77 @@ const limit = 2 * 1024 * 1024
 const core = ["-c", "core.longpaths=true", "-c", "core.symlinks=true"]
 const cfg = ["-c", "core.autocrlf=false", ...core]
 const quote = [...cfg, "-c", "core.quotepath=false"]
+
+// Persistent tuning for a fresh snapshot gitdir. `git config` sets one key per
+// invocation and GIT_CONFIG_* env vars and `-c` flags are ephemeral, so there
+// is no supported batched set. Two paths:
+// - Configs carrying include directives, or ones git cannot parse, keep the
+//   original eight `git config <key> <value>` spawns: git's own writers keep
+//   git's own include precedence and tolerated-failure behavior, unchanged.
+// - Otherwise the eight values are appended in one atomic write (tmp file +
+//   rename), then any pre-existing assignments of the same keys (Windows git
+//   init writes core.symlinks=false) are collapsed by git itself via
+//   --replace-all. No config syntax is parsed here, so this cannot corrupt
+//   the file: the worst tolerated outcome is a leftover duplicate key, which
+//   keeps reads correct (last assignment wins) and only makes a later plain
+//   `git config <key> <value>` fail.
+// The write bypasses git's config.lock protocol; this module is the only
+// writer of the file, track() serializes access per gitdir, and a
+// cross-process race converges to the same appended block. Every snapshot
+// git call also passes the core values as -c flags, so this file only
+// carries performance tuning.
+const SNAPSHOT_CONFIG_APPEND = `
+[core]
+	autocrlf = false
+	longpaths = true
+	symlinks = true
+	fsmonitor = false
+	untrackedCache = true
+[feature]
+	manyFiles = true
+[index]
+	version = 4
+	threads = true
+`
+
+// Disambiguates the tmp config file across concurrent configure calls; the
+// pid already disambiguates across processes.
+let snapshotConfigTmpCounter = 0
+
+// Canonical lowercase section.key form and value for each appended key.
+const SNAPSHOT_CONFIG_VALUES: ReadonlyMap<string, string> = new Map([
+  ["core.autocrlf", "false"],
+  ["core.longpaths", "true"],
+  ["core.symlinks", "true"],
+  ["core.fsmonitor", "false"],
+  ["core.untrackedcache", "true"],
+  ["feature.manyfiles", "true"],
+  ["index.version", "4"],
+  ["index.threads", "true"],
+])
+
+// Joins existing config content with the appended block. A missing trailing
+// newline is added first: an unterminated continuation on the last line then
+// consumes only the empty line SNAPSHOT_CONFIG_APPEND starts with, instead of
+// swallowing the [core] header into the previous value.
+export function joinSnapshotConfig(previous: string): string {
+  return (previous.endsWith("\n") ? previous : previous + "\n") + SNAPSHOT_CONFIG_APPEND
+}
+
+// Tuning keys assigned more than once in `git config --list -z` output, as
+// [key, value] pairs for --replace-all. Entry format is "key\nvalue\0", or
+// "key\0" for a bare key; git already lowercases key names and resolves
+// continuations, quoting, subsections ("index.x.version", a different key)
+// and comments.
+export function duplicatedSnapshotConfigKeys(listZ: string): [string, string][] {
+  const counts = new Map<string, number>()
+  for (const entry of listZ.split("\0")) {
+    const newline = entry.indexOf("\n")
+    const key = newline === -1 ? entry : entry.slice(0, newline)
+    if (SNAPSHOT_CONFIG_VALUES.has(key)) counts.set(key, (counts.get(key) ?? 0) + 1)
+  }
+  return [...SNAPSHOT_CONFIG_VALUES].filter(([key]) => (counts.get(key) ?? 0) > 1)
+}
 interface GitResult {
   readonly code: ChildProcessSpawner.ExitCode
   readonly text: string
@@ -315,6 +386,45 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | AppProcess.Service | C
           )
         })
 
+        // Write the persistent gitdir config atomically. Failures are tolerated
+        // like the previous per-key `git config` spawns (unchecked results): the
+        // gitdir keeps git's init defaults and every later git call still works.
+        const configure = Effect.fnUntraced(function* (gitdir: string) {
+          const file = path.join(gitdir, "config")
+          yield* Effect.gen(function* () {
+            // --get-regexp exits 1 on no match, 0 on match, >1 on a file git
+            // cannot parse. Any include directive (include.path, includeIf.*)
+            // or an unparsable file keeps the original git-owned spawns.
+            const includes = yield* git(["--git-dir", gitdir, "config", "--local", "--get-regexp", "^include"])
+            if (includes.code !== 1) {
+              for (const [key, value] of SNAPSHOT_CONFIG_VALUES) {
+                yield* git(["--git-dir", gitdir, "config", key, value])
+              }
+              return
+            }
+            const info = yield* fs.stat(file)
+            const previous = yield* fs.readFileString(file)
+            const tmp = `${file}.tmp-${process.pid}-${snapshotConfigTmpCounter++}`
+            yield* fs.writeFileString(tmp, joinSnapshotConfig(previous))
+            if (typeof info.mode === "number") yield* fs.chmod(tmp, info.mode).pipe(Effect.ignore)
+            yield* fs.rename(tmp, file).pipe(Effect.tapError(() => fs.remove(tmp).pipe(Effect.ignore)))
+            // No -c flags on these spawns: injected values would show up in
+            // --list output and masquerade as assignments.
+            const list = yield* git(["config", "--local", "--list", "-z"], { env: { GIT_DIR: gitdir } })
+            if (list.code === 0) {
+              for (const [key, value] of duplicatedSnapshotConfigKeys(list.text)) {
+                yield* git(["config", "--local", "--replace-all", key, value], { env: { GIT_DIR: gitdir } })
+              }
+            }
+          }).pipe(
+            Effect.catch((error) =>
+              Effect.logWarning("failed to persist snapshot git config; keeping init defaults", {
+                error: String(error),
+              }),
+            ),
+          )
+        })
+
         const track = Effect.fnUntraced(function* () {
           return yield* locked(
             Effect.gen(function* () {
@@ -325,15 +435,7 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | AppProcess.Service | C
                 yield* git(["init"], {
                   env: { GIT_DIR: state.gitdir, GIT_WORK_TREE: state.worktree },
                 })
-                yield* git(["--git-dir", state.gitdir, "config", "core.autocrlf", "false"])
-                yield* git(["--git-dir", state.gitdir, "config", "core.longpaths", "true"])
-                yield* git(["--git-dir", state.gitdir, "config", "core.symlinks", "true"])
-                yield* git(["--git-dir", state.gitdir, "config", "core.fsmonitor", "false"])
-                // Tuning for very large worktrees so the first add stays bounded.
-                yield* git(["--git-dir", state.gitdir, "config", "feature.manyFiles", "true"])
-                yield* git(["--git-dir", state.gitdir, "config", "index.version", "4"])
-                yield* git(["--git-dir", state.gitdir, "config", "index.threads", "true"])
-                yield* git(["--git-dir", state.gitdir, "config", "core.untrackedCache", "true"])
+                yield* configure(state.gitdir)
                 yield* seed()
                 yield* Effect.logInfo("initialized")
               }
