@@ -1,4 +1,4 @@
-import { afterEach, expect } from "bun:test"
+import { afterEach, expect, test } from "bun:test"
 import { $ } from "bun"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { Global } from "@opencode-ai/core/global"
@@ -205,6 +205,42 @@ it.instance(
   }),
   { git: true },
 )
+
+test("stripSnapshotConfigKeys removes only the appended tuning keys", () => {
+  const stripped = Snapshot.stripSnapshotConfigKeys(
+    [
+      "[core]",
+      "\trepositoryformatversion = 0",
+      "\tfilemode = false",
+      "\tbare = false",
+      "\tlogallrefupdates = true",
+      "\tsymlinks = false",
+      "\tautocrlf = true",
+      "\tthreads = 4",
+      "[feature]",
+      "\tversion = 1",
+      "[index]",
+      "\tversion = 2",
+      "; symlinks = false",
+      "",
+    ].join("\n"),
+  )
+  expect(stripped).toBe(
+    [
+      "[core]",
+      "\trepositoryformatversion = 0",
+      "\tfilemode = false",
+      "\tbare = false",
+      "\tlogallrefupdates = true",
+      "\tthreads = 4",
+      "[feature]",
+      "\tversion = 1",
+      "[index]",
+      "; symlinks = false",
+      "",
+    ].join("\n"),
+  )
+})
 
 it.instance(
   "empty directory handling",

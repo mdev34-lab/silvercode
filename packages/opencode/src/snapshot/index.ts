@@ -28,11 +28,19 @@ const quote = [...cfg, "-c", "core.quotepath=false"]
 
 // Persistent tuning for a fresh snapshot gitdir. `git config` sets one key per
 // invocation and GIT_CONFIG_* env vars and `-c` flags are ephemeral, so there
-// is no supported batched set: the eight values are appended to the config
-// file in one atomic write (tmp file + rename) instead of eight subprocesses.
-// A trailing section overrides earlier keys, matching `git config <key> <value>`
-// set semantics. Existing init/template keys, includes and permissions are
-// preserved; the same append technique is used in test/fixture/fixture.ts.
+// is no supported batched set: the eight values are written to the config file
+// in one atomic write (tmp file + rename) instead of eight subprocesses. Two
+// deliberate differences from `git config <key> <value>` set semantics:
+// existing occurrences of these keys (git init writes core.symlinks=false on
+// Windows) are stripped so no duplicate keys remain, since a duplicated key
+// makes a later plain `git config <key> <value>` fail, and the trailing block
+// wins over any include.path instead of sitting before it. Neither divergence
+// bites in practice: git init writes no includes, the gitdir is private to
+// this app, and every snapshot git call also passes the core values as -c
+// flags, so this file only carries performance tuning. The write bypasses
+// git's config.lock protocol; this module is the only writer of the file,
+// track() serializes access per gitdir, and a cross-process race converges to
+// the same appended block.
 const SNAPSHOT_CONFIG_APPEND = `
 [core]
 	autocrlf = false
@@ -46,6 +54,36 @@ const SNAPSHOT_CONFIG_APPEND = `
 	version = 4
 	threads = true
 `
+
+// section.key pairs (lowercased; both are case-insensitive in git config)
+// whose existing assignments are removed before SNAPSHOT_CONFIG_APPEND.
+const SNAPSHOT_CONFIG_KEYS = new Set([
+  "core.autocrlf",
+  "core.longpaths",
+  "core.symlinks",
+  "core.fsmonitor",
+  "core.untrackedcache",
+  "feature.manyfiles",
+  "index.version",
+  "index.threads",
+])
+
+// Removes existing assignments of the tuning keys so the appended block leaves
+// no duplicate keys behind. Scoped to what a fresh `git init` config contains:
+// plain sections and `key = value` lines, no subsections, quoted keys or
+// multiline values. Anything unrecognized is preserved untouched.
+export function stripSnapshotConfigKeys(content: string): string {
+  let section = ""
+  const lines: string[] = []
+  for (const line of content.split("\n")) {
+    const header = /^\s*\[([A-Za-z0-9.-]+)/.exec(line)
+    if (header) section = (header[1] ?? "").toLowerCase()
+    const key = /^\s*([A-Za-z0-9-]+)\s*=/.exec(line)
+    if (section && key && SNAPSHOT_CONFIG_KEYS.has(`${section}.${(key[1] ?? "").toLowerCase()}`)) continue
+    lines.push(line)
+  }
+  return lines.join("\n")
+}
 interface GitResult {
   readonly code: ChildProcessSpawner.ExitCode
   readonly text: string
@@ -345,7 +383,7 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | AppProcess.Service | C
             const info = yield* fs.stat(file)
             const previous = yield* fs.readFileString(file)
             const tmp = `${file}.tmp-${process.pid}`
-            yield* fs.writeFileString(tmp, previous + SNAPSHOT_CONFIG_APPEND)
+            yield* fs.writeFileString(tmp, stripSnapshotConfigKeys(previous) + SNAPSHOT_CONFIG_APPEND)
             if (typeof info.mode === "number") yield* fs.chmod(tmp, info.mode).pipe(Effect.ignore)
             yield* fs.rename(tmp, file)
           }).pipe(
