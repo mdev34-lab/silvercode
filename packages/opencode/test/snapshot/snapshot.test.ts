@@ -206,40 +206,31 @@ it.instance(
   { git: true },
 )
 
-test("stripSnapshotConfigKeys removes only the appended tuning keys", () => {
-  const stripped = Snapshot.stripSnapshotConfigKeys(
+test("duplicatedSnapshotConfigKeys finds only multiply-assigned tuning keys", () => {
+  // Real `git config --list -z` output: "key\nvalue\0" per entry, "key\0"
+  // for bare keys, key names already lowercased by git, continuation and
+  // quoted values decoded (may contain newlines), subsections shown as
+  // "index.x.version" (a different key from index.version).
+  const listZ =
     [
-      "[core]",
-      "\trepositoryformatversion = 0",
-      "\tfilemode = false",
-      "\tbare = false",
-      "\tlogallrefupdates = true",
-      "\tsymlinks = false",
-      "\tautocrlf = true",
-      "\tthreads = 4",
-      "[feature]",
-      "\tversion = 1",
-      "[index]",
-      "\tversion = 2",
-      "; symlinks = false",
-      "",
-    ].join("\n"),
-  )
-  expect(stripped).toBe(
-    [
-      "[core]",
-      "\trepositoryformatversion = 0",
-      "\tfilemode = false",
-      "\tbare = false",
-      "\tlogallrefupdates = true",
-      "\tthreads = 4",
-      "[feature]",
-      "\tversion = 1",
-      "[index]",
-      "; symlinks = false",
-      "",
-    ].join("\n"),
-  )
+      "core.repositoryformatversion\n0",
+      "core.symlinks\nfalse", // Windows init default
+      "core.symlinks\ntrue", // the appended assignment
+      "core.fsmonitor\nfirst  second", // continuation value from a template
+      "core.fsmonitor\nfalse",
+      "index.x.version\n3",
+      "core.bare", // bare key, not a tuning key
+      "feature.manyfiles\ntrue",
+      "index.version\n4",
+      "core.untrackedcache\ntrue",
+      "core.autocrlf\nline one\nline two", // quoted value with an embedded newline
+      "core.autocrlf\nfalse",
+    ].join("\0") + "\0"
+  expect(Snapshot.duplicatedSnapshotConfigKeys(listZ)).toEqual([
+    ["core.autocrlf", "false"],
+    ["core.symlinks", "true"],
+    ["core.fsmonitor", "false"],
+  ])
 })
 
 it.instance(

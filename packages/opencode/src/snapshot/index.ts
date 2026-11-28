@@ -28,19 +28,23 @@ const quote = [...cfg, "-c", "core.quotepath=false"]
 
 // Persistent tuning for a fresh snapshot gitdir. `git config` sets one key per
 // invocation and GIT_CONFIG_* env vars and `-c` flags are ephemeral, so there
-// is no supported batched set: the eight values are written to the config file
-// in one atomic write (tmp file + rename) instead of eight subprocesses. Two
-// deliberate differences from `git config <key> <value>` set semantics:
-// existing occurrences of these keys (git init writes core.symlinks=false on
-// Windows) are stripped so no duplicate keys remain, since a duplicated key
-// makes a later plain `git config <key> <value>` fail, and the trailing block
-// wins over any include.path instead of sitting before it. Neither divergence
-// bites in practice: git init writes no includes, the gitdir is private to
-// this app, and every snapshot git call also passes the core values as -c
-// flags, so this file only carries performance tuning. The write bypasses
-// git's config.lock protocol; this module is the only writer of the file,
-// track() serializes access per gitdir, and a cross-process race converges to
-// the same appended block.
+// is no supported batched set: the eight values are appended to the config
+// file in one atomic write (tmp file + rename), then any pre-existing
+// assignments of the same keys (Windows git init writes core.symlinks=false;
+// init templates can carry arbitrary config) are collapsed by git itself via
+// `git config --replace-all`. No config syntax is parsed here, so this code
+// cannot corrupt the file: the worst outcome of a tolerated failure is a
+// leftover duplicate key, which keeps reads correct (last assignment wins)
+// and only makes a later plain `git config <key> <value>` fail.
+// One deliberate difference from `git config <key> <value>` set semantics:
+// the trailing block sits after any include.path directive, so it wins over
+// included values, where a per-key set could land before one. That requires
+// an init template that writes include.path, the gitdir is private to this
+// app, and every snapshot git call also passes the core values as -c flags,
+// so this file only carries performance tuning. The write bypasses git's
+// config.lock protocol; this module is the only writer of the file,
+// track() serializes access per gitdir, and a cross-process race converges
+// to the same appended block.
 const SNAPSHOT_CONFIG_APPEND = `
 [core]
 	autocrlf = false
@@ -55,34 +59,31 @@ const SNAPSHOT_CONFIG_APPEND = `
 	threads = true
 `
 
-// section.key pairs (lowercased; both are case-insensitive in git config)
-// whose existing assignments are removed before SNAPSHOT_CONFIG_APPEND.
-const SNAPSHOT_CONFIG_KEYS = new Set([
-  "core.autocrlf",
-  "core.longpaths",
-  "core.symlinks",
-  "core.fsmonitor",
-  "core.untrackedcache",
-  "feature.manyfiles",
-  "index.version",
-  "index.threads",
+// Canonical lowercase section.key form and value for each appended key.
+const SNAPSHOT_CONFIG_VALUES: ReadonlyMap<string, string> = new Map([
+  ["core.autocrlf", "false"],
+  ["core.longpaths", "true"],
+  ["core.symlinks", "true"],
+  ["core.fsmonitor", "false"],
+  ["core.untrackedcache", "true"],
+  ["feature.manyfiles", "true"],
+  ["index.version", "4"],
+  ["index.threads", "true"],
 ])
 
-// Removes existing assignments of the tuning keys so the appended block leaves
-// no duplicate keys behind. Scoped to what a fresh `git init` config contains:
-// plain sections and `key = value` lines, no subsections, quoted keys or
-// multiline values. Anything unrecognized is preserved untouched.
-export function stripSnapshotConfigKeys(content: string): string {
-  let section = ""
-  const lines: string[] = []
-  for (const line of content.split("\n")) {
-    const header = /^\s*\[([A-Za-z0-9.-]+)/.exec(line)
-    if (header) section = (header[1] ?? "").toLowerCase()
-    const key = /^\s*([A-Za-z0-9-]+)\s*=/.exec(line)
-    if (section && key && SNAPSHOT_CONFIG_KEYS.has(`${section}.${(key[1] ?? "").toLowerCase()}`)) continue
-    lines.push(line)
+// Tuning keys assigned more than once in `git config --list -z` output, as
+// [key, value] pairs for --replace-all. Entry format is "key\nvalue\0", or
+// "key\0" for a bare key; git already lowercases key names and resolves
+// continuations, quoting, subsections ("index.x.version", a different key)
+// and comments.
+export function duplicatedSnapshotConfigKeys(listZ: string): [string, string][] {
+  const counts = new Map<string, number>()
+  for (const entry of listZ.split("\0")) {
+    const newline = entry.indexOf("\n")
+    const key = newline === -1 ? entry : entry.slice(0, newline)
+    if (SNAPSHOT_CONFIG_VALUES.has(key)) counts.set(key, (counts.get(key) ?? 0) + 1)
   }
-  return lines.join("\n")
+  return [...SNAPSHOT_CONFIG_VALUES].filter(([key]) => (counts.get(key) ?? 0) > 1)
 }
 interface GitResult {
   readonly code: ChildProcessSpawner.ExitCode
@@ -383,9 +384,17 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | AppProcess.Service | C
             const info = yield* fs.stat(file)
             const previous = yield* fs.readFileString(file)
             const tmp = `${file}.tmp-${process.pid}`
-            yield* fs.writeFileString(tmp, stripSnapshotConfigKeys(previous) + SNAPSHOT_CONFIG_APPEND)
+            yield* fs.writeFileString(tmp, previous + SNAPSHOT_CONFIG_APPEND)
             if (typeof info.mode === "number") yield* fs.chmod(tmp, info.mode).pipe(Effect.ignore)
             yield* fs.rename(tmp, file)
+            // No -c flags on these spawns: injected values would show up in
+            // --list output and masquerade as assignments.
+            const list = yield* git(["config", "--local", "--list", "-z"], { env: { GIT_DIR: gitdir } })
+            if (list.code === 0) {
+              for (const [key, value] of duplicatedSnapshotConfigKeys(list.text)) {
+                yield* git(["config", "--local", "--replace-all", key, value], { env: { GIT_DIR: gitdir } })
+              }
+            }
           }).pipe(
             Effect.catch((error) =>
               Effect.logWarning("failed to persist snapshot git config; keeping init defaults", {
