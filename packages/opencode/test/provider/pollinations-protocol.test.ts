@@ -7,6 +7,20 @@ const options: LanguageModelV3CallOptions = {
   prompt: [],
   tools: [{ type: "function", name: "finish", inputSchema: { type: "object" } }],
 }
+const readToolOptions: LanguageModelV3CallOptions = {
+  prompt: [],
+  tools: [
+    {
+      type: "function",
+      name: "read",
+      inputSchema: {
+        type: "object",
+        properties: { filePath: { type: "string" } },
+        required: ["filePath"],
+      },
+    },
+  ],
+}
 const usage = {
   inputTokens: { total: 1, noCache: 1, cacheRead: undefined, cacheWrite: undefined },
   outputTokens: { total: 1, text: 1, reasoning: undefined },
@@ -38,9 +52,7 @@ describe("Pollinations text protocol", () => {
 
   test("salvages truncated reasoning instead of aborting the turn", () => {
     // A model truncated mid-think-block used to throw and kill the whole turn.
-    expect(parsePollinationsProtocol("<think>unfinished", options)).toEqual([
-      { type: "reasoning", text: "unfinished" },
-    ])
+    expect(parsePollinationsProtocol("<think>unfinished", options)).toEqual([{ type: "reasoning", text: "unfinished" }])
     // An unterminated think block inside ordinary prose stays ordinary text.
     const prose = "Sure! <think>still thinking"
     expect(parsePollinationsProtocol(prose, options)).toEqual([{ type: "text", text: prose }])
@@ -169,7 +181,7 @@ describe("Pollinations text protocol", () => {
       { type: "finish", usage, finishReason: { unified: "stop", raw: "stop" } },
     ] satisfies LanguageModelV3StreamPart[]
     const events = await streamEvents(chunks)
-    expect(events).toEqual([
+    expect(events.map((event) => event.type)).toEqual([
       "stream-start",
       "text-start",
       "text-delta",
@@ -203,7 +215,9 @@ describe("Pollinations text protocol", () => {
     const reader = wrapped.stream.getReader()
     const read = async () => {
       const item = await Promise.race([reader.read(), new Promise<undefined>((resolve) => setTimeout(resolve, 500))])
-      return item && !(item as { done?: boolean }).done ? (item as { value: LanguageModelV3StreamPart }).value : undefined
+      return item && !(item as { done?: boolean }).done
+        ? (item as { value: LanguageModelV3StreamPart }).value
+        : undefined
     }
     const events: string[] = []
     for (let i = 0; i < 6; i++) {
@@ -226,7 +240,7 @@ describe("Pollinations text protocol", () => {
       { type: "finish", usage, finishReason: { unified: "stop", raw: "stop" } },
     ] satisfies LanguageModelV3StreamPart[]
     const events = await streamEvents(chunks)
-    expect(events).toEqual([
+    expect(events.map((event) => event.type)).toEqual([
       "stream-start",
       "reasoning-start",
       "reasoning-delta",
@@ -246,9 +260,7 @@ describe("Pollinations text protocol", () => {
       model: undefined as never,
       doStream: undefined as never,
       doGenerate: async () => ({
-        content: [
-          { type: "text", text: '<think>checking</think>{"name":null,"message":"Sunny in Recife."}' },
-        ],
+        content: [{ type: "text", text: '<think>checking</think>{"name":null,"message":"Sunny in Recife."}' }],
         finishReason: { unified: "stop", raw: "stop" },
         usage,
         warnings: [],
@@ -312,7 +324,10 @@ describe("Pollinations text protocol", () => {
       "finish",
     ])
     // Parity with the batch parse of the same full content.
-    const batch = parsePollinationsProtocol('<think>r</think>Hello world {"name":"finish","arguments":{"ok":true}}', options)
+    const batch = parsePollinationsProtocol(
+      '<think>r</think>Hello world {"name":"finish","arguments":{"ok":true}}',
+      options,
+    )
     expect(batch).toEqual([
       { type: "reasoning", text: "r" },
       { type: "text", text: "Hello world" },
@@ -355,14 +370,31 @@ describe("Pollinations text protocol", () => {
   test("qualifies flat envelopes against the offered tool's input schema", () => {
     // Real converted tool shapes (effect Struct semantics: closed to extra
     // keys unless additionalProperties/patternProperties opt out).
-    const shell = { type: "object", properties: { command: { type: "string" }, timeout: { type: "number" }, workdir: { type: "string" } }, required: ["command"] }
-    const read = { type: "object", properties: { filePath: { type: "string" }, offset: { type: "number" }, limit: { type: "number" } }, required: ["filePath"] }
-    const finish = { type: "object", properties: { reason: { type: "string" }, result: { type: "string" } }, required: ["reason", "result"] }
+    const shell = {
+      type: "object",
+      properties: { command: { type: "string" }, timeout: { type: "number" }, workdir: { type: "string" } },
+      required: ["command"],
+    }
+    const read = {
+      type: "object",
+      properties: { filePath: { type: "string" }, offset: { type: "number" }, limit: { type: "number" } },
+      required: ["filePath"],
+    }
+    const finish = {
+      type: "object",
+      properties: { reason: { type: "string" }, result: { type: "string" } },
+      required: ["reason", "result"],
+    }
     const list = { type: "object", properties: {}, required: [] }
     const freeform = { type: "object" }
-    const opts = (tools: unknown[]): LanguageModelV3CallOptions => ({ prompt: [], tools: tools as LanguageModelV3CallOptions["tools"] })
+    const opts = (tools: unknown[]): LanguageModelV3CallOptions => ({
+      prompt: [],
+      tools: tools as LanguageModelV3CallOptions["tools"],
+    })
     const types = (doc: string, tools: unknown[]) =>
-      parsePollinationsProtocol(doc, opts(tools)).map((part) => (part.type === "tool-call" ? `call:${part.toolName}` : part.type))
+      parsePollinationsProtocol(doc, opts(tools)).map((part) =>
+        part.type === "tool-call" ? `call:${part.toolName}` : part.type,
+      )
 
     const shellTool = { type: "function", name: "shell", inputSchema: shell }
     const readTool = { type: "function", name: "read", inputSchema: read }
@@ -386,11 +418,13 @@ describe("Pollinations text protocol", () => {
     // Zero-argument tools: a bare name promotes against a closed empty
     // schema, but an unexpected key demotes.
     expect(types('{"name":"list"}', [{ type: "function", name: "list", inputSchema: list }])).toEqual(["call:list"])
-    expect(types('{"name":"list","verbose":true}', [{ type: "function", name: "list", inputSchema: list }])).toEqual(["text"])
-    // Schemas that cannot discriminate (no properties object) accept.
-    expect(types('{"name":"freeform","anything":"goes"}', [{ type: "function", name: "freeform", inputSchema: freeform }])).toEqual([
-      "call:freeform",
+    expect(types('{"name":"list","verbose":true}', [{ type: "function", name: "list", inputSchema: list }])).toEqual([
+      "text",
     ])
+    // Schemas that cannot discriminate (no properties object) accept.
+    expect(
+      types('{"name":"freeform","anything":"goes"}', [{ type: "function", name: "freeform", inputSchema: freeform }]),
+    ).toEqual(["call:freeform"])
     // The nested dialect is not gated by this rule (pre-existing behavior).
     expect(types('{"name":"read","arguments":{"path":"./env"}}', [readTool])).toEqual(["call:read"])
     // A demoted flat envelope keeps its raw text visible.
@@ -416,11 +450,190 @@ describe("Pollinations text protocol", () => {
     const ids = result.content.filter((part) => part.type === "tool-call").map((part) => part.toolCallId)
     expect(ids).toEqual(["pollinations-call-0", "pollinations-call-1"])
   })
+
+  test("decodes the serialized assistant-message dialect observed from GPT-6-Luna", () => {
+    // Observed 2026-11-27 in the real TUI: Luna imitates the backend's raw
+    // JSON serialization of an assistant message, including the ids this
+    // middleware assigned to earlier promoted calls (path anonymized).
+    const envelope =
+      '{"tool_calls":[{"id":"pollinations-call-1","type":"function","function":{"name":"read","arguments":"{\\"filePath\\":\\"/tmp/example\\"}"}}],"role":"assistant","content":"No matches for that pattern."}'
+    expect(parsePollinationsProtocol(envelope, readToolOptions)).toEqual([
+      { type: "text", text: "No matches for that pattern." },
+      {
+        type: "tool-call",
+        toolCallId: "pollinations-call-0",
+        toolName: "read",
+        input: '{"filePath":"/tmp/example"}',
+      },
+    ])
+  })
+
+  test("decodes the reasoning_content sibling of the assistant-message dialect", () => {
+    const envelope =
+      '{"tool_calls":[{"id":"pollinations-call-2","type":"function","function":{"name":"read","arguments":"{\\"filePath\\":\\"/tmp/example\\"}"}}],"reasoning_content":"The previous read call ended the turn without a result, so I will retry."}'
+    expect(parsePollinationsProtocol(envelope, readToolOptions)).toEqual([
+      { type: "reasoning", text: "The previous read call ended the turn without a result, so I will retry." },
+      {
+        type: "tool-call",
+        toolCallId: "pollinations-call-0",
+        toolName: "read",
+        input: '{"filePath":"/tmp/example"}',
+      },
+    ])
+  })
+
+  test("assigns fresh ids to every call in an assistant-message envelope", () => {
+    // Echoed ids collide with calls already in history; they are discarded.
+    const envelope =
+      '{"tool_calls":[{"id":"pollinations-call-1","type":"function","function":{"name":"read","arguments":"{\\"filePath\\":\\"/tmp/a\\"}"}},{"id":"pollinations-call-1","type":"function","function":{"name":"read","arguments":"{\\"filePath\\":\\"/tmp/b\\"}"}}],"role":"assistant"}'
+    expect(parsePollinationsProtocol(envelope, readToolOptions)).toEqual([
+      { type: "tool-call", toolCallId: "pollinations-call-0", toolName: "read", input: '{"filePath":"/tmp/a"}' },
+      { type: "tool-call", toolCallId: "pollinations-call-1", toolName: "read", input: '{"filePath":"/tmp/b"}' },
+    ])
+  })
+
+  test("accepts assistant-message arguments already decoded as an object", () => {
+    const envelope = '{"tool_calls":[{"type":"function","function":{"name":"read","arguments":{"filePath":"/tmp/a"}}}]}'
+    expect(parsePollinationsProtocol(envelope, readToolOptions)).toEqual([
+      { type: "tool-call", toolCallId: "pollinations-call-0", toolName: "read", input: '{"filePath":"/tmp/a"}' },
+    ])
+  })
+
+  test("demotes assistant-message envelopes that fail strict qualification", () => {
+    // A call naming a tool that was not offered never executes.
+    const unknownTool =
+      '{"tool_calls":[{"type":"function","function":{"name":"shell","arguments":"{\\"command\\":\\"pwd\\"}"}}],"role":"assistant"}'
+    expect(parsePollinationsProtocol(unknownTool, readToolOptions)).toEqual([{ type: "text", text: unknownTool }])
+    // An arguments string that is not decodable JSON stays visible text.
+    const badArguments =
+      '{"tool_calls":[{"type":"function","function":{"name":"read","arguments":"{not json"}}],"role":"assistant"}'
+    expect(parsePollinationsProtocol(badArguments, readToolOptions)).toEqual([{ type: "text", text: badArguments }])
+    // Sibling keys beyond the observed assistant-message shape stay text.
+    const extraKey =
+      '{"tool_calls":[{"type":"function","function":{"name":"read","arguments":"{\\"filePath\\":\\"/tmp/a\\"}"}}],"role":"assistant","finish_reason":"tool_calls"}'
+    expect(parsePollinationsProtocol(extraKey, readToolOptions)).toEqual([{ type: "text", text: extraKey }])
+    // A non-assistant role is not the observed dialect.
+    const toolRole =
+      '{"tool_calls":[{"type":"function","function":{"name":"read","arguments":"{\\"filePath\\":\\"/tmp/a\\"}"}}],"role":"tool"}'
+    expect(parsePollinationsProtocol(toolRole, readToolOptions)).toEqual([{ type: "text", text: toolRole }])
+    // Ordinary prose quoting the dialect is never promoted (anchored rule).
+    const quoted = `Documentation may show ${extraKey} without calling anything.`
+    expect(parsePollinationsProtocol(quoted, readToolOptions)).toEqual([{ type: "text", text: quoted }])
+  })
+
+  test("maps the assistant-message dialect to native content in generate", async () => {
+    const result = await pollinationsProtocolMiddleware.wrapGenerate!({
+      params: readToolOptions,
+      model: undefined as never,
+      doStream: undefined as never,
+      doGenerate: async () => ({
+        content: [
+          {
+            type: "text",
+            text: '{"tool_calls":[{"id":"pollinations-call-1","type":"function","function":{"name":"read","arguments":"{\\"filePath\\":\\"/tmp/example\\"}"}}],"role":"assistant","content":"No matches for that pattern."}',
+          },
+        ],
+        finishReason: { unified: "stop", raw: "stop" },
+        usage,
+        warnings: [],
+      }),
+    })
+    expect(result.content).toEqual([
+      { type: "text", text: "No matches for that pattern." },
+      {
+        type: "tool-call",
+        toolCallId: "pollinations-call-0",
+        toolName: "read",
+        input: '{"filePath":"/tmp/example"}',
+      },
+    ])
+    expect(result.finishReason.unified).toBe("tool-calls")
+  })
+
+  test("streams the fragmented assistant-message dialect as reasoning and a tool call", async () => {
+    const events = await streamEvents(
+      [
+        { type: "stream-start", warnings: [] },
+        { type: "text-start", id: "upstream" },
+        { type: "text-delta", id: "upstream", delta: '{"tool_calls":[{"id":"pollinations-call-2","type":"func' },
+        {
+          type: "text-delta",
+          id: "upstream",
+          delta: 'tion","function":{"name":"read","arguments":"{\\"filePath\\":\\"/tmp/example\\"}"}}],',
+        },
+        { type: "text-delta", id: "upstream", delta: '"reasoning_content":"Retrying the listing."}' },
+        { type: "text-end", id: "upstream" },
+        { type: "finish", usage, finishReason: { unified: "stop", raw: "stop" } },
+      ],
+      readToolOptions,
+    )
+    expect(events.map((event) => event.type)).toEqual([
+      "stream-start",
+      "reasoning-start",
+      "reasoning-delta",
+      "reasoning-end",
+      "tool-call",
+      "finish",
+    ])
+    const call = events.find((event) => event.type === "tool-call")
+    expect(call).toMatchObject({
+      toolCallId: "pollinations-call-0",
+      toolName: "read",
+      input: '{"filePath":"/tmp/example"}',
+    })
+    expect(events.at(-1)).toMatchObject({ finishReason: { unified: "tool-calls" } })
+  })
+
+  test("promotes the dialect through wrapLanguageModel, the composition provider.ts uses", async () => {
+    const { MockLanguageModelV3 } = await import("ai/test")
+    const { wrapLanguageModel } = await import("ai")
+    const mock = new MockLanguageModelV3({
+      doStream: async () => ({
+        stream: new ReadableStream({
+          start(controller) {
+            controller.enqueue({ type: "text-start", id: "upstream" })
+            controller.enqueue({
+              type: "text-delta",
+              id: "upstream",
+              delta:
+                '{"tool_calls":[{"id":"pollinations-call-1","type":"function","function":{"name":"read","arguments":"{\\"filePath\\":\\"/tmp/example\\"}"}}],"role":"assistant","content":"No matches for that pattern."}',
+            })
+            controller.enqueue({ type: "text-end", id: "upstream" })
+            controller.enqueue({
+              type: "finish",
+              usage: {
+                inputTokens: { total: 1, noCache: 1, cacheRead: undefined, cacheWrite: undefined },
+                outputTokens: { total: 1, text: 1, reasoning: undefined },
+              },
+              finishReason: { unified: "stop", raw: "stop" },
+            })
+            controller.close()
+          },
+        }),
+      }),
+    })
+    const model = wrapLanguageModel({ model: mock, middleware: pollinationsProtocolMiddleware })
+    const result = await model.doStream(readToolOptions)
+    const events: LanguageModelV3StreamPart[] = []
+    const reader = result.stream.getReader()
+    while (true) {
+      const item = await reader.read()
+      if (item.done) break
+      events.push(item.value)
+    }
+    expect(events.map((event) => event.type)).toEqual(["text-start", "text-delta", "text-end", "tool-call", "finish"])
+    expect(events[3]).toMatchObject({
+      toolCallId: "pollinations-call-0",
+      toolName: "read",
+      input: '{"filePath":"/tmp/example"}',
+    })
+    expect(events.at(-1)).toMatchObject({ finishReason: { unified: "tool-calls" } })
+  })
 })
 
-async function streamEvents(chunks: LanguageModelV3StreamPart[]) {
+async function streamEvents(chunks: LanguageModelV3StreamPart[], params: LanguageModelV3CallOptions = options) {
   const wrapped = await pollinationsProtocolMiddleware.wrapStream!({
-    params: options,
+    params,
     model: undefined as never,
     doGenerate: undefined as never,
     doStream: async () => ({
@@ -439,5 +652,5 @@ async function streamEvents(chunks: LanguageModelV3StreamPart[]) {
     if (item.done) break
     events.push(item.value)
   }
-  return events.map((event) => event.type)
+  return events
 }

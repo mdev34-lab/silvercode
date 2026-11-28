@@ -45,6 +45,15 @@ type Counter = { next: number }
 //   carry the tool's declared parameters is indistinguishable from an
 //   intended call, on either dialect — that class is inherent to a
 //   text-envelope protocol and stays accepted.
+// - The serialized assistant-message dialect observed from GPT-6-Luna
+//   (2026-11-27, real TUI): the backend renders assistant history as raw
+//   JSON and the model imitates the whole message shape as its output —
+//   {"tool_calls":[{"id":"...","type":"function","function":{"name":"read",
+//   "arguments":"<json string>"}}],"role":"assistant","content":"..."} or
+//   with "reasoning_content" instead. Promotion is strict: only those
+//   observed sibling keys, role absent or "assistant", every call an
+//   offered tool with JSON-decodable arguments; echoed call ids are
+//   discarded in favor of fresh ones. Anything else stays visible text.
 export function parsePollinationsProtocol(
   content: string,
   options: LanguageModelV3CallOptions,
@@ -83,7 +92,7 @@ export function parsePollinationsProtocol(
       if (scan.status === "complete") {
         const envelope = decodeEnvelope(scan.value, tools, counter)
         if (envelope) {
-          segments.push(envelope)
+          segments.push(...envelope)
           cursor = scan.end
           continue
         }
@@ -154,7 +163,10 @@ function transformStream(stream: ReadableStream<LanguageModelV3StreamPart>, opti
   let sawToolCall = false
   let emitted = false
 
-  function out(controller: ReadableStreamDefaultController<LanguageModelV3StreamPart>, part: LanguageModelV3StreamPart) {
+  function out(
+    controller: ReadableStreamDefaultController<LanguageModelV3StreamPart>,
+    part: LanguageModelV3StreamPart,
+  ) {
     emitted = true
     controller.enqueue(part)
   }
@@ -234,7 +246,7 @@ function transformStream(stream: ReadableStream<LanguageModelV3StreamPart>, opti
         if (scan.status === "complete") {
           const envelope = decodeEnvelope(scan.value, tools, counter)
           if (envelope) {
-            emitSegment(controller, envelope)
+            envelope.forEach((segment) => emitSegment(controller, segment))
           } else {
             emitTextDelta(controller, pending.slice(0, scan.end))
           }
@@ -406,8 +418,30 @@ function toContent(segments: Segment[]): LanguageModelV3Content[] {
   return segments.map((segment) => segment)
 }
 
+// Serialized assistant-message shape: a "tool_calls" array of OpenAI-style
+// function calls. Shape check only; decodeToolCallsEnvelope applies the
+// strict sibling-key, role, offered-tool, and arguments gates.
+function isToolCallsShape(value: Record<string, unknown>): boolean {
+  if (!Array.isArray(value.tool_calls) || value.tool_calls.length === 0) return false
+  return value.tool_calls.every(isFunctionCallShape)
+}
+
+function isFunctionCallShape(value: unknown): boolean {
+  if (!isRecord(value)) return false
+  const keys = Object.keys(value)
+  if (keys.some((key) => key !== "id" && key !== "type" && key !== "function")) return false
+  if ("id" in value && typeof value.id !== "string") return false
+  if ("type" in value && value.type !== "function") return false
+  if (!isRecord(value.function)) return false
+  const fn = value.function
+  if (typeof fn.name !== "string") return false
+  return typeof fn.arguments === "string" || isRecord(fn.arguments)
+}
+
 function isEnvelopeShape(value: unknown): boolean {
-  if (!isRecord(value) || !("name" in value)) return false
+  if (!isRecord(value)) return false
+  if (isToolCallsShape(value)) return true
+  if (!("name" in value)) return false
   const keys = Object.keys(value).sort().join(",")
   if (value.name === null && keys === "message,name" && typeof value.message === "string") return true
   if (typeof value.name !== "string") return false
@@ -417,10 +451,11 @@ function isEnvelopeShape(value: unknown): boolean {
   return !("arguments" in value)
 }
 
-function decodeEnvelope(value: unknown, tools: Map<string, unknown>, counter: Counter): Segment | undefined {
+function decodeEnvelope(value: unknown, tools: Map<string, unknown>, counter: Counter): Segment[] | undefined {
   if (!isEnvelopeShape(value)) return undefined
+  if (isRecord(value) && isToolCallsShape(value)) return decodeToolCallsEnvelope(value, tools, counter)
   const record = value as { name: string | null; message?: string; arguments?: unknown }
-  if (record.name === null) return { type: "text", text: record.message as string }
+  if (record.name === null) return [{ type: "text", text: record.message as string }]
   if (!tools.has(record.name)) {
     // Demote: an envelope for a tool that was not offered stays visible as
     // text instead of erroring the turn or executing by accident.
@@ -429,24 +464,79 @@ function decodeEnvelope(value: unknown, tools: Map<string, unknown>, counter: Co
   // Nested dialect passes "arguments" through; the flat dialect collects
   // every key except "name" as the call input.
   if ("arguments" in record) {
-    return {
-      type: "tool-call",
-      toolCallId: `pollinations-call-${counter.next++}`,
-      toolName: record.name,
-      input: JSON.stringify(record.arguments),
-    }
+    return [
+      {
+        type: "tool-call",
+        toolCallId: `pollinations-call-${counter.next++}`,
+        toolName: record.name,
+        input: JSON.stringify(record.arguments),
+      },
+    ]
   }
   // The flat shape {"name": string, ...params} also matches ordinary JSON
   // data, so it promotes only when the collected keys are compatible with
   // the offered tool's input schema. A mismatch demotes the envelope to
   // visible text: it never executes and never becomes a tool error.
   if (!flatInputQualifies(record, tools.get(record.name))) return undefined
-  return {
-    type: "tool-call",
-    toolCallId: `pollinations-call-${counter.next++}`,
-    toolName: record.name,
-    input: flatArgumentsInput(record),
+  return [
+    {
+      type: "tool-call",
+      toolCallId: `pollinations-call-${counter.next++}`,
+      toolName: record.name,
+      input: flatArgumentsInput(record),
+    },
+  ]
+}
+
+// Decodes the serialized assistant-message dialect. Strict gates beyond the
+// shape check: only the observed sibling keys (role/content/
+// reasoning_content), role absent or "assistant", content null or string,
+// every call naming an offered tool, and arguments decodable as JSON when
+// they arrive as the conventional string. One failure demotes the whole
+// envelope to visible text: it never partially executes.
+function decodeToolCallsEnvelope(
+  record: Record<string, unknown>,
+  tools: Map<string, unknown>,
+  counter: Counter,
+): Segment[] | undefined {
+  const keys = Object.keys(record)
+  if (keys.some((key) => key !== "tool_calls" && key !== "role" && key !== "content" && key !== "reasoning_content")) {
+    return undefined
   }
+  if ("role" in record && record.role !== "assistant") return undefined
+  if ("content" in record && record.content !== null && typeof record.content !== "string") return undefined
+  if ("reasoning_content" in record && typeof record.reasoning_content !== "string") return undefined
+  const segments: Segment[] = []
+  if (typeof record.reasoning_content === "string" && record.reasoning_content.trim()) {
+    segments.push({ type: "reasoning", text: record.reasoning_content.trim() })
+  }
+  if (typeof record.content === "string" && record.content.trim()) {
+    segments.push({ type: "text", text: record.content.trim() })
+  }
+  for (const call of record.tool_calls as Array<{ function: { name: string; arguments: unknown } }>) {
+    const fn = call.function
+    if (!tools.has(fn.name)) return undefined
+    let input: string
+    if (typeof fn.arguments === "string") {
+      try {
+        JSON.parse(fn.arguments)
+      } catch {
+        return undefined
+      }
+      input = fn.arguments
+    } else {
+      input = JSON.stringify(fn.arguments)
+    }
+    // Echoed ids are discarded: they can collide with ids this middleware
+    // already assigned to earlier promoted calls in the same history.
+    segments.push({
+      type: "tool-call",
+      toolCallId: `pollinations-call-${counter.next++}`,
+      toolName: fn.name,
+      input,
+    })
+  }
+  return segments
 }
 
 // Flat-dialect qualification (a shape gate, not validation; the tool's own
