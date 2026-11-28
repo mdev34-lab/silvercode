@@ -5,6 +5,7 @@ import { Global } from "@opencode-ai/core/global"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import fs from "fs/promises"
+import os from "os"
 import path from "path"
 import { Effect, Fiber, Layer } from "effect"
 import { Snapshot } from "../../src/snapshot"
@@ -205,6 +206,28 @@ it.instance(
   }),
   { git: true },
 )
+
+test("joinSnapshotConfig preserves a trailing unterminated continuation", async () => {
+  // A template/user config whose last line is an unterminated continuation
+  // must not swallow the appended [core] header into its value.
+  const file = path.join(await fs.mkdtemp(path.join(os.tmpdir(), "snapshot-config-")), "config")
+  await fs.writeFile(file, Snapshot.joinSnapshotConfig("[user]\n\tname = val\\"))
+  const out = await $`git config --file ${file} --list`.text()
+  const entries = out.trim().split("\n")
+  expect(entries).toContain("user.name=val")
+  for (const entry of [
+    "core.autocrlf=false",
+    "core.longpaths=true",
+    "core.symlinks=true",
+    "core.fsmonitor=false",
+    "core.untrackedcache=true",
+    "feature.manyfiles=true",
+    "index.version=4",
+    "index.threads=true",
+  ]) {
+    expect(entries).toContain(entry)
+  }
+})
 
 test("duplicatedSnapshotConfigKeys finds only multiply-assigned tuning keys", () => {
   // Real `git config --list -z` output: "key\nvalue\0" per entry, "key\0"

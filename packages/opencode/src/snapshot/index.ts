@@ -28,23 +28,22 @@ const quote = [...cfg, "-c", "core.quotepath=false"]
 
 // Persistent tuning for a fresh snapshot gitdir. `git config` sets one key per
 // invocation and GIT_CONFIG_* env vars and `-c` flags are ephemeral, so there
-// is no supported batched set: the eight values are appended to the config
-// file in one atomic write (tmp file + rename), then any pre-existing
-// assignments of the same keys (Windows git init writes core.symlinks=false;
-// init templates can carry arbitrary config) are collapsed by git itself via
-// `git config --replace-all`. No config syntax is parsed here, so this code
-// cannot corrupt the file: the worst outcome of a tolerated failure is a
-// leftover duplicate key, which keeps reads correct (last assignment wins)
-// and only makes a later plain `git config <key> <value>` fail.
-// One deliberate difference from `git config <key> <value>` set semantics:
-// the trailing block sits after any include.path directive, so it wins over
-// included values, where a per-key set could land before one. That requires
-// an init template that writes include.path, the gitdir is private to this
-// app, and every snapshot git call also passes the core values as -c flags,
-// so this file only carries performance tuning. The write bypasses git's
-// config.lock protocol; this module is the only writer of the file,
-// track() serializes access per gitdir, and a cross-process race converges
-// to the same appended block.
+// is no supported batched set. Two paths:
+// - Configs carrying include directives, or ones git cannot parse, keep the
+//   original eight `git config <key> <value>` spawns: git's own writers keep
+//   git's own include precedence and tolerated-failure behavior, unchanged.
+// - Otherwise the eight values are appended in one atomic write (tmp file +
+//   rename), then any pre-existing assignments of the same keys (Windows git
+//   init writes core.symlinks=false) are collapsed by git itself via
+//   --replace-all. No config syntax is parsed here, so this cannot corrupt
+//   the file: the worst tolerated outcome is a leftover duplicate key, which
+//   keeps reads correct (last assignment wins) and only makes a later plain
+//   `git config <key> <value>` fail.
+// The write bypasses git's config.lock protocol; this module is the only
+// writer of the file, track() serializes access per gitdir, and a
+// cross-process race converges to the same appended block. Every snapshot
+// git call also passes the core values as -c flags, so this file only
+// carries performance tuning.
 const SNAPSHOT_CONFIG_APPEND = `
 [core]
 	autocrlf = false
@@ -59,6 +58,10 @@ const SNAPSHOT_CONFIG_APPEND = `
 	threads = true
 `
 
+// Disambiguates the tmp config file across concurrent configure calls; the
+// pid already disambiguates across processes.
+let snapshotConfigTmpCounter = 0
+
 // Canonical lowercase section.key form and value for each appended key.
 const SNAPSHOT_CONFIG_VALUES: ReadonlyMap<string, string> = new Map([
   ["core.autocrlf", "false"],
@@ -70,6 +73,14 @@ const SNAPSHOT_CONFIG_VALUES: ReadonlyMap<string, string> = new Map([
   ["index.version", "4"],
   ["index.threads", "true"],
 ])
+
+// Joins existing config content with the appended block. A missing trailing
+// newline is added first: an unterminated continuation on the last line then
+// consumes only the empty line SNAPSHOT_CONFIG_APPEND starts with, instead of
+// swallowing the [core] header into the previous value.
+export function joinSnapshotConfig(previous: string): string {
+  return (previous.endsWith("\n") ? previous : previous + "\n") + SNAPSHOT_CONFIG_APPEND
+}
 
 // Tuning keys assigned more than once in `git config --list -z` output, as
 // [key, value] pairs for --replace-all. Entry format is "key\nvalue\0", or
@@ -381,12 +392,22 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | AppProcess.Service | C
         const configure = Effect.fnUntraced(function* (gitdir: string) {
           const file = path.join(gitdir, "config")
           yield* Effect.gen(function* () {
+            // --get-regexp exits 1 on no match, 0 on match, >1 on a file git
+            // cannot parse. Any include directive (include.path, includeIf.*)
+            // or an unparsable file keeps the original git-owned spawns.
+            const includes = yield* git(["--git-dir", gitdir, "config", "--local", "--get-regexp", "^include"])
+            if (includes.code !== 1) {
+              for (const [key, value] of SNAPSHOT_CONFIG_VALUES) {
+                yield* git(["--git-dir", gitdir, "config", key, value])
+              }
+              return
+            }
             const info = yield* fs.stat(file)
             const previous = yield* fs.readFileString(file)
-            const tmp = `${file}.tmp-${process.pid}`
-            yield* fs.writeFileString(tmp, previous + SNAPSHOT_CONFIG_APPEND)
+            const tmp = `${file}.tmp-${process.pid}-${snapshotConfigTmpCounter++}`
+            yield* fs.writeFileString(tmp, joinSnapshotConfig(previous))
             if (typeof info.mode === "number") yield* fs.chmod(tmp, info.mode).pipe(Effect.ignore)
-            yield* fs.rename(tmp, file)
+            yield* fs.rename(tmp, file).pipe(Effect.tapError(() => fs.remove(tmp).pipe(Effect.ignore)))
             // No -c flags on these spawns: injected values would show up in
             // --list output and masquerade as assignments.
             const list = yield* git(["config", "--local", "--list", "-z"], { env: { GIT_DIR: gitdir } })
