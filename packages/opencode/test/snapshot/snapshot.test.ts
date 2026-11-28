@@ -1,6 +1,7 @@
 import { afterEach, expect } from "bun:test"
 import { $ } from "bun"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
+import { Global } from "@opencode-ai/core/global"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import fs from "fs/promises"
@@ -160,6 +161,48 @@ it.instance(
       expect(yield* readText(`${tmp.path}/b.txt`)).toBe(tmp.extra.bContent)
     }),
   ),
+  { git: true },
+)
+
+it.instance(
+  "fresh gitdir persists the snapshot tuning config",
+  Effect.gen(function* () {
+    const tmp = yield* bootstrap()
+    const snapshot = yield* Snapshot.Service
+    const before = yield* snapshot.track()
+    expect(before).toBeTruthy()
+    const config = yield* Effect.promise(async () => {
+      const root = path.join(Global.Path.data, "snapshot")
+      const matches: string[] = []
+      const walk = async (dir: string): Promise<void> => {
+        for (const entry of await fs.readdir(dir, { withFileTypes: true })) {
+          const full = path.join(dir, entry.name)
+          if (entry.isDirectory()) await walk(full)
+          else if (entry.name === "config") {
+            const raw = await fs.readFile(full, "utf8")
+            if (raw.includes(path.basename(tmp.path))) matches.push(raw)
+          }
+        }
+      }
+      await walk(root)
+      expect(matches.length).toBe(1)
+      return matches[0]!
+    })
+    for (const line of [
+      "autocrlf = false",
+      "longpaths = true",
+      "symlinks = true",
+      "fsmonitor = false",
+      "untrackedCache = true",
+      "manyFiles = true",
+      "version = 4",
+      "threads = true",
+      "repositoryformatversion",
+      "worktree = ",
+    ]) {
+      expect(config).toContain(line)
+    }
+  }),
   { git: true },
 )
 
