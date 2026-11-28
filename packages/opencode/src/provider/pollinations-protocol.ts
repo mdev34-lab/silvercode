@@ -46,14 +46,17 @@ type Counter = { next: number }
 //   intended call, on either dialect — that class is inherent to a
 //   text-envelope protocol and stays accepted.
 // - The serialized assistant-message dialect observed from GPT-6-Luna
-//   (2026-11-27, real TUI): the backend renders assistant history as raw
-//   JSON and the model imitates the whole message shape as its output —
+//   (2026-11-27, real TUI): the model emits a whole assistant message as
+//   raw JSON text —
 //   {"tool_calls":[{"id":"...","type":"function","function":{"name":"read",
 //   "arguments":"<json string>"}}],"role":"assistant","content":"..."} or
-//   with "reasoning_content" instead. Promotion is strict: only those
-//   observed sibling keys, role absent or "assistant", every call an
-//   offered tool with JSON-decodable arguments; echoed call ids are
-//   discarded in favor of fresh ones. Anything else stays visible text.
+//   with "reasoning_content" instead. The observed call ids match this
+//   middleware's own generated-id prefix, consistent with the model
+//   echoing serialized history. Promotion is strict: only those observed
+//   sibling keys, role absent or "assistant", every call an offered tool
+//   whose arguments decode to an object consistent with that tool's input
+//   schema (the flat dialect's shape gate); echoed call ids are discarded
+//   in favor of fresh ones. Anything else stays visible text.
 export function parsePollinationsProtocol(
   content: string,
   options: LanguageModelV3CallOptions,
@@ -516,47 +519,58 @@ function decodeToolCallsEnvelope(
   for (const call of record.tool_calls as Array<{ function: { name: string; arguments: unknown } }>) {
     const fn = call.function
     if (!tools.has(fn.name)) return undefined
-    let input: string
+    let parsed: unknown
     if (typeof fn.arguments === "string") {
       try {
-        JSON.parse(fn.arguments)
+        parsed = JSON.parse(fn.arguments)
       } catch {
         return undefined
       }
-      input = fn.arguments
     } else {
-      input = JSON.stringify(fn.arguments)
+      parsed = fn.arguments
     }
+    // Arguments must decode to an object consistent with the offered tool's
+    // input schema — the same shape gate the flat dialect applies. A
+    // decodable-but-mismatched payload is JSON data, not a call, and stays
+    // visible text.
+    if (!isRecord(parsed) || !inputQualifies(Object.keys(parsed), tools.get(fn.name))) return undefined
     // Echoed ids are discarded: they can collide with ids this middleware
     // already assigned to earlier promoted calls in the same history.
     segments.push({
       type: "tool-call",
       toolCallId: `pollinations-call-${counter.next++}`,
       toolName: fn.name,
-      input,
+      input: typeof fn.arguments === "string" ? fn.arguments : JSON.stringify(fn.arguments),
     })
   }
   return segments
 }
 
-// Flat-dialect qualification (a shape gate, not validation; the tool's own
-// schema decode still runs on promoted calls). The schema is treated like
-// the repo's tool layer treats it: object schemas with declared "properties"
-// are closed to extra keys unless they opt out with additionalProperties: true
-// or patternProperties, and every "required" key must be present. Schemas
-// that cannot discriminate (no properties object, or $ref/anyOf/oneOf/allOf
-// at the top level) accept, so demotion only happens on positive evidence of
-// a mismatch and open/zero-argument tools keep working.
 function flatInputQualifies(record: Record<string, unknown>, schema: unknown): boolean {
+  return inputQualifies(
+    Object.keys(record).filter((key) => key !== "name"),
+    schema,
+  )
+}
+
+// Input-shape qualification shared by the flat and assistant-message
+// dialects (a shape gate, not validation; the tool's own schema decode still
+// runs on promoted calls). The schema is treated like the repo's tool layer
+// treats it: object schemas with declared "properties" are closed to extra
+// keys unless they opt out with additionalProperties: true or
+// patternProperties, and every "required" key must be present. Schemas that
+// cannot discriminate (no properties object, or $ref/anyOf/oneOf/allOf at
+// the top level) accept, so demotion only happens on positive evidence of a
+// mismatch and open/zero-argument tools keep working.
+function inputQualifies(keys: string[], schema: unknown): boolean {
   if (!isRecord(schema)) return true
   if ("$ref" in schema || "anyOf" in schema || "oneOf" in schema || "allOf" in schema) return true
   if (!isRecord(schema.properties)) return true
   const properties = schema.properties as Record<string, unknown>
   const open = schema.additionalProperties === true || isRecord(schema.patternProperties)
-  const keys = Object.keys(record).filter((key) => key !== "name")
   if (!open && keys.some((key) => !(key in properties))) return false
   const required = Array.isArray(schema.required) ? schema.required : []
-  return required.every((key) => typeof key !== "string" || key in record)
+  return required.every((key) => typeof key !== "string" || keys.includes(key))
 }
 
 function flatArgumentsInput(record: Record<string, unknown>): string {

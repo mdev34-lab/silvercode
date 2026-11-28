@@ -2,12 +2,27 @@
 import { describe, expect, test } from "bun:test"
 import type { LanguageModelV3CallOptions, LanguageModelV3StreamPart } from "@ai-sdk/provider"
 import { parsePollinationsProtocol, pollinationsProtocolMiddleware } from "../../src/provider/pollinations-protocol"
+import { Parameters as ReadToolParameters } from "../../src/tool/read"
+import { ToolJsonSchema } from "../../src/tool/json-schema"
 
 const options: LanguageModelV3CallOptions = {
   prompt: [],
   tools: [{ type: "function", name: "finish", inputSchema: { type: "object" } }],
 }
+// The real schema the agent loop offers for the read tool, generated from
+// the tool's own Effect Schema parameters by the repo's converter.
 const readToolOptions: LanguageModelV3CallOptions = {
+  prompt: [],
+  tools: [
+    {
+      type: "function",
+      name: "read",
+      inputSchema: ToolJsonSchema.fromSchema(ReadToolParameters as never),
+    },
+  ],
+}
+// A tool whose schema explicitly allows extra keys.
+const openToolOptions: LanguageModelV3CallOptions = {
   prompt: [],
   tools: [
     {
@@ -17,6 +32,7 @@ const readToolOptions: LanguageModelV3CallOptions = {
         type: "object",
         properties: { filePath: { type: "string" } },
         required: ["filePath"],
+        additionalProperties: true,
       },
     },
   ],
@@ -452,9 +468,9 @@ describe("Pollinations text protocol", () => {
   })
 
   test("decodes the serialized assistant-message dialect observed from GPT-6-Luna", () => {
-    // Observed 2026-11-27 in the real TUI: Luna imitates the backend's raw
-    // JSON serialization of an assistant message, including the ids this
-    // middleware assigned to earlier promoted calls (path anonymized).
+    // Observed 2026-11-27 in the real TUI: Luna emits a whole serialized
+    // assistant message as raw JSON text; its call ids match this
+    // middleware's generated-id prefix (path anonymized).
     const envelope =
       '{"tool_calls":[{"id":"pollinations-call-1","type":"function","function":{"name":"read","arguments":"{\\"filePath\\":\\"/tmp/example\\"}"}}],"role":"assistant","content":"No matches for that pattern."}'
     expect(parsePollinationsProtocol(envelope, readToolOptions)).toEqual([
@@ -508,6 +524,23 @@ describe("Pollinations text protocol", () => {
     const badArguments =
       '{"tool_calls":[{"type":"function","function":{"name":"read","arguments":"{not json"}}],"role":"assistant"}'
     expect(parsePollinationsProtocol(badArguments, readToolOptions)).toEqual([{ type: "text", text: badArguments }])
+    // Decodable JSON that is not an object is data, not a call.
+    const scalarArguments =
+      '{"tool_calls":[{"type":"function","function":{"name":"read","arguments":"\\"/tmp/example\\""}}],"role":"assistant"}'
+    expect(parsePollinationsProtocol(scalarArguments, readToolOptions)).toEqual([
+      { type: "text", text: scalarArguments },
+    ])
+    // Arguments decodable but inconsistent with the offered tool's real
+    // schema (unknown key against the closed read schema, or a missing
+    // required key) are JSON data, not a call: they stay visible text.
+    const unknownKey =
+      '{"tool_calls":[{"type":"function","function":{"name":"read","arguments":"{\\"filePath\\":\\"/tmp/a\\",\\"unexpected\\":1}"}}],"role":"assistant"}'
+    expect(parsePollinationsProtocol(unknownKey, readToolOptions)).toEqual([{ type: "text", text: unknownKey }])
+    const missingRequired =
+      '{"tool_calls":[{"type":"function","function":{"name":"read","arguments":"{\\"offset\\":1}"}}],"role":"assistant"}'
+    expect(parsePollinationsProtocol(missingRequired, readToolOptions)).toEqual([
+      { type: "text", text: missingRequired },
+    ])
     // Sibling keys beyond the observed assistant-message shape stay text.
     const extraKey =
       '{"tool_calls":[{"type":"function","function":{"name":"read","arguments":"{\\"filePath\\":\\"/tmp/a\\"}"}}],"role":"assistant","finish_reason":"tool_calls"}'
@@ -519,6 +552,19 @@ describe("Pollinations text protocol", () => {
     // Ordinary prose quoting the dialect is never promoted (anchored rule).
     const quoted = `Documentation may show ${extraKey} without calling anything.`
     expect(parsePollinationsProtocol(quoted, readToolOptions)).toEqual([{ type: "text", text: quoted }])
+  })
+
+  test("honors schemas that permit extra properties in the assistant-message dialect", () => {
+    const extraKey =
+      '{"tool_calls":[{"type":"function","function":{"name":"read","arguments":"{\\"filePath\\":\\"/tmp/a\\",\\"unexpected\\":1}"}}],"role":"assistant"}'
+    expect(parsePollinationsProtocol(extraKey, openToolOptions)).toEqual([
+      {
+        type: "tool-call",
+        toolCallId: "pollinations-call-0",
+        toolName: "read",
+        input: '{"filePath":"/tmp/a","unexpected":1}',
+      },
+    ])
   })
 
   test("maps the assistant-message dialect to native content in generate", async () => {
