@@ -25,6 +25,27 @@ const limit = 2 * 1024 * 1024
 const core = ["-c", "core.longpaths=true", "-c", "core.symlinks=true"]
 const cfg = ["-c", "core.autocrlf=false", ...core]
 const quote = [...cfg, "-c", "core.quotepath=false"]
+
+// Persistent tuning for a fresh snapshot gitdir. `git config` sets one key per
+// invocation and GIT_CONFIG_* env vars and `-c` flags are ephemeral, so there
+// is no supported batched set: the eight values are appended to the config
+// file in one atomic write (tmp file + rename) instead of eight subprocesses.
+// A trailing section overrides earlier keys, matching `git config <key> <value>`
+// set semantics. Existing init/template keys, includes and permissions are
+// preserved; the same append technique is used in test/fixture/fixture.ts.
+const SNAPSHOT_CONFIG_APPEND = `
+[core]
+	autocrlf = false
+	longpaths = true
+	symlinks = true
+	fsmonitor = false
+	untrackedCache = true
+[feature]
+	manyFiles = true
+[index]
+	version = 4
+	threads = true
+`
 interface GitResult {
   readonly code: ChildProcessSpawner.ExitCode
   readonly text: string
@@ -315,6 +336,27 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | AppProcess.Service | C
           )
         })
 
+        // Write the persistent gitdir config atomically. Failures are tolerated
+        // like the previous per-key `git config` spawns (unchecked results): the
+        // gitdir keeps git's init defaults and every later git call still works.
+        const configure = Effect.fnUntraced(function* (gitdir: string) {
+          const file = path.join(gitdir, "config")
+          yield* Effect.gen(function* () {
+            const info = yield* fs.stat(file)
+            const previous = yield* fs.readFileString(file)
+            const tmp = `${file}.tmp-${process.pid}`
+            yield* fs.writeFileString(tmp, previous + SNAPSHOT_CONFIG_APPEND)
+            if (typeof info.mode === "number") yield* fs.chmod(tmp, info.mode).pipe(Effect.ignore)
+            yield* fs.rename(tmp, file)
+          }).pipe(
+            Effect.catch((error) =>
+              Effect.logWarning("failed to persist snapshot git config; keeping init defaults", {
+                error: String(error),
+              }),
+            ),
+          )
+        })
+
         const track = Effect.fnUntraced(function* () {
           return yield* locked(
             Effect.gen(function* () {
@@ -325,15 +367,7 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | AppProcess.Service | C
                 yield* git(["init"], {
                   env: { GIT_DIR: state.gitdir, GIT_WORK_TREE: state.worktree },
                 })
-                yield* git(["--git-dir", state.gitdir, "config", "core.autocrlf", "false"])
-                yield* git(["--git-dir", state.gitdir, "config", "core.longpaths", "true"])
-                yield* git(["--git-dir", state.gitdir, "config", "core.symlinks", "true"])
-                yield* git(["--git-dir", state.gitdir, "config", "core.fsmonitor", "false"])
-                // Tuning for very large worktrees so the first add stays bounded.
-                yield* git(["--git-dir", state.gitdir, "config", "feature.manyFiles", "true"])
-                yield* git(["--git-dir", state.gitdir, "config", "index.version", "4"])
-                yield* git(["--git-dir", state.gitdir, "config", "index.threads", "true"])
-                yield* git(["--git-dir", state.gitdir, "config", "core.untrackedCache", "true"])
+                yield* configure(state.gitdir)
                 yield* seed()
                 yield* Effect.logInfo("initialized")
               }
