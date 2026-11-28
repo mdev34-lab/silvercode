@@ -70,6 +70,14 @@ jobs:
         env:
           OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER: ${{ runner.os == 'Windows' && 'true' || 'false' }}
 
+      - name: Upload unit test timing report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: unit-test-timings-${{ matrix.settings.name }}
+          path: packages/opencode/junit.xml
+          if-no-files-found: ignore
+
       - name: Check generated client
         if: runner.os == 'Linux'
         working-directory: packages/client
